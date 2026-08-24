@@ -1366,10 +1366,15 @@ def _remove_runtime_file():
         pass
 
 
-def start_server(port: int = DEFAULT_PORT, host: str = "0.0.0.0", pinned: bool = False):
+def start_server(port: int = DEFAULT_PORT, host: str = "127.0.0.1", pinned: bool = False, allow_remote: bool = False):
     """启动简易 HTTP 看板服务（含端口探测与同项目复用）"""
     if not os.path.exists(KANBAN_DIR):
         print(f"[FAILED]  [ERROR] 无法找到看板目录: {KANBAN_DIR}")
+        sys.exit(1)
+
+    is_loopback = host in ("", "127.0.0.1", "localhost", "::1")
+    if not is_loopback and not allow_remote:
+        print(f"[FAILED]  [ERROR] 为了安全起见，非本机监听 ({host}) 必须显式添加 --allow-remote 参数。")
         sys.exit(1)
 
     fingerprint = compute_project_fingerprint(_DATA_ROOT)
@@ -1380,15 +1385,18 @@ def start_server(port: int = DEFAULT_PORT, host: str = "0.0.0.0", pinned: bool =
         print(f"[REUSE]  本项目看板服务已在运行 (端口: {result.port})，直接复用既有实例")
         print(f" 既有实例 PID: {result.health.get('pid', '未知')} | 启动于: {result.health.get('data_root', '')}")
         print("=" * 70)
-        print_kanban_urls(result.port, get_local_ip())
+        # Reuse returns same local URLs; only show LAN if we were asked to allow_remote
+        local_ip = get_local_ip() if allow_remote or not is_loopback else ""
+        print_kanban_urls(result.port, local_ip)
         return
 
     # probe_port 在 127.0.0.1 上试探性绑定成功；若最终要求监听其他 host，重建监听
     httpd = result.httpd
-    if host not in ("", "127.0.0.1", "localhost"):
+    if not is_loopback:
         httpd.server_close()
         try:
             httpd = ReusableHTTPServer((host, result.port), KanbanHTTPRequestHandler)
+            print("\n[WARNING] 警告：已开启局域网远程访问 (--allow-remote)，当前无身份认证，请勿在公网暴露！")
         except OSError as e:
             print(f"[FAILED]  [ERROR] 端口 {result.port} 绑定 {host} 失败: {e}")
             sys.exit(1)
@@ -1403,7 +1411,7 @@ def start_server(port: int = DEFAULT_PORT, host: str = "0.0.0.0", pinned: bool =
     _write_runtime_file(result.port, fingerprint)
     atexit.register(_remove_runtime_file)
 
-    local_ip = get_local_ip()
+    local_ip = get_local_ip() if allow_remote or not is_loopback else ""
     print_kanban_urls(result.port, local_ip)
 
     try:
@@ -1418,7 +1426,7 @@ def print_kanban_urls(port: int, local_ip: str):
     print(f"[START]  Multi-Agent Flow 看板 Web 服务已就绪 (端口: {port})")
     print("=" * 70)
     print(f" 本地 Web 访问直达: http://127.0.0.1:{port}/")
-    if local_ip != "127.0.0.1":
+    if local_ip and local_ip != "127.0.0.1":
         print(f" 局域网访问地址    : http://{local_ip}:{port}/")
     print("=" * 70 + "\n")
 
@@ -1427,7 +1435,8 @@ def main():
     parser = argparse.ArgumentParser(description="Multi-Agent Flow 看板简易 HTTP 服务")
     parser.add_argument("--port", type=int, default=None,
                         help=f"固定服务端口 (默认: 环境变量 KANBAN_PORT 或 {DEFAULT_PORT}+自动探测)")
-    parser.add_argument("--host", type=str, default="0.0.0.0", help="监听 Host (默认: 0.0.0.0)")
+    parser.add_argument("--host", type=str, default="127.0.0.1", help="监听 Host (默认: 127.0.0.1)")
+    parser.add_argument("--allow-remote", action="store_true", help="允许局域网远程访问 (默认仅本机)")
     args = parser.parse_args()
 
     env_port = os.environ.get("KANBAN_PORT", "").strip()
@@ -1438,7 +1447,7 @@ def main():
     else:
         port, pinned = DEFAULT_PORT, False
 
-    start_server(port=port, host=args.host, pinned=pinned)
+    start_server(port=port, host=args.host, pinned=pinned, allow_remote=args.allow_remote)
 
 
 if __name__ == "__main__":
