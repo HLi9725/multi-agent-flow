@@ -1,0 +1,1347 @@
+# Multi-Agent Flow 多客户端可信化与生态改造实施方案
+
+> 文档状态：Draft / 待用户批准执行  
+> 适用仓库：`YuanYii/multi-agent-flow`  
+> 目标客户端：ChatGPT、OpenAI Codex、Google Antigravity  
+> 制定日期：2026-08-24  
+> 实施原则：先可信、再真实多 Agent、再降复杂度、最后扩生态
+
+## 1. 文档目的
+
+本方案用于指导 `multi-agent-flow` 从“以提示词和本地状态机为主的流程 Skill”演进为：
+
+1. 默认安全、可审计、不会伪造完成状态的工作流工具；
+2. 能通过宿主原生能力运行真实子 Agent 的多客户端适配层；
+3. 能根据任务风险选择 Lite、Standard、Compliance 流程；
+4. 全局安装能力、按项目隔离数据，不在不同项目间串任务；
+5. 后续可通过远程 MCP Server 和 Plugin/App 接入 ChatGPT Web、Codex、Antigravity及外部系统。
+
+本文是实施依据，不代表所有阶段已经完成。任何阶段进入编码前，均需用户确认；最终进入“已验收”状态必须再次由用户确认。
+
+## 2. 当前基线
+
+截至本文制定时，仓库大约包含 7,410 行 Python 代码和 217 个测试函数。当前测试无法完成收集，直接原因是 `scripts/start_kanban_server.py` 使用了 `Any`、`Optional`，但没有从 `typing` 导入：
+
+```text
+NameError: name 'Any' is not defined
+```
+
+当前架构已有以下基础：
+
+- 状态流转、角色权限、审计、离线看板和外部看板 Adapter；
+- `YY_FLOW_PROJECT_ROOT`、`.yy-flow` 与 CWD 路径解析；
+- 全局共享 Skill 与项目运行数据分离的初步设计；
+- Codex、Antigravity等平台的 Agent 定义导出；
+- L0/L1/L2 与 A-G 类型流程；
+- 阶段门禁和 Git 工作区检查。
+
+当前关键缺口：
+
+- `/auto` 能生成总结并推进状态，但没有执行真实开发、审查和测试；
+- 子 Agent 调用写死或隐含依赖特定宿主能力；
+- Reviewer、QA 的“角色不同”尚不等于“独立上下文真实运行”；
+- 状态变更没有统一、可校验的证据对象；
+- 项目隔离仍可能静默回退 CWD，缺少稳定的 `project_id`；
+- 看板删除为物理删除；
+- ChatGPT Web 不能直接使用本地脚本，需要 Plugin + 远程 MCP；
+- 现有部分全局 Skill/Agent 路径与客户端现行规范不一致。
+
+## 3. 官方能力边界与兼容目标
+
+### 3.1 OpenAI ChatGPT 与 Codex
+
+根据 [OpenAI Build skills 文档](https://learn.chatgpt.com/docs/build-skills)，ChatGPT 和 Codex 都可以显式或隐式激活 Skill；Codex 会从项目 `.agents/skills` 和用户 `$HOME/.agents/skills` 等位置发现本地 Skill。可复用分发及连接器场景应优先使用 Plugin。
+
+根据 [OpenAI Subagents 文档](https://learn.chatgpt.com/docs/agent-configuration/subagents)，ChatGPT Work 与 Codex 支持子 Agent 工作流；Codex 的个人自定义 Agent 位于 `~/.codex/agents/`，项目自定义 Agent 位于 `.codex/agents/`。每个子 Agent 会进行独立模型和工具工作，因此不能把“角色文本切换”当成真实子 Agent。
+
+根据 [OpenAI Plugin architecture 文档](https://developers.openai.com/plugins/concepts/plugins)，Plugin 可以组合 Skill、MCP Server 和可选 UI。ChatGPT Web/Work 的跨设备接入应在第四阶段通过该机制完成，不能承诺仅安装本地 Python Skill 后即可在所有 ChatGPT Web 对话中运行。
+
+### 3.2 Google Antigravity
+
+根据 [Antigravity Skills 文档](https://antigravity.google/docs/skills/)，工作区 Skill 位于 `.agents/skills/<skill>/`，IDE/Desktop 全局 Skill 位于 `~/.gemini/config/skills/<skill>/`。
+
+根据 [Antigravity Subagents 文档](https://antigravity.google/docs/subagents)，自定义 Agent 的工作区路径为 `.agents/agents/<name>.md` 或 `.agents/agents/<name>/agent.md`，全局路径为 `~/.gemini/config/agents/<name>.md` 或相应目录形式。子 Agent 可使用 `inherit`、`branch` 或 `share` 工作区模式，其中 `branch` 可创建隔离 Git worktree。
+
+Antigravity CLI 可能使用独立的 CLI 全局 Skill 目录。实现时必须按宿主 surface 探测并分别验证，不能用一个未经检测的硬编码路径覆盖 IDE、Desktop 和 CLI。
+
+### 3.3 分阶段兼容承诺
+
+| 阶段 | Codex 本地客户端 | Antigravity 本地客户端 | ChatGPT Desktop | ChatGPT Web/Work |
+|---|---|---|---|---|
+| 第一阶段 | 本地 Skill/脚本可信运行 | 本地 Skill/脚本可信运行 | 仅支持已暴露的本地能力 | 不承诺本地脚本执行 |
+| 第二阶段 | 原生子 Agent Adapter | 原生 `invoke_subagent` Adapter | 依赖可用的 Codex/Plugin 能力 | 仅宿主已提供子 Agent 时可用 |
+| 第三阶段 | Lite/Standard/Compliance | Lite/Standard/Compliance | Profile 规则可复用 | Profile 规则可复用 |
+| 第四阶段 | 本地或远程 MCP/Plugin | 本地或远程 MCP/Plugin | Plugin + MCP | Plugin/App + 远程 MCP |
+
+## 4. 目标架构
+
+```text
+用户请求
+  │
+  ▼
+Skill Router
+  ├── 判断项目身份
+  ├── 判断 L0/L1/L2 与 Profile
+  ├── 生成执行计划
+  └── 等待用户确认
+  │
+  ▼
+Host Adapter
+  ├── CodexAdapter
+  ├── AntigravityAdapter
+  └── ChatGPTAdapter / RemoteMcpAdapter
+  │
+  ▼
+Execution Core
+  ├── 项目隔离与 worktree
+  ├── 任务状态机
+  ├── 证据门禁
+  ├── Reviewer/QA 独立性校验
+  └── 用户最终验收
+  │
+  ▼
+Board Adapter
+  ├── Local JSON
+  ├── Remote MCP Board
+  ├── GitHub Projects
+  ├── Jira
+  └── Feishu Base
+```
+
+建议逐步形成以下代码结构，并保留现有 `scripts/*.py` 作为向后兼容 CLI 包装器：
+
+```text
+multi-agent-flow/
+├── SKILL.md
+├── skills/
+│   ├── router/SKILL.md
+│   ├── task-flow/SKILL.md
+│   ├── review/SKILL.md
+│   └── qa/SKILL.md
+├── yy_flow/
+│   ├── core/
+│   ├── evidence/
+│   ├── execution/
+│   ├── hosts/
+│   ├── projects/
+│   └── boards/
+├── scripts/                 # 兼容入口
+├── agents/                  # 中立角色源定义
+├── config/
+├── tests/
+└── docs/
+```
+
+## 5. 全局能力与项目数据隔离
+
+### 5.1 基本原则
+
+全局安装只共享代码、Skill、通用角色模板和 Adapter，不共享项目任务数据、技术栈覆盖、会话绑定和锁文件。
+
+```text
+全局共享：
+  yy-flow Skill / Python Core / Host Adapters / 通用角色模板
+
+项目私有：
+  .yy-flow/project.json
+  .yy-flow/user_data/board.json
+  .yy-flow/user_data/evidence/
+  .yy-flow/user_data/logs/
+  .yy-flow/user_data/worktrees.json
+  .yy-flow/user_data/session-bindings/
+```
+
+### 5.2 项目身份文件
+
+每个项目首次启用时生成 `.yy-flow/project.json`：
+
+```json
+{
+  "schema_version": 1,
+  "project_id": "licenseplate-7f31c2",
+  "project_name": "LicensePlate",
+  "root_realpath": "C:\\Users\\user\\Desktop\\Project\\LicensePlate",
+  "vcs": "git",
+  "remote_fingerprint": "sha256:...",
+  "created_at": "2026-08-24T10:00:00+08:00"
+}
+```
+
+`project_id` 一经生成不得因项目改名而改变。任务外部标识使用：
+
+```text
+<project_id>:<task_id>
+licenseplate-7f31c2:T0001
+```
+
+### 5.3 防串项目门禁
+
+任何写操作前执行：
+
+1. 解析显式 `--project-root`；
+2. 解析 Git 顶层目录；
+3. 读取 `.yy-flow/project.json`；
+4. 比较 realpath、`project_id` 和远端指纹；
+5. 确认任务所属 `project_id`；
+6. 不一致则 Fail-Closed，禁止静默退回其他 CWD；
+7. 用户明确确认“切换项目”后才建立新的会话绑定。
+
+注意事项：
+
+- 全局目录中出现 `board.json` 必须视为安装污染并阻断；
+- 环境变量 `YY_FLOW_PROJECT_ROOT` 只能作为显式覆盖，必须与项目身份文件交叉校验；
+- 同一对话操作多个仓库时，每个写调用都要携带 `project_id`，不能依赖“上一条消息”；
+- 远程 MCP 的数据主键必须至少包含 `tenant_id + user_id + project_id + task_id`；
+- 全局 Agent 只能使用通用模板，项目技术栈在每次调用时动态加载，不能写回全局 Agent 文件。
+
+## 6. 用户确认与自动执行策略
+
+### 6.1 两次确认
+
+```text
+请求 → 分级与计划 → 用户确认开始 → 执行/审查/测试 → 用户确认验收
+```
+
+第一次确认控制“是否开始产生变更”，第二次确认控制“是否进入已验收终态”。
+
+建议配置：
+
+```yaml
+execution_policy:
+  default: selective
+  plan_before_execute: true
+  require_start_confirmation: true
+  final_acceptance: human
+  allow_auto_accept: false
+  prefer_single_agent: true
+  max_subagents: 2
+```
+
+若用户的原始命令已经明确包含“执行、修改、修复并测试”，可以视为第一次确认；高风险、破坏性、外部发布和权限扩张仍必须单独请求确认。最终验收不得从原始执行授权中推导。
+
+### 6.2 任务分级
+
+| 等级 | 使用场景 | 默认执行 |
+|---|---|---|
+| L0 | 解释、只读查询、无文件交付 | 主 Agent 直接处理，不建卡 |
+| L1 | 小范围、低风险、易验证修改 | Lite，Builder + 独立 Verifier |
+| L2 | 多模块、高风险、长周期或外部影响 | Standard/Compliance，多角色与严格证据 |
+
+### 6.3 执行委托合同
+
+总体方案不能直接等同于一次执行授权。每次交给 Antigravity、Codex 或其他宿主实施前，必须生成一份范围冻结的执行委托合同。合同至少包含：执行阶段、允许事项、禁止事项、Git 基线、权限边界、交付物、停止条件和复审方。
+
+第一阶段建议合同如下：
+
+```yaml
+delegation_contract:
+  contract_version: 1
+  execution_batch_id: phase-1-trust
+  plan_document: MULTI_CLIENT_MODERNIZATION_PLAN.zh-CN.md
+  executor_host: antigravity
+  reviewer_host: codex
+  status: approved_to_execute
+
+  scope:
+    phase: phase-1
+    allowed_items:
+      - "7.1"
+      - "7.2"
+      - "7.3"
+      - "7.4"
+      - "7.5"
+      - "7.6"
+    forbidden_phases:
+      - phase-2
+      - phase-3
+      - phase-4
+
+  repository:
+    base_branch: main
+    base_commit: "<执行前运行 git rev-parse HEAD 获取>"
+    expected_clean_worktree: true
+    require_new_branch: true
+    prefer_new_worktree: true
+    allow_git_push: false
+    allow_force_push: false
+    allow_release: false
+
+  permissions:
+    allow_workspace_read: true
+    allow_workspace_write: true
+    allow_dependency_install: false
+    allow_global_directory_write: false
+    allow_external_system_write: false
+    allow_destructive_git: false
+
+  delivery:
+    implementation_report: PHASE1_IMPLEMENTATION_REPORT.md
+    require_test_evidence: true
+    require_diff_summary: true
+    require_known_issues: true
+    final_state: awaiting_user_acceptance
+```
+
+合同执行规则：
+
+1. 实施 Agent 只能执行 `allowed_items`；
+2. 发现必须修改范围外内容时，先停止并请求合同扩展；
+3. 第一阶段完成后立即停止，不得提前实现 Host Adapter、MCP、Plugin 或第三方连接器；
+4. 实施 Agent 不得把阶段状态改为“已验收”；
+5. 审查方可以读取所有变更和证据，但默认不直接修改；
+6. 用户明确批准修复审查问题后，才进入下一轮修改；
+7. 合同变更必须留下时间、原因和批准人记录。
+
+#### 6.3.1 执行前置检查
+
+实施前必须执行并记录：
+
+```text
+git status --short
+git branch --show-current
+git rev-parse HEAD
+python --version
+python -m pytest -q
+```
+
+当前方案文档在首次生成时是 Git 未跟踪文件。若使用 Antigravity `New Worktree` 或子 Agent `branch` 模式，新 worktree 不会自动包含未跟踪文件。因此执行前必须满足下列任一条件：
+
+1. 用户先把方案文档加入 Git 并提交；
+2. 用户将文档明确复制到新 worktree；
+3. 用户把完整执行合同和对应阶段内容附加到 Antigravity 请求中。
+
+不允许实施 Agent自行提交、移动或删除用户的未跟踪文件来“清理工作区”。若基线工作区不干净，应列出文件并等待用户决定。
+
+Antigravity 临时 worktree 在子 Agent 被终止时可能被自动清理。终止或清理前必须确保代码提交、补丁或实施报告已经持久化到用户确认的位置；不得让未提交成果只存在于临时 worktree。
+
+### 6.4 禁止事项
+
+以下行为在所有阶段默认禁止，除非用户通过新的书面合同逐项授权。
+
+#### 6.4.1 测试与证据红线
+
+禁止为了“测试全绿”而：
+
+- 删除原有测试；
+- 大量降低断言强度；
+- 增加无明确原因的 `skip`、`xfail` 或条件绕过；
+- 捕获并吞掉本应暴露的异常；
+- 把真实功能改成固定返回成功；
+- 只修改测试去迎合错误实现；
+- 伪造测试数量、命令、退出码、日志或客户端验证结果；
+- 把合成文本总结作为开发、审查、测试或验收证据；
+- 未运行完整测试却声称“全量测试通过”。
+
+测试确需调整时，实施报告必须解释：原行为、规范依据、测试为什么错误、新断言验证什么，并由独立 Reviewer 审查。
+
+#### 6.4.2 文件、依赖和环境红线
+
+默认禁止：
+
+- 未经批准安装、升级或移除依赖；
+- 写入用户主目录、全局 Skill/Agent 目录或系统配置；
+- 修改真实 API Key、OAuth Token、SSH Key 或凭证文件；
+- 把秘密写入代码、配置、测试夹具、日志或实施报告；
+- 修改与本执行批次无关的业务文件；
+- 覆盖、移动或删除用户已有未提交修改；
+- 启动面向公网或局域网的未认证服务；
+- 调用真实 Jira、GitHub、飞书等外部系统执行写操作；
+- 创建计划外的后台常驻服务。
+
+#### 6.4.3 Git 和发布红线
+
+默认禁止：
+
+- `git reset --hard`、强制 checkout 覆盖、清理整个工作区；
+- 改写已有提交历史；
+- force push；
+- 未经批准 push、创建 PR、合并或打 Tag；
+- 发布包、部署服务或修改生产环境；
+- 把多个阶段混入同一提交；
+- 为了获得干净状态而删除未跟踪文件。
+
+允许创建本地任务分支和提交，但必须由合同明确指定。若合同未明确允许 commit，则实施方只能保留工作区 diff 和实施报告。
+
+### 6.5 交付报告
+
+每个执行批次必须在仓库根目录生成独立、可跟踪的实施报告。第一阶段固定使用：
+
+```text
+PHASE1_IMPLEMENTATION_REPORT.md
+```
+
+报告模板：
+
+```markdown
+# 第一阶段实施报告
+
+## 1. 执行身份
+- 执行宿主：
+- 主 Agent / 子 Agent：
+- 执行批次：phase-1-trust
+- 开始时间：
+- 结束时间：
+
+## 2. Git 基线
+- 仓库绝对路径：
+- 起始分支：
+- 起始提交：
+- 工作分支：
+- worktree 路径：
+- 开始前 git status：
+
+## 3. 范围
+- 已执行条目：
+- 未执行条目：
+- 获批的范围变更：
+
+## 4. 文件变更
+| 文件 | 修改目的 | 对应方案条目 | 风险 |
+|---|---|---|---|
+
+## 5. 行为变化
+- Any/Optional：
+- 监听地址：
+- 软删除与恢复：
+- Antigravity 路径：
+- /auto 模拟：
+
+## 6. 测试证据
+| 命令 | 工作目录 | Python | 退出码 | 结果 | 日志/哈希 |
+|---|---|---|---:|---|---|
+
+## 7. 客户端验证
+| 客户端/Surface | 验证方式 | 状态 | 证据 | 未验证原因 |
+|---|---|---|---|---|
+
+## 8. Git 结果
+- 最终提交：
+- 提交列表：
+- git diff --stat：
+- 最终 git status：
+- 未跟踪文件：
+
+## 9. 已知问题与风险
+- 阻断问题：
+- 非阻断问题：
+- 后续建议：
+
+## 10. 回滚方式
+- 代码回滚：
+- 数据迁移回滚：
+- 路径迁移回滚：
+
+## 11. 声明
+- 未执行第二至第四阶段；
+- 未自动标记用户验收；
+- 未伪造或推断未运行的验证结果。
+```
+
+报告要求：
+
+- 空白项必须写“未执行/不适用及原因”，不能删除；
+- 测试结果必须来自真实命令；
+- 日志含敏感信息时保存脱敏副本并记录脱敏规则；
+- 报告自身必须出现在最终 `git status` 或提交列表中；
+- 报告只描述事实，不能用“应该通过”替代“已经通过”。
+
+### 6.6 停止条件
+
+发生下列任一情况，实施 Agent 必须停止修改、保存当前证据并请求用户确认：
+
+1. 需要安装、升级或移除依赖；
+2. 需要修改合同未列出的阶段或大范围文件；
+3. 发现方案与现有 API 兼容要求、测试或数据格式冲突；
+4. 需要写入用户目录、系统目录、全局配置或外部服务；
+5. 需要执行删除、批量移动、重置历史、强制覆盖等破坏性操作；
+6. 工作区存在来源不明的用户修改；
+7. 测试出现与本阶段无关且无法解释的失败；
+8. 无法验证软删除没有造成变相物理删除；
+9. 无法在真实 Antigravity surface 验证路径发现；
+10. 子 Agent 或命令持续循环、超时或请求超出合同的权限；
+11. worktree 产生冲突或成果可能在清理时丢失；
+12. 需要 push、创建 PR、合并、发布或连接生产账号；
+13. 证据文件、基线提交或项目身份无法确定；
+14. 预计实现与计划的工作量、风险明显不一致。
+
+停止后的输出必须包括：已完成事项、未完成事项、当前 diff、最后成功测试、失败信息、需要用户决定的问题。停止不等于失败，也不得为了避免停止而静默扩大权限。
+
+### 6.7 自动测试与真实客户端验证边界
+
+| 内容 | 自动测试 | 本地冒烟 | 真实客户端验证 | 第一阶段判定 |
+|---|---|---|---|---|
+| `Any/Optional` 导入 | 必须 | 可选 | 不需要 | 自动测试通过即可 |
+| `127.0.0.1` 监听 | 必须 | 必须 | 可选 | socket 与进程验证 |
+| 软删除/恢复 | 必须 | 必须 | 看板 UI 建议验证 | API、文件和 UI 证据 |
+| `/auto` 零副作用 | 必须 | 必须 | CLI 建议验证 | 前后哈希一致 |
+| Antigravity Skill 路径 | 路径测试 | 导出测试 | 必须 | 未真实发现不得写“已验证” |
+| Antigravity Agent 路径 | 格式测试 | 导出测试 | 必须 | 至少发现一个自定义 Agent |
+| Codex 兼容性 | 静态/格式测试 | Codex 侧复审 | Codex E2E 后续执行 | 第一阶段不夸大结论 |
+| ChatGPT Web | 不适用 | 不适用 | 第四阶段 Plugin/MCP | 第一阶段明确未验证 |
+
+客户端验证状态只能使用：
+
+```text
+verified      已在指定真实客户端和 surface 验证
+static_only   仅完成路径、格式或契约静态验证
+not_run       未执行
+blocked       因账户、权限、环境或功能不可用而阻塞
+```
+
+禁止把 `static_only` 转换成 `verified`。IDE、Desktop、CLI 属于不同 surface，应分别记录版本和结果。
+
+### 6.8 交给 Antigravity 的第一阶段执行指令
+
+可将下面内容与本方案一起交给 Antigravity：
+
+```text
+请完整阅读仓库根目录的
+MULTI_CLIENT_MODERNIZATION_PLAN.zh-CN.md。
+
+我批准你仅执行“第一阶段：先保证可信”的 7.1～7.6，
+并遵守 6.3～6.7 的执行委托合同、禁止事项、交付报告和停止条件。
+禁止实施第二、第三、第四阶段。
+
+执行要求：
+1. 开始前输出 Git 基线、未提交文件、预计修改文件、测试计划和风险，等待我确认。
+2. 使用独立分支；复杂修改优先使用 New Worktree。
+3. 不得 reset、覆盖、移动或删除用户现有修改和未跟踪文件。
+4. 不得删除测试、弱化断言、添加无理由 skip 或伪造测试结果。
+5. 不得安装/升级依赖、修改全局目录、写外部系统、push 或发布。
+6. 每项修改先运行相关测试，最后运行全量测试并记录命令和退出码。
+7. Antigravity 路径必须区分 static_only 和真实 verified。
+8. /auto 必须是零写入纯模拟，不得推进真实状态。
+9. 完成后在仓库根目录生成 PHASE1_IMPLEMENTATION_REPORT.md。
+10. 第一阶段完成后立即停止，状态保持 awaiting_user_acceptance。
+11. 遇到 6.6 任一停止条件时，保存证据并向我请求决定。
+
+开始修改前只提交执行前检查结果和计划；我确认后再修改。
+```
+
+如果用户在发送本指令时已经明确说“确认执行第一阶段”，可以视为实施开始确认；它不包含最终验收，也不授权范围扩展、破坏性操作或外部写入。
+
+### 6.9 Codex 独立复审交接
+
+Antigravity 完成后，交给 Codex 的材料必须包括：
+
+- 本方案文档；
+- `PHASE1_IMPLEMENTATION_REPORT.md`；
+- 起始提交和最终提交；
+- 工作分支和 worktree 信息；
+- 完整 `git status --short`；
+- `git diff --stat` 和可审查的完整 diff；
+- 全部测试命令、退出码和失败日志；
+- 未跟踪文件列表；
+- 未解决问题、范围变更和用户批准记录；
+- Antigravity 真实客户端验证记录。
+
+推荐给 Codex 的复审指令：
+
+```text
+Antigravity 已完成第一阶段。请以
+MULTI_CLIENT_MODERNIZATION_PLAN.zh-CN.md
+和 PHASE1_IMPLEMENTATION_REPORT.md 为依据进行独立审查。
+
+本轮默认只读：不要直接修复。
+请检查完整 Git diff、实施范围、软删除语义、/auto 零副作用、
+默认监听安全、Antigravity 路径兼容、测试真实性和报告一致性。
+重新运行必要测试，并按阻断/重要/一般问题输出证据。
+最后给出：建议验收、修改后验收或拒绝验收。
+不要代替用户执行最终验收。
+```
+
+Codex 复审流程：
+
+1. 先确认基线、当前分支和工作区状态；
+2. 检查是否越过第一阶段范围；
+3. 逐文件审查，不只阅读实施报告；
+4. 独立重跑受影响测试和全量测试；
+5. 检查报告声明与实际 diff、命令结果是否一致；
+6. 将问题按优先级列出，并给出文件和复现证据；
+7. 默认不修改代码；用户批准修复后再进入修复批次；
+8. 即使无问题，也只能“建议用户验收”，不能自行进入已验收。
+
+### 6.10 执行批次完成定义
+
+一个执行批次只有同时满足以下条件，才可以标记为“待用户验收”：
+
+- 合同范围内事项全部完成，范围外事项未实施；
+- 相关测试和全量测试按计划运行，失败均被如实记录；
+- 实施报告完整且与实际 Git 状态一致；
+- 没有遗失在临时 worktree 的未提交成果；
+- 没有未披露的依赖、权限、全局目录或外部系统修改；
+- 实施方完成自检；
+- 独立 Reviewer 可以获得完整 diff 和证据。
+
+“待用户验收”不等于“已验收”。只有用户在阅读独立复审结论后明确确认，才能推进最终状态。
+
+## 7. 第一阶段：先保证可信
+
+### 7.1 修复 `Any/Optional` 导入
+
+目标：恢复测试收集并消除运行时类型注解错误。
+
+涉及文件：
+
+- `scripts/start_kanban_server.py`
+- `tests/test_kanban_server.py`
+- `tests/test_kanban_api_v2.py`
+
+执行流程：
+
+1. 在 `start_kanban_server.py` 增加 `from typing import Any, Optional`；
+2. 运行两个看板测试文件，确认可以完成收集；
+3. 运行全量测试；
+4. 检查其他运行时注解是否存在未导入名称；
+5. 增加“模块可独立 import”测试，防止同类问题再次发生。
+
+注意事项：
+
+- 不要通过 `from __future__ import annotations` 单独掩盖所有缺失导入；若运行时使用类型对象，仍应明确导入；
+- 测试必须使用 Python 3.11，并在 CI 增加至少一个更新版本验证。
+
+验收标准：
+
+- `python -m pytest tests/test_kanban_server.py tests/test_kanban_api_v2.py -q` 能完成；
+- 全量测试不再在收集阶段失败。
+
+### 7.2 默认监听改为 `127.0.0.1`
+
+目标：默认不向局域网暴露未认证看板服务。
+
+涉及文件：
+
+- `scripts/start_kanban_server.py`
+- `kanban/start.ps1`、`kanban/start.sh`、`kanban/start.bat`
+- 看板服务相关测试和 README
+
+执行流程：
+
+1. 将 `start_server()` 和 CLI `--host` 默认值统一改为 `127.0.0.1`；
+2. `print_kanban_urls()` 仅在实际绑定非回环地址时显示局域网 URL；
+3. 增加显式 `--allow-remote`；未提供时拒绝 `0.0.0.0` 或非回环地址；
+4. 远程监听时输出醒目安全警告；
+5. 增加监听地址单元测试和真实 socket 集成测试。
+
+注意事项：
+
+- 当前端口探测在 `127.0.0.1` 进行，但默认启动随后会重建为 `0.0.0.0`，两处都必须校验；
+- 第一阶段没有完善认证，因此不应把远程监听作为默认功能；
+- CSRF/Origin 检查不能替代身份认证。
+
+验收标准：
+
+- 无参数启动仅监听 `127.0.0.1`；
+- 未加 `--allow-remote` 时不能绑定 `0.0.0.0`；
+- 现有本机看板功能不回归。
+
+### 7.3 删除 API 改为软删除
+
+目标：删除操作可恢复、可审计，不破坏任务历史和编号链。
+
+涉及文件：
+
+- `scripts/start_kanban_server.py`
+- `scripts/_lib/boards/offline_board_adapter.py`
+- `kanban/js/board.js`、`kanban/js/app.js`、`kanban/js/data.js`
+- API 测试、离线看板测试、审计测试
+
+建议字段：
+
+```json
+{
+  "is_deleted": true,
+  "deleted_at": "2026-08-24T10:00:00+08:00",
+  "deleted_by": "user-or-agent-id",
+  "delete_reason": "duplicate",
+  "delete_version": 1
+}
+```
+
+执行流程：
+
+1. `DELETE /api/tasks/{id}` 不再移除数组元素，只写软删除元数据；
+2. 单条和批量删除共用一个领域服务，避免两套行为；
+3. 默认列表、统计和重复任务检查排除软删除记录；
+4. 增加 `include_deleted=true` 的受控查询；
+5. 增加 `POST /api/tasks/{id}/restore` 恢复接口；
+6. UI 文案从“删除”改为“移入回收站”，增加回收站和恢复；
+7. 审计记录删除前后版本、操作者和原因；
+8. 物理清理单独设计为管理员维护命令，不对普通 Agent 暴露。
+
+注意事项：
+
+- 不建议把状态直接改成“已删除”，否则会破坏原状态历史；软删除应为正交元数据；
+- 兼容旧客户端的批量删除路由也必须软删除；
+- `POST /board.json` 全量覆盖可能变相物理删除未提交的卡片，应弃用或改为 merge + version 校验；
+- 恢复后应保留原任务 ID，不重新编号。
+
+验收标准：
+
+- 删除后原记录仍存在于数据文件；
+- 默认 UI 不显示、回收站可显示并恢复；
+- 删除和恢复都有审计证据；
+- 并发版本冲突返回 409。
+
+### 7.4 修正 Antigravity 全局 Agent 路径
+
+目标：按不同 Antigravity surface 输出正确的 Skill 和 Agent 位置。
+
+涉及文件：
+
+- `config/agent_platforms.yaml`
+- `scripts/verify_and_export_agents.py`
+- `scripts/install_global.ps1`、`scripts/install_global.sh`
+- 路径和导出测试
+
+执行流程：
+
+1. 保留 IDE/Desktop 全局 Skill：`~/.gemini/config/skills/yy-flow/`；
+2. 把全局 Agent 从错误的 `~/.gemini/config/skills-agents/...` 改为 `~/.gemini/config/agents/...`；
+3. 工作区 Agent 统一使用 `.agents/agents/<name>.md`；
+4. 对 Antigravity CLI 单独声明和探测 CLI Skill 目录，不与 IDE 目录混为一谈；
+5. 导出前检测宿主、版本和目标目录；无法确认时只打印建议，不猜测写入；
+6. 为旧路径提供一次性迁移检测，禁止静默删除用户文件；
+7. 增加导出后格式解析和宿主发现测试。
+
+注意事项：
+
+- Skill 路径和 Agent 路径是两个概念；
+- 不要把项目技术栈写入全局 Agent；
+- Windows Junction、symlink 权限失败时必须报告降级结果，不能显示假成功；
+- 同名实体目录存在时不得覆盖。
+
+验收标准：
+
+- Antigravity 能发现全局 Skill；
+- 能发现至少一个导出的全局自定义 Agent；
+- 工作区 Agent 不污染其他项目；
+- 路径测试覆盖 Windows、POSIX 和 `~` 展开。
+
+### 7.5 `/auto` 改为纯模拟模式
+
+目标：杜绝没有真实执行就自动进入审查、测试、完成或验收。
+
+涉及文件：
+
+- `scripts/auto_task.py`
+- `SKILL.md`
+- `README.md`
+- `tests/test_workflow_v2.py`
+
+执行流程：
+
+1. `/auto` 和 `auto_task.py` 默认只输出计划，不写看板；
+2. 移除或禁用自动生成“已完成审查/测试”的合成总结；
+3. 输出内容明确标记 `SIMULATION`；
+4. 禁止模拟结果作为证据提交；
+5. 如保留 `--simulate`，将其设为兼容别名；
+6. 原来的真实执行入口更名为 `run`，但在第二阶段 Host Adapter 完成前保持不可用；
+7. 已验收自动链测试改成“不得改变数据”的断言。
+
+注意事项：
+
+- 模拟可计算预计状态链，但不能创建任务、修改状态或写审计为成功；
+- 不能用 `--force` 绕过证据门禁；
+- CLI 输出和返回码要区分“模拟成功”和“业务执行成功”。
+
+验收标准：
+
+- 默认运行 `/auto` 前后 `board.json` 哈希不变；
+- 输出不包含未经执行的成功事实；
+- 只有第二阶段真实 Runner 可以提交状态变更。
+
+### 7.6 测试重新全绿
+
+目标：建立第一阶段可信基线。
+
+执行流程：
+
+1. 先运行受影响测试；
+2. 再运行全量 217 个现有测试函数；
+3. 新增监听、软删除、恢复、模拟无副作用、路径迁移测试；
+4. 增加 Windows 与 Linux CI；
+5. 测试中不得依赖真实外部 Jira、GitHub 或飞书凭证；
+6. 记录测试命令、退出码、测试数量和日志哈希。
+
+注意事项：
+
+- 不能通过删除失败测试、放宽断言或统一 skip 达到“全绿”；
+- 测试通过只是第一阶段完成条件之一，还要进行本机 API 冒烟验证；
+- 测试产生的数据必须位于临时项目目录，不能写入全局 Skill 正本。
+
+第一阶段退出条件：
+
+- 全量测试通过；
+- 默认仅本机监听；
+- 删除可恢复；
+- `/auto` 零副作用；
+- Antigravity 全局路径通过真实宿主验证；
+- 用户确认第一阶段验收。
+
+## 8. 第二阶段：建立真实多 Agent
+
+### 8.1 增加 Host Adapter
+
+目标：把业务流程与宿主原生 Agent 调用解耦。
+
+建议接口：
+
+```python
+class HostAdapter(Protocol):
+    def detect(self) -> HostCapabilities: ...
+    def build_dispatch(self, request: AgentRequest) -> DispatchPlan: ...
+    def spawn(self, plan: DispatchPlan) -> AgentHandle: ...
+    def wait(self, handle: AgentHandle) -> AgentResult: ...
+    def cancel(self, handle: AgentHandle) -> None: ...
+    def request_confirmation(self, request: ConfirmationRequest) -> ConfirmationResult: ...
+```
+
+建议文件：
+
+```text
+yy_flow/hosts/base.py
+yy_flow/hosts/detect.py
+yy_flow/hosts/codex.py
+yy_flow/hosts/antigravity.py
+yy_flow/hosts/chatgpt.py
+yy_flow/hosts/manifest.py
+```
+
+执行流程：
+
+1. 定义标准能力：子 Agent、并行、独立上下文、worktree、权限审批、MCP、用量信息；
+2. 定义标准请求和结果 Schema；
+3. 先做 capability detection，再选择 Adapter；
+4. 不支持真实子 Agent 时 Fail-Closed 或降级单 Agent，不得模拟多个 Agent；
+5. Adapter 返回宿主 session/thread ID，供独立性和审计校验；
+6. 统一超时、取消、失败和部分结果语义。
+
+注意事项：
+
+- 很多“子 Agent 工具”属于宿主会话能力，不能假设 Python 子进程可直接调用；
+- Adapter 应分为“生成标准调度计划”和“由宿主执行原生工具”两层；
+- 宿主工具名、模型名和路径不能散落在核心状态机中。
+
+验收标准：
+
+- FakeHostAdapter 可完成全部契约测试；
+- 不同 Adapter 的结果都能归一化为同一 `AgentResult`；
+- 未检测到宿主时不会伪装运行成功。
+
+### 8.2 实现 Codex Adapter
+
+执行流程：
+
+1. 探测 Codex 多 Agent 是否启用以及并发上限；
+2. 使用 Codex 原生子 Agent 工作流，不在 Python 中伪造角色；
+3. 从 `~/.codex/agents/` 或项目 `.codex/agents/` 加载角色；
+4. Builder 使用 workspace-write，Reviewer 默认 read-only，QA 仅获得测试所需权限；
+5. 保存父任务、子 Agent 线程、模型、权限模式和结果摘要；
+6. 子 Agent 失败时不得自动提交下一状态；
+7. 增加真实 Codex 手工 E2E 清单。
+
+注意事项：
+
+- Codex 子 Agent 会增加 Token，应受 Profile 和并发上限约束；
+- 子 Agent 会继承部分父会话设置，必须在调度前检查权限；
+- 不要依赖未公开、易变化的内部函数名；优先使用宿主暴露的能力和指令契约。
+
+### 8.3 实现 Antigravity Adapter
+
+执行流程：
+
+1. 探测 `invoke_subagent` 与自定义 Agent 能力；
+2. 按 `.agents/agents` 或全局 `.gemini/config/agents` 加载角色；
+3. 映射工作区模式：只读探索可 `inherit`，写入实现优先 `branch`，明确共享才使用 `share`；
+4. 映射 Antigravity 工具权限、命令策略、MCP Server 和模型层级；
+5. 保存 invocation ID、workspace 模式和结果；
+6. 对无子 Agent 权限或额度不足提供明确降级提示。
+
+注意事项：
+
+- `share` 会让多个写 Agent 操作同一目录，默认禁止并行写；
+- `inherit` 不等于独立代码工作区；上下文独立与文件隔离是两个维度；
+- IDE、Desktop、CLI 的发现路径和能力应分别做契约测试。
+
+### 8.4 增加 worktree 隔离
+
+目标：避免并行 Agent 在同一工作目录互相覆盖。
+
+执行流程：
+
+1. 校验当前目录是干净 Git 仓库；
+2. 为任务生成分支：`yy-flow/<project-id>/<task-id>/<role>`；
+3. 在项目外的受控目录创建 worktree；
+4. 写入 `worktrees.json`，记录路径、分支、基线提交、Agent 和状态；
+5. Agent 只获得自己 worktree 的写权限；
+6. Reviewer 对提交差异做只读审查；
+7. QA 在候选提交上测试；
+8. 合并前检测冲突并请求用户确认；
+9. 用户验收后再清理 worktree；失败时保留以便诊断。
+
+注意事项：
+
+- 不允许对未提交用户修改自动 stash、reset 或覆盖；
+- Windows 路径长度、文件锁和杀毒软件占用需专项测试；
+- 非 Git 项目必须显式降级为单写者临时副本，不可假装具备 worktree 隔离；
+- 清理属于破坏性操作，必须精确校验路径在受控 worktree 根内。
+
+### 8.5 状态流转必须提交真实证据
+
+建议证据 Schema：
+
+```json
+{
+  "evidence_id": "ev-uuid",
+  "project_id": "licenseplate-7f31c2",
+  "task_id": "T0001",
+  "transition": "测试中->已完成",
+  "type": "test_result",
+  "actor_role": "QA",
+  "host": "codex",
+  "host_session_id": "...",
+  "command": "python -m pytest -q",
+  "exit_code": 0,
+  "artifact_uri": ".yy-flow/user_data/evidence/...json",
+  "artifact_sha256": "...",
+  "git_commit": "...",
+  "created_at": "..."
+}
+```
+
+门禁矩阵：
+
+| 流转 | 最低证据 |
+|---|---|
+| 待开始 → 进行中 | 用户开始确认、项目身份、Agent/worktree ID |
+| 进行中 → 审查中 | Git diff/commit、修改摘要、开发自测结果 |
+| 审查中 → 测试中 | 独立 Reviewer session、审查报告、结论 |
+| 测试中 → 已完成 | 独立 QA session、命令、退出码、日志哈希 |
+| 已完成 → 已验收 | 用户确认 ID、确认时间、验收说明 |
+
+注意事项：
+
+- 纯文本总结不是证据；
+- 文件路径必须在项目或受控证据目录内；
+- 命令输出应做敏感信息脱敏；
+- Git commit 不是所有任务的唯一证据，文档、设计和研究任务使用相应 artifact 类型；
+- 外部看板只保存引用和摘要，原始证据应有可验证存储。
+
+### 8.6 Reviewer 和 QA 独立运行
+
+独立性最低要求：
+
+- Reviewer/QA 的 `host_session_id` 不得等于 Builder；
+- Reviewer 默认不能修改实现代码；
+- QA 不能修改代码让测试通过；
+- Reviewer 与 QA 必须从实际 diff/commit 和测试环境重新获取事实；
+- Lite 可以合并 Reviewer + QA 为一个 Verifier，但 Verifier 仍必须独立于 Builder；
+- Compliance 下 Reviewer、QA、Builder 三者必须分离。
+
+执行流程：
+
+1. Builder 提交候选提交和开发证据；
+2. Reviewer 在独立 session 审查；
+3. 有缺陷则生成 DEF 并退回，不进入测试；
+4. Reviewer 通过后，QA 在候选提交上独立运行；
+5. QA 失败则退回并附失败证据；
+6. QA 通过后只能进入“已完成/待用户验收”。
+
+### 8.7 最终验收默认要求用户确认
+
+执行流程：
+
+1. 汇总修改、风险、审查、测试和未解决事项；
+2. 生成验收请求，状态保持“已完成”；
+3. 用户明确回复确认后写入 `user_acceptance` 证据；
+4. 状态机验证证据后进入“已验收”；
+5. 超时不自动验收，只提醒或保持等待。
+
+注意事项：
+
+- PM Agent 不能代替用户；
+- “测试通过”不等于“业务验收”；
+- 用户拒绝时应进入退回或阻塞，而不是修改历史证据。
+
+第二阶段退出条件：
+
+- Codex 和 Antigravity各完成至少一个真实 L2 任务；
+- Builder、Reviewer、QA session 独立可证明；
+- worktree 无交叉写入；
+- 无证据不能流转；
+- 用户确认才能验收。
+
+## 9. 第三阶段：控制复杂度
+
+### 9.1 拆分 Skill
+
+目标：使用渐进式加载，避免一个 Skill 装载所有规则。
+
+建议拆分：
+
+```text
+yy-flow-router       # 项目识别、分级、Profile、确认
+yy-flow-task         # 建卡与状态流转
+yy-flow-review       # 独立审查
+yy-flow-qa           # 测试证据
+yy-flow-release      # 合并、发布和最终验收
+yy-flow-admin        # 初始化、迁移、诊断
+```
+
+执行流程：
+
+1. 统计 SKILL.md 重复规则；
+2. 把通用不变量放入短小核心参考；
+3. 每个 Skill 只负责一个明确任务；
+4. Router 根据任务选择加载；
+5. 宿主不支持动态 Skill 时，由 Adapter 合成最小上下文；
+6. 增加触发/不触发提示词测试。
+
+### 9.2 增加 Lite / Standard / Compliance
+
+推荐角色：
+
+| Profile | 角色组合 | 独立性 |
+|---|---|---|
+| Lite | Builder + Verifier + User | Verifier 独立于 Builder |
+| Standard | Coordinator + Builder + Reviewer + QA + User | Reviewer、QA 独立 |
+| Compliance | PM、Architect、Dev/Frontend、Reviewer、QA、Docs、DevOps、User | 严格职责分离 |
+
+选择规则：
+
+- Lite：少文件、低风险、无生产/权限/数据迁移影响；
+- Standard：多模块、接口变更、常规业务功能；
+- Compliance：安全、财务、隐私、生产发布、不可逆数据操作或监管要求；
+- 用户可以向上提升 Profile；向下降级必须给出风险并确认。
+
+注意事项：
+
+- 小项目角色合并不能把实现者与验证者合并；
+- Profile 控制最大 Agent 数，不要求每次都启动到上限；
+- L0 不应因为安装了 Skill 就自动建卡。
+
+### 9.3 缩短重复规则
+
+执行流程：
+
+1. 建立唯一术语表和状态机来源；
+2. 角色文件只声明差异，不复制完整流程；
+3. 公共门禁从代码或 reference 引用；
+4. 删除同义重复和硬编码人物姓名依赖；
+5. 文案与可执行规则分离，规则由 Schema 校验。
+
+验收标准：
+
+- 相同门禁只有一个权威定义；
+- 修改状态规则不需要同步八份 Agent 文件；
+- Skill 主入口控制在可快速理解的长度。
+
+### 9.4 按需加载参考文件
+
+执行流程：
+
+1. 为每个参考文件建立触发条件；
+2. Router 先加载目录和摘要，不加载全文；
+3. 仅在当前步骤需要时加载对应 reference；
+4. 记录本次实际加载的参考文件；
+5. 不同客户端分别测量上下文占用。
+
+注意事项：
+
+- “按需加载”不能变成只读半个必需规则文件；选中一个规则文件后必须完整读取；
+- 安全门禁和项目隔离规则属于常驻最小核心；
+- 客户端无法动态读取时，使用构建期生成的精简 bundle。
+
+### 9.5 单 Agent 与多 Agent 真实评测
+
+评测任务至少覆盖：
+
+1. 小型单文件修复；
+2. 多文件功能；
+3. 隐蔽回归 Bug；
+4. 安全/权限改动；
+5. 文档和配置任务；
+6. 外部 API 或 UI 测试任务。
+
+每个任务分别运行：
+
+- 单 Agent；
+- Lite；
+- Standard；
+- 必要时 Compliance。
+
+指标：
+
+```text
+正确性：测试通过率、Reviewer 真问题数、回归数
+质量：修改范围、可维护性、缺陷逃逸率
+效率：总耗时、人工等待时间、并行收益
+成本：可获得时记录 Token；否则记录模型调用次数、轮次和子 Agent 数
+稳定性：失败恢复、冲突、超时、权限请求数
+```
+
+注意事项：
+
+- 不同客户端订阅模式不一定暴露精确 Token，缺失时不得伪造；
+- 同一任务使用相同基线提交、相同测试和验收标准；
+- 至少重复运行三次，避免单次随机结果决定策略；
+- 原始日志脱敏后保存。
+
+第三阶段退出条件：
+
+- Profile 选择可解释；
+- Lite 小项目只需 Builder + Verifier；
+- 单 Agent 与多 Agent 有真实数据对比；
+- 默认策略能在质量与成本间作合理选择。
+
+## 10. 第四阶段：扩展生态
+
+### 10.1 MCP Server
+
+目标：把稳定的领域能力作为受控工具提供给多个客户端。
+
+第一版工具建议：
+
+```text
+initialize_project
+get_project
+classify_task
+create_task
+get_task
+list_tasks
+submit_evidence
+transition_task
+request_acceptance
+soft_delete_task
+restore_task
+```
+
+执行流程：
+
+1. 先从只读工具开始；
+2. 为每个工具定义 JSON Schema、幂等键和错误码；
+3. 写工具增加用户、项目、权限与证据校验；
+4. 本地使用 STDIO，远程使用 Streamable HTTP；
+5. 增加 Bearer/OAuth、TLS、限流、审计；
+6. 私有部署使用安全隧道或内网，不默认暴露公网；
+7. 做 Codex、ChatGPT Plugin、Antigravity MCP 契约测试。
+
+注意事项：
+
+- 不提供“任意 shell”MCP 工具；
+- MCP Server 只暴露受约束业务操作；
+- `transition_task` 必须服务端再次验证证据，不能信任客户端声明；
+- 远程服务不得使用客户端传来的任意文件路径访问服务器文件系统。
+
+### 10.2 ChatGPT Plugin/App
+
+目标：让 ChatGPT Web/Work 能使用远程工作流，而不是依赖用户电脑上的 Python。
+
+执行流程：
+
+1. 用 Skill + MCP Server 组成 Plugin；
+2. 为看板、验收和证据摘要提供可选 UI；
+3. 实现 OAuth 用户认证和项目授权；
+4. 把写操作配置为需要批准；
+5. 提供无 UI 的 headless 工具结果，保证 Codex 也能使用；
+6. 完成隐私、安全、错误处理和发布测试。
+
+注意事项：
+
+- ChatGPT Plugin 使用远程数据，不自动拥有本地仓库访问权限；
+- 若要修改代码，需结合 Codex、本地执行器或远程受控 Runner；
+- Plugin 能力可因账户、工作区管理员策略和产品 surface 不同而不同。
+
+### 10.3 远程看板与认证
+
+建议数据隔离键：
+
+```text
+tenant_id / user_id / project_id / task_id
+```
+
+执行流程：
+
+1. 从本地 JSON 抽象 Repository；
+2. 设计数据库迁移和版本字段；
+3. OAuth 登录后建立用户与项目授权；
+4. 写操作使用乐观锁和幂等键；
+5. 证据对象存储与任务记录分离；
+6. 审计日志采用追加写，不允许普通用户修改；
+7. 提供本地导入、远程导出和灾难恢复。
+
+注意事项：
+
+- 不同用户同名项目不能共享命名空间；
+- 删除继续采用软删除和保留策略；
+- 认证、授权、审计是三件事，必须分别实现；
+- API Token、客户端模型额度和外部连接器凭证必须分开管理。
+
+### 10.4 GitHub / Jira / 飞书等连接器
+
+执行顺序建议：GitHub → Jira → 飞书。
+
+每个连接器统一流程：
+
+1. 定义最小只读能力；
+2. 完成 OAuth/最小权限；
+3. 映射项目和任务外部 ID；
+4. 增加幂等创建与双向同步冲突策略；
+5. 写操作默认要求确认；
+6. 增加速率限制、重试、退避和失败队列；
+7. 完成沙箱账号 E2E；
+8. 再开放生产账号。
+
+注意事项：
+
+- 不把第三方记录 ID 当成本地全局唯一 ID；
+- 同步必须保存来源和版本，避免回环更新；
+- 凭证不得写入项目仓库和审计正文；
+- 一个连接器失败不得让本地任务状态显示假成功。
+
+第四阶段退出条件：
+
+- ChatGPT Web/Work 可通过 Plugin + MCP 查看并操作授权项目；
+- Codex 与 Antigravity可使用同一远程领域工具；
+- 租户和项目隔离测试通过；
+- 至少一个外部连接器完成真实 E2E。
+
+## 11. 测试与验证总体策略
+
+### 11.1 测试层级
+
+| 层级 | 内容 |
+|---|---|
+| Unit | 路径、状态机、证据、软删除、Profile、Schema |
+| Contract | Host Adapter、Board Adapter、MCP 工具契约 |
+| Integration | Git/worktree、看板服务、恢复、并发版本 |
+| Host E2E | Codex、Antigravity、ChatGPT Plugin 各自真实运行 |
+| Security | 项目越权、路径穿越、凭证泄漏、未认证写入 |
+| Evaluation | 单 Agent 与多 Agent 质量、耗时和成本 |
+
+### 11.2 CI 建议
+
+```text
+OS: Windows + Linux，后续补 macOS
+Python: 3.11 + 当前稳定版本
+模式: local board + fake host + git worktree
+门禁: 单测、类型检查、格式检查、安全扫描、文档链接检查
+```
+
+真实客户端 E2E 不应依赖普通 PR CI 的个人账户，可采用发布候选人工验证或受控测试账号。
+
+## 12. 工作量、里程碑和依赖
+
+| 阶段 | 预计人日 | 前置依赖 | 建议里程碑 |
+|---|---:|---|---|
+| 第一阶段 | 2～4 | 无 | `vNext-alpha.1-trust` |
+| 第二阶段 | 9～16 | 第一阶段全绿 | `vNext-alpha.2-agents` |
+| 第三阶段 | 5～9 | 真实 Adapter 稳定 | `vNext-beta.1-profiles` |
+| 第四阶段 | 12～25 | Core API 与项目隔离稳定 | `vNext-beta.2-ecosystem` |
+
+总工作量约 28～54 人日。本地 MVP 建议只承诺第一阶段、第二阶段核心和 Lite/Standard，约 12～20 人日。连接器按产品逐个估算，每个成熟连接器通常另需 2～5 人日。
+
+## 13. 推荐实施顺序与提交策略
+
+每个编号项独立分支、独立测试、独立审查，不在一个提交中混合四个阶段。
+
+每次开始实施前，先按 6.3 生成并冻结执行委托合同。总体方案描述了完整路线，但只有当前合同中 `allowed_items` 列出的条目获得执行授权。实施报告和复审交接分别遵循 6.5 与 6.9。
+
+```text
+1. 建立基线标签和测试报告
+2. Phase 1.1 import 修复
+3. Phase 1.2 本机监听
+4. Phase 1.3 软删除
+5. Phase 1.4 路径修正
+6. Phase 1.5 auto 模拟化
+7. Phase 1.6 全量回归
+8. 用户确认第一阶段
+9. Host Adapter 契约与 Fake Adapter
+10. Codex Adapter
+11. Antigravity Adapter
+12. worktree 与证据门禁
+13. 独立 Reviewer/QA 与用户验收
+14. 用户确认第二阶段
+15. Skill/Profile/评测
+16. 用户确认第三阶段
+17. MCP/Plugin/远程看板/连接器
+```
+
+每个提交必须包含：
+
+- 变更目的；
+- 受影响文件；
+- 测试证据；
+- 兼容性影响；
+- 回滚方式；
+- 尚未解决的问题。
+
+## 14. 回滚原则
+
+- 第一阶段保留旧 API 路由，但内部改为软删除；
+- 路径迁移先创建兼容链接或提示，不自动删除旧目录；
+- `auto_task.py` 旧行为不得通过隐藏开关重新启用；需要真实执行时走新 Runner；
+- Host Adapter 可按配置禁用并降级单 Agent；
+- MCP 和远程看板必须保留本地离线模式；
+- 数据 Schema 升级前备份，迁移必须可重复、可审计；
+- 回滚代码不能回滚或删除已经产生的审计证据。
+
+## 15. 最终验收清单
+
+### 可信性
+
+- [ ] 全量测试通过且没有删除、skip 原失败测试；
+- [ ] 默认仅监听 `127.0.0.1`；
+- [ ] 删除可恢复；
+- [ ] `/auto` 不产生任何成功状态或数据修改；
+- [ ] 没有真实证据不能推进状态。
+
+### 多 Agent
+
+- [ ] Codex 使用真实子 Agent；
+- [ ] Antigravity使用真实 `invoke_subagent`；
+- [ ] Builder、Reviewer、QA 的 session 和权限可区分；
+- [ ] 并行写入使用隔离 worktree；
+- [ ] 小项目 Lite 至少保持 Builder/Verifier 分离；
+- [ ] 最终验收必须由用户确认。
+
+### 多项目
+
+- [ ] 全局安装不保存项目任务数据；
+- [ ] 每个项目有稳定 `project_id`；
+- [ ] 任务外部 ID 包含项目命名空间；
+- [ ] 错误 CWD、错误项目 ID、错误远端指纹都会阻断写入；
+- [ ] 同一对话切换项目需要明确确认。
+
+### 多客户端
+
+- [ ] Codex 当前推荐 Skill 与 Agent 路径验证通过；
+- [ ] Antigravity IDE/Desktop/CLI 分别验证；
+- [ ] ChatGPT Desktop 的可用能力有明确测试记录；
+- [ ] ChatGPT Web/Work 通过 Plugin + 远程 MCP 使用，不依赖本地路径；
+- [ ] 各客户端不支持的能力会明确降级或 Fail-Closed。
+
+## 16. 执行批准
+
+本文档生成不代表批准实施。建议用户按阶段批准：
+
+```text
+批准第一阶段：仅实施可信化六项，完成后停止并提交测试证据。
+批准第二阶段：在第一阶段验收后实施真实多 Agent。
+批准第三阶段：在两个真实 Host Adapter 验证后实施 Profile 和评测。
+批准第四阶段：在 Core API 稳定后实施远程生态。
+```
+
+每一阶段结束后，状态保持“待用户验收”；只有用户明确确认后才能标记该阶段完成并进入下一阶段。
+
+批准语句还应同时指定：执行宿主、执行批次、是否允许本地 commit、是否使用新 worktree，以及是否允许本批次访问全局目录或外部系统。未明确的高风险权限一律视为未授权。
+
+第一阶段推荐完整批准语句：
+
+```text
+我批准 Antigravity 按本文 6.3 的执行委托合同实施第一阶段 7.1～7.6。
+允许创建本地分支和本地提交，优先使用 New Worktree；
+不允许 push、发布、安装依赖、写全局目录、写外部系统或执行第二至第四阶段。
+完成后生成 PHASE1_IMPLEMENTATION_REPORT.md 并停止在待用户验收。
+```
