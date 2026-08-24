@@ -28,11 +28,6 @@ def record_audit_event(*args, **kwargs):
         return
     return _real_record_audit_event(*args, **kwargs)
 
-_DRY_RUN_MODE = False
-
-def record_audit_event(*args, **kwargs):
-    if not _DRY_RUN_MODE:
-        return _real_record_audit_event(*args, **kwargs)
 
 from _lib.core.file_lock import acquire_lock, release_lock, remove_lock_file_if_free, LockBusyError
 from enums import TaskStatus, TaskType, RoleEnum, normalize_role, ROLE_NORMALIZE_MAP
@@ -137,7 +132,7 @@ def check_duplicate_tasks(adapter, task_name, cfg_dup, limit=10, threshold=0.8, 
     limit = int(dup_cfg.get("limit", limit) or limit)
     threshold = float(dup_cfg.get("threshold", threshold) or threshold)
     try:
-        recs = adapter.list_records(limit=1000)
+        recs = adapter_list(limit=1000)
     except Exception:
         return []
     recs = sorted(recs, key=lambda r: int(r.get("fields", {}).get("seq") or 0), reverse=True)
@@ -242,6 +237,8 @@ def _transition_task_pipeline_impl(
         import yaml
         try:
             adapter = get_board_adapter(config_path)
+            adapter_get = getattr(adapter, "get_record_readonly", adapter.get_record) if dry_run else adapter.get_record
+            adapter_list = getattr(adapter, "list_records_readonly", adapter.list_records) if dry_run else adapter.list_records
             # config_path 为 None（未传 --config）时用 factory 同一解析链定位
             effective_config = config_path or paths.resolve_runtime_config()
             with open(effective_config, "r", encoding="utf-8") as cfg_f:
@@ -319,7 +316,7 @@ def _transition_task_pipeline_impl(
 
         effective_task_name = task_name or ""
         if resolved_task_id != "AUTO":
-            existing_rec = adapter.get_record(resolved_task_id)
+            existing_rec = adapter_get(resolved_task_id)
             if existing_rec:
                 f_data = existing_rec.get("fields", {})
                 board_task_name = f_data.get("task_name") or f_data.get("name") or ""
@@ -333,7 +330,7 @@ def _transition_task_pipeline_impl(
             try:
                 status_k = field_mapping.get("status", "status")
                 assignee_k = field_mapping.get("assignee", "assignee")
-                recs = adapter.list_records(limit=1000)
+                recs = adapter_list(limit=1000)
                 board_active_count = 0
                 target_norms = {normalize_role(assignee), normalize_role(current_role), assignee, current_role}
                 for r in recs:
@@ -356,7 +353,7 @@ def _transition_task_pipeline_impl(
 
         # 4. 任务存在性检查（只读，前置）：确定目标记录与是否需要自动建单
         resolved_record_id = record_id or task_id
-        existing = adapter.get_record(resolved_record_id) if resolved_record_id else None
+        existing = adapter_get(resolved_record_id) if resolved_record_id else None
 
         # 5. 强制运行防护门控 (并发上限与 HOTFIX 特权透传，未通过则直接抛错中断！)
         is_valid = validate(

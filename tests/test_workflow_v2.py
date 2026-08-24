@@ -229,7 +229,17 @@ class TestAutoChains:
         assert "DRY-RUN" in r.stderr or "SIMULATE" in r.stdout
 
     def test_simulate_no_write(self, env):
+        import os
+        def get_tree(p):
+            return {os.path.relpath(os.path.join(r, f), p) for r, d, files in os.walk(p) for f in files}
+        
+        tree_before = get_tree(str(env["tmp"]))
         r = run(env, "auto_task.py", "--task-name", "模拟任务", "--simulate")
+        tree_after = get_tree(str(env["tmp"]))
+        
+        # Should have exactly the same files
+        assert tree_before == tree_after
+        
         assert cards(env) == []
         assert "DRY-RUN" in r.stderr or "SIMULATE" in r.stdout
 

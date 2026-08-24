@@ -169,6 +169,8 @@ def main():
 
     try:
         adapter = get_board_adapter(args.config)
+        adapter_get = getattr(adapter, "get_record_readonly", adapter.get_record) if args.simulate else adapter.get_record
+        adapter_list = getattr(adapter, "list_records_readonly", adapter.list_records) if args.simulate else adapter.list_records
         import yaml
         # args.config 为 None（未传 --config）时用 factory 同一解析链定位
         effective_config = args.config or paths.resolve_runtime_config()
@@ -182,7 +184,7 @@ def main():
 
         # 1. 任务解析：不存在 → 建卡【待开始】（simulate 模式不建卡，仅演示）
         if task_id:
-            rec = adapter.get_record(task_id)
+            rec = adapter_get(task_id)
             if rec:
                 fields = rec.get("fields", {})
                 current_status = str(fields.get("status") or "")
@@ -215,10 +217,10 @@ def main():
                 )
                 if not ok:
                     sys.exit(1)
-                rec = adapter.get_record(task_id) if task_id else None
+                rec = adapter_get(task_id) if task_id else None
                 if rec is None:
                     # 自动编号建卡后回查最新卡片（追加在列表末尾）
-                    recs = adapter.list_records(limit=10000)
+                    recs = adapter_list(limit=10000)
                     if not recs:
                         print("[FAILED]  建卡后未找到任务！")
                         sys.exit(1)
@@ -243,7 +245,7 @@ def main():
         # 4. 挂起态恢复
         resume_from = current_status
         if current_status == "已阻塞":
-            fields = adapter.get_record(task_id).get("fields", {})
+            fields = adapter_get(task_id).get("fields", {})
             if not check_block_resolved(fields):
                 remarks = str(fields.get("remarks") or fields.get("process") or "")
                 print(f"[FAILED]  [阻断未解除] 任务 {task_id} 仍处于【已阻塞】且无有效【解除】记录，自动恢复被拒绝！")
