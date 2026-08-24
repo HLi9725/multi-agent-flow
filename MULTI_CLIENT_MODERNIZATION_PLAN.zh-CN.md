@@ -860,8 +860,9 @@ phase-1-trust                        -> 冻结分支 b83741b，不再承载新�
 | 环境修复 | 从已验收 worktree 复制无凭证的 `config/workflow.config.yaml` 本地快照；不提交、不升级依赖、不改代码 |
 | 第二次复验 | 退出码 `0`：`226 passed in 51.78s` |
 | 旧未跟踪方案 | 已移至仓库外 `C:\Users\user\Desktop\user\multi-agent-flow-backups\MULTI_CLIENT_MODERNIZATION_PLAN.zh-CN.pre-phase1-untracked.md`，SHA-256 `B3FDF2EF0269F67F02C796CCA208AFDEF004FDA81A49DFB206BC80CCE9F10378` |
-| 第二阶段分支 | `phase-2-real-agents`，从包含本记录的最终 `main` 创建 |
+| 第二阶段分支 | `phase-2-real-agents`，初始分支点 `79513e1b10d33ef2c193c3e64d02402b0e170ae2`，随后仅同步本交接文档 |
 | 第二阶段 worktree | `C:\Users\user\Desktop\user\multi-agent-flow-phase2-real-agents` |
+| 第二阶段 worktree 复验 | `python -m pytest tests -q -rs`，退出码 `0`：`226 passed in 56.97s`；测试后已恢复权威看板快照并校验一致 |
 
 本地运行数据交接规则：
 
