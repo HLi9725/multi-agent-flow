@@ -259,6 +259,10 @@ def export_platform_assets(platforms_config, active_platforms, global_mode=False
     arch_data = None if global_mode else load_arch_data()
     if global_mode:
         print("[GLOBAL] 全局共享安装模式：Subagent 导出为通用版（不含项目技术栈，防跨项目泄漏）")
+        legacy_agent_dir = os.path.expanduser("~/.gemini/config/skills-agents")
+        if os.path.exists(legacy_agent_dir):
+            print(f"[MIGRATION] 检测到旧版全局 Agent 路径: {legacy_agent_dir}")
+            print("请手动清理或迁移，系统不静默删除用户文件。")
     elif arch_data:
         proj = (arch_data.get("project") or {}).get("name", "未知")
         print(f"[SYNC]  检测到已初始化架构配置，导出时合并项目技术栈: 【{proj}】")

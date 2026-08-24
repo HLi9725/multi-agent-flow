@@ -11,17 +11,30 @@ version: "1.0.0"
 default_skill_name: "yy-flow"
 
 platforms:
-  # 1. Google Antigravity (AGY)
+  # 1. Google Antigravity IDE / 2.0
   antigravity:
-    name: "Google Antigravity"
+    name: "Google Antigravity IDE"
     detect_dirs: [".agents", ".agent"]
     mount_type: "symlink"
     skill_target: ".agents/skills/{skill_name}"
     global_skill_target: "~/.gemini/config/skills/{skill_name}"
-    global_detect_dirs: ["~/.gemini"]
+    global_detect_dirs: ["~/.gemini/config"]
     subagent_export:
-      pattern: ".agents/agents/{agent_id}/agent.md"
-      user_pattern: "~/.gemini/config/skills-agents/{agent_id}/agent.md"
+      pattern: ".agents/agents/{agent_id}.md"
+      user_pattern: "~/.gemini/config/agents/{agent_id}.md"
+      format: "markdown_frontmatter"
+      frontmatter_subagent: true
+
+  antigravity_cli:
+    name: "Google Antigravity CLI"
+    detect_dirs: [".agents", ".agent"]
+    mount_type: "symlink"
+    skill_target: ".agents/skills/{skill_name}"
+    global_skill_target: "~/.gemini/antigravity-cli/skills/{skill_name}"
+    global_detect_dirs: ["~/.gemini/antigravity-cli"]
+    subagent_export:
+      pattern: ".agents/agents/{agent_id}.md"
+      user_pattern: "~/.gemini/antigravity-cli/agents/{agent_id}.md"
       format: "markdown_frontmatter"
       frontmatter_subagent: true
 

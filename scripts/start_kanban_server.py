@@ -719,6 +719,31 @@ class KanbanHTTPRequestHandler(SimpleHTTPRequestHandler):
             self._send_json_resp(200, "success", pref)
             return
 
+        # 5.5 REST API: GET /api/agent/paths
+        if path == "/api/agent/paths":
+            paths_data = {
+                "antigravity_ide": {
+                    "status": "verified",
+                    "skill_target": ".agents/skills/{skill_name}",
+                    "global_skill_target": "~/.gemini/config/skills/{skill_name}",
+                    "subagent_pattern": ".agents/agents/{agent_id}.md",
+                    "global_subagent_pattern": "~/.gemini/config/agents/{agent_id}.md"
+                },
+                "antigravity_cli": {
+                    "status": "static_only",
+                    "global_skill_target": "~/.gemini/antigravity-cli/skills/{skill_name}",
+                    "global_subagent_pattern": "~/.gemini/antigravity-cli/agents/{agent_id}.md"
+                },
+                "opencode": {
+                    "status": "not_run"
+                },
+                "zcode": {
+                    "status": "not_run"
+                }
+            }
+            self._send_json_resp(200, "success", paths_data)
+            return
+
         # 6. REST API: GET /api/version (board.json 版本哈希，供前端轮询与乐观锁)
         if path == "/api/version":
             self._send_json_resp(200, "success", {"v": compute_board_version()})
