@@ -723,7 +723,7 @@ class KanbanHTTPRequestHandler(SimpleHTTPRequestHandler):
         if path == "/api/agent/paths":
             paths_data = {
                 "antigravity_ide": {
-                    "status": "verified",
+                    "status": "static_only",
                     "skill_target": ".agents/skills/{skill_name}",
                     "global_skill_target": "~/.gemini/config/skills/{skill_name}",
                     "subagent_pattern": ".agents/agents/{agent_id}.md",
@@ -937,17 +937,21 @@ class KanbanHTTPRequestHandler(SimpleHTTPRequestHandler):
             task_ids_to_del = set(raw_ids)
 
             def _mutate_batch_del(cards):
-                initial_count = len(cards)
-                remaining = [c for c in cards if c.get("id") not in task_ids_to_del]
-                cards.clear()
-                cards.extend(remaining)
-                deleted_count = initial_count - len(cards)
-                for tid in task_ids_to_del:
-                    append_audit_log(tid, "PM", "-", "已删除", "用户", f"批量删除任务: {tid}")
+                deleted_count = 0
+                for task in cards:
+                    if task.get("id") in task_ids_to_del:
+                        if not task.get("is_deleted"):
+                            task["is_deleted"] = True
+                            task["deleted_at"] = datetime.now().isoformat()
+                            task["deleted_by"] = get_default_operator()
+                            task["delete_reason"] = "batch delete"
+                            task["delete_version"] = task.get("delete_version", 0) + 1
+                            deleted_count += 1
+                            append_audit_log(task.get("id"), "PM", "-", "已删除", get_default_operator(), f"批量删除任务: {task.get('id')}")
                 return True, 200, f"成功删除 {deleted_count} 条任务", {
                     "deleted_count": deleted_count,
                     "deleted": deleted_count,
-                    "remaining_total": len(cards)
+                    "remaining_total": len([c for c in cards if not c.get("is_deleted")])
                 }
 
             code, msg, data = atomic_mutate_board_data(_mutate_batch_del, expected_version=expected_v)

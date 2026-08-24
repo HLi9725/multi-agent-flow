@@ -1444,12 +1444,24 @@
 
         function batchDeleteRecords() {
             if (selectedTaskIds.size === 0) return;
-            openCustomConfirm('批量删除确认', `确定要批量删除选中的 ${selectedTaskIds.size} 条任务记录吗？删除后无法恢复。`, () => {
-                rawCardsData = rawCardsData.filter(c => !selectedTaskIds.has(c.id));
-                selectedTaskIds.clear();
-                saveStorageData();
-                applyFilters();
-                showToast('已完成批量删除操作！');
+            openCustomConfirm('批量删除确认', `确定要批量删除选中的 ${selectedTaskIds.size} 条任务记录吗？`, () => {
+                const ids = Array.from(selectedTaskIds);
+                fetch('/api/tasks/batch-delete', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ task_ids: ids })
+                })
+                .then(res => res.json())
+                .then(data => {
+                    if (data.code === 200) {
+                        selectedTaskIds.clear();
+                        if (typeof loadBoardData === 'function') loadBoardData();
+                        showToast(`已成功移入回收站 ${data.data.deleted_count} 条记录`);
+                    } else {
+                        showToast('批量删除失败: ' + data.msg);
+                    }
+                })
+                .catch(e => console.error(e));
             });
         }
 
@@ -2154,14 +2166,19 @@
             const cardId = document.getElementById('edit-original-id').value;
             closeDetailModal();
             openCustomConfirm('移入回收站确认', `确认要将任务 [${cardId}] 移入回收站吗？`, () => {
-                const targetCard = rawCardsData.find(c => c.id === cardId);
-                if (targetCard) {
-                    targetCard.is_deleted = true;
-                    targetCard.deleted_at = new Date().toISOString();
-                }
-                saveStorageData();
-                applyFilters();
-                showToast(`已移入回收站 ${cardId}`);
+                fetch(`/api/tasks/${cardId}`, {
+                    method: 'DELETE'
+                })
+                .then(res => res.json())
+                .then(data => {
+                    if (data.code === 200) {
+                        if (typeof loadBoardData === 'function') loadBoardData();
+                        showToast(`已移入回收站 ${cardId}`);
+                    } else {
+                        showToast('删除失败: ' + data.msg);
+                    }
+                })
+                .catch(e => console.error(e));
             });
         }
 

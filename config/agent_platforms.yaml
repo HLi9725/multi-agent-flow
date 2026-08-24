@@ -34,7 +34,7 @@ platforms:
     global_detect_dirs: ["~/.gemini/antigravity-cli"]
     subagent_export:
       pattern: ".agents/agents/{agent_id}.md"
-      user_pattern: "~/.gemini/antigravity-cli/agents/{agent_id}.md"
+      user_pattern: "~/.gemini/config/agents/{agent_id}.md"
       format: "markdown_frontmatter"
       frontmatter_subagent: true
 

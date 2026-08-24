@@ -177,7 +177,6 @@ class TestYyFlowLayout:
         got = paths.resolve_data_root(env={}, cwd="/anywhere")
         assert got == str(tmp_path / "legacyskill")
 
-    @pytest.mark.skipif(sys.platform == "win32", reason="Symlinks require admin privileges on Windows")
     def test_symlink_yyflow_layout_resolution(self, tmp_path):
         """验证通过 .agents/skills/yy-flow 软链接调用时，realpath 能够正确解析为 .yy-flow 数据根"""
         real_skill = tmp_path / ".yy-flow" / "skill"
@@ -188,8 +187,16 @@ class TestYyFlowLayout:
         symlink_dir = tmp_path / ".agents" / "skills"
         symlink_dir.mkdir(parents=True)
         symlink_path = symlink_dir / "yy-flow"
-        os.symlink(str(real_skill), str(symlink_path))
-        
+
+        try:
+            os.symlink(str(real_skill), str(symlink_path))
+        except OSError as e:
+            if getattr(e, "winerror", None) == 1314:
+                import subprocess
+                subprocess.run(["mklink", "/J", str(symlink_path), str(real_skill)], shell=True, check=True)
+            else:
+                raise
+
         # 模拟从软链接脚本目录获取 realpath
         symlinked_script = symlink_path / "scripts" / "paths.py"
         real_script_dir = os.path.dirname(os.path.realpath(str(symlinked_script)))

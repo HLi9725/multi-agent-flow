@@ -157,14 +157,15 @@ def main():
     from _lib.core.file_lock import LockBusyError
 
     chain_lock_handle = None
-    try:
-        locks_dir = paths.locks_dir()
-        os.makedirs(locks_dir, exist_ok=True)
-        lock_path = os.path.join(locks_dir, ".lock_auto_chain.lock")
-        chain_lock_handle = file_lock.acquire_lock(lock_path, blocking=False)
-    except (LockBusyError, OSError):
-        print("[FAILED]  另一条自动链正在执行或锁不可用，物理阻断！")
-        sys.exit(1)
+    if not args.simulate:
+        try:
+            locks_dir = paths.locks_dir()
+            os.makedirs(locks_dir, exist_ok=True)
+            lock_path = os.path.join(locks_dir, ".lock_auto_chain.lock")
+            chain_lock_handle = file_lock.acquire_lock(lock_path, blocking=False)
+        except (LockBusyError, OSError):
+            print("[FAILED]  另一条自动链正在执行或锁不可用，物理阻断！")
+            sys.exit(1)
 
     try:
         adapter = get_board_adapter(args.config)
