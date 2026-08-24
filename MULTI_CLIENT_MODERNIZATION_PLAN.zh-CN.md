@@ -1,6 +1,17 @@
+---
+title: Multi-Agent Flow 多客户端可信化与生态改造实施方案
+module: multi-agent-flow
+stage: Phase-2
+type: design-spec
+status: active
+author: User / Codex
+updated_at: 2026-08-24
+tags: [多客户端, 多Agent, 可信化, 实施计划]
+---
+
 # Multi-Agent Flow 多客户端可信化与生态改造实施方案
 
-> 文档状态：Draft / 待用户批准执行  
+> 文档状态：Active / 第一阶段已验收，第二阶段待分批批准
 > 适用仓库：`YuanYii/multi-agent-flow`  
 > 目标客户端：ChatGPT、OpenAI Codex、Google Antigravity  
 > 制定日期：2026-08-24  
@@ -16,7 +27,7 @@
 4. 全局安装能力、按项目隔离数据，不在不同项目间串任务；
 5. 后续可通过远程 MCP Server 和 Plugin/App 接入 ChatGPT Web、Codex、Antigravity及外部系统。
 
-本文是实施依据，不代表所有阶段已经完成。任何阶段进入编码前，均需用户确认；最终进入“已验收”状态必须再次由用户确认。
+本文是实施依据，不代表所有阶段已经完成。第一阶段已于 2026-08-24 经用户明确验收并冻结；第二至第四阶段进入编码前仍需用户按批次确认，最终进入“已验收”状态必须再次由用户确认。
 
 ## 2. 当前基线
 
@@ -779,7 +790,75 @@ Codex 复审流程：
 - Antigravity 全局路径通过真实宿主验证；
 - 用户确认第一阶段验收。
 
+### 7.7 第一阶段验收与冻结记录
+
+验收结论：**通过**。
+
+| 项目 | 记录 |
+|---|---|
+| 用户确认日期 | 2026-08-24 |
+| 验收范围 | 7.1～7.6 |
+| 基线提交 | `43156b0710005ad80cf610fbc456cb503eb2d0ca` |
+| 第一阶段交付提交 | `b83741b25ad567eb44f085bdea7bc3ac9537e840` |
+| 独立全量测试 | `226 passed`，退出码 `0` |
+| `/auto` 零写入 | 已通过目录树前后对比验证 |
+| Antigravity 路径结论 | 静态验证通过；未获得真实客户端证据的项继续标记 `static_only` |
+| 最终状态 | 第一阶段正式结束，保持只读基线 |
+
+冻结规则：
+
+1. 后续批次不得顺带重构或补改 7.1～7.6；发现第一阶段回归时，停止第二阶段并单独申请 Hotfix；
+2. 不得改写第一阶段测试证据、实施报告或验收结论；允许追加更正说明，但必须保留原始记录；
+3. 第二阶段必须从已验收提交或其经验证的 `main` 合流提交开始，不能从旧 `main` 基线另起开发；
+4. 第一阶段 worktree 在合流和主分支复验前保留，不自动清理。
+
 ## 8. 第二阶段：建立真实多 Agent
+
+### 8.0 阶段准入、基线与 worktree 处置
+
+第二阶段尚未因第一阶段验收而自动获得实施授权。进入开发前必须同时满足：
+
+1. 用户单独批准某一个第二阶段子批次；
+2. Git 基线包含第一阶段已验收成果；
+3. 主工作区和目标 worktree 的未提交文件已披露并得到妥善保留；
+4. 输出预计修改文件、测试计划、风险点和宿主能力检测结果；
+5. 未触发依赖升级、全局目录写入、外部系统写入或付费 API 调用。
+
+当前两个目录不是两个项目，而是同一 Git 仓库的两个 worktree：
+
+```text
+multi-agent-flow               -> main
+multi-agent-flow-phase1-trust  -> phase-1-trust
+```
+
+禁止手工复制或“合并文件夹”。推荐的 Git 合流顺序为：
+
+1. 保留 `phase-1-trust` 作为第一阶段可审计来源；
+2. 单独处理 `main` worktree 中与受控文件同名的未跟踪文件，不得覆盖或删除；
+3. 经用户批准后，由 DevOps 将 `phase-1-trust` 合入 `main`；若 `main` 仍为其祖先，可使用 fast-forward；
+4. 在更新后的 `main` 上重新运行全量测试；
+5. 从复验通过的 `main` 新建 `phase-2-real-agents` 分支和 `multi-agent-flow-phase2-real-agents` worktree；
+6. 第二阶段只在新 worktree 开发，不复用第一阶段冻结 worktree；
+7. 合并和清理 worktree 均是独立 Git 操作，必须另行批准。
+
+若暂不合流，技术上可以直接从 `b83741b` 创建第二阶段分支，但会使 `main` 长期落后、验收链复杂化，因此不作为默认方案。
+
+### 8.0.1 第二阶段执行委托合同
+
+**允许范围：**仅实施用户当次明确批准的 2A～2F 子批次；允许在独立分支/worktree 内修改、运行本地测试和生成交付报告。
+
+**禁止事项：**
+
+- 禁止实施第三、第四阶段，包括 Profile 拆分、MCP Server、ChatGPT Plugin/App、远程看板、认证和第三方连接器；
+- 禁止升级或新增依赖、推送远端、发布版本、打 Tag、自动合并或自动清理 worktree；
+- 禁止写入用户级 Codex/Antigravity 全局目录，除非用户对精确路径另行批准；
+- 禁止调用付费 API、使用 API Key、创建外部资源或写外部系统，除非用户另行批准调用范围和费用边界；
+- 禁止 `reset`、自动 `stash`、覆盖未提交文件、删除用户文件或伪造 Host/session/evidence；
+- 禁止 Fake Adapter、模拟输出或单会话角色切换满足“真实多 Agent”验收条件。
+
+**停止条件：**出现范围不明、基线不一致、工作区不干净、依赖变更、全局目录写入、外部认证/计费、破坏性操作、测试失败无法在本批次内解释、宿主能力无法确定、拿不到真实 session/invocation ID，或需要修改已冻结第一阶段时，立即停止并请求用户确认。
+
+**交付要求：**每个子批次生成变更摘要、实际文件、测试命令/退出码/数量、Git 状态、风险和未完成项；第二阶段最终生成 `PHASE2_IMPLEMENTATION_REPORT.md`。实施方只能提交“待独立复审”，不能自行宣布用户验收。
 
 ### 8.1 增加 Host Adapter
 
@@ -831,21 +910,37 @@ yy_flow/hosts/manifest.py
 
 ### 8.2 实现 Codex Adapter
 
+Codex 必须区分两条执行路线：
+
+| Adapter | 执行位置 | 凭证与用量 | 第二阶段定位 |
+|---|---|---|---|
+| `CodexNativeAdapter` | ChatGPT Desktop、Codex CLI 或 IDE 当前宿主会话 | 使用该客户端当前账户、模型、权限和用量规则 | 默认路线 |
+| `OpenAIResponsesAdapter` | Python 通过 OpenAI Responses API 调用 | 使用单独 API Key，并按 API Token/工具用量计费 | 可选路线，必须单独授权 |
+
+两者不能相互冒充。Python Core 可以生成调度计划和验证结果，但只有宿主实际暴露的原生子 Agent 能力才能创建 Codex 客户端线程；不得假设存在未公开的本地 Python 函数可直接操纵 Codex Desktop。OpenAI 官方文档确认当前 Codex 客户端可运行独立子 Agent 线程，并从 `~/.codex/agents/*.toml` 或项目 `.codex/agents/*.toml` 加载自定义 Agent；Responses API 的 Multi-agent 则是独立的 API 能力。
+
 执行流程：
 
 1. 探测 Codex 多 Agent 是否启用以及并发上限；
 2. 使用 Codex 原生子 Agent 工作流，不在 Python 中伪造角色；
-3. 从 `~/.codex/agents/` 或项目 `.codex/agents/` 加载角色；
+3. 按官方 TOML Schema 从 `~/.codex/agents/*.toml` 或项目 `.codex/agents/*.toml` 加载角色，至少包含 `name`、`description` 和 `developer_instructions`；
 4. Builder 使用 workspace-write，Reviewer 默认 read-only，QA 仅获得测试所需权限；
 5. 保存父任务、子 Agent 线程、模型、权限模式和结果摘要；
 6. 子 Agent 失败时不得自动提交下一状态；
-7. 增加真实 Codex 手工 E2E 清单。
+7. 增加真实 Codex 手工 E2E 清单，并由宿主返回可检查的 Agent thread ID；
+8. 只有用户明确批准 API Key、模型、费用上限和数据边界后，才实现或启用 `OpenAIResponsesAdapter`。
 
 注意事项：
 
 - Codex 子 Agent 会增加 Token，应受 Profile 和并发上限约束；
 - 子 Agent 会继承部分父会话设置，必须在调度前检查权限；
 - 不要依赖未公开、易变化的内部函数名；优先使用宿主暴露的能力和指令契约。
+- 客户端订阅/额度与 OpenAI API 账单不是同一授权面；报告必须记录实际使用的 Adapter，不推断或伪报 Token 来源。
+
+官方依据：
+
+- [Codex Subagents](https://learn.chatgpt.com/docs/agent-configuration/subagents)
+- [OpenAI Responses API Multi-agent](https://developers.openai.com/api/docs/guides/responses-multi-agent)
 
 ### 8.3 实现 Antigravity Adapter
 
@@ -879,6 +974,9 @@ yy_flow/hosts/manifest.py
 7. QA 在候选提交上测试；
 8. 合并前检测冲突并请求用户确认；
 9. 用户验收后再清理 worktree；失败时保留以便诊断。
+10. worktree 根目录必须为配置的受控绝对路径；创建、合并、移除前分别校验解析后的目标仍在受控根内；
+11. Builder 仅写自己的 worktree，Reviewer 默认只读，QA 固定在候选提交测试；
+12. 不允许 Adapter 自动合入 `main`，也不允许因任务完成自动删除分支或目录。
 
 注意事项：
 
@@ -899,13 +997,18 @@ yy_flow/hosts/manifest.py
   "transition": "测试中->已完成",
   "type": "test_result",
   "actor_role": "QA",
+  "adapter": "codex_native",
+  "is_real_host": true,
   "host": "codex",
   "host_session_id": "...",
+  "host_invocation_id": "...",
+  "workspace_mode": "worktree",
+  "baseline_commit": "...",
   "command": "python -m pytest -q",
   "exit_code": 0,
   "artifact_uri": ".yy-flow/user_data/evidence/...json",
   "artifact_sha256": "...",
-  "git_commit": "...",
+  "result_commit": "...",
   "created_at": "..."
 }
 ```
@@ -927,6 +1030,8 @@ yy_flow/hosts/manifest.py
 - 命令输出应做敏感信息脱敏；
 - Git commit 不是所有任务的唯一证据，文档、设计和研究任务使用相应 artifact 类型；
 - 外部看板只保存引用和摘要，原始证据应有可验证存储。
+- `is_real_host=false`、缺少宿主 ID、无法核对基线/结果提交的证据只能用于契约测试，不能推进真实任务状态；
+- Host Adapter 的能力声明、调用结果和证据对象必须交叉校验，不能仅相信 Adapter 自报 `success`。
 
 ### 8.6 Reviewer 和 QA 独立运行
 
@@ -963,6 +1068,40 @@ yy_flow/hosts/manifest.py
 - PM Agent 不能代替用户；
 - “测试通过”不等于“业务验收”；
 - 用户拒绝时应进入退回或阻塞，而不是修改历史证据。
+
+### 8.8 第二阶段子批次与逐批授权
+
+第二阶段拆为六个可独立验收的子批次。默认一次只批准一个，上一批达到“待用户验收”且经用户明确确认后，下一批才可开工。
+
+| 批次 | 目标 | 允许的核心产出 | 本批次禁止 |
+|---|---|---|---|
+| 2A | Host 契约与能力探测 | Schema、`HostAdapter`、`FakeHostAdapter`、契约测试 | 真实客户端调用、worktree 写入、状态推进 |
+| 2B | 证据存储与状态门禁 | Evidence Schema、存储、哈希、门禁测试 | 把 Fake/模拟证据当真实证据 |
+| 2C | worktree 隔离 | `WorktreeManager`、受控路径、冲突/清理保护测试 | 自动合并、自动清理、stash/reset |
+| 2D | Codex 真实 Adapter | `CodexNativeAdapter`、真实线程证据、Codex E2E | 未经批准的 Responses API/API Key 使用 |
+| 2E | Antigravity 真实 Adapter | `AntigravityAdapter`、真实 invocation 证据、Antigravity E2E | 写全局目录、用静态路径测试代替真实宿主 |
+| 2F | 独立 Reviewer/QA 与验收 | 独立 session 门禁、真实 L2 双宿主验证、验收请求 | 自动用户验收、进入第三阶段 |
+
+每批开始前必须输出：
+
+- 基线分支、提交和 worktree；
+- 预计修改文件；
+- 相关测试与全量测试计划；
+- 风险点、外部调用、权限和费用；
+- 是否存在未提交或未跟踪文件；
+- 本批次完成后停止位置。
+
+每批完成后必须在 `PHASE2_IMPLEMENTATION_REPORT.md` 追加：
+
+1. 批次、授权原文和范围对账；
+2. 实际修改文件与 `git diff --stat`；
+3. 每条测试的实际命令、退出码、通过/失败/跳过数量和必要日志哈希；
+4. Host/Adapter、真实或模拟标识、session/invocation ID、权限与 workspace 模式；
+5. 基线提交、结果提交、工作区状态和未提交文件；
+6. 已知限制、风险、偏差和后续建议；
+7. 明确写明“未实施的后续批次”和“待用户验收”。
+
+2A 的完成不代表真实多 Agent 已建立；2D、2E 未分别取得真实宿主证据前，产品文案必须保持“契约/静态能力”，不能宣传为“已支持真实 Codex/Antigravity 多 Agent”。
 
 第二阶段退出条件：
 
@@ -1324,11 +1463,11 @@ Python: 3.11 + 当前稳定版本
 
 ## 16. 执行批准
 
-本文档生成不代表批准实施。建议用户按阶段批准：
+第一阶段已由用户在 2026-08-24 明确验收并关闭。本文档的更新、第一阶段验收或 Git 合流均不构成第二阶段实施授权。建议用户按阶段、按子批次批准：
 
 ```text
 批准第一阶段：仅实施可信化六项，完成后停止并提交测试证据。
-批准第二阶段：在第一阶段验收后实施真实多 Agent。
+批准第二阶段：在第一阶段验收后按 2A～2F 逐批实施真实多 Agent。
 批准第三阶段：在两个真实 Host Adapter 验证后实施 Profile 和评测。
 批准第四阶段：在 Core API 稳定后实施远程生态。
 ```
@@ -1345,3 +1484,29 @@ Python: 3.11 + 当前稳定版本
 不允许 push、发布、安装依赖、写全局目录、写外部系统或执行第二至第四阶段。
 完成后生成 PHASE1_IMPLEMENTATION_REPORT.md 并停止在待用户验收。
 ```
+
+第一阶段关闭记录：
+
+```text
+我确认第一阶段 7.1～7.6 验收通过。第一阶段正式结束，不再继续修改第一阶段范围。
+```
+
+第二阶段 **2A** 推荐完整批准语句（完成主分支合流和新 worktree 准备后使用）：
+
+```text
+我批准仅执行 MULTI_CLIENT_MODERNIZATION_PLAN.zh-CN.md 的第二阶段 2A：
+Host 契约、能力探测、FakeHostAdapter 和契约测试。
+
+执行要求：
+1. 从已包含第一阶段验收成果且复验通过的 main 创建独立分支和 New Worktree；
+2. 开始前输出基线提交、预计修改文件、测试计划、风险点及未提交/未跟踪文件；
+3. 允许本地修改、测试和本地 commit；禁止 push、发布、升级/新增依赖；
+4. 禁止真实 Codex/Antigravity 调用、API Key/付费 API、全局目录和外部系统写入；
+5. FakeHostAdapter 必须明确 is_real_host=false，不得推进真实任务状态；
+6. 不得实施 2B～2F、第三阶段或第四阶段；
+7. 测试必须记录实际命令、退出码和通过/失败/跳过数量；
+8. 完成后追加 PHASE2_IMPLEMENTATION_REPORT.md，停止在“2A 待用户验收”。
+9. 遇到范围不明、依赖变更、破坏性操作、基线不一致或需要全局/外部权限时先请求确认。
+```
+
+后续 2B～2F 必须分别使用同等粒度的批准语句，不能用“继续第二阶段”一次性放行全部子批次。
