@@ -863,6 +863,8 @@ phase-1-trust                        -> 冻结分支 b83741b，不再承载新�
 | 第二阶段分支 | `phase-2-real-agents`，初始分支点 `79513e1b10d33ef2c193c3e64d02402b0e170ae2`，随后仅同步本交接文档 |
 | 第二阶段 worktree | `C:\Users\user\Desktop\user\multi-agent-flow-phase2-real-agents` |
 | 第二阶段 worktree 复验 | `python -m pytest tests -q -rs`，退出码 `0`：`226 passed in 56.97s`；测试后已恢复权威看板快照并校验一致 |
+| 远端分支 | 用户已确认并推送 `origin/main`、`origin/phase-1-trust`、`origin/phase-2-real-agents`；本次同步前第二阶段本地/远端差异为 `0/0` |
+| 2A 当前状态 | 环境与分支已就绪，尚未开始编码；必须由用户粘贴第 16 节完整批准语句后才能开工 |
 
 本地运行数据交接规则：
 
@@ -888,6 +890,19 @@ phase-1-trust                        -> 冻结分支 b83741b，不再承载新�
 **停止条件：**出现范围不明、基线不一致、工作区不干净、依赖变更、全局目录写入、外部认证/计费、破坏性操作、测试失败无法在本批次内解释、宿主能力无法确定、拿不到真实 session/invocation ID，或需要修改已冻结第一阶段时，立即停止并请求用户确认。
 
 **交付要求：**每个子批次生成变更摘要、实际文件、测试命令/退出码/数量、Git 状态、风险和未完成项；第二阶段最终生成 `PHASE2_IMPLEMENTATION_REPORT.md`。实施方只能提交“待独立复审”，不能自行宣布用户验收。
+
+### 8.0.3 2A 开工交接不变量
+
+Antigravity 执行 2A 时必须满足：
+
+1. 唯一工作目录为 `C:\Users\user\Desktop\user\multi-agent-flow-phase2-real-agents`，唯一开发分支为 `phase-2-real-agents`；
+2. 开工前执行 `git fetch origin`，确认 `HEAD` 与 `origin/phase-2-real-agents` 的关系；若存在远端新提交、分叉或用户未提交修改，停止并报告，不自行 rebase、merge、reset 或覆盖；
+3. 2A 只定义 Host 契约、纯只读能力探测、`FakeHostAdapter` 和契约测试，不接入真实 Codex/Antigravity，不创建 worktree，不接入状态机和证据存储；
+4. `FakeHostAdapter` 的所有结果必须携带 `is_real_host=false`，其 session/invocation ID 必须带 fake/test 命名空间，且不能通过任何真实状态门禁；
+5. 能力探测不得以创建文件、目录、锁、日志、会话或外部请求验证能力；未确认能力一律返回 unsupported/unknown；
+6. 如果现有源码布局不适合计划中的 `yy_flow/hosts/`，先在开工报告中提出最小布局方案，用户未确认前不得进行大规模包迁移；
+7. 只允许新增或修改 2A 直接相关代码、测试、`PHASE2_IMPLEMENTATION_REPORT.md` 和必要索引说明；第一阶段代码与报告保持冻结；
+8. 完成后工作区必须干净、允许本地 commit，但不得 push；状态停止在“2A 待用户验收”。
 
 ### 8.1 增加 Host Adapter
 
@@ -1520,22 +1535,56 @@ Python: 3.11 + 当前稳定版本
 我确认第一阶段 7.1～7.6 验收通过。第一阶段正式结束，不再继续修改第一阶段范围。
 ```
 
-第二阶段 **2A** 推荐完整批准语句（完成主分支合流和新 worktree 准备后使用）：
+第二阶段 **2A** 推荐完整批准语句（当前环境已就绪，可直接交给 Antigravity）：
 
 ```text
-我批准仅执行 MULTI_CLIENT_MODERNIZATION_PLAN.zh-CN.md 的第二阶段 2A：
-Host 契约、能力探测、FakeHostAdapter 和契约测试。
+工作目录固定为：
+C:\Users\user\Desktop\user\multi-agent-flow-phase2-real-agents
+
+当前开发分支必须为：
+phase-2-real-agents
+
+请完整阅读仓库根目录：
+MULTI_CLIENT_MODERNIZATION_PLAN.zh-CN.md
+
+我批准你仅执行该文档第二阶段 2A：
+Host 契约、纯只读能力探测、FakeHostAdapter 和契约测试。
+禁止实施 2B～2F、第三阶段和第四阶段。
 
 执行要求：
-1. 从已包含第一阶段验收成果且复验通过的 main 创建独立分支和 New Worktree；
-2. 开始前输出基线提交、预计修改文件、测试计划、风险点及未提交/未跟踪文件；
-3. 允许本地修改、测试和本地 commit；禁止 push、发布、升级/新增依赖；
-4. 禁止真实 Codex/Antigravity 调用、API Key/付费 API、全局目录和外部系统写入；
-5. FakeHostAdapter 必须明确 is_real_host=false，不得推进真实任务状态；
-6. 不得实施 2B～2F、第三阶段或第四阶段；
-7. 测试必须记录实际命令、退出码和通过/失败/跳过数量；
-8. 完成后追加 PHASE2_IMPLEMENTATION_REPORT.md，停止在“2A 待用户验收”。
-9. 遇到范围不明、依赖变更、破坏性操作、基线不一致或需要全局/外部权限时先请求确认。
+1. 修改前执行并原样报告：
+   - git fetch origin
+   - git branch --show-current
+   - git rev-parse HEAD
+   - git rev-list --left-right --count origin/phase-2-real-agents...HEAD
+   - git status --short
+2. 开始前先输出：基线提交、预计修改文件、测试计划、风险点、能力假设、是否存在未提交/未跟踪文件；输出后再开始合同范围内工作。
+3. 若当前分支不是 phase-2-real-agents、与远端发生分叉、工作区不干净或基线与文档冲突，立即停止，不得自行 merge、rebase、reset、stash、覆盖或清理。
+4. 2A 仅允许实现：
+   - HostCapabilities、AgentRequest、DispatchPlan、AgentHandle、AgentResult、ConfirmationRequest/Result 等必要 Schema；
+   - HostAdapter Protocol/ABC 及统一错误、超时、取消语义；
+   - 无副作用的 Host capability detection；
+   - 明确 is_real_host=false 的 FakeHostAdapter；
+   - 上述内容的单元测试和契约测试。
+5. 2A 禁止实现或调用：
+   - 真实 Codex、Antigravity 或 ChatGPT Adapter；
+   - OpenAI Responses API、API Key、付费 API 或任何外部请求；
+   - Evidence Store/状态流转门禁（2B）；
+   - WorktreeManager 或自动分支/合并/清理（2C）；
+   - Reviewer/QA 独立运行（2F）；
+   - MCP、Plugin/App、远程服务、认证、连接器；
+   - 用户级/全局目录写入。
+6. FakeHostAdapter 的结果必须带 is_real_host=false；fake/test session ID 不得作为真实 Agent 证据，不得推进任何真实任务状态。
+7. 能力探测必须零写入：不得创建目录、文件、锁、日志或会话；不确定的能力返回 unknown/unsupported，禁止猜测为 supported。
+8. 不得修改第一阶段 7.1～7.6 的实现、PHASE1_IMPLEMENTATION_REPORT.md 或既有验收证据。若发现回归，停止并单独报告，不在 2A 顺手修复。
+9. 不得升级或新增依赖，不得删除/弱化测试、放宽断言或添加无理由 skip。
+10. 每项完成后运行相关测试；最后执行：
+    python -m pytest tests -q -rs
+11. 测试记录必须包含实际命令、退出码、通过/失败/跳过数量；失败必须如实保留。
+12. 允许在 phase-2-real-agents 上创建本地 commit；禁止 push、发布、创建 PR、打 Tag、合并 main 或删除 worktree。
+13. 创建或追加仓库根目录 PHASE2_IMPLEMENTATION_REPORT.md，记录授权范围、实际文件、diff、测试、Git 状态、限制和未实施批次。
+14. 完成后立即停止在“2A 待用户验收”，不要继续 2B，不要自行宣布第二阶段完成或已验收。
+15. 遇到范围不明、依赖变更、破坏性操作、外部/全局权限、真实 Host 调用需求或布局需要大规模迁移时，先请求我的确认。
 ```
 
 后续 2B～2F 必须分别使用同等粒度的批准语句，不能用“继续第二阶段”一次性放行全部子批次。
