@@ -15,12 +15,17 @@ class CapabilitySupport(str, Enum):
     UNSUPPORTED = "unsupported"
     UNKNOWN = "unknown"
 
-@dataclass
+@dataclass(frozen=True)
 class HostCapabilities:
     is_real_host: bool = False
-    supports_mcp: CapabilitySupport = CapabilitySupport.UNKNOWN
+    supports_real_subagents: CapabilitySupport = CapabilitySupport.UNKNOWN
+    supports_parallelism: CapabilitySupport = CapabilitySupport.UNKNOWN
+    supports_isolated_context: CapabilitySupport = CapabilitySupport.UNKNOWN
     supports_worktree: CapabilitySupport = CapabilitySupport.UNKNOWN
+    supports_permission_approval: CapabilitySupport = CapabilitySupport.UNKNOWN
+    supports_mcp: CapabilitySupport = CapabilitySupport.UNKNOWN
     supports_interactive_confirmation: CapabilitySupport = CapabilitySupport.UNKNOWN
+    supports_usage_telemetry: CapabilitySupport = CapabilitySupport.UNKNOWN
     max_concurrent_agents: int = 0
     extra: Dict[str, Any] = field(default_factory=dict)
 
@@ -38,16 +43,16 @@ class AgentRequest:
 class DispatchPlan:
     plan_id: str
     requests: List[AgentRequest] = field(default_factory=list)
-    strategy: str = "parallel"  # parallel or sequential
+    strategy: str = "parallel"
 
-@dataclass
+@dataclass(frozen=True)
 class AgentHandle:
     session_id: str
     host_id: str
     status: str = "running"
     is_real_host: bool = False
 
-@dataclass
+@dataclass(frozen=True)
 class AgentResult:
     session_id: str
     status: AgentStatus
@@ -56,13 +61,13 @@ class AgentResult:
     error_message: Optional[str] = None
     is_real_host: bool = False
 
-@dataclass
+@dataclass(frozen=True)
 class ConfirmationRequest:
     request_id: str
     prompt: str
     options: List[str] = field(default_factory=list)
 
-@dataclass
+@dataclass(frozen=True)
 class ConfirmationResult:
     request_id: str
     selected_option: str
