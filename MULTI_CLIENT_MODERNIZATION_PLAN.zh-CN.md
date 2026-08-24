@@ -824,11 +824,13 @@ Codex 复审流程：
 4. 输出预计修改文件、测试计划、风险点和宿主能力检测结果；
 5. 未触发依赖升级、全局目录写入、外部系统写入或付费 API 调用。
 
-当前两个目录不是两个项目，而是同一 Git 仓库的两个 worktree：
+这些目录不是多个项目，而是同一 Git 仓库的多个 worktree。第二阶段交付后的布局为：
 
 ```text
-multi-agent-flow               -> main
-multi-agent-flow-phase1-trust  -> phase-1-trust
+multi-agent-flow                     -> main
+multi-agent-flow-phase1-trust        -> phase-transition-plan（过渡/文档分支，目录名保留历史名称）
+multi-agent-flow-phase2-real-agents  -> phase-2-real-agents（第二阶段唯一开发 worktree）
+phase-1-trust                        -> 冻结分支 b83741b，不再承载新修改
 ```
 
 禁止手工复制或“合并文件夹”。推荐的 Git 合流顺序为：
@@ -843,7 +845,33 @@ multi-agent-flow-phase1-trust  -> phase-1-trust
 
 若暂不合流，技术上可以直接从 `b83741b` 创建第二阶段分支，但会使 `main` 长期落后、验收链复杂化，因此不作为默认方案。
 
-### 8.0.1 第二阶段执行委托合同
+### 8.0.1 第一阶段合流与第二阶段交接记录
+
+2026-08-24 实际执行记录：
+
+| 项目 | 实际结果 |
+|---|---|
+| 原 `main` | `43156b0710005ad80cf610fbc456cb503eb2d0ca` |
+| 第一阶段冻结分支 | `phase-1-trust`，`b83741b25ad567eb44f085bdea7bc3ac9537e840` |
+| 过渡分支 | `phase-transition-plan` |
+| 第一轮合流提交 | `4273e21`，fast-forward 合入 `main` |
+| 全量测试命令 | `python -m pytest tests -q -rs` |
+| 首次复验 | 退出码 `1`：`4 failed, 169 passed, 53 errors`；原因是新 worktree 不携带 Git 忽略的本地配置和数据文件 |
+| 环境修复 | 从已验收 worktree 复制无凭证的 `config/workflow.config.yaml` 本地快照；不提交、不升级依赖、不改代码 |
+| 第二次复验 | 退出码 `0`：`226 passed in 51.78s` |
+| 旧未跟踪方案 | 已移至仓库外 `C:\Users\user\Desktop\user\multi-agent-flow-backups\MULTI_CLIENT_MODERNIZATION_PLAN.zh-CN.pre-phase1-untracked.md`，SHA-256 `B3FDF2EF0269F67F02C796CCA208AFDEF004FDA81A49DFB206BC80CCE9F10378` |
+| 第二阶段分支 | `phase-2-real-agents`，从包含本记录的最终 `main` 创建 |
+| 第二阶段 worktree | `C:\Users\user\Desktop\user\multi-agent-flow-phase2-real-agents` |
+
+本地运行数据交接规则：
+
+1. `config/workflow.config.yaml` 和 `user_data/` 被 `.gitignore` 排除，Git 分支/合并/worktree 不会自动携带；
+2. 创建第二阶段 worktree 后，必须复制已验收的无凭证配置和最终看板快照，并校验 SHA-256；
+3. 第二阶段开始后，以 `multi-agent-flow-phase2-real-agents` 下的数据根为唯一权威写入源；`main`、过渡 worktree 和历史 worktree 只读，禁止多份看板并行推进；
+4. 测试可能在被忽略的 `user_data/` 中生成本地数据，测试结束后必须恢复经校验的权威看板快照；
+5. Antigravity 开工前仍须执行 `git rev-parse HEAD`、`git status --short` 和全量测试，不得仅依据本文中的历史结果。
+
+### 8.0.2 第二阶段执行委托合同
 
 **允许范围：**仅实施用户当次明确批准的 2A～2F 子批次；允许在独立分支/worktree 内修改、运行本地测试和生成交付报告。
 
