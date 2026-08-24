@@ -20,6 +20,13 @@ sys.path.insert(0, SCRIPT_DIR)
 from _lib.core.validate_transition import validate, validate_delegation_authority
 from _lib.boards.board_adapter_factory import get_board_adapter
 from _lib.audit.audit_logger import record_audit_event as _real_record_audit_event
+import threading
+_local_ctx = threading.local()
+
+def record_audit_event(*args, **kwargs):
+    if getattr(_local_ctx, "dry_run", False):
+        return
+    return _real_record_audit_event(*args, **kwargs)
 
 _DRY_RUN_MODE = False
 
@@ -167,7 +174,17 @@ def print_duplicate_protocol(task_name, hits):
         print(f"  [重复候选] {h['task_id']} {h['name']} ({h['level']})")
 
 
-def transition_task_pipeline(
+def transition_task_pipeline(*args, **kwargs):
+    dry_run = kwargs.get('dry_run', False)
+    if len(args) > 11:
+        dry_run = args[11]
+    _local_ctx.dry_run = dry_run
+    try:
+        return _transition_task_pipeline_impl(*args, **kwargs)
+    finally:
+        _local_ctx.dry_run = False
+
+def _transition_task_pipeline_impl(
     config_path: str,
     task_id: str = "",
     record_id: str = None,
@@ -193,8 +210,6 @@ def transition_task_pipeline(
     force: bool = False,
     no_dup_check: bool = False,
 ) -> bool:
-    global _DRY_RUN_MODE
-    _DRY_RUN_MODE = dry_run
     resolved_task_id = task_id or "AUTO"
     extra_log = {"task_id": resolved_task_id}
     logger.info(f"[SECURITY]  触发防错门控校验 ({from_status} -> {to_status}, 模式: {'DRY-RUN' if dry_run else 'REAL'})...", extra=extra_log)

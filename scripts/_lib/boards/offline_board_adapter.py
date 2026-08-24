@@ -199,6 +199,31 @@ class OfflineBoardAdapter:
     # ------------------------------------------------------------------
     # 统一接口
     # ------------------------------------------------------------------
+    def list_records_readonly(self, filter_json: Optional[Dict[str, Any]] = None,
+                              limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
+        """获取记录列表的只读快照（无锁）"""
+        cards = self._read_cards()
+        cards = [c for c in cards if not c.get("is_deleted")]
+        items = [{"record_id": c.get("id"), "fields": c} for c in cards]
+        if filter_json:
+            for cond in filter_json.get("conditions", []):
+                field_name = str(cond.get("field_name", ""))
+                operator = cond.get("operator", "is")
+                values = [str(v) for v in (cond.get("value") or [])]
+                kanban_field = (self._value_to_kanban.get(field_name) or KANBAN_FIELD_MAP.get(field_name) or field_name)
+                filtered = []
+                for item in items:
+                    cell = item["fields"].get(kanban_field)
+                    cell_str = "" if cell is None else str(cell)
+                    if operator in ("is", "isNot") and values:
+                        hit = cell_str in values
+                        if (operator == "is" and hit) or (operator == "isNot" and not hit):
+                            filtered.append(item)
+                    else:
+                        filtered.append(item)
+                items = filtered
+        return items[offset : offset + limit]
+
     def list_records(self, filter_json: Optional[Dict[str, Any]] = None,
                      limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
         """检索看板记录（支持按 status/assignee 等字段的简单等值过滤）。"""
@@ -232,6 +257,13 @@ class OfflineBoardAdapter:
                                 filtered.append(item)
                     items = filtered
             return items[offset:offset + limit]
+
+    def get_record_readonly(self, record_id: str) -> Optional[Dict[str, Any]]:
+        """获取任务详情记录的只读快照（无锁）"""
+        for c in self._read_cards():
+            if str(c.get("id")) == str(record_id):
+                return {"record_id": c.get("id"), "fields": c}
+        return None
 
     def get_record(self, record_id: str) -> Optional[Dict[str, Any]]:
         """获取指定任务编号的详情记录；不存在返回 None。"""
