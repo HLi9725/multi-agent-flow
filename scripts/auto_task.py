@@ -100,25 +100,8 @@ def parse_block_markers(text: str) -> tuple:
 
 
 def generate_auto_step_summary(from_st: str, to_st: str, name: str, role_name: str) -> str:
-    """生成结合具体任务名称的阶段交付实质性总结"""
-    n = name or "当前工作包任务"
-    if from_st == "待开始" and to_st == "进行中":
-        return f"认领【{n}】并进入开发/设计，初始化工作区与依赖"
-    elif from_st == "进行中" and to_st == "审查中":
-        return f"完成【{n}】核心逻辑实现与模块自测，提交代码审查"
-    elif from_st == "审查中" and to_st == "测试中":
-        return f"完成【{n}】代码质量、安全与规范合规性审查，未见明显异常，移交测试"
-    elif from_st == "测试中" and to_st == "已完成":
-        return f"完成【{n}】单元测试与集成冒烟验证，功能符合预期，提请 PM 验收"
-    elif from_st == "已完成" and to_st == "已验收":
-        return f"核验【{n}】全部交付物与验收标准，确认闭环，完成阶段结项"
-    elif to_st == "进行中":
-        return f"恢复【{n}】至进行中，继续推进研发"
-    elif to_st == "已完成":
-        return f"完成【{n}】任务交付，提请 PM 验收"
-    elif to_st == "已验收":
-        return f"核验【{n}】交付物合规，完成最终验收"
-    return f"推进【{n}】由【{from_st}】至【{to_st}】"
+    """生成阶段总结（纯模拟模式）"""
+    return f"[SIMULATION] 纯模拟模式：假设完成 {from_st} -> {to_st}，未真实执行代码修改或审查。"
 
 
 def check_block_resolved(fields: Dict) -> bool:
@@ -144,11 +127,20 @@ def main():
     parser.add_argument("--wbs", default="", help="建卡时写入 WBS")
     parser.add_argument("--delegated-by", default="USER", help="代行来源 (默认 USER)")
     parser.add_argument("--delegation-reason", default="auto", help="代行理由")
-    parser.add_argument("--simulate", action="store_true", help="模拟模式：不落库仅演示流转")
-    parser.add_argument("--force", action="store_true", help="建卡重复校验命中时强制创建")
-    parser.add_argument("--no-dup-check", action="store_true", help="跳过建卡重复校验")
-    parser.add_argument("--step-delay", type=float, default=0.0, help="步骤间微延时秒数（默认 0 不阻塞 CI）")
+    parser.add_argument("--simulate", action="store_true", help="模拟模式：仅演示不改变看板 (默认)")
+    parser.add_argument("--run", action="store_true", help="真实执行模式（尚未启用）")
+    parser.add_argument("--force", action="store_true", help="当重复校验失败时强制建卡")
+    parser.add_argument("--no-dup-check", action="store_true", help="跳过重复校验")
+    parser.add_argument("--step-delay", type=float, default=0.0, help="步骤停顿延迟 (秒)")
     args = parser.parse_args()
+
+    # 7.5 规则：默认模拟，禁止 /auto 直接写入
+    if args.run:
+        print("[FAILED] 第二阶段 Host Adapter 完成前，真实执行 --run 功能暂不可用。")
+        sys.exit(1)
+    
+    # 强制开启 simulate
+    args.simulate = True
 
     if not args.task_id and not args.task_name:
         parser.error("必须提供 --task-id 或 --task-name")
@@ -312,7 +304,7 @@ def main():
                 sys.exit(1)
             prev = target
 
-        print(f"[AUTO]  ✅ 任务 {task_id} 自动链完成，终态【{prev}】" if prev == "已验收" else f"[AUTO]  任务 {task_id} 到达【{prev}】")
+        print(f"[AUTO]  任务 {task_id} 自动链完成，终态【{prev}】" if prev == "已验收" else f"[AUTO]  任务 {task_id} 到达【{prev}】")
         sys.exit(0)
     finally:
         if chain_lock_handle:

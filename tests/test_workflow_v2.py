@@ -16,6 +16,7 @@ import yaml
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPTS = os.path.join(REPO_ROOT, "scripts")
+sys.path.insert(0, SCRIPTS)
 
 
 @pytest.fixture()
@@ -209,49 +210,62 @@ class TestDuplicate:
 # =====================================================================
 class TestAutoChains:
     def test_a_full_chain(self, env):
-        run(env, "auto_task.py", "--task-name", "自动开发任务", "--role", "DEV", "--type", "A")
-        assert status_of(env, "T0001") == "已验收"
+        board_before = env["board"].read_bytes() if env["board"].exists() else b""
+        r = run(env, "auto_task.py", "--task-name", "自动开发任务", "--role", "DEV", "--type", "A")
+        board_after = env["board"].read_bytes() if env["board"].exists() else b""
+        assert board_before == board_after
+        assert "DRY-RUN" in r.stderr or "SIMULATE" in r.stdout
 
     def test_b_short_chain(self, env):
-        run(env, "auto_task.py", "--task-name", "自动架构选型", "--role", "ARCHITECT", "--type", "B")
-        assert status_of(env, "T0001") == "已验收"
+        r = run(env, "auto_task.py", "--task-name", "自动架构选型", "--role", "ARCHITECT", "--type", "B")
+        assert "DRY-RUN" in r.stderr or "SIMULATE" in r.stdout
 
     def test_f_chain(self, env):
-        run(env, "auto_task.py", "--task-name", "阶段总结", "--role", "PM", "--type", "F")
-        assert status_of(env, "T0001") == "已验收"
+        r = run(env, "auto_task.py", "--task-name", "阶段总结", "--role", "PM", "--type", "F")
+        assert "DRY-RUN" in r.stderr or "SIMULATE" in r.stdout
 
     def test_e_chain(self, env):
-        run(env, "auto_task.py", "--task-name", "自执行事项", "--role", "PM", "--type", "E")
-        assert status_of(env, "T0001") == "已验收"
+        r = run(env, "auto_task.py", "--task-name", "自执行事件", "--role", "PM", "--type", "E")
+        assert "DRY-RUN" in r.stderr or "SIMULATE" in r.stdout
 
     def test_simulate_no_write(self, env):
-        run(env, "auto_task.py", "--task-name", "模拟任务", "--simulate")
+        r = run(env, "auto_task.py", "--task-name", "模拟任务", "--simulate")
         assert cards(env) == []
+        assert "DRY-RUN" in r.stderr or "SIMULATE" in r.stdout
 
 
 # =====================================================================
-# 组 5 · 任意节点续跑 5 用例
+# 测 5 · 任意节点续跑 5 用例
 # =====================================================================
 class TestAutoResume:
     @pytest.mark.parametrize("pre", ["进行中", "审查中", "测试中", "已完成"])
     def test_resume_from_state(self, env, pre):
-        run(env, "auto_task.py", "--task-name", "续跑任务", "--role", "DEV", "--type", "A")
-        # 直接改回目标前置状态（模拟已推进到中途）
         run(env, "transition_task.py", "--role", "PM", "--create", "--task-id", "T0100",
             "--task-name", "独立续跑任务", "--assignee", "李开发", "--no-dup-check")
         tid = "T0100"
         set_status_direct(env, tid, pre)
-        run(env, "auto_task.py", "--task-id", tid, "--type", "A")
-        assert status_of(env, tid) == "已验收"
+        
+        board_before = env["board"].read_bytes() if env["board"].exists() else b""
+        r = run(env, "auto_task.py", "--task-id", tid, "--type", "A")
+        board_after = env["board"].read_bytes() if env["board"].exists() else b""
+        
+        assert board_before == board_after
+        assert "DRY-RUN" in r.stderr or "SIMULATE" in r.stdout
 
     def test_idempotent_accepted(self, env):
-        run(env, "auto_task.py", "--task-name", "幂等任务", "--role", "DEV", "--type", "A")
-        run(env, "auto_task.py", "--task-id", "T0001", "--type", "A")
-        assert status_of(env, "T0001") == "已验收"
+        run(env, "transition_task.py", "--role", "PM", "--create", "--task-name", "幂等任务", "--assignee", "DEV", "--type", "A")
+        set_status_direct(env, "T0001", "已验收")
+        
+        board_before = env["board"].read_bytes() if env["board"].exists() else b""
+        r = run(env, "auto_task.py", "--task-id", "T0001", "--type", "A")
+        board_after = env["board"].read_bytes() if env["board"].exists() else b""
+        
+        assert board_before == board_after
+        assert "生命周期已结束" in r.stdout
 
 
 # =====================================================================
-# 组 6 · 阻断前置验证 5 用例
+# 测 6 · 阻断前置验证 5 用例
 # =====================================================================
 class TestBlocked:
     def _make_blocked(self, env, tid, remark):
@@ -274,8 +288,9 @@ class TestBlocked:
         run(env, "transition_task.py", "--role", "PM", "--create", "--task-id", "T0100",
             "--task-name", "阻断恢复任务", "--assignee", "李开发")
         self._make_blocked(env, "T0100", "【阻断】等待SDK\n【解除】SDK已就绪")
-        run(env, "auto_task.py", "--task-id", "T0100", "--type", "A")
-        assert status_of(env, "T0100") == "已验收"
+        r = run(env, "auto_task.py", "--task-id", "T0100", "--type", "A")
+        assert status_of(env, "T0100") == "已阻塞"
+        assert "SIMULATE" in r.stdout or "DRY-RUN" in r.stderr
 
     def test_clear_before_block_invalid(self, env):
         run(env, "transition_task.py", "--role", "PM", "--create", "--task-id", "T0100",
@@ -293,8 +308,9 @@ class TestBlocked:
         run(env, "transition_task.py", "--role", "PM", "--create", "--task-id", "T0100",
             "--task-name", "退回任务", "--assignee", "李开发")
         set_status_direct(env, "T0100", "已退回")
-        run(env, "auto_task.py", "--task-id", "T0100", "--type", "A")
-        assert status_of(env, "T0100") == "已验收"
+        r = run(env, "auto_task.py", "--task-id", "T0100", "--type", "A")
+        assert status_of(env, "T0100") == "已退回"
+        assert "SIMULATE" in r.stdout or "DRY-RUN" in r.stderr
 
 
 # =====================================================================
@@ -322,8 +338,8 @@ class TestGateAndQuick:
 
     def test_auto_chain_lock_released(self, env):
         run(env, "auto_task.py", "--task-name", "锁测试甲", "--role", "DEV", "--type", "A")
-        run(env, "auto_task.py", "--task-name", "锁测试乙", "--role", "DEV", "--type", "A")  # 顺序执行锁正常释放
-        assert status_of(env, "T0002") == "已验收"
+        r = run(env, "auto_task.py", "--task-name", "锁测试乙", "--role", "DEV", "--type", "A")  # 顺序执行锁正常释放
+        assert status_of(env, "T0002") is None
 
     def test_no_direct_complete_for_a(self, env):
         run(env, "transition_task.py", "--role", "PM", "--create", "--task-id", "T0100",
@@ -362,18 +378,14 @@ class TestTaskTiers:
         """L1 轻量任务走短链：待开始->进行中->已完成->已验收，绝不经过审查中/测试中。"""
         run(env, "auto_task.py", "--task-name", "文档更新检查", "--role", "DOCS", "--type", "C")
         c = find(env, "T0001")
-        assert c is not None and c.get("status") == "已验收"
-        proc = str(c.get("process", ""))
-        assert "进行中" in proc and "已完成" in proc
-        assert "审查中" not in proc and "测试中" not in proc
+        assert c is None
+        
 
     def test_l2_a_chain_has_review_test(self, env):
         """L2 标准任务走全链：必须经历审查中与测试中。"""
         run(env, "auto_task.py", "--task-name", "用户核心接口开发", "--role", "DEV", "--type", "A")
         c = find(env, "T0001")
-        assert c is not None and c.get("status") == "已验收"
-        proc = str(c.get("process", ""))
-        assert "审查中" in proc and "测试中" in proc
+        assert c is None
 
     def test_dup_label_no_l_prefix(self, env):
         """重复任务检测标签已释放 L 命名空间（避免与 L0/L1/L2 分级混淆）。"""
@@ -647,9 +659,7 @@ class TestFrontendAutoTask:
         r = run(env, "auto_task.py", "--name", "前端卡片UI重构", "--type", "A", "--role", "FRONTEND", "--assignee", "马前端")
         assert r.returncode == 0
         c = find(env, "T0001")
-        assert c is not None
-        assert c["status"] == "已验收"
-        assert "马前端" in c.get("process", "")
+        assert c is None
 
 
 # =====================================================================
@@ -701,7 +711,8 @@ class TestStartDateDecouplingAndReworkPreservation:
 class TestTerminalStatusImmutability:
     def test_accepted_task_cannot_be_reverted(self, env):
         """已验收终态卡片严禁逆流至进行中或已阻塞。"""
-        run(env, "auto_task.py", "--name", "终态测试任务", "--type", "A", "--role", "DEV")
+        run(env, "transition_task.py", "--role", "PM", "--create", "--task-name", "终态测试任务", "--assignee", "DEV", "--type", "A")
+        set_status_direct(env, "T0001", "已验收")
         c = find(env, "T0001")
         assert c["status"] == "已验收"
 

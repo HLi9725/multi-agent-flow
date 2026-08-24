@@ -107,6 +107,7 @@ def save_architecture_config(arch_dict: dict) -> bool:
     
     candidate_patterns = [
         os.path.join(project_root, ".agents", "agents", "{r}", "agent.md"),
+        os.path.join(project_root, ".agents", "agents", "{r}.md"),
         os.path.join(project_root, ".claude", "agents", "{r}.md"),
         os.path.join(project_root, ".cursor", "agents", "{r}.md"),
         os.path.join(project_root, ".universal_agents", "{r}.md"),

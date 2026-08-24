@@ -44,6 +44,7 @@ def test_validate_schema_missing_required():
 def test_save_architecture_config_and_assertions(tmp_path, monkeypatch):
     test_user_data = tmp_path / "user_data"
     test_user_data.mkdir()
+    (tmp_path / ".agents").mkdir()
     
     # 模拟 paths
     monkeypatch.setenv("YY_FLOW_PROJECT_ROOT", str(tmp_path))

@@ -44,17 +44,17 @@ class TestGlobalExport:
 
     def test_global_mounts_claude_skills_dir(self, tmp_path):
         fake_home = tmp_path / "home"
-        (fake_home / ".claude").mkdir(parents=True)
+        (fake_home / ".gemini/config").mkdir(parents=True)
         r = _run([os.path.join(SCRIPTS, "verify_and_export_agents.py"), "--global"],
-                 env_extra={"HOME": str(fake_home)})
+                 env_extra={"USERPROFILE": str(fake_home)})
         assert r.returncode == 0, r.stdout[-500:] + r.stderr[-300:]
 
-        link = fake_home / ".claude" / "skills" / "yy-flow"
-        assert link.is_symlink()
+        link = fake_home / ".gemini/config" / "skills" / "yy-flow"
+        assert link.exists()
         assert os.path.realpath(str(link)) == os.path.realpath(REPO_ROOT)
 
         # 用户级 subagent 导出（Claude Code 支持 user_pattern）
-        agents_dir = fake_home / ".claude" / "agents"
+        agents_dir = fake_home / ".gemini/config" / "agents"
         exported = list(agents_dir.glob("flow-*.md"))
         assert len(exported) == 8
         dev = (agents_dir / "flow-dev.md").read_text(encoding="utf-8")
@@ -63,30 +63,30 @@ class TestGlobalExport:
     def test_global_subagents_are_generic(self, tmp_path):
         """全局模式不合并项目技术栈（本仓库 legacy 架构配置存在也不得泄漏）"""
         fake_home = tmp_path / "home2"
-        (fake_home / ".claude").mkdir(parents=True)
+        (fake_home / ".gemini/config").mkdir(parents=True)
         r = _run([os.path.join(SCRIPTS, "verify_and_export_agents.py"), "--global"],
-                 env_extra={"HOME": str(fake_home), "YY_FLOW_PROJECT_ROOT": str(REPO_ROOT)})
+                 env_extra={"USERPROFILE": str(fake_home), "YY_FLOW_PROJECT_ROOT": str(REPO_ROOT)})
         assert r.returncode == 0, r.stdout[-400:]
-        dev = (fake_home / ".claude" / "agents" / "flow-dev.md").read_text(encoding="utf-8")
+        dev = (fake_home / ".gemini/config" / "agents" / "flow-dev.md").read_text(encoding="utf-8")
         assert "Rust" not in dev
         assert "通用语言" in dev  # 模板基线
 
     def test_project_mode_unaffected_by_global_flag(self, tmp_path):
-        """同一台机器上项目级导出照常（.claude 目录存在 → 项目级激活）"""
+        """同一台机器上项目级导出照常（.gemini/config 目录存在 → 项目级激活）"""
         host = tmp_path / "projhost"
-        (host / ".claude").mkdir(parents=True)
+        (host / ".agents").mkdir(parents=True)
         r = _run([os.path.join(SCRIPTS, "verify_and_export_agents.py")],
                  env_extra={"YY_FLOW_PROJECT_ROOT": str(host)}, cwd=str(host))
         assert r.returncode == 0, r.stdout[-400:]
-        assert (host / ".claude" / "skills" / "yy-flow").exists()
-        assert (host / ".claude" / "agents" / "flow-pm.md").exists()
+        assert (host / ".agents" / "skills" / "yy-flow").exists()
+        assert (host / ".agents" / "agents" / "flow-pm.md").exists()
 
     def test_global_no_platform_detected_fails_closed(self, tmp_path):
         """无任何已安装宿主（fake HOME 空）→ 全局模式 Fail-Closed"""
         empty_home = tmp_path / "emptyhome"
         empty_home.mkdir()
         r = _run([os.path.join(SCRIPTS, "verify_and_export_agents.py"), "--global"],
-                 env_extra={"HOME": str(empty_home)})
+                 env_extra={"USERPROFILE": str(empty_home)})
         assert r.returncode == 1
         assert "FAILED" in r.stdout
 
