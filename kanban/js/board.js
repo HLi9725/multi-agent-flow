@@ -1123,8 +1123,10 @@
             const endFrom = document.getElementById('filter-end-from') ? document.getElementById('filter-end-from').value : '';
             const endTo = document.getElementById('filter-end-to') ? document.getElementById('filter-end-to').value : '';
             const personFocusActive = typeof isPersonFocusActive === 'function' && isPersonFocusActive();
+            const showTrash = document.getElementById('show-trash-checkbox')?.checked;
 
             return rawCardsData.filter(c => {
+                if (!showTrash && c.is_deleted) return false;
                 const matchQuery = !query || (
                     (c.id && c.id.toLowerCase().includes(query)) ||
                     (c.name && c.name.toLowerCase().includes(query)) ||
@@ -1748,19 +1750,25 @@
             const toggleBtn = document.getElementById('toggle-detail-edit-btn');
             const saveBtn = document.getElementById('detail-save-btn');
             const deleteBtn = document.getElementById('detail-delete-btn');
+            const restoreBtn = document.getElementById('detail-restore-btn');
+            const cardId = document.getElementById('edit-original-id')?.value;
+            const targetCard = cardId ? rawCardsData.find(c => c.id === cardId) : null;
+            const isDeleted = targetCard ? targetCard.is_deleted : false;
 
             if (isTaskEditMode) {
                 if (readBox) readBox.style.display = 'none';
                 if (editBox) editBox.style.display = 'flex';
                 if (toggleBtn) toggleBtn.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right:4px; vertical-align:-1px;"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>切换为查看详情';
                 if (saveBtn) saveBtn.style.display = 'inline-flex';
-                if (deleteBtn) deleteBtn.style.display = 'inline-flex';
+                if (deleteBtn) deleteBtn.style.display = isDeleted ? 'none' : 'inline-flex';
+                if (restoreBtn) restoreBtn.style.display = isDeleted ? 'inline-flex' : 'none';
             } else {
                 if (readBox) readBox.style.display = 'flex';
                 if (editBox) editBox.style.display = 'none';
                 if (toggleBtn) toggleBtn.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right:4px; vertical-align:-1px;"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>切换为编辑模式';
                 if (saveBtn) saveBtn.style.display = 'none';
                 if (deleteBtn) deleteBtn.style.display = 'none';
+                if (restoreBtn) restoreBtn.style.display = 'none';
             }
         }
 
@@ -2145,12 +2153,29 @@
         function deleteCurrentTask() {
             const cardId = document.getElementById('edit-original-id').value;
             closeDetailModal();
-            openCustomConfirm('删除任务确认', `确认要永久删除任务 [${cardId}] 吗？删除后无法恢复。`, () => {
-                rawCardsData = rawCardsData.filter(c => c.id !== cardId);
+            openCustomConfirm('移入回收站确认', `确认要将任务 [${cardId}] 移入回收站吗？`, () => {
+                const targetCard = rawCardsData.find(c => c.id === cardId);
+                if (targetCard) {
+                    targetCard.is_deleted = true;
+                    targetCard.deleted_at = new Date().toISOString();
+                }
                 saveStorageData();
                 applyFilters();
-                showToast(`已删除任务 ${cardId}`);
+                showToast(`已移入回收站 ${cardId}`);
             });
+        }
+
+        function restoreCurrentTask() {
+            const cardId = document.getElementById('edit-original-id').value;
+            closeDetailModal();
+            const targetCard = rawCardsData.find(c => c.id === cardId);
+            if (targetCard) {
+                targetCard.is_deleted = false;
+                targetCard.restored_at = new Date().toISOString();
+            }
+            saveStorageData();
+            applyFilters();
+            showToast(`已恢复任务 ${cardId}`);
         }
 
         // Column & Row Resizable Drag Event Handlers

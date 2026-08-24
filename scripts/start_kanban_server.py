@@ -596,8 +596,13 @@ class KanbanHTTPRequestHandler(SimpleHTTPRequestHandler):
             end_from = query.get("end_from", [None])[0]
             end_to = query.get("end_to", [None])[0]
             keyword = query.get("keyword", [None])[0] or query.get("q", [None])[0]
+            include_deleted_str = query.get("include_deleted", [None])[0]
+            include_deleted = include_deleted_str and include_deleted_str.lower() in ("true", "1", "yes")
 
             filtered = cards
+            if not include_deleted:
+                filtered = [c for c in filtered if not c.get("is_deleted")]
+
             if status_filter:
                 filtered = [c for c in filtered if c.get("status") == status_filter]
             if assignee_filter:
@@ -815,8 +820,11 @@ class KanbanHTTPRequestHandler(SimpleHTTPRequestHandler):
                 return
 
             def _mutate_bulk(cards):
+                client_ids = {str(c.get("id")) for c in body_data if c.get("id")}
+                retained_deleted = [c for c in cards if c.get("is_deleted") and str(c.get("id")) not in client_ids]
                 cards.clear()
                 cards.extend(body_data)
+                cards.extend(retained_deleted)
                 return True, 200, "保存成功", {"count": len(cards)}
 
             code, msg, data = atomic_mutate_board_data(_mutate_bulk, expected_version=expected_v)
@@ -988,6 +996,29 @@ class KanbanHTTPRequestHandler(SimpleHTTPRequestHandler):
                 }
 
             code, msg, data = atomic_mutate_board_data(_mutate_trans, expected_version=expected_v)
+            self._send_json_resp(code, msg, data, http_status=code)
+            return
+
+        # 5. REST API: POST /api/tasks/{task_id}/restore
+        m_restore = re.match(r"^/api/(?:tasks|cards)/([A-Za-z0-9_\-]+)/restore$", path)
+        if m_restore:
+            task_id = m_restore.group(1)
+            
+            def _mutate_restore(cards):
+                card = next((c for c in cards if c.get("id") == task_id), None)
+                if not card:
+                    return False, 404, f"未找到任务 [{task_id}]", None
+                if not card.get("is_deleted"):
+                    return True, 200, f"任务 {task_id} 并不在回收站中", {"id": task_id, "restored": 0}
+                
+                card["is_deleted"] = False
+                card["restored_at"] = datetime.now().isoformat()
+                card["restored_by"] = get_default_operator()
+                
+                append_audit_log(task_id, "PM", "已删除", card.get("status", "未知"), get_default_operator(), f"恢复任务: {task_id}")
+                return True, 200, f"成功恢复任务 {task_id}", {"id": task_id, "restored": 1, "card": card}
+
+            code, msg, data = atomic_mutate_board_data(_mutate_restore, expected_version=expected_v)
             self._send_json_resp(code, msg, data, http_status=code)
             return
 
@@ -1182,13 +1213,19 @@ class KanbanHTTPRequestHandler(SimpleHTTPRequestHandler):
             task_id = m_task.group(1)
 
             def _mutate_del_one(cards):
-                initial_len = len(cards)
-                remaining = [c for c in cards if c.get("id") != task_id]
-                if len(remaining) == initial_len:
+                task = next((c for c in cards if c.get("id") == task_id), None)
+                if not task:
                     return False, 404, f"未找到待删除任务 [{task_id}]", None
-                cards.clear()
-                cards.extend(remaining)
-                append_audit_log(task_id, "PM", "-", "已删除", "用户", f"删除任务: {task_id}")
+                if task.get("is_deleted"):
+                    return True, 200, f"任务 {task_id} 已经是删除状态", {"deleted_id": task_id, "deleted": 0}
+
+                task["is_deleted"] = True
+                task["deleted_at"] = datetime.now().isoformat()
+                task["deleted_by"] = get_default_operator()
+                task["delete_reason"] = "user action"
+                task["delete_version"] = task.get("delete_version", 0) + 1
+
+                append_audit_log(task_id, "PM", "-", "已删除", get_default_operator(), f"删除任务: {task_id}")
                 return True, 200, f"成功删除任务 {task_id}", {"deleted_id": task_id, "deleted": 1}
 
             code, msg, data = atomic_mutate_board_data(_mutate_del_one, expected_version=expected_v)
@@ -1213,17 +1250,23 @@ class KanbanHTTPRequestHandler(SimpleHTTPRequestHandler):
             task_ids_to_del = set(ids_list)
 
             def _mutate_del_multi(cards):
-                initial_len = len(cards)
-                remaining = [c for c in cards if c.get("id") not in task_ids_to_del]
-                cards.clear()
-                cards.extend(remaining)
-                deleted_count = initial_len - len(cards)
-                for tid in task_ids_to_del:
-                    append_audit_log(tid, "PM", "-", "已删除", "用户", f"批量删除任务: {tid}")
+                deleted_count = 0
+                operator = get_default_operator()
+                now_str = datetime.now().isoformat()
+                for c in cards:
+                    if c.get("id") in task_ids_to_del and not c.get("is_deleted"):
+                        c["is_deleted"] = True
+                        c["deleted_at"] = now_str
+                        c["deleted_by"] = operator
+                        c["delete_reason"] = "bulk delete"
+                        c["delete_version"] = c.get("delete_version", 0) + 1
+                        deleted_count += 1
+                        append_audit_log(c["id"], "PM", "-", "已删除", operator, f"批量删除任务: {c['id']}")
+
                 return True, 200, f"成功删除 {deleted_count} 条任务", {
                     "deleted": deleted_count,
                     "deleted_count": deleted_count,
-                    "remaining_total": len(cards)
+                    "remaining_total": len([x for x in cards if not x.get("is_deleted")])
                 }
 
             code, msg, data = atomic_mutate_board_data(_mutate_del_multi, expected_version=expected_v)

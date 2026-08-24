@@ -204,6 +204,7 @@ class OfflineBoardAdapter:
         """检索看板记录（支持按 status/assignee 等字段的简单等值过滤）。"""
         with file_lock.acquire_lock(self.seq_lock_file, blocking=True, timeout=5.0):
             cards = self._read_cards()
+            cards = [c for c in cards if not c.get("is_deleted")]
             items = [{"record_id": c.get("id"), "fields": c} for c in cards]
 
             if filter_json:

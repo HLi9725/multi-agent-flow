@@ -123,6 +123,10 @@ async function fetchTableTasksFromServer(params = {}) {
     if (params.keyword) queryParts.push(`keyword=${encodeURIComponent(params.keyword)}`);
     if (params.sort) queryParts.push(`sort=${encodeURIComponent(params.sort)}`);
     if (params.order) queryParts.push(`order=${encodeURIComponent(params.order)}`);
+    
+    const includeDeleted = document.getElementById('show-trash-checkbox')?.checked;
+    if (includeDeleted) queryParts.push('include_deleted=true');
+    
     queryParts.push(`t=${Date.now()}`);
 
     const qs = queryParts.join('&');
@@ -154,6 +158,9 @@ async function fetchTableTasksFromServer(params = {}) {
     if (stored) {
         try { localCards = JSON.parse(stored) || []; } catch (err) {}
     }
+    if (!includeDeleted) {
+        localCards = localCards.filter(c => !c.is_deleted);
+    }
     tableServerData = {
         items: localCards.slice((page - 1) * (parseInt(size, 10) || 20), page * (parseInt(size, 10) || 20)),
         total: localCards.length,
@@ -167,7 +174,8 @@ async function fetchTableTasksFromServer(params = {}) {
  */
 async function fetchKanbanTasksFromServer() {
     try {
-        const res = await fetch('/api/tasks?size=all&t=' + Date.now());
+        const includeDeleted = document.getElementById('show-trash-checkbox')?.checked ? '&include_deleted=true' : '';
+        const res = await fetch('/api/tasks?size=all&t=' + Date.now() + includeDeleted);
         if (res.ok) {
             const resp = await res.json();
             if (resp && resp.data && Array.isArray(resp.data.items)) {
@@ -378,7 +386,7 @@ async function apiUpdateTask(taskId, patchData) {
 }
 
 /**
- * 接口 3: 删除任务 (DELETE /api/tasks/{id})
+ * 接口 3: 移入回收站 (DELETE /api/tasks/{id})
  */
 async function apiDeleteTask(taskId) {
     isWriteInFlight = true;
@@ -402,6 +410,37 @@ async function apiDeleteTask(taskId) {
         return { ok: false, code: res.status, message: resp.message, error: resp.message || `HTTP ${res.status}` };
     } catch (e) {
         console.warn(`[API] DELETE /api/tasks/${taskId} offline`, e);
+        return { ok: false, error: e.message || '网络连接异常' };
+    } finally {
+        isWriteInFlight = false;
+    }
+}
+
+/**
+ * 接口 3.5: 恢复任务 (POST /api/tasks/{id}/restore)
+ */
+async function apiRestoreTask(taskId) {
+    isWriteInFlight = true;
+    try {
+        const headers = {};
+        if (currentBoardVersion) headers['If-Match'] = currentBoardVersion;
+
+        const res = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/restore`, {
+            method: 'POST',
+            headers: headers
+        });
+        const resp = await res.json();
+        if (res.status === 409) {
+            handle409Conflict(resp.data);
+            return { ok: false, code: 409, message: resp.message, error: resp.message };
+        }
+        if (res.ok && resp) {
+            if (resp.data && resp.data.v) currentBoardVersion = resp.data.v;
+            return { ok: true, code: 200, message: resp.message, data: resp.data };
+        }
+        return { ok: false, code: res.status, message: resp.message, error: resp.message || `HTTP ${res.status}` };
+    } catch (e) {
+        console.warn(`[API] POST /api/tasks/${taskId}/restore offline`, e);
         return { ok: false, error: e.message || '网络连接异常' };
     } finally {
         isWriteInFlight = false;

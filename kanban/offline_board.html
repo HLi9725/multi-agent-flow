@@ -53,9 +53,12 @@
         <button class="btn" onclick="toggleCustomPopover(event, 'sort-popover')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 16V4M7 4L3 8M7 4L11 8M17 8V20M17 20L21 16M17 20L13 16"/></svg> 排序</button>
 
         <!-- Batch Delete Button -->
-        <button class="btn danger-btn sm" id="batch-delete-btn" style="display:none;" onclick="batchDeleteRecords()"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg> 批量删除 (<span id="selected-count">0</span>)</button>
+        <button class="btn danger-btn sm" id="batch-delete-btn" style="display:none;" onclick="batchDeleteRecords()"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg> 移入回收站 (<span id="selected-count">0</span>)</button>
 
         <button class="btn" onclick="resetFilters()" title="重置所有筛选条件与排序"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg> 重置</button>
+        <label class="checkbox-label" style="margin-left:8px;" title="显示已删除任务">
+            <input type="checkbox" id="show-trash-checkbox" onchange="toggleTrashView()"> 回收站
+        </label>
 
         <!-- Pure Static MVP JSON Import / Export -->
         <span class="toolbar-divider" id="import-export-divider" role="separator" aria-orientation="vertical"></span>
@@ -393,7 +396,8 @@
 
             <!-- Modal Footer Actions -->
             <div class="modal-actions">
-                <button class="btn danger-btn sm" id="detail-delete-btn" onclick="deleteCurrentTask()" style="display:none;"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg> 删除任务</button>
+                <button class="btn danger-btn sm" id="detail-delete-btn" onclick="deleteCurrentTask()" style="display:none;"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg> 移入回收站</button>
+                <button class="btn success-btn sm" id="detail-restore-btn" onclick="restoreCurrentTask()" style="display:none;"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg> 恢复任务</button>
                 <div style="margin-left:auto; display:flex; gap:10px;">
                     <button class="btn" onclick="closeDetailModal()">关闭</button>
                     <button class="btn primary-btn" id="detail-save-btn" onclick="saveTaskDetails()" style="display:none;">保存更新</button>
