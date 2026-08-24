@@ -19,6 +19,7 @@ import urllib.request
 from datetime import datetime
 from urllib.parse import urlparse, parse_qs, unquote
 from http.server import HTTPServer, SimpleHTTPRequestHandler
+from typing import Any, Optional
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SKILL_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
@@ -1302,7 +1303,7 @@ class ProbeResult:
 def _is_addr_in_use(e: OSError) -> bool:
     """跨平台判断"地址被占用"错误（macOS/Linux errno 48/98，Windows winerror 10048）"""
     import errno as _errno
-    if e.errno == _errno.EADDRINUSE:
+    if e.errno in (_errno.EADDRINUSE, 48, 98):
         return True
     if getattr(e, "winerror", None) == 10048:
         return True
