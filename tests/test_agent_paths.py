@@ -22,7 +22,7 @@ def test_agent_paths_api():
         
         # Verify required status keys
         assert "antigravity_ide" in data
-        assert data["antigravity_ide"]["status"] == "verified"
+        assert data["antigravity_ide"]["status"] == "static_only"
         assert data["antigravity_ide"]["global_skill_target"] == "~/.gemini/config/skills/{skill_name}"
         
         assert "antigravity_cli" in data

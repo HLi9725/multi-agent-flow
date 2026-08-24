@@ -284,7 +284,7 @@ def main():
             need_end_time = target in ("已完成", "已验收") and task_type != "E"
             dynamic_end_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S") if need_end_time else None
             step_comment = generate_auto_step_summary(prev, target, board_name, step_role)
-            print(f"[AUTO]  执行: {prev} -> {target} (角色 {step_role}, 处理人 {step_assignee})")
+            print(f"[AUTO-SIMULATE] 模拟转移: {prev} -> {target} (角色 {step_role}, 处理人 {step_assignee})")
             ok = transition_task_pipeline(
                 config_path=args.config,
                 task_id=task_id,
@@ -305,7 +305,7 @@ def main():
                 sys.exit(1)
             prev = target
 
-        print(f"[AUTO]  任务 {task_id} 自动链完成，终态【{prev}】" if prev == "已验收" else f"[AUTO]  任务 {task_id} 到达【{prev}】")
+        print(f"[AUTO-SIMULATE] 任务 {task_id} 模拟链路到达终态" if prev == "已验收" else f"[AUTO-SIMULATE] 任务 {task_id} 模拟停留在【{prev}】")
         sys.exit(0)
     finally:
         if chain_lock_handle:

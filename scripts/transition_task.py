@@ -19,7 +19,14 @@ sys.path.insert(0, SCRIPT_DIR)
 
 from _lib.core.validate_transition import validate, validate_delegation_authority
 from _lib.boards.board_adapter_factory import get_board_adapter
-from _lib.audit.audit_logger import record_audit_event
+from _lib.audit.audit_logger import record_audit_event as _real_record_audit_event
+
+_DRY_RUN_MODE = False
+
+def record_audit_event(*args, **kwargs):
+    if not _DRY_RUN_MODE:
+        return _real_record_audit_event(*args, **kwargs)
+
 from _lib.core.file_lock import acquire_lock, release_lock, remove_lock_file_if_free, LockBusyError
 from enums import TaskStatus, TaskType, RoleEnum, normalize_role, ROLE_NORMALIZE_MAP
 import paths
@@ -186,6 +193,8 @@ def transition_task_pipeline(
     force: bool = False,
     no_dup_check: bool = False,
 ) -> bool:
+    global _DRY_RUN_MODE
+    _DRY_RUN_MODE = dry_run
     resolved_task_id = task_id or "AUTO"
     extra_log = {"task_id": resolved_task_id}
     logger.info(f"[SECURITY]  触发防错门控校验 ({from_status} -> {to_status}, 模式: {'DRY-RUN' if dry_run else 'REAL'})...", extra=extra_log)
@@ -204,12 +213,14 @@ def transition_task_pipeline(
 
     # 1. 尝试获取并发独占锁 (Fail-Closed 硬拦截)
     #    AUTO 场景使用全局建单锁，特定 task_id 使用 per-task 锁
-    lock_key = resolved_task_id if resolved_task_id != "AUTO" else "auto_create_global"
-    lock_tuple = acquire_concurrency_lock(lock_key)
-    if not lock_tuple or not lock_tuple[0]:
-        logger.error(f"[FAILED]  [并发锁排他硬拦截] 任务 {resolved_task_id} (锁标识: {lock_key}) 当前正被另一个进程独占写卡中，物理阻断！", extra=extra_log)
-        record_audit_event(resolved_task_id, current_role, from_status, to_status, assignee, False, "物理并发排他锁硬拦截", delegated_by=delegated_by, delegation_reason=delegation_reason)
-        return False
+    lock_tuple = None
+    if not dry_run:
+        lock_key = resolved_task_id if resolved_task_id != "AUTO" else "auto_create_global"
+        lock_tuple = acquire_concurrency_lock(lock_key)
+        if not lock_tuple or not lock_tuple[0]:
+            logger.error(f"[FAILED]  [并发锁排他硬拦截] 任务 {resolved_task_id} (锁标识: {lock_key}) 当前正被另一个进程独占写卡中，物理阻断！", extra=extra_log)
+            record_audit_event(resolved_task_id, current_role, from_status, to_status, assignee, False, "物理并发排他锁硬拦截", delegated_by=delegated_by, delegation_reason=delegation_reason)
+            return False
 
     try:
         # 2. 完整加载看板 Adapter 与配置文件格式断言 (dry-run 模式下也不跳过校验)

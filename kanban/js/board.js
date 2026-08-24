@@ -1444,24 +1444,21 @@
 
         function batchDeleteRecords() {
             if (selectedTaskIds.size === 0) return;
-            openCustomConfirm('批量删除确认', `确定要批量删除选中的 ${selectedTaskIds.size} 条任务记录吗？`, () => {
+            openCustomConfirm('批量删除确认', `确定要批量删除选中的 ${selectedTaskIds.size} 条任务记录吗？`, async () => {
                 const ids = Array.from(selectedTaskIds);
-                fetch('/api/tasks/batch-delete', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ task_ids: ids })
-                })
-                .then(res => res.json())
-                .then(data => {
-                    if (data.code === 200) {
+                try {
+                    const res = await apiBatchDeleteTasks(ids);
+                    if (res && res.code === 200) {
                         selectedTaskIds.clear();
-                        if (typeof loadBoardData === 'function') loadBoardData();
-                        showToast(`已成功移入回收站 ${data.data.deleted_count} 条记录`);
+                        if (typeof loadBoardData === 'function') await loadBoardData();
+                        showToast(`已成功移入回收站 ${res.data.deleted_count} 条记录`);
                     } else {
-                        showToast('批量删除失败: ' + data.msg);
+                        showToast('批量删除失败: ' + (res ? res.msg : '未知错误'));
                     }
-                })
-                .catch(e => console.error(e));
+                } catch (e) {
+                    console.error(e);
+                    showToast('批量删除异常');
+                }
             });
         }
 
@@ -2165,34 +2162,39 @@
         function deleteCurrentTask() {
             const cardId = document.getElementById('edit-original-id').value;
             closeDetailModal();
-            openCustomConfirm('移入回收站确认', `确认要将任务 [${cardId}] 移入回收站吗？`, () => {
-                fetch(`/api/tasks/${cardId}`, {
-                    method: 'DELETE'
-                })
-                .then(res => res.json())
-                .then(data => {
-                    if (data.code === 200) {
-                        if (typeof loadBoardData === 'function') loadBoardData();
+            openCustomConfirm('移入回收站确认', `确认要将任务 [${cardId}] 移入回收站吗？`, async () => {
+                try {
+                    const res = await apiDeleteTask(cardId);
+                    if (res && res.code === 200) {
+                        if (typeof loadBoardData === 'function') await loadBoardData();
                         showToast(`已移入回收站 ${cardId}`);
                     } else {
-                        showToast('删除失败: ' + data.msg);
+                        showToast('删除失败: ' + (res ? res.msg : '未知错误'));
                     }
-                })
-                .catch(e => console.error(e));
+                } catch (e) {
+                    console.error(e);
+                    showToast('删除异常');
+                }
             });
         }
 
         function restoreCurrentTask() {
             const cardId = document.getElementById('edit-original-id').value;
             closeDetailModal();
-            const targetCard = rawCardsData.find(c => c.id === cardId);
-            if (targetCard) {
-                targetCard.is_deleted = false;
-                targetCard.restored_at = new Date().toISOString();
-            }
-            saveStorageData();
-            applyFilters();
-            showToast(`已恢复任务 ${cardId}`);
+            openCustomConfirm('恢复确认', `确认要恢复任务 [${cardId}] 吗？`, async () => {
+                try {
+                    const res = await apiRestoreTask(cardId);
+                    if (res && res.code === 200) {
+                        if (typeof loadBoardData === 'function') await loadBoardData();
+                        showToast(`已恢复任务 ${cardId}`);
+                    } else {
+                        showToast('恢复失败: ' + (res ? res.msg : '未知错误'));
+                    }
+                } catch (e) {
+                    console.error(e);
+                    showToast('恢复异常');
+                }
+            });
         }
 
         // Column & Row Resizable Drag Event Handlers
