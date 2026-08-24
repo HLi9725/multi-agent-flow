@@ -132,7 +132,8 @@ def check_duplicate_tasks(adapter, task_name, cfg_dup, limit=10, threshold=0.8, 
     limit = int(dup_cfg.get("limit", limit) or limit)
     threshold = float(dup_cfg.get("threshold", threshold) or threshold)
     try:
-        recs = adapter_list(limit=1000)
+        list_func = getattr(adapter, "list_records_readonly", adapter.list_records) if getattr(_local_ctx, "dry_run", False) else adapter.list_records
+        recs = list_func(limit=1000)
     except Exception:
         return []
     recs = sorted(recs, key=lambda r: int(r.get("fields", {}).get("seq") or 0), reverse=True)
@@ -330,7 +331,8 @@ def _transition_task_pipeline_impl(
             try:
                 status_k = field_mapping.get("status", "status")
                 assignee_k = field_mapping.get("assignee", "assignee")
-                recs = adapter_list(limit=1000)
+                list_func = getattr(adapter, "list_records_readonly", adapter.list_records) if getattr(_local_ctx, "dry_run", False) else adapter.list_records
+                recs = list_func(limit=1000)
                 board_active_count = 0
                 target_norms = {normalize_role(assignee), normalize_role(current_role), assignee, current_role}
                 for r in recs:
