@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field, is_dataclass
-from typing import List, Dict, Any, Optional, Tuple, Mapping
+from typing import List, Dict, Any, Optional, Tuple, Mapping, Set, FrozenSet
 from enum import Enum
 import types
 
@@ -10,11 +10,15 @@ class EvidenceType(str, Enum):
     USER_CONFIRMATION = "user_confirmation"
 
 def freeze_value(val: Any) -> Any:
-    if isinstance(val, dict):
+    if val is None or isinstance(val, (int, float, str, bool, bytes, Enum)):
+        return val
+    if isinstance(val, Mapping):
         return types.MappingProxyType({k: freeze_value(v) for k, v in val.items()})
-    elif isinstance(val, list):
+    if isinstance(val, (list, tuple)):
         return tuple(freeze_value(v) for v in val)
-    return val
+    if isinstance(val, (set, frozenset)):
+        return frozenset(freeze_value(v) for v in val)
+    raise TypeError(f"Unsupported mutable or complex type for Evidence: {type(val)}")
 
 @dataclass(frozen=True)
 class ArtifactRecord:
@@ -52,9 +56,12 @@ class EvidenceRecord:
     content_hash: Optional[str] = None
 
     def __post_init__(self):
-        if isinstance(self.artifacts, list):
+        if not isinstance(self.artifacts, tuple):
             object.__setattr__(self, 'artifacts', tuple(self.artifacts))
-
+        for art in self.artifacts:
+            if not isinstance(art, ArtifactRecord):
+                raise TypeError(f"Artifact must be an ArtifactRecord, got {type(art)}")
+            
 class EvidenceError(Exception): pass
 class EvidenceSecurityError(EvidenceError): pass
 class EvidenceIntegrityError(EvidenceError): pass
