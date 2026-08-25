@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field, is_dataclass
-from typing import List, Dict, Any, Optional, Tuple, Mapping, Set, FrozenSet
+from typing import List, Dict, Any, Optional, Tuple, Mapping
 from enum import Enum
 import types
 
@@ -17,7 +17,7 @@ def freeze_value(val: Any) -> Any:
     if isinstance(val, (list, tuple)):
         return tuple(freeze_value(v) for v in val)
     if isinstance(val, (set, frozenset)):
-        return frozenset(freeze_value(v) for v in val)
+        raise TypeError(f"set/frozenset is strictly forbidden in Evidence schema due to non-deterministic serialization.")
     raise TypeError(f"Unsupported mutable or complex type for Evidence: {type(val)}")
 
 @dataclass(frozen=True)
@@ -61,7 +61,7 @@ class EvidenceRecord:
         for art in self.artifacts:
             if not isinstance(art, ArtifactRecord):
                 raise TypeError(f"Artifact must be an ArtifactRecord, got {type(art)}")
-            
+
 class EvidenceError(Exception): pass
 class EvidenceSecurityError(EvidenceError): pass
 class EvidenceIntegrityError(EvidenceError): pass
