@@ -864,7 +864,7 @@ phase-1-trust                        -> 冻结分支 b83741b，不再承载新�
 | 第二阶段 worktree | `C:\Users\user\Desktop\user\multi-agent-flow-phase2-real-agents` |
 | 第二阶段 worktree 复验 | `python -m pytest tests -q -rs`，退出码 `0`：`226 passed in 56.97s`；测试后已恢复权威看板快照并校验一致 |
 | 远端分支 | 用户已确认并推送 `origin/main`、`origin/phase-1-trust`、`origin/phase-2-real-agents`；本次同步前第二阶段本地/远端差异为 `0/0` |
-| 2A 当前状态 | 环境与分支已就绪，尚未开始编码；必须由用户粘贴第 16 节完整批准语句后才能开工 |
+| 2A 当前状态 | 已完成最终修复与 Codex 准出验证；代码提交 `9c59b14`，定向测试 `11 passed`，全量测试 `237 passed`；等待用户使用第 16 节 2B 独立批准语句进入下一批次 |
 
 本地运行数据交接规则：
 
@@ -903,6 +903,31 @@ Antigravity 执行 2A 时必须满足：
 6. 如果现有源码布局不适合计划中的 `yy_flow/hosts/`，先在开工报告中提出最小布局方案，用户未确认前不得进行大规模包迁移；
 7. 只允许新增或修改 2A 直接相关代码、测试、`PHASE2_IMPLEMENTATION_REPORT.md` 和必要索引说明；第一阶段代码与报告保持冻结；
 8. 完成后工作区必须干净、允许本地 commit，但不得 push；状态停止在“2A 待用户验收”。
+
+### 8.0.4 2A 准出结论与 2B 开工不变量
+
+2A 于 2026-08-25 完成最终修复和 Codex 准出验证，交付基线为代码提交 `9c59b14` 及其后的报告/交接文档提交。最终契约具备以下不变量：
+
+1. 契约对象及其常见嵌套容器递归冻结，调用方不能原地污染 Adapter 的能力、请求或结果；
+2. Fake session、Adapter 实例和 invocation token 分属独立命名空间；Handle 明确采用不可猜测 token 的 bearer-capability 模型；
+3. Fake 结果始终为 `is_real_host=false`，不支持交互确认，也不能成为真实状态证据；
+4. 超时基于 `time.monotonic()`、请求默认值、显式覆盖值和剩余执行时间计算；
+5. 能力探测测试封锁文件、临时目录、子进程和网络等副作用入口；
+6. 定向测试 `11 passed`，全量回归 `237 passed`，测试后权威看板已恢复并完成哈希核验；
+7. `PHASE2_IMPLEMENTATION_REPORT.md` 是 2A 的最终交付与风险说明。
+
+2B 开工时必须满足：
+
+1. 2B 只实现 Evidence Schema、canonical serializer、受控的 append-only Evidence Store、SHA-256 完整性校验和纯门禁判定；
+2. 2B 不调用真实 Codex/Antigravity，不创建 worktree，不实现 Reviewer/QA 独立运行，不推进 2C～2F；
+3. Evidence Store 只能写项目内或显式配置的受控证据根，必须阻断绝对路径逃逸、`..`、符号链接/联接点逃逸、覆盖、删除和更新既有证据；
+4. 落盘采用 canonical UTF-8 JSON、确定字段顺序、原子创建和 SHA-256 校验；同一 `evidence_id` 不得覆盖；
+5. `is_real_host=false`、Fake session、缺失 Host/session/invocation ID、哈希不符、基线不符或 transition 不匹配时，门禁必须 Fail-Closed；
+6. invocation token、API Key、访问令牌、环境变量秘密和未脱敏命令输出不得进入证据；2A Handle 的 invocation token 仅供进程内校验；
+7. 用户验收证据只能来自显式用户确认，Fake confirmation 或模型自述不得生成用户确认凭据；
+8. 2B 测试只能在 `tmp_path` 或受控临时根写证据，不得污染权威 `user_data/`；
+9. 2B 只提供门禁服务和最小集成 seam，不改变第一阶段既有 CLI 的默认流转行为；真正接入实际多 Agent 状态链留到后续获批批次；
+10. 完成后停止在“2B 待用户验收”，不得自行进入 2C。
 
 ### 8.1 增加 Host Adapter
 
@@ -1587,4 +1612,71 @@ Host 契约、纯只读能力探测、FakeHostAdapter 和契约测试。
 15. 遇到范围不明、依赖变更、破坏性操作、外部/全局权限、真实 Host 调用需求或布局需要大规模迁移时，先请求我的确认。
 ```
 
-后续 2B～2F 必须分别使用同等粒度的批准语句，不能用“继续第二阶段”一次性放行全部子批次。
+第二阶段 **2B** 推荐完整批准语句（2A 验收后可直接交给 Antigravity）：
+
+```text
+工作目录固定为：
+C:\Users\user\Desktop\user\multi-agent-flow-phase2-real-agents
+
+当前开发分支必须为：
+phase-2-real-agents
+
+请完整阅读仓库根目录：
+MULTI_CLIENT_MODERNIZATION_PLAN.zh-CN.md
+PHASE2_IMPLEMENTATION_REPORT.md
+
+我确认第二阶段 2A 验收通过并冻结 2A 范围。
+我批准你仅执行第二阶段 2B：证据存储与状态门禁。
+禁止实施 2C～2F、第三阶段和第四阶段。
+
+执行要求：
+1. 修改前执行并原样报告：
+   - git fetch origin
+   - git branch --show-current
+   - git rev-parse HEAD
+   - git log -5 --oneline
+   - git rev-list --left-right --count origin/phase-2-real-agents...HEAD
+   - git status --short
+2. 开始前先输出：基线提交、预计修改文件、Schema 草案、存储根设计、门禁矩阵、测试计划、风险点，以及是否存在未提交/未跟踪文件；输出后再开始合同范围内工作。
+3. 若分支错误、工作区不干净、远端分叉、2A 报告与代码不一致或需要修改 2A 已冻结契约，立即停止，不得自行 merge、rebase、reset、stash、覆盖或清理。
+4. 2B 仅允许实现：
+   - Evidence Schema 与必要枚举/统一异常；
+   - canonical UTF-8 JSON serializer；
+   - 项目受控根内的 append-only Evidence Store；
+   - artifact SHA-256、证据内容哈希和读取时完整性复验；
+   - 真实/模拟标记、Host/session/invocation、transition、actor、baseline/result commit 等门禁校验；
+   - 不实际写看板的纯 EvidenceGate 判定接口及契约测试；
+   - PHASE2_IMPLEMENTATION_REPORT.md 的 2B 追加章节。
+5. Evidence Store 必须：
+   - 阻断绝对路径逃逸、..、符号链接/Junction 逃逸；
+   - 同一 evidence_id 只允许创建一次，禁止覆盖、更新或删除；
+   - 使用原子创建，失败不得留下被当成有效证据的半文件；
+   - 读取时重新计算哈希，内容或 artifact 被篡改必须 Fail-Closed；
+   - 对命令、输出和 metadata 做敏感字段拦截或脱敏。
+6. EvidenceGate 必须拒绝：
+   - is_real_host=false 或 fake/test session；
+   - 缺失 host_session_id/host_invocation_id；
+   - transition、task、actor、Host 或 Adapter 能力不匹配；
+   - baseline/result commit 无法核对；
+   - artifact 不存在、越界或 SHA-256 不匹配；
+   - Fake confirmation、模型自述或无显式用户确认 ID 的最终验收证据。
+7. 严禁把 AgentHandle.invocation_token、API Key、Token、Cookie、凭证环境变量或未脱敏原始输出写入 Evidence。
+8. 2B 测试只能写 pytest tmp_path/受控临时目录，不得写权威 user_data、全局目录或外部系统。
+9. 2B 禁止实现或调用：
+   - WorktreeManager、自动分支/合并/清理（2C）；
+   - Codex、Antigravity、ChatGPT 真实 Adapter 或付费 API（2D/2E）；
+   - Reviewer/QA 独立运行或用户自动验收（2F）；
+   - MCP、Plugin/App、远程服务、认证和第三方连接器；
+   - 现有 transition_task/quick_task 默认真实状态写入链的行为变更。
+10. 不得新增/升级依赖，不得删除或弱化既有测试，不得添加无理由 skip。
+11. 每项完成后运行相关测试，最后执行：
+    python -m pytest tests -q -rs
+    git diff --check
+12. 测试记录必须包含实际命令、退出码、通过/失败/跳过数量；测试前后核对权威 board.json 哈希，如被既有测试污染必须恢复原快照并记录。
+13. 允许在 phase-2-real-agents 创建本地 commit；禁止 push、PR、发布、Tag、合并 main 或删除 worktree。
+14. 在 PHASE2_IMPLEMENTATION_REPORT.md 追加 2B：授权范围、实际文件、diff、Schema/存储/门禁说明、测试证据、Git 状态、风险和未实施批次。
+15. 完成后立即停止在“2B 待用户验收”，不得自行进入 2C，不得宣布第二阶段整体完成。
+16. 遇到范围不明、路径安全无法证明、破坏性操作、依赖升级、外部权限、需要修改冻结 2A/第一阶段或真实 Host 调用时，先请求我的确认。
+```
+
+后续 2C～2F 必须分别使用同等粒度的批准语句，不能用“继续第二阶段”一次性放行全部子批次。
