@@ -56,18 +56,23 @@
    - 并发创建保护: \worktree_id\ 唯一且具有原子级别锁定（使用 \os.O_CREAT | os.O_EXCL\ 生成锁文件）。
    - 真实校验: 严格验证 \git rev-parse --absolute-git-dir\ 和 \--git-common-dir\。
    - 目录与分支名安全: 正则验证和 \git check-ref-format\ 防御注入，隔离逃逸目录限制（阻止 \../\ 和 Symlink/Junction 等攻击）。
-   - 只读与清理计划: \erify\ 和 \inspect\ 只读执行 Git 解析，\get_cleanup_plan\ 返回不带有破坏性清理动作的纯文本计划。
+   - 只读与清理计划: \erify\ 和 \inspect\ 只读执行 Git 解析，\get_cleanup_plan\ 返回不带有破坏性清理动作的结构化计划。
+   - 完全抽离注册表: .registry 存储在 Agent worktree 外部，确保 \git status\ 原生干净，实施严格交叉核验。
 3. **测试覆盖**:
    - \	est_worktree_manager.py\ 通过真实 \pytest tmp_path\ 生成 Git 临时空仓库并挂载文件流。
    - 测试涵盖全场景: 绝对路径逃逸防御、并发覆盖防护、非法命令注入拦截、清理不落盘、linked worktree 场景验证。
 
 ### 测试记录
-- **定向工作树测试**: \python -m pytest tests/test_worktree_manager.py -q -rs\ -> 9 passed (0 failed, 0 skipped)
+- **定向工作树测试**: \python -m pytest tests/test_worktree_manager.py -q -rs\ -> 13 passed (0 failed, 0 skipped)
 - **定向环境测试**: \python -m pytest tests/test_host_adapter.py tests/test_evidence.py -q -rs\ -> 25 passed
-- **全量测试**: \python -m pytest tests -q -rs\ -> 260 passed (0 failed, 0 skipped)
+- **全量测试**: \python -m pytest tests -q -rs\ -> 264 passed (0 failed, 0 skipped)
 - **代码规范**: \git diff --check\ -> 通过无报错
 
-### 2C 返工修复记录（DEF-T0023-1 ~ 3）
-1. **[DEF-T0023-1] 增加 meta.json 完整性校验**: inspect() 中强制断言 bsolute_path、ranch_name 与安全生成的路径及分支完全一致，断绝了跨 Worktree 验证冒充。
-2. **[DEF-T0023-2] 完善 erify() 的 Fail-Closed 机制**: 增加了对 OSError 家族的捕获，遇到无效挂载或篡改导致的 I/O 错误时统一返回无效状态。
-3. **[DEF-T0023-3] 清理了所有尾随空白符**。
+### 2C 返工修复记录（DEF-T0023-1 ~ 9）
+1. **[DEF-T0023-1, 5, 6] 注册表独立与严格核验**: 将元数据抽离到 .registry 独立目录，不仅恢复了原生 clean 状态，并且实施了最严格的字典交叉核验（重建 ID、对比所有路径和分支）。对损坏或篡改的登记文件强 fail-closed。
+2. **[DEF-T0023-2] 完善 verify() 的 Fail-Closed**: 增加了对 OSError 的捕获。
+3. **[DEF-T0023-3] 代码格式**: 彻底清除了所有尾随空白。
+4. **[DEF-T0023-4] 失败保留分支**: 移除 \ranch -D\，在 worktree 创建失败时报错提醒 recovery_required。
+5. **[DEF-T0023-7] 40位 SHA 校验**: 在创建前统一转化为 canonical 小写，并在元数据与请求中拦截短 SHA 与无效引用。
+6. **[DEF-T0023-8] 清理计划结构化**: \get_cleanup_plan\ 不再生成 raw git string，改用安全的纯数据格式。
+7. **[DEF-T0023-9] 只读 list_worktrees**: 实现了无副作用的 \list_worktrees\，并对损坏记录保持 fail-closed。

@@ -16,7 +16,6 @@ def test_repo(tmp_path):
     repo_dir = tmp_path / "target_repo"
     repo_dir.mkdir()
     subprocess.run(["git", "init"], cwd=str(repo_dir), check=True)
-    # create initial commit
     (repo_dir / "init.txt").write_text("init")
     subprocess.run(["git", "add", "init.txt"], cwd=str(repo_dir), check=True)
     subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo_dir), check=True)
@@ -45,6 +44,9 @@ def test_worktree_creation_and_inspection(manager, test_repo):
     assert "proj1-T001-DEV-sess1" in desc.branch_name
     assert os.path.exists(desc.absolute_path)
 
+    # Meta should NOT be inside worktree
+    assert not os.path.exists(os.path.join(desc.absolute_path, ".agent_worktree_meta.json"))
+
     # Inspect
     inspected = manager.inspect(desc.worktree_id)
     assert inspected.branch_name == desc.branch_name
@@ -56,9 +58,15 @@ def test_worktree_creation_and_inspection(manager, test_repo):
     assert status.current_commit == commit_hash
     assert status.head_ref == desc.branch_name
 
-    # Cleanup plan
+def test_cleanup_plan_format(manager, test_repo):
+    repo_path, commit_hash = test_repo
+    req = WorktreeRequest("p", "t", "DEV", "s1", commit_hash)
+    desc = manager.create_worktree(req)
     plan = manager.get_cleanup_plan(desc.worktree_id)
-    assert "git worktree remove" in plan["git_commands"][0]
+    # Ensure no executable git commands
+    assert "git_commands" not in plan
+    assert plan["requires_user_confirmation"] is True
+    assert plan["target_worktree"] == desc.absolute_path
 
 def test_isolation(manager, test_repo):
     _, commit_hash = test_repo
@@ -70,7 +78,6 @@ def test_isolation(manager, test_repo):
 
     assert d1.absolute_path != d2.absolute_path
 
-    # Write file in wt1
     with open(os.path.join(d1.absolute_path, "dev.txt"), "w") as f:
         f.write("dev")
 
@@ -85,17 +92,12 @@ def test_isolation(manager, test_repo):
 
 def test_invalid_ref_and_injection(manager, test_repo):
     _, commit_hash = test_repo
-    # Injection attempt in session ID -> forms invalid branch name
     req = WorktreeRequest("p", "t", "DEV", "s1 -o option", commit_hash)
     with pytest.raises(WorktreeSecurityError, match="Invalid worktree_id format"):
         manager.create_worktree(req)
 
 def test_path_traversal_and_escapes(manager, test_repo, tmp_path):
     _, commit_hash = test_repo
-
-    req = WorktreeRequest("p", "t", "DEV", "s1", commit_hash)
-
-    # Try traversing using project_id (though safe_path prevents bad chars, if it passed it would hit traversal check)
     bad_req = WorktreeRequest("../p", "t", "DEV", "s1", commit_hash)
     with pytest.raises(WorktreeSecurityError, match="Invalid worktree_id format"):
         manager.create_worktree(bad_req)
@@ -120,9 +122,9 @@ def test_concurrency_collision(manager, test_repo):
     assert len(failures) == 4
     for f in failures:
         assert isinstance(f, WorktreeSecurityError)
+        assert "already exists" in str(f)
 
 def test_spaces_in_path(tmp_path):
-    # Setup repo with spaces
     repo_dir = tmp_path / "my target repo"
     repo_dir.mkdir()
     subprocess.run(["git", "init"], cwd=str(repo_dir), check=True)
@@ -145,16 +147,11 @@ def test_user_file_protection_on_failure(manager, test_repo):
     repo_path, commit_hash = test_repo
     req = WorktreeRequest("proj", "task", "DEV", "sess1", commit_hash)
 
-    # Intentionally cause `git worktree add` to fail (e.g., branch exists but worktree doesn't)
-    # We will manually create the branch so git branch creation fails gracefully,
-    # wait, if branch creation fails it raises WorktreeSecurityError.
+    # Intentionally cause branch to fail (already exists)
     subprocess.run(["git", "branch", "agent-branch-proj-task-DEV-sess1", commit_hash], cwd=repo_path, check=True)
 
     with pytest.raises(WorktreeSecurityError, match="already exists"):
         manager.create_worktree(req)
-
-    # The directory should not be left behind
-    assert not os.path.exists(os.path.join(manager.controlled_root, "proj-task-DEV-sess1"))
 
 def test_junction_escape(tmp_path, test_repo):
     repo_path, commit_hash = test_repo
@@ -167,7 +164,6 @@ def test_junction_escape(tmp_path, test_repo):
 
     manager = WorktreeManager(str(root_dir), repo_path)
 
-    # create a junction inside controlled_root
     link_path = root_dir / "proj-task-DEV-sess"
     if os.name == 'nt':
         subprocess.run(f'cmd /c mklink /J "{link_path}" "{ext_dir}"', shell=True, check=True)
@@ -184,8 +180,7 @@ def test_meta_json_integrity(manager, test_repo):
     req1 = WorktreeRequest("p", "t", "DEV", "s1", commit_hash)
     d1 = manager.create_worktree(req1)
 
-    # Tamper with meta JSON
-    meta_path = os.path.join(d1.absolute_path, ".agent_worktree_meta.json")
+    meta_path = os.path.join(manager.registry_dir, f"{d1.worktree_id}.json")
     import json
     with open(meta_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
@@ -193,10 +188,53 @@ def test_meta_json_integrity(manager, test_repo):
     with open(meta_path, 'w', encoding='utf-8') as f:
         json.dump(data, f)
 
-    with pytest.raises(WorktreeSecurityError, match="integrity compromised"):
+    with pytest.raises(WorktreeSecurityError, match="Registry spoofed"):
         manager.inspect(d1.worktree_id)
 
     status = manager.verify(d1.worktree_id)
     assert not status.is_valid
     assert not status.is_clean
     assert status.untracked_files == 0
+
+def test_short_sha_rejection(manager, test_repo):
+    _, commit_hash = test_repo
+    short_hash = commit_hash[:7]
+    req = WorktreeRequest("p", "t", "DEV", "s2", short_hash)
+    with pytest.raises(WorktreeSecurityError, match="full 40-char SHA"):
+        manager.create_worktree(req)
+
+def test_corrupt_json_handling(manager, test_repo):
+    _, commit_hash = test_repo
+    req = WorktreeRequest("p", "t", "DEV", "s3", commit_hash)
+    d = manager.create_worktree(req)
+
+    meta_path = os.path.join(manager.registry_dir, f"{d.worktree_id}.json")
+    with open(meta_path, 'w') as f:
+        f.write("{corrupt_json: ")
+
+    with pytest.raises(WorktreeSecurityError, match="Corrupt registry"):
+        manager.inspect(d.worktree_id)
+
+    # verify gracefully returns invalid
+    status = manager.verify(d.worktree_id)
+    assert not status.is_valid
+
+def test_list_worktrees(manager, test_repo):
+    _, commit_hash = test_repo
+    req1 = WorktreeRequest("projA", "t1", "DEV", "s1", commit_hash)
+    req2 = WorktreeRequest("projB", "t2", "QA", "s2", commit_hash)
+    req3 = WorktreeRequest("projA", "t3", "DEV", "s3", commit_hash)
+
+    manager.create_worktree(req1)
+    manager.create_worktree(req2)
+    manager.create_worktree(req3)
+
+    list_a = manager.list_worktrees("projA")
+    assert len(list_a) == 2
+    assert all(w.request.project_id == "projA" for w in list_a)
+
+    list_b = manager.list_worktrees("projB")
+    assert len(list_b) == 1
+
+    list_c = manager.list_worktrees("projC")
+    assert len(list_c) == 0

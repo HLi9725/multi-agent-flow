@@ -3,7 +3,7 @@ import re
 import subprocess
 import time
 import json
-from typing import List, Dict
+from typing import List, Dict, Any
 
 from .worktree_schema import (
     WorktreeRequest, WorktreeDescriptor, WorktreeStatus,
@@ -15,6 +15,8 @@ class WorktreeManager:
         self.controlled_root = os.path.realpath(os.path.abspath(controlled_root))
         self.target_repo_path = os.path.realpath(os.path.abspath(target_repo_path))
         os.makedirs(self.controlled_root, exist_ok=True)
+        self.registry_dir = os.path.join(self.controlled_root, ".registry")
+        os.makedirs(self.registry_dir, exist_ok=True)
         self._verify_repo_identity(self.target_repo_path)
         self._repo_git_dir = self._get_absolute_git_dir(self.target_repo_path)
 
@@ -55,7 +57,7 @@ class WorktreeManager:
 
         if os.path.commonpath([self.controlled_root, real_path]) != self.controlled_root:
             raise WorktreeSecurityError("Path traversal detected.")
-        if real_path == self.controlled_root:
+        if real_path == self.controlled_root or real_path == self.registry_dir:
             raise WorktreeSecurityError("Path collision.")
 
         return real_path
@@ -66,11 +68,11 @@ class WorktreeManager:
         except WorktreeGitError:
             raise WorktreeSecurityError(f"Invalid branch name format: {branch_name}")
 
-    def _verify_commit(self, commit: str):
-        if not re.match(r'^[0-9a-f]{4,40}$', commit):
-             raise WorktreeSecurityError(f"Invalid commit hash format: {commit}")
+    def _verify_commit(self, commit: str) -> str:
+        if not re.match(r'^[0-9a-f]{40}$', commit.lower()):
+             raise WorktreeSecurityError(f"Baseline commit must be a full 40-char SHA: {commit}")
         try:
-            self._run_git(self.target_repo_path, ["rev-parse", "--verify", f"{commit}^{{commit}}"])
+            return self._run_git(self.target_repo_path, ["rev-parse", "--verify", f"{commit}^{{commit}}"]).lower()
         except WorktreeGitError:
             raise WorktreeError(f"Commit {commit} does not exist in target repository.")
 
@@ -80,106 +82,104 @@ class WorktreeManager:
         branch_name = f"agent-branch-{worktree_id}"
 
         self._check_branch_name(branch_name)
-        self._verify_commit(request.baseline_commit)
+        canonical_commit = self._verify_commit(request.baseline_commit)
 
-        # Atomic directory lock
-        lock_path = path + ".lock"
-        fd = None
-        try:
-            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-            os.close(fd)
-            fd = None
-        except (FileExistsError, OSError):
-            raise WorktreeSecurityError(f"Worktree or lock already exists for {worktree_id}")
+        if request.baseline_commit != canonical_commit:
+             raise WorktreeSecurityError("Baseline commit not provided as lowercase canonical SHA")
 
         if os.path.exists(path):
-            os.unlink(lock_path)
             raise WorktreeSecurityError(f"Worktree path already exists: {path}")
 
-        try:
-            try:
-                self._run_git(self.target_repo_path, ["branch", branch_name, request.baseline_commit])
-            except WorktreeGitError as e:
-                if "already exists" in str(e):
-                    raise WorktreeSecurityError(f"Branch {branch_name} already exists.")
-                raise
-
-            try:
-                self._run_git(self.target_repo_path, ["worktree", "add", path, branch_name])
-            except WorktreeGitError:
-                self._run_git(self.target_repo_path, ["branch", "-D", branch_name])
-                raise
-
-            meta_path = os.path.join(path, ".agent_worktree_meta.json")
-            desc = WorktreeDescriptor(
-                worktree_id=worktree_id,
-                absolute_path=path,
-                branch_name=branch_name,
-                baseline_commit=request.baseline_commit,
-                created_at=time.time(),
-                request=request
-            )
-            meta_dict = {
-                "worktree_id": desc.worktree_id,
-                "absolute_path": desc.absolute_path,
-                "branch_name": desc.branch_name,
-                "baseline_commit": desc.baseline_commit,
-                "created_at": desc.created_at,
-                "request": {
-                    "project_id": request.project_id,
-                    "task_id": request.task_id,
-                    "actor_role": request.actor_role,
-                    "host_session_id": request.host_session_id,
-                    "baseline_commit": request.baseline_commit
-                }
+        meta_path = os.path.join(self.registry_dir, f"{worktree_id}.json")
+        desc = WorktreeDescriptor(
+            worktree_id=worktree_id,
+            absolute_path=path,
+            branch_name=branch_name,
+            baseline_commit=canonical_commit,
+            created_at=time.time(),
+            request=request
+        )
+        meta_dict = {
+            "worktree_id": desc.worktree_id,
+            "absolute_path": desc.absolute_path,
+            "branch_name": desc.branch_name,
+            "baseline_commit": desc.baseline_commit,
+            "created_at": desc.created_at,
+            "request": {
+                "project_id": request.project_id,
+                "task_id": request.task_id,
+                "actor_role": request.actor_role,
+                "host_session_id": request.host_session_id,
+                "baseline_commit": request.baseline_commit
             }
-            with open(meta_path, 'w', encoding='utf-8') as f:
-                json.dump(meta_dict, f)
+        }
+        meta_bytes = json.dumps(meta_dict, ensure_ascii=False).encode('utf-8')
 
-            return desc
+        # Atomic registry creation
+        try:
+            fd = os.open(meta_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            try:
+                os.write(fd, meta_bytes)
+            finally:
+                os.close(fd)
+        except (FileExistsError, OSError):
+            raise WorktreeSecurityError(f"Worktree registry already exists for {worktree_id}")
 
-        except Exception as e:
-            if not os.path.exists(os.path.join(path, ".git")):
-                if os.path.exists(path):
-                    try:
-                        os.rmdir(path)
-                    except OSError:
-                        pass
-            raise e
-        finally:
-            if os.path.exists(lock_path):
-                try:
-                    os.unlink(lock_path)
-                except OSError:
-                    pass
+        try:
+            self._run_git(self.target_repo_path, ["branch", branch_name, canonical_commit])
+        except WorktreeGitError as e:
+            if "already exists" in str(e):
+                raise WorktreeSecurityError(f"Branch {branch_name} already exists.")
+            raise
+
+        try:
+            self._run_git(self.target_repo_path, ["worktree", "add", path, branch_name])
+        except WorktreeGitError as e:
+            raise WorktreeError(f"Git worktree add failed, residual branch '{branch_name}' retained. recovery_required=True. Stderr: {str(e)}")
+
+        return desc
 
     def inspect(self, worktree_id: str) -> WorktreeDescriptor:
-        path = self._safe_path(worktree_id)
-        if not os.path.exists(path):
-            raise WorktreeError(f"Worktree not found: {worktree_id}")
-
-        meta_path = os.path.join(path, ".agent_worktree_meta.json")
+        meta_path = os.path.join(self.registry_dir, f"{worktree_id}.json")
         if not os.path.exists(meta_path):
-            raise WorktreeError(f"Not a valid agent worktree (missing metadata): {worktree_id}")
+            raise WorktreeError(f"Registry not found: {worktree_id}")
 
-        with open(meta_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
+        try:
+            with open(meta_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception as e:
+            raise WorktreeSecurityError(f"Corrupt registry for {worktree_id}: {str(e)}")
 
+        req_data = data.get("request", {})
+        if not isinstance(req_data, dict):
+             raise WorktreeSecurityError("Corrupt registry: missing or invalid request object")
+
+        try:
+            req = WorktreeRequest(
+                project_id=req_data["project_id"],
+                task_id=req_data["task_id"],
+                actor_role=req_data["actor_role"],
+                host_session_id=req_data["host_session_id"],
+                baseline_commit=req_data["baseline_commit"]
+            )
+        except KeyError as e:
+             raise WorktreeSecurityError(f"Corrupt registry: missing key {str(e)}")
+
+        rebuilt_id = f"{req.project_id}-{req.task_id}-{req.actor_role}-{req.host_session_id}"
+        expected_path = self._safe_path(rebuilt_id)
+        expected_branch = f"agent-branch-{rebuilt_id}"
+
+        if rebuilt_id != worktree_id:
+            raise WorktreeSecurityError("Registry spoofed: reconstructed ID mismatch.")
         if data.get("worktree_id") != worktree_id:
-            raise WorktreeSecurityError("Meta JSON integrity compromised: worktree_id mismatch.")
-        if data.get("absolute_path") != path:
-            raise WorktreeSecurityError("Meta JSON integrity compromised: absolute_path mismatch.")
-        if data.get("branch_name") != f"agent-branch-{worktree_id}":
-            raise WorktreeSecurityError("Meta JSON integrity compromised: branch_name mismatch.")
+            raise WorktreeSecurityError("Registry spoofed: worktree_id mismatch.")
+        if data.get("absolute_path") != expected_path:
+            raise WorktreeSecurityError("Registry spoofed: absolute_path mismatch.")
+        if data.get("branch_name") != expected_branch:
+            raise WorktreeSecurityError("Registry spoofed: branch_name mismatch.")
+        if data.get("baseline_commit") != req.baseline_commit:
+            raise WorktreeSecurityError("Registry spoofed: baseline_commit mismatch.")
 
-        req_data = data["request"]
-        req = WorktreeRequest(
-            project_id=req_data["project_id"],
-            task_id=req_data["task_id"],
-            actor_role=req_data["actor_role"],
-            host_session_id=req_data["host_session_id"],
-            baseline_commit=req_data["baseline_commit"]
-        )
         return WorktreeDescriptor(
             worktree_id=data["worktree_id"],
             absolute_path=data["absolute_path"],
@@ -207,8 +207,6 @@ class WorktreeManager:
             for line in status_out.split('\n'):
                 line = line.strip()
                 if not line: continue
-                if line.endswith('.agent_worktree_meta.json'):
-                    continue
                 if line.startswith('??'):
                     untracked += 1
                 else:
@@ -228,16 +226,30 @@ class WorktreeManager:
         except (WorktreeGitError, WorktreeError, OSError):
             return WorktreeStatus(False, False, "", "", 0, 0)
 
-    def get_cleanup_plan(self, worktree_id: str) -> Dict[str, str]:
+    def list_worktrees(self, project_id: str) -> List[WorktreeDescriptor]:
+        results = []
+        if not os.path.exists(self.registry_dir):
+            return results
+
+        for fname in os.listdir(self.registry_dir):
+            if not fname.endswith(".json"): continue
+            wid = fname[:-5]
+            try:
+                desc = self.inspect(wid)
+                if desc.request.project_id == project_id:
+                    results.append(desc)
+            except (WorktreeError, WorktreeSecurityError):
+                raise WorktreeError(f"Corrupt registry detected during list: {wid}")
+        return results
+
+    def get_cleanup_plan(self, worktree_id: str) -> Dict[str, Any]:
         desc = self.inspect(worktree_id)
         plan = {
-            "action": "Worktree Cleanup Plan",
-            "worktree_path": desc.absolute_path,
-            "branch_to_delete": desc.branch_name,
-            "git_commands": [
-                f"git worktree remove {desc.absolute_path}",
-                f"git branch -D {desc.branch_name}"
-            ],
-            "warning": "This is a plan only. No physical deletion will be performed by 2C."
+            "action": "Cleanup Plan",
+            "target_worktree": desc.absolute_path,
+            "target_branch": desc.branch_name,
+            "requires_user_confirmation": True,
+            "recovery_reason": "Automated deletion is prohibited in Phase 2C.",
+            "risks": "Removing worktree and branch might lead to loss of uncommitted work."
         }
         return plan
