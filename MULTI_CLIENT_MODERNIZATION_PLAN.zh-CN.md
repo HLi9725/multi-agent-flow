@@ -864,14 +864,16 @@ phase-1-trust                        -> 冻结分支 b83741b，不再承载新�
 | 第二阶段 worktree | `C:\Users\user\Desktop\user\multi-agent-flow-phase2-real-agents` |
 | 第二阶段 worktree 复验 | `python -m pytest tests -q -rs`，退出码 `0`：`226 passed in 56.97s`；测试后已恢复权威看板快照并校验一致 |
 | 远端分支 | 用户已确认并推送 `origin/main`、`origin/phase-1-trust`、`origin/phase-2-real-agents`；本次同步前第二阶段本地/远端差异为 `0/0` |
-| 2A 当前状态 | 已完成最终修复与 Codex 准出验证；代码提交 `9c59b14`，定向测试 `11 passed`，全量测试 `237 passed`；等待用户使用第 16 节 2B 独立批准语句进入下一批次 |
+| 2A 当前状态 | 已验收并冻结；代码提交 `9c59b14`，定向测试 `11 passed`，全量测试 `237 passed` |
+| 2B 当前状态 | 已于 2026-08-25 完成 AutoLaw 独立复审、Codex QA 准出和用户授权终态验收；候选提交 `f6b79e9`，Codex 定向复验 `25 passed`、全量复验 `251 passed`；2B 已冻结 |
+| 2C 交接 | 实施任务书见 `docs/D04-研发过程/D01-任务/Phase2-2C-Worktree隔离实施任务书.md`；仅允许 Worktree 隔离，不得进入真实 Host Adapter |
 
 本地运行数据交接规则：
 
 1. `config/workflow.config.yaml` 和 `user_data/` 被 `.gitignore` 排除，Git 分支/合并/worktree 不会自动携带；
 2. 创建第二阶段 worktree 后，必须复制已验收的无凭证配置和最终看板快照，并校验 SHA-256；
 3. 第二阶段开始后，以 `multi-agent-flow-phase2-real-agents` 下的数据根为唯一权威写入源；`main`、过渡 worktree 和历史 worktree 只读，禁止多份看板并行推进；
-4. 测试可能在被忽略的 `user_data/` 中生成本地数据，测试结束后必须恢复经校验的权威看板快照；
+4. 测试必须使用隔离数据根；若既有全量测试仍在 `user_data/` 生成污染卡，只能通过合法状态 CLI 软取消并记录，禁止复制快照覆盖或直接编辑权威 `board.json`；
 5. Antigravity 开工前仍须执行 `git rev-parse HEAD`、`git status --short` 和全量测试，不得仅依据本文中的历史结果。
 
 ### 8.0.2 第二阶段执行委托合同
@@ -928,6 +930,19 @@ Antigravity 执行 2A 时必须满足：
 8. 2B 测试只能在 `tmp_path` 或受控临时根写证据，不得污染权威 `user_data/`；
 9. 2B 只提供门禁服务和最小集成 seam，不改变第一阶段既有 CLI 的默认流转行为；真正接入实际多 Agent 状态链留到后续获批批次；
 10. 完成后停止在“2B 待用户验收”，不得自行进入 2C。
+
+### 8.0.5 2B 最终准出与 2C 开工不变量
+
+2B 于 2026-08-25 以候选提交 `f6b79e903fb39d8724bfe303e817d7a0748cd7b6` 完成最终验收。Codex 独立复验结果为：`tests/test_evidence.py tests/test_host_adapter.py` 共 `25 passed in 0.96s`，全量 `251 passed in 41.08s`，`git diff --check` 退出码 0。原工单已完成 QA 与 PM 终态流转，2B 正式冻结。
+
+2C 开工必须遵循：
+
+1. 仅实现 Worktree Schema、`WorktreeManager`、受控路径/仓库身份/并发保护、只读核验和测试；
+2. 不实现真实 Codex/Antigravity Adapter，不改 Reviewer/QA 编排和现有业务状态链；
+3. 禁止自动合并、删除、prune、reset、stash、clean、push 或写全局目录；
+4. 实际物理清理不属于 2C；2C 只能返回清理计划，后续需用户对精确目标另行授权；
+5. 详细执行、对抗测试、开发交付和独立复审合同以 `docs/D04-研发过程/D01-任务/Phase2-2C-Worktree隔离实施任务书.md` 为准；
+6. 完成后停止在“2C 待用户验收”，不得自行进入 2D。
 
 ### 8.1 增加 Host Adapter
 
@@ -1675,7 +1690,7 @@ PHASE2_IMPLEMENTATION_REPORT.md
 11. 每项完成后运行相关测试，最后执行：
     python -m pytest tests -q -rs
     git diff --check
-12. 测试记录必须包含实际命令、退出码、通过/失败/跳过数量；测试前后核对权威 board.json 哈希，如被既有测试污染必须恢复原快照并记录。
+12. 测试记录必须包含实际命令、退出码、通过/失败/跳过数量；测试前后核对权威 board.json 哈希。测试必须隔离数据根；如被既有测试污染，只能使用合法状态 CLI 软取消污染卡并记录，禁止快照覆盖或直接编辑 board.json。
 13. 允许在 phase-2-real-agents 创建本地 commit；禁止 push、PR、发布、Tag、合并 main 或删除 worktree。
 14. 在 PHASE2_IMPLEMENTATION_REPORT.md 追加 2B：授权范围、实际文件、diff、Schema/存储/门禁说明、测试证据、Git 状态、风险和未实施批次。
 15. 完成后立即停止在“2B 待用户验收”，不得自行进入 2C，不得宣布第二阶段整体完成。
@@ -1683,3 +1698,7 @@ PHASE2_IMPLEMENTATION_REPORT.md
 ```
 
 后续 2C～2F 必须分别使用同等粒度的批准语句，不能用“继续第二阶段”一次性放行全部子批次。
+
+第二阶段 **2C** 的完整批准语句、开发交付合同和 AutoLaw 独立复审合同见：
+
+`docs/D04-研发过程/D01-任务/Phase2-2C-Worktree隔离实施任务书.md`
