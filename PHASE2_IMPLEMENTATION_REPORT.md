@@ -62,7 +62,12 @@
    - 测试涵盖全场景: 绝对路径逃逸防御、并发覆盖防护、非法命令注入拦截、清理不落盘、linked worktree 场景验证。
 
 ### 测试记录
-- **定向工作树测试**: \python -m pytest tests/test_worktree_manager.py -q -rs\ -> 8 passed (0 failed, 0 skipped)
+- **定向工作树测试**: \python -m pytest tests/test_worktree_manager.py -q -rs\ -> 9 passed (0 failed, 0 skipped)
 - **定向环境测试**: \python -m pytest tests/test_host_adapter.py tests/test_evidence.py -q -rs\ -> 25 passed
-- **全量测试**: \python -m pytest tests -q -rs\ -> 259 passed (0 failed, 0 skipped)
+- **全量测试**: \python -m pytest tests -q -rs\ -> 260 passed (0 failed, 0 skipped)
 - **代码规范**: \git diff --check\ -> 通过无报错
+
+### 2C 返工修复记录（DEF-T0023-1 ~ 3）
+1. **[DEF-T0023-1] 增加 meta.json 完整性校验**: inspect() 中强制断言 bsolute_path、ranch_name 与安全生成的路径及分支完全一致，断绝了跨 Worktree 验证冒充。
+2. **[DEF-T0023-2] 完善 erify() 的 Fail-Closed 机制**: 增加了对 OSError 家族的捕获，遇到无效挂载或篡改导致的 I/O 错误时统一返回无效状态。
+3. **[DEF-T0023-3] 清理了所有尾随空白符**。

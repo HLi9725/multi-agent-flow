@@ -49,15 +49,15 @@ class WorktreeManager:
     def _safe_path(self, worktree_id: str) -> str:
         if not worktree_id or not re.match(r'^[\w\-]{1,128}$', worktree_id):
             raise WorktreeSecurityError(f"Invalid worktree_id format: {worktree_id}")
-        
+
         path = os.path.join(self.controlled_root, worktree_id)
         real_path = os.path.realpath(path)
-        
+
         if os.path.commonpath([self.controlled_root, real_path]) != self.controlled_root:
             raise WorktreeSecurityError("Path traversal detected.")
         if real_path == self.controlled_root:
             raise WorktreeSecurityError("Path collision.")
-            
+
         return real_path
 
     def _check_branch_name(self, branch_name: str):
@@ -78,7 +78,7 @@ class WorktreeManager:
         worktree_id = f"{request.project_id}-{request.task_id}-{request.actor_role}-{request.host_session_id}"
         path = self._safe_path(worktree_id)
         branch_name = f"agent-branch-{worktree_id}"
-        
+
         self._check_branch_name(branch_name)
         self._verify_commit(request.baseline_commit)
 
@@ -164,7 +164,14 @@ class WorktreeManager:
 
         with open(meta_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        
+
+        if data.get("worktree_id") != worktree_id:
+            raise WorktreeSecurityError("Meta JSON integrity compromised: worktree_id mismatch.")
+        if data.get("absolute_path") != path:
+            raise WorktreeSecurityError("Meta JSON integrity compromised: absolute_path mismatch.")
+        if data.get("branch_name") != f"agent-branch-{worktree_id}":
+            raise WorktreeSecurityError("Meta JSON integrity compromised: branch_name mismatch.")
+
         req_data = data["request"]
         req = WorktreeRequest(
             project_id=req_data["project_id"],
@@ -183,43 +190,43 @@ class WorktreeManager:
         )
 
     def verify(self, worktree_id: str) -> WorktreeStatus:
-        desc = self.inspect(worktree_id)
-        
         try:
+            desc = self.inspect(worktree_id)
+
             common_dir = self._get_common_dir(desc.absolute_path)
             repo_common_dir = self._get_common_dir(self.target_repo_path)
             if common_dir != repo_common_dir:
                  return WorktreeStatus(False, False, "", "", 0, 0)
-        except WorktreeGitError:
+
+            current_commit = self._run_git(desc.absolute_path, ["rev-parse", "HEAD"])
+            head_ref = self._run_git(desc.absolute_path, ["rev-parse", "--abbrev-ref", "HEAD"])
+
+            status_out = self._run_git(desc.absolute_path, ["status", "--porcelain"])
+            untracked = 0
+            modified = 0
+            for line in status_out.split('\n'):
+                line = line.strip()
+                if not line: continue
+                if line.endswith('.agent_worktree_meta.json'):
+                    continue
+                if line.startswith('??'):
+                    untracked += 1
+                else:
+                    modified += 1
+
+            is_clean = (untracked == 0 and modified == 0)
+            is_valid = (head_ref == desc.branch_name)
+
+            return WorktreeStatus(
+                is_valid=is_valid,
+                is_clean=is_clean,
+                current_commit=current_commit,
+                head_ref=head_ref,
+                untracked_files=untracked,
+                modified_files=modified
+            )
+        except (WorktreeGitError, WorktreeError, OSError):
             return WorktreeStatus(False, False, "", "", 0, 0)
-
-        current_commit = self._run_git(desc.absolute_path, ["rev-parse", "HEAD"])
-        head_ref = self._run_git(desc.absolute_path, ["rev-parse", "--abbrev-ref", "HEAD"])
-        
-        status_out = self._run_git(desc.absolute_path, ["status", "--porcelain"])
-        untracked = 0
-        modified = 0
-        for line in status_out.split('\n'):
-            line = line.strip()
-            if not line: continue
-            if line.endswith('.agent_worktree_meta.json'):
-                continue
-            if line.startswith('??'):
-                untracked += 1
-            else:
-                modified += 1
-                
-        is_clean = (untracked == 0 and modified == 0)
-        is_valid = (head_ref == desc.branch_name)
-
-        return WorktreeStatus(
-            is_valid=is_valid,
-            is_clean=is_clean,
-            current_commit=current_commit,
-            head_ref=head_ref,
-            untracked_files=untracked,
-            modified_files=modified
-        )
 
     def get_cleanup_plan(self, worktree_id: str) -> Dict[str, str]:
         desc = self.inspect(worktree_id)
