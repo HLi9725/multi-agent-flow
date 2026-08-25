@@ -1,136 +1,226 @@
-import os
 import time
-import pytest
-from dataclasses import FrozenInstanceError
+from contextlib import ExitStack
+from dataclasses import FrozenInstanceError, replace
 from unittest.mock import patch
 
+import pytest
+
 from scripts._lib.core.agent_schema import (
-    AgentRequest, AgentHandle, AgentResult,
-    AgentTimeoutError, AgentCancelledError, AgentNotSupportedError,
-    AgentStatus, CapabilitySupport, ConfirmationRequest, HostCapabilities
+    AgentCancelledError,
+    AgentInvalidHandleError,
+    AgentNotSupportedError,
+    AgentRequest,
+    AgentResult,
+    AgentStatus,
+    AgentTimeoutError,
+    CapabilitySupport,
+    ConfirmationRequest,
+    HostCapabilities,
 )
 from scripts._lib.core.host_adapter import FakeHostAdapter
 
-def test_fake_host_adapter_capabilities_immutable():
+
+def test_contract_schemas_are_deeply_immutable():
+    caps = HostCapabilities(extra={"nested": {"items": [1, 2]}})
+    with pytest.raises(FrozenInstanceError):
+        caps.is_real_host = True
+    with pytest.raises(TypeError):
+        caps.extra["poison"] = True
+    with pytest.raises(TypeError):
+        caps.extra["nested"]["poison"] = True
+    assert caps.extra["nested"]["items"] == (1, 2)
+
+    request = AgentRequest(
+        session_id="caller-request",
+        prompt="Do something",
+        role="DEV",
+        workspace_dir="/tmp/fake",
+        capabilities_required=["worktree"],
+        extra_context={"nested": {"roles": ["DEV"]}},
+    )
+    assert request.capabilities_required == ("worktree",)
+    assert request.extra_context["nested"]["roles"] == ("DEV",)
+    with pytest.raises(TypeError):
+        request.extra_context["new"] = "value"
+
+    result = AgentResult(
+        session_id="fake-session:test",
+        status=AgentStatus.PARTIAL,
+        output="partial",
+        partial_results=[{"artifacts": ["a.txt"]}],
+    )
+    assert result.partial_results[0]["artifacts"] == ("a.txt",)
+    with pytest.raises(TypeError):
+        result.partial_results[0]["new"] = "value"
+
+    confirmation = ConfirmationRequest(
+        request_id="confirm-1",
+        prompt="Continue?",
+        options=["yes", "no"],
+    )
+    assert confirmation.options == ("yes", "no")
+
+
+def test_fake_host_adapter_capabilities_fail_closed():
     adapter = FakeHostAdapter()
     caps = adapter.detect_capabilities()
 
-    with pytest.raises(FrozenInstanceError):
-        caps.is_real_host = True
+    assert caps.is_real_host is False
+    assert caps.max_concurrent_agents == 0
+    assert caps.supports_real_subagents == CapabilitySupport.UNSUPPORTED
+    assert caps.supports_parallelism == CapabilitySupport.UNSUPPORTED
+    assert caps.supports_worktree == CapabilitySupport.UNSUPPORTED
+    assert caps.supports_mcp == CapabilitySupport.UNSUPPORTED
 
-    caps2 = adapter.detect_capabilities()
-    assert caps2.is_real_host is False
-    assert caps2.max_concurrent_agents == 0
 
-def test_fake_host_adapter_capabilities_zero_write():
-    """
-    能力探测必须是零写入。我们通过 mock builtins.open 和 os.makedirs 来确保调用即失败。
-    """
+def test_fake_host_adapter_capabilities_have_no_io_side_effects():
     adapter = FakeHostAdapter()
+    blocked_targets = (
+        "builtins.open",
+        "os.open",
+        "os.mkdir",
+        "os.makedirs",
+        "os.replace",
+        "pathlib.Path.open",
+        "pathlib.Path.mkdir",
+        "pathlib.Path.touch",
+        "pathlib.Path.write_bytes",
+        "pathlib.Path.write_text",
+        "tempfile.NamedTemporaryFile",
+        "tempfile.TemporaryDirectory",
+        "tempfile.mkdtemp",
+        "tempfile.mkstemp",
+        "subprocess.Popen",
+        "subprocess.run",
+        "socket.create_connection",
+        "socket.socket",
+        "urllib.request.urlopen",
+    )
 
-    with patch('builtins.open', side_effect=RuntimeError("Zero-write violation: open() called")), \
-         patch('os.makedirs', side_effect=RuntimeError("Zero-write violation: makedirs() called")), \
-         patch('os.mkdir', side_effect=RuntimeError("Zero-write violation: mkdir() called")):
+    with ExitStack() as stack:
+        for target in blocked_targets:
+            stack.enter_context(
+                patch(target, side_effect=RuntimeError(f"Side effect attempted: {target}"))
+            )
         caps = adapter.detect_capabilities()
 
     assert caps.is_real_host is False
 
-def test_fake_host_adapter_dispatch_namespace():
-    adapter = FakeHostAdapter()
-    req = AgentRequest(
-        session_id="codex-real-looking-123",
-        prompt="Do something",
+
+def _request(*, timeout_seconds=3600, prompt="Do something"):
+    return AgentRequest(
+        session_id="caller-controlled-id",
+        prompt=prompt,
         role="DEV",
-        workspace_dir="/tmp/fake"
+        workspace_dir="/tmp/fake",
+        timeout_seconds=timeout_seconds,
     )
 
-    handle = adapter.dispatch_agent(req)
-    # The session_id must not be the caller's requested ID
-    assert handle.session_id != "codex-real-looking-123"
+
+def test_fake_host_adapter_dispatch_uses_internal_namespace_and_bearer_handle():
+    adapter = FakeHostAdapter()
+    handle = adapter.dispatch_agent(_request())
+
+    assert handle.session_id != "caller-controlled-id"
     assert handle.session_id.startswith("fake-session:")
+    assert handle.adapter_instance_id.startswith("fake-adapter:")
+    assert handle.invocation_token
+    assert handle.is_real_host is False
 
-def test_fake_host_adapter_forged_handle_rejected():
+    # AgentHandle is an immutable bearer capability: an exact serialized copy is valid.
+    copied_handle = replace(handle)
+    result = adapter.wait_for_result(copied_handle)
+    assert result.status == AgentStatus.SUCCESS
+    assert result.is_real_host is False
+
+
+def test_fake_host_adapter_rejects_unknown_cross_host_and_tampered_handles():
     adapter = FakeHostAdapter()
+    handle = adapter.dispatch_agent(_request())
 
-    forged_handle = AgentHandle(
-        session_id="fake-session:forged-id",
-        host_id="fake_host",
-        is_real_host=False
-    )
-    with pytest.raises(ValueError, match="Session fake-session:forged-id not found or forged."):
-        adapter.wait_for_result(forged_handle)
+    unknown = replace(handle, session_id="fake-session:unknown")
+    with pytest.raises(AgentInvalidHandleError, match="not found or forged"):
+        adapter.wait_for_result(unknown)
 
-    real_claiming_handle = AgentHandle(
-        session_id="some-id",
-        host_id="fake_host",
-        is_real_host=True
-    )
-    with pytest.raises(ValueError, match="claims to be a real host"):
-        adapter.cancel_agent(real_claiming_handle)
+    wrong_host = replace(handle, host_id="other_host")
+    with pytest.raises(AgentInvalidHandleError, match="Invalid host_id"):
+        adapter.wait_for_result(wrong_host)
 
-    wrong_host_handle = AgentHandle(
-        session_id="some-id",
-        host_id="other_host",
-        is_real_host=False
-    )
-    with pytest.raises(ValueError, match="Invalid host_id: other_host"):
-        adapter.wait_for_result(wrong_host_handle)
+    real_claim = replace(handle, is_real_host=True)
+    with pytest.raises(AgentInvalidHandleError, match="claims to be a real host"):
+        adapter.cancel_agent(real_claim)
 
-def test_fake_host_adapter_timeout_semantics():
+    tampered_token = replace(handle, invocation_token="tampered")
+    with pytest.raises(AgentInvalidHandleError, match="invocation token"):
+        adapter.wait_for_result(tampered_token)
+
+    other_adapter = FakeHostAdapter()
+    with pytest.raises(AgentInvalidHandleError, match="another adapter instance"):
+        other_adapter.wait_for_result(handle)
+
+
+def test_fake_host_adapter_request_timeout_is_default_and_can_be_overridden():
     adapter = FakeHostAdapter()
-    req = AgentRequest(
-        session_id="test",
-        prompt="Test timeout",
-        role="QA",
-        workspace_dir="/tmp/fake"
-    )
-    handle = adapter.dispatch_agent(req)
+    handle = adapter.dispatch_agent(_request(timeout_seconds=0.005))
 
-    # Fake adapter has a simulated latency of 0.05s
-    start = time.time()
     with pytest.raises(AgentTimeoutError):
-        adapter.wait_for_result(handle, timeout_seconds=0.01)
+        adapter.wait_for_result(handle)
 
-    # Now it should succeed if we give it enough time
-    # Actually wait_for_result will just sleep for the remaining latency
     result = adapter.wait_for_result(handle, timeout_seconds=0.1)
     assert result.status == AgentStatus.SUCCESS
+
+
+def test_fake_host_adapter_timeout_uses_remaining_time():
+    adapter = FakeHostAdapter()
+    handle = adapter.dispatch_agent(_request(timeout_seconds=1))
+
+    time.sleep(0.04)
+    result = adapter.wait_for_result(handle, timeout_seconds=0.02)
+    assert result.status == AgentStatus.SUCCESS
+
+
+def test_fake_host_adapter_explicit_timeout_and_negative_timeout_validation():
+    with pytest.raises(ValueError, match="finite non-negative"):
+        _request(timeout_seconds=-1)
+    with pytest.raises(ValueError, match="finite non-negative"):
+        _request(timeout_seconds=float("inf"))
+    with pytest.raises(ValueError, match="finite non-negative"):
+        _request(timeout_seconds=True)
+
+    adapter = FakeHostAdapter()
+    handle = adapter.dispatch_agent(_request())
+    with pytest.raises(ValueError, match="finite non-negative"):
+        adapter.wait_for_result(handle, timeout_seconds=-1)
+    with pytest.raises(AgentTimeoutError):
+        adapter.wait_for_result(handle, timeout_seconds=0.001)
+
 
 def test_fake_host_confirmation_fails_closed():
     adapter = FakeHostAdapter()
     req = ConfirmationRequest(
         request_id="conf_1",
         prompt="Are you sure?",
-        options=["yes", "no"]
+        options=["yes", "no"],
     )
     with pytest.raises(AgentNotSupportedError):
         adapter.request_confirmation(req)
 
+
 def test_fake_host_adapter_cancel():
     adapter = FakeHostAdapter()
-    req = AgentRequest(
-        session_id="test_session_2",
-        prompt="Do something else",
-        role="REVIEWER",
-        workspace_dir="/tmp/fake"
-    )
-    handle = adapter.dispatch_agent(req)
+    handle = adapter.dispatch_agent(_request())
 
     assert adapter.cancel_agent(handle) is True
     with pytest.raises(AgentCancelledError):
         adapter.wait_for_result(handle)
 
-def test_fake_host_adapter_partial():
+
+def test_fake_host_adapter_partial_result_is_immutable_and_cached():
     adapter = FakeHostAdapter()
-    req = AgentRequest(
-        session_id="test_session_4",
-        prompt="Simulate PARTIAL condition",
-        role="QA",
-        workspace_dir="/tmp/fake"
-    )
-    handle = adapter.dispatch_agent(req)
+    handle = adapter.dispatch_agent(_request(prompt="Simulate PARTIAL condition"))
 
     result = adapter.wait_for_result(handle)
     assert result.status == AgentStatus.PARTIAL
-    assert len(result.partial_results) > 0
+    assert result.partial_results == ("part1", "part2")
     assert result.is_real_host is False
+    assert adapter.wait_for_result(handle) is result
