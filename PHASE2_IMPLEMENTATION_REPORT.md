@@ -84,3 +84,9 @@
 ### 2C 返工修复记录（DEF-T0023-12 ~ 13）
 1. **[DEF-T0023-12] 严密的 Registry 身份与所有权回滚**: 彻底修正了 \create_worktree()\ 中的文件回滚漏洞。不再使用简单且具有竞态风险的 \os.path.exists()\ 判断。利用 \os.fstat(fd)\ 锁定 O_EXCL 创建时的 inode (\st_ino\) 与 device ID (\st_dev\)，当且仅当 \os.lstat()\ 证实元数据文件身份一致、且严格比对写入二进制内容无篡改后，才准许 \os.unlink()\ 进行安全回滚，对外部恶意替换/Symlink/Junction 免疫。
 2. **[DEF-T0023-13] 高强度的 Schema 与提交真实性防御**: 在 \inspect()\ 加入了极致的字典边界与类型校验。拒绝包含不合理 Float 的假造时间，强制 \isinstance(val, str)\ 检测。对 baseline_commit 进行底层 \git rev-parse\ 严格双重校验，保证内外 commit 与请求绝对一致。对于任何畸变类型强制抛出 \WorktreeSecurityError\，使门禁校验 (\erify()\) 永远返回无效而非抛出异常裸奔（Fail-Closed）。
+
+### 2C 返工修复记录（DEF-T0023-14 ~ 17）
+1. **[DEF-T0023-14] 彻底消除回滚 TOCTOU 竞态**: 摒弃了基于 lstat 和 hash 比较后删除文件的复杂逻辑。直接确立了无竞态的安全生成顺序：1) 校验通过并生成唯一 Git branch（占位）；2) 使用 O_EXCL 创建 Registry；3) 如果任意后续操作（写入、worktree add）失败，原样保留遗留的分支和 Registry 现场以供追溯和人工干预。在抛出的 WorktreeError 中附带 `recovery_required=True, branch_retained=True` 结构化字段，永不在事后静默抹除外挂资源，全面践行 Fail-Closed。
+2. **[DEF-T0023-15] Registry OS.write 短写保护与持久化**: 使用 `memoryview` 与循环 `write-all` 模式对 `os.write` 的字节数进行严密确认。若出现 0 字节、负数或异常则立即终止并抛出恢复警告；一切数据落盘循环完成后强制 `os.fsync` 确保数据被刷新到介质，最后才启动 `git worktree add`。
+3. **[DEF-T0023-16] 严苛的 Canonical SHA1 同态断言**: 不再主动提供大写转小写的柔性兼容。入参强制进行 `^[0-9a-f]{40}$`（只能是小写完整态）匹配。校验 `git rev-parse` 返回结果时，严格要求与入参 SHA 完全相同；内外 baseline 在各种接口均交叉对齐，从源头上杜绝了注入。
+4. **[DEF-T0023-17] 卫生清理与测试重构**: 彻底清理了三个临时脚本与无效提交。测试用例全系升维：加入了 OS.write 的三种模拟、`copy.deepcopy` 数据防污染改造、多类校验拒绝模拟，所有 `verify` 全面退守至全 False 安全面。

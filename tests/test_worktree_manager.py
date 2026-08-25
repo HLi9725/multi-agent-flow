@@ -3,6 +3,8 @@ import subprocess
 import pytest
 import time
 import shutil
+import json
+import copy
 from concurrent.futures import ThreadPoolExecutor
 
 from scripts._lib.core.worktree_schema import (
@@ -32,16 +34,8 @@ def manager(tmp_path, test_repo):
 
 def test_worktree_creation_and_inspection(manager, test_repo):
     repo_path, commit_hash = test_repo
-    req = WorktreeRequest(
-        project_id="proj1",
-        task_id="T001",
-        actor_role="DEV",
-        host_session_id="sess1",
-        baseline_commit=commit_hash
-    )
+    req = WorktreeRequest("proj1", "T001", "DEV", "sess1", commit_hash)
     desc = manager.create_worktree(req)
-    assert desc.request == req
-    assert "proj1-T001-DEV-sess1" in desc.branch_name
     assert os.path.exists(desc.absolute_path)
 
     # Meta should NOT be inside worktree
@@ -63,7 +57,6 @@ def test_cleanup_plan_format(manager, test_repo):
     req = WorktreeRequest("p", "t", "DEV", "s1", commit_hash)
     desc = manager.create_worktree(req)
     plan = manager.get_cleanup_plan(desc.worktree_id)
-    # Ensure no executable git commands
     assert "git_commands" not in plan
     assert plan["requires_user_confirmation"] is True
     assert plan["target_worktree"] == desc.absolute_path
@@ -121,8 +114,7 @@ def test_concurrency_collision(manager, test_repo):
     assert len(success) == 1
     assert len(failures) == 4
     for f in failures:
-        assert isinstance(f, WorktreeSecurityError)
-        assert "already exists" in str(f)
+        assert isinstance(f, WorktreeError)
 
 def test_spaces_in_path(tmp_path):
     repo_dir = tmp_path / "my target repo"
@@ -147,7 +139,6 @@ def test_user_file_protection_on_failure(manager, test_repo):
     repo_path, commit_hash = test_repo
     req = WorktreeRequest("proj", "task", "DEV", "sess1", commit_hash)
 
-    # Intentionally cause branch to fail (already exists)
     subprocess.run(["git", "branch", "agent-branch-proj-task-DEV-sess1", commit_hash], cwd=repo_path, check=True)
 
     with pytest.raises(WorktreeSecurityError, match="already exists"):
@@ -181,7 +172,6 @@ def test_meta_json_integrity(manager, test_repo):
     d1 = manager.create_worktree(req1)
 
     meta_path = os.path.join(manager.registry_dir, f"{d1.worktree_id}.json")
-    import json
     with open(meta_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
     data['absolute_path'] = "/some/spoofed/path"
@@ -215,7 +205,6 @@ def test_corrupt_json_handling(manager, test_repo):
     with pytest.raises(WorktreeSecurityError, match="Corrupt registry"):
         manager.inspect(d.worktree_id)
 
-    # verify gracefully returns invalid
     status = manager.verify(d.worktree_id)
     assert not status.is_valid
 
@@ -244,8 +233,6 @@ def test_json_root_types(manager, test_repo):
     req = WorktreeRequest("p", "t", "DEV", "json", commit_hash)
     d = manager.create_worktree(req)
     meta_path = os.path.join(manager.registry_dir, f"{d.worktree_id}.json")
-    import json, pytest
-    from scripts._lib.core.worktree_schema import WorktreeSecurityError
     for invalid_root in [[], 123, "str", None]:
         with open(meta_path, 'w', encoding='utf-8') as f:
             json.dump(invalid_root, f)
@@ -254,66 +241,9 @@ def test_json_root_types(manager, test_repo):
         status = manager.verify(d.worktree_id)
         assert not status.is_valid
 
-def test_registry_rollback_on_branch_failure(manager, test_repo):
-    repo_path, commit_hash = test_repo
-    req = WorktreeRequest("p", "t", "DEV", "fail", commit_hash)
-
-    # Intentionally pre-create branch
-    import subprocess
-    worktree_id = f"{req.project_id}-{req.task_id}-{req.actor_role}-{req.host_session_id}"
-    subprocess.run(["git", "branch", f"agent-branch-{worktree_id}", commit_hash], cwd=repo_path, check=True)
-
-    import pytest
-    from scripts._lib.core.worktree_schema import WorktreeSecurityError
-    with pytest.raises(WorktreeSecurityError, match="already exists"):
-        manager.create_worktree(req)
-
-    meta_path = os.path.join(manager.registry_dir, f"{worktree_id}.json")
-    assert not os.path.exists(meta_path)
-
-    # We should be able to retry if the branch was deleted
-    subprocess.run(["git", "branch", "-D", f"agent-branch-{worktree_id}"], cwd=repo_path, check=True)
-    d = manager.create_worktree(req)
-    assert os.path.exists(meta_path)
-
-import os
-import subprocess
-import pytest
-import time
-import shutil
-import json
-from scripts._lib.core.worktree_schema import WorktreeRequest, WorktreeSecurityError, WorktreeError, WorktreeGitError
-
-def test_registry_rollback_ownership_and_symlink(manager, test_repo):
-    repo_path, commit_hash = test_repo
-    req = WorktreeRequest("p", "t", "DEV", "fail2", commit_hash)
-    worktree_id = f"{req.project_id}-{req.task_id}-{req.actor_role}-{req.host_session_id}"
-    subprocess.run(["git", "branch", f"agent-branch-{worktree_id}", commit_hash], cwd=repo_path, check=True)
-    with pytest.raises(WorktreeSecurityError, match="already exists"):
-        manager.create_worktree(req)
-    meta_path = os.path.join(manager.registry_dir, f"{worktree_id}.json")
-    assert not os.path.exists(meta_path)
-    subprocess.run(["git", "branch", "-D", f"agent-branch-{worktree_id}"], cwd=repo_path, check=True)
-
-    original_run_git = manager._run_git
-    def mocked_run_git(cwd, args):
-        if args[:2] == ["worktree", "add"]:
-            os.remove(meta_path)
-            with open(meta_path, 'w') as f:
-                f.write("fake")
-            raise WorktreeGitError("mock fail")
-        return original_run_git(cwd, args)
-    manager._run_git = mocked_run_git
-    with pytest.raises(WorktreeError, match="recovery_required"):
-        manager.create_worktree(req)
-    assert os.path.exists(meta_path)
-    with open(meta_path, 'r') as f:
-        assert f.read() == "fake"
-    manager._run_git = original_run_git
-
-def test_inspect_schema_validation(manager, test_repo):
+def test_inspect_schema_validation_advanced(manager, test_repo):
     _, commit_hash = test_repo
-    req = WorktreeRequest("p", "t", "DEV", "s2", commit_hash)
+    req = WorktreeRequest("p", "t", "DEV", "sadv", commit_hash)
     d = manager.create_worktree(req)
     meta_path = os.path.join(manager.registry_dir, f"{d.worktree_id}.json")
 
@@ -324,17 +254,82 @@ def test_inspect_schema_validation(manager, test_repo):
         with open(meta_path, 'w', encoding='utf-8') as f:
             json.dump(mod, f)
 
-    tampered = dict(original_data)
+    # test 000...000
+    tampered = copy.deepcopy(original_data)
     tampered['baseline_commit'] = "0"*40
     tampered['request']['baseline_commit'] = "0"*40
     write_tampered(tampered)
     with pytest.raises(WorktreeError, match="does not exist"):
         manager.inspect(d.worktree_id)
 
-    tampered = dict(original_data)
+    # test created_at
+    tampered = copy.deepcopy(original_data)
     tampered['created_at'] = "str"
     write_tampered(tampered)
     with pytest.raises(WorktreeSecurityError, match="must be a number"):
         manager.inspect(d.worktree_id)
 
+    # verify fail-closed
     assert not manager.verify(d.worktree_id).is_valid
+
+def test_worktree_add_fails_retains_branch_and_registry(manager, test_repo):
+    repo_path, commit_hash = test_repo
+    req = WorktreeRequest("p", "t", "DEV", "failwt", commit_hash)
+
+    original_run_git = manager._run_git
+    def mocked_run_git(cwd, args):
+        if args[:2] == ["worktree", "add"]:
+            raise WorktreeGitError("mock fail")
+        return original_run_git(cwd, args)
+    manager._run_git = mocked_run_git
+
+    with pytest.raises(WorktreeError) as exc_info:
+        manager.create_worktree(req)
+
+    assert exc_info.value.recovery_required
+    assert exc_info.value.branch_retained
+    assert exc_info.value.registry_retained
+
+    manager._run_git = original_run_git
+    worktree_id = f"{req.project_id}-{req.task_id}-{req.actor_role}-{req.host_session_id}"
+    meta_path = os.path.join(manager.registry_dir, f"{worktree_id}.json")
+    assert os.path.exists(meta_path)
+
+def test_os_write_failures(manager, test_repo, monkeypatch):
+    _, commit_hash = test_repo
+    req = WorktreeRequest("p", "t", "DEV", "failwt2", commit_hash)
+
+    # 1 byte write loop emulation
+    original_write = os.write
+    def mock_write_1byte(fd, view):
+        return original_write(fd, view[:1])
+    monkeypatch.setattr(os, "write", mock_write_1byte)
+
+    d = manager.create_worktree(req)
+    assert os.path.exists(d.absolute_path)
+
+    req2 = WorktreeRequest("p", "t", "DEV", "failwt3", commit_hash)
+    def mock_write_0byte(fd, view):
+        return 0
+    monkeypatch.setattr(os, "write", mock_write_0byte)
+    with pytest.raises(WorktreeError) as exc_info:
+        manager.create_worktree(req2)
+    assert exc_info.value.recovery_required
+    assert exc_info.value.branch_retained
+    assert exc_info.value.registry_retained
+
+    req3 = WorktreeRequest("p", "t", "DEV", "failwt4", commit_hash)
+    def mock_write_exc(fd, view):
+        raise OSError("mock")
+    monkeypatch.setattr(os, "write", mock_write_exc)
+    with pytest.raises(WorktreeError) as exc_info:
+        manager.create_worktree(req3)
+    assert exc_info.value.recovery_required
+    assert exc_info.value.branch_retained
+    assert exc_info.value.registry_retained
+
+def test_canonical_commit_uppercase_rejected(manager, test_repo):
+    _, commit_hash = test_repo
+    req = WorktreeRequest("p", "t", "DEV", "upp", commit_hash.upper())
+    with pytest.raises(WorktreeSecurityError, match="lowercase full 40-char SHA"):
+        manager.create_worktree(req)

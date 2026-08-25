@@ -72,10 +72,13 @@ class WorktreeManager:
     def _verify_commit(self, commit: str) -> str:
         if not isinstance(commit, str):
             raise WorktreeSecurityError("Baseline commit must be a string")
-        if not re.match(r'^[0-9a-f]{40}$', commit.lower()):
-             raise WorktreeSecurityError(f"Baseline commit must be a full 40-char SHA: {commit}")
+        if not re.match(r'^[0-9a-f]{40}$', commit):
+             raise WorktreeSecurityError(f"Baseline commit must be a lowercase full 40-char SHA: {commit}")
         try:
-            return self._run_git(self.target_repo_path, ["rev-parse", "--verify", f"{commit}^{{commit}}"]).lower()
+            parsed = self._run_git(self.target_repo_path, ["rev-parse", "--verify", f"{commit}^{{commit}}"])
+            if parsed != commit:
+                 raise WorktreeSecurityError("Baseline commit canonical mismatch")
+            return parsed
         except WorktreeGitError:
             raise WorktreeError(f"Commit {commit} does not exist in target repository.")
 
@@ -118,47 +121,41 @@ class WorktreeManager:
         }
         meta_bytes = json.dumps(meta_dict, ensure_ascii=False).encode('utf-8')
 
-        file_ino = None
-        file_dev = None
-
-        try:
-            fd = os.open(meta_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-            try:
-                st = os.fstat(fd)
-                file_ino = st.st_ino
-                file_dev = st.st_dev
-                os.write(fd, meta_bytes)
-                os.fsync(fd)
-            finally:
-                os.close(fd)
-        except (FileExistsError, OSError):
-            raise WorktreeSecurityError(f"Worktree registry already exists for {worktree_id}")
-
-        def _rollback_registry():
-            try:
-                st = os.lstat(meta_path)
-                if stat.S_ISREG(st.st_mode) and st.st_ino == file_ino and st.st_dev == file_dev:
-                    content_match = False
-                    with open(meta_path, 'rb') as f:
-                        content_match = (f.read() == meta_bytes)
-                    if content_match:
-                        os.unlink(meta_path)
-            except OSError:
-                pass
-
+        # DEF-T0023-14 & 15: Create Branch FIRST. If it fails, no registry was created.
         try:
             self._run_git(self.target_repo_path, ["branch", branch_name, canonical_commit])
         except WorktreeGitError as e:
-            _rollback_registry()
             if "already exists" in str(e):
                 raise WorktreeSecurityError(f"Branch {branch_name} already exists.")
             raise
 
+        # Create Registry with write-all and fsync
+        try:
+            fd = os.open(meta_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            try:
+                view = memoryview(meta_bytes)
+                total = len(view)
+                written = 0
+                while written < total:
+                    w = os.write(fd, view[written:])
+                    if w <= 0:
+                        raise OSError("os.write returned short count")
+                    written += w
+                os.fsync(fd)
+            except Exception as e:
+                # Retain branch if registry write fails
+                raise WorktreeError(f"Registry write failed. recovery_required=True, branch_retained=True, registry_retained=True. Stderr: {str(e)}", recovery_required=True, branch_retained=True, registry_retained=True)
+            finally:
+                os.close(fd)
+        except (FileExistsError, OSError) as e:
+            raise WorktreeError(f"Registry creation failed: {str(e)}. recovery_required=True, branch_retained=True, registry_retained=False", recovery_required=True, branch_retained=True, registry_retained=False)
+
+        # Create Worktree
         try:
             self._run_git(self.target_repo_path, ["worktree", "add", path, branch_name])
         except WorktreeGitError as e:
-            _rollback_registry()
-            raise WorktreeError(f"Git worktree add failed, residual branch '{branch_name}' retained. recovery_required=True. Stderr: {str(e)}")
+            # Retain everything
+            raise WorktreeError(f"Git worktree add failed. recovery_required=True, branch_retained=True, registry_retained=True. Stderr: {str(e)}", recovery_required=True, branch_retained=True, registry_retained=True)
 
         return desc
 
@@ -214,7 +211,9 @@ class WorktreeManager:
             baseline_commit=req_data["baseline_commit"]
         )
 
-        self._verify_commit(req.baseline_commit)
+        parsed_commit = self._verify_commit(req.baseline_commit)
+        if parsed_commit != data["baseline_commit"]:
+            raise WorktreeSecurityError("Registry spoofed: baseline_commit canonical mismatch")
 
         rebuilt_id = f"{req.project_id}-{req.task_id}-{req.actor_role}-{req.host_session_id}"
         expected_path = self._safe_path(rebuilt_id)
