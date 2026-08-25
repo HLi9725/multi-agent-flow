@@ -64,9 +64,6 @@ def dummy_record(dummy_metadata):
 @pytest.fixture
 def expected_context(caps):
     handle = AgentHandle(session_id="session_xyz", host_id="real_host", is_real_host=True)
-    # Using object.__setattr__ because Handle is frozen, and invocation_id isn't in default schema
-    object.__setattr__(handle, 'invocation_id', 'inv_xyz')
-
     res = AgentResult(session_id="session_xyz", status=AgentStatus.SUCCESS, output="done", is_real_host=True)
 
     return EvidenceValidationContext(
@@ -77,6 +74,10 @@ def expected_context(caps):
         transition_to="IN_PROGRESS",
         baseline_commit="abc",
         result_commit="def",
+        expected_invocation_id="inv_xyz",
+        expected_adapter="real_adapter",
+        expected_workspace_mode="branch",
+        expected_evidence_type=EvidenceType.TASK_START,
         host_handle=handle,
         expected_capabilities=caps,
         agent_result=res
@@ -146,9 +147,13 @@ def test_gate_validate_artifact(store, expected_context, dummy_metadata, tmp_pat
         artifacts=(ArtifactRecord(relative_path="test_file.txt", sha256_hash=file_hash),),
         metadata=dummy_metadata
     )
+    # Expected type for this specific evidence
+    c_context = EvidenceValidationContext(
+        **{**expected_context.__dict__, "expected_evidence_type": EvidenceType.TASK_COMPLETE}
+    )
     store.append(rec)
     gate = EvidenceGate(store, str(tmp_path))
-    assert gate.validate_evidence("evt_art", expected_context) is True
+    assert gate.validate_evidence("evt_art", c_context) is True
 
 # 7. Artifact Tampering
 def test_gate_reject_tampered_artifact(store, expected_context, dummy_metadata, tmp_path):
@@ -164,11 +169,14 @@ def test_gate_reject_tampered_artifact(store, expected_context, dummy_metadata, 
         artifacts=(ArtifactRecord(relative_path="test_file2.txt", sha256_hash=file_hash),),
         metadata=dummy_metadata
     )
+    c_context = EvidenceValidationContext(
+        **{**expected_context.__dict__, "expected_evidence_type": EvidenceType.TASK_COMPLETE}
+    )
     store.append(rec)
     art_path.write_bytes(b"tampered content")
     gate = EvidenceGate(store, str(tmp_path))
     with pytest.raises(EvidenceGateError, match="Artifact hash mismatch"):
-        gate.validate_evidence("evt_art2", expected_context)
+        gate.validate_evidence("evt_art2", c_context)
 
 # 8. Secret Masking + Env vars
 def test_secret_masking(store, dummy_metadata):
@@ -277,7 +285,7 @@ def test_gate_model_confirmation(store, dummy_metadata, expected_context, tmp_pa
     )
     conf_res = ConfirmationResult(request_id="c123", selected_option="yes", is_confirmed=True, is_real_host=True)
     c_context = EvidenceValidationContext(
-        **{**expected_context.__dict__, "confirmation_result": conf_res}
+        **{**expected_context.__dict__, "confirmation_result": conf_res, "expected_evidence_type": EvidenceType.USER_CONFIRMATION}
     )
     rec = EvidenceRecord(evidence_id="evt_conf", evidence_type=EvidenceType.USER_CONFIRMATION, baseline_commit="abc", result_commit="def", artifacts=(), metadata=meta)
     store.append(rec)
@@ -314,6 +322,10 @@ def test_gate_junction_escape(store, dummy_metadata, expected_context, tmp_path)
         artifacts=(ArtifactRecord(relative_path="linked/target.txt", sha256_hash=file_hash),),
         metadata=dummy_metadata
     )
+
+    c_context = EvidenceValidationContext(
+        **{**expected_context.__dict__, "expected_evidence_type": EvidenceType.TASK_COMPLETE}
+    )
     store.append(rec)
     with pytest.raises(EvidenceGateError, match="traversal"):
-        gate.validate_evidence("evt_junc", expected_context)
+        gate.validate_evidence("evt_junc", c_context)

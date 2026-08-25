@@ -18,6 +18,10 @@ class EvidenceValidationContext:
     transition_to: str
     baseline_commit: str
     result_commit: str
+    expected_invocation_id: str
+    expected_adapter: str
+    expected_workspace_mode: str
+    expected_evidence_type: EvidenceType
     host_handle: AgentHandle
     expected_capabilities: HostCapabilities
     agent_result: Optional[AgentResult] = None
@@ -51,7 +55,7 @@ class EvidenceGate:
         if ctx.host_handle.is_real_host is False:
             raise EvidenceGateError("Evidence rejected: Context handle is not a real host.")
 
-        # 2. Non-empty critical fields
+        # 2. Non-empty critical fields (self-checks for safety, real check is against context)
         for f in [meta.host_id, meta.adapter, meta.host_session_id, meta.host_invocation_id, meta.workspace_mode]:
             if not f or str(f).strip() == "":
                 raise EvidenceGateError("Evidence rejected: Critical identifier field is empty.")
@@ -67,7 +71,8 @@ class EvidenceGate:
         if not record.baseline_commit or not record.result_commit:
             raise EvidenceGateError("Evidence rejected: Missing commits.")
 
-        # 4. Cross validate explicit expected context
+        # 4. Cross validate explicit expected context (1:1 Exact Matches)
+        self._check_match("evidence_type", record.evidence_type, ctx.expected_evidence_type)
         self._check_match("project_id", meta.project_id, ctx.project_id)
         self._check_match("task_id", meta.task_id, ctx.task_id)
         self._check_match("actor_role", meta.actor_role, ctx.actor_role)
@@ -79,8 +84,9 @@ class EvidenceGate:
         # Handle details matching
         self._check_match("host_id", meta.host_id, ctx.host_handle.host_id)
         self._check_match("host_session_id", meta.host_session_id, ctx.host_handle.session_id)
-        if hasattr(ctx.host_handle, "invocation_id") and ctx.host_handle.invocation_id is not None:
-             self._check_match("host_invocation_id", meta.host_invocation_id, ctx.host_handle.invocation_id)
+        self._check_match("host_invocation_id", meta.host_invocation_id, ctx.expected_invocation_id)
+        self._check_match("adapter", meta.adapter, ctx.expected_adapter)
+        self._check_match("workspace_mode", meta.workspace_mode, ctx.expected_workspace_mode)
 
         # Verify Result context if present
         if ctx.agent_result:
