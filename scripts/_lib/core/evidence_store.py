@@ -1,42 +1,77 @@
 import os
 import json
 import hashlib
-from typing import Dict, Any, List
-from dataclasses import asdict
+import uuid
+import math
+import re
+from typing import Dict, Any, List, Mapping
+from dataclasses import is_dataclass
+from enum import Enum
 
 from .evidence_schema import (
     EvidenceRecord, EvidenceMetadata, ArtifactRecord,
     EvidenceType, EvidenceError, EvidenceSecurityError, EvidenceIntegrityError
 )
 
+def _to_dict(obj):
+    if is_dataclass(obj):
+        return {k: _to_dict(getattr(obj, k)) for k in obj.__annotations__ if hasattr(obj, k)}
+    elif isinstance(obj, Enum):
+        return obj.value
+    elif isinstance(obj, Mapping):
+        return {k: _to_dict(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [_to_dict(v) for v in obj]
+    elif isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            raise ValueError("NaN/Infinity not allowed")
+        return obj
+    return obj
+
 def canonical_json(data: dict) -> bytes:
-    return json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    clean_data = _to_dict(data)
+    return json.dumps(clean_data, ensure_ascii=False, sort_keys=True, separators=(',', ':'), allow_nan=False).encode('utf-8')
 
 class EvidenceStore:
     def __init__(self, root_dir: str):
-        self.root_dir = os.path.abspath(root_dir)
+        self.root_dir = os.path.realpath(os.path.abspath(root_dir))
         os.makedirs(self.root_dir, exist_ok=True)
 
     def _safe_path(self, evidence_id: str) -> str:
-        if not evidence_id or '/' in evidence_id or '\\' in evidence_id or '..' in evidence_id:
-            raise EvidenceSecurityError("Invalid evidence_id format or path traversal attempt.")
-        path = os.path.abspath(os.path.join(self.root_dir, f"{evidence_id}.json"))
-        if not path.startswith(self.root_dir):
+        if not evidence_id or not re.match(r'^[\w\-]{1,64}$', evidence_id):
+            raise EvidenceSecurityError("Invalid evidence_id format.")
+
+        path = os.path.join(self.root_dir, f"{evidence_id}.json")
+        real_path = os.path.realpath(path)
+        real_root = self.root_dir
+
+        if os.path.commonpath([real_root, real_path]) != real_root:
             raise EvidenceSecurityError("Path traversal detected.")
-        return path
+        if real_path == real_root:
+            raise EvidenceSecurityError("Path collision.")
+
+        return real_path
 
     def _mask_secrets(self, data: Any) -> Any:
-        if isinstance(data, dict):
+        if isinstance(data, (dict, Mapping)):
             masked = {}
             for k, v in data.items():
-                k_lower = k.lower()
-                if 'token' in k_lower or 'api_key' in k_lower or 'cookie' in k_lower or 'secret' in k_lower or 'password' in k_lower:
+                k_lower = str(k).lower()
+                if 'invocation_token' in k_lower:
+                    raise EvidenceSecurityError("invocation_token must be rejected, not masked")
+                if any(x in k_lower for x in ['authorization', 'bearer', 'cookie', 'api_key', 'api-key', 'secret', 'password', 'private_key', 'private-key', 'credentials']):
                     masked[k] = "***MASKED***"
                 else:
                     masked[k] = self._mask_secrets(v)
             return masked
-        elif isinstance(data, list):
+        elif isinstance(data, (list, tuple)):
             return [self._mask_secrets(item) for item in data]
+        elif isinstance(data, str):
+            v_lower = data.lower()
+            if any(x in v_lower for x in ['authorization:', 'bearer ', 'cookie:', 'api_key', 'api-key', 'secret', 'password', 'private key']):
+                return "***MASKED***"
+            if 'mongodb://' in v_lower or 'mysql://' in v_lower or 'postgres://' in v_lower or 'redis://' in v_lower:
+                return "***MASKED***"
         return data
 
     def append(self, record: EvidenceRecord) -> str:
@@ -44,17 +79,11 @@ class EvidenceStore:
         if os.path.exists(path):
             raise EvidenceSecurityError(f"Evidence {record.evidence_id} already exists. Overwriting is forbidden.")
 
-        data = asdict(record)
-        # Remove original content_hash before hashing
+        data = _to_dict(record)
         data.pop("content_hash", None)
 
-        # Mask secrets in metadata.extra
         if "metadata" in data and "extra" in data["metadata"]:
             data["metadata"]["extra"] = self._mask_secrets(data["metadata"]["extra"])
-
-        # Ensure strict forbidden fields are completely absent or masked
-        if "invocation_token" in data.get("metadata", {}).get("extra", {}):
-             data["metadata"]["extra"]["invocation_token"] = "***MASKED***"
 
         raw_bytes = canonical_json(data)
         content_hash = hashlib.sha256(raw_bytes).hexdigest()
@@ -62,21 +91,25 @@ class EvidenceStore:
         data["content_hash"] = content_hash
         final_bytes = canonical_json(data)
 
-        tmp_path = path + ".tmp"
+        tmp_path = path + "." + str(uuid.uuid4())
         try:
             with open(tmp_path, 'wb') as f:
                 f.write(final_bytes)
                 f.flush()
                 os.fsync(f.fileno())
-            # Atomic rename
-            os.replace(tmp_path, path)
-        except Exception as e:
+
+            if os.name == 'nt':
+                os.rename(tmp_path, path) # Fails if exists
+            else:
+                os.link(tmp_path, path)
+                os.unlink(tmp_path)
+        except (FileExistsError, OSError) as e:
             if os.path.exists(tmp_path):
                 try:
                     os.remove(tmp_path)
                 except OSError:
                     pass
-            raise EvidenceError(f"Failed to atomically write evidence: {str(e)}")
+            raise EvidenceSecurityError(f"Failed to atomically write evidence or file already exists: {str(e)}")
 
         return content_hash
 
@@ -98,10 +131,9 @@ class EvidenceStore:
         if stored_hash != computed_hash:
             raise EvidenceIntegrityError(f"Evidence integrity compromised! Expected {stored_hash}, got {computed_hash}")
 
-        # Reconstruct
         try:
             metadata = EvidenceMetadata(**data["metadata"])
-            artifacts = [ArtifactRecord(**a) for a in data["artifacts"]]
+            artifacts = tuple(ArtifactRecord(**a) for a in data["artifacts"])
             record = EvidenceRecord(
                 evidence_id=data["evidence_id"],
                 evidence_type=EvidenceType(data["evidence_type"]),

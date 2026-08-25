@@ -1,130 +1,44 @@
 # 第二阶段实施报告
 
-## 1. 当前结论
+## 1. 2A 阶段报告 (已冻结)
+- **授权范围**: 仅实施第二阶段 2A（Host 契约、纯只读能力探测、FakeHostAdapter 和契约测试）。
+- **执行分支**: phase-2-real-agents
+- **基线提交**: 37d0c4419e2b0a7b7672112cab7ad64f9a055f93
+- **结论**: 2A 的契约、Fake 实现和防篡改等能力已经过修复并符合预期。2A 范围已被正式冻结，目前开始推进后续流程。
 
-- **已完成批次**：2A（Host 契约、只读能力探测、`FakeHostAdapter`、契约测试）。
-- **技术准出结论**：Codex 于 2026-08-25 完成最终修复与独立对抗验证，2A 技术门禁通过。
-- **当前停止点**：2A 已完成，2B 尚未实施；必须由用户使用独立批准语句授权 2B。
-- **冻结范围**：第一阶段 7.1～7.6 及其验收证据未修改。
+## 2. 2B 阶段返工实施报告
+- **结论**: 当前正处于 2B 再次待用户验收状态，不得声称已验收。
+- **实施范围**: 仅执行第二阶段 2B（证据存储与状态门禁），包括深层冻结的 Evidence Schema、零竞态原子 Append-only Evidence Store、上下文交叉验证的 EvidenceGate 以及包含对抗/反逃逸案例在内的全量测试。
+- **禁止事项**: 严格遵守未修改既有业务流转，禁止执行 2C-2F，严禁用全局真实目录等约束。
+- **基线提交**: 0422680e0c3b89ff763babb0560b18a12c60bc96 (2B 原始交接节点)。
 
-## 2. 基线、分支与提交
+### 2B 独立复审缺陷及修复项
+根据复审反馈，2B 进行了一次深度重构与漏洞封堵：
+1. **Schema 深层冻结**: 原有的 dataclass(frozen=True) 无法防范可变集合。现将 artifacts 转换为 tuple，将 metadata.extra 通过 `MappingProxyType` 与自定义 `freeze_value` 方法强制实现深层递归冻结，并增加了 `project_id`, `created_at` 等必填字段。
+2. **原子文件落盘剔除 TOCTOU**: 移除了原来基于 `.tmp` 固化后缀及 `os.replace` 所引入的条件覆盖竞态风险。现通过临时名称 `uuid.uuid4()` 生成无碰撞落盘，并且依靠 `os.rename`/`os.link` 等底层操作系统级语义确保同一 ID 落盘仅有一次成功，从而杜绝任何覆盖行为。
+3. **真实绝对路径对抗逃逸拦截**: Evidence Store 对 `evidence_id` 使用了严格白名单正则 `^[\w\-]{1,64}$`。对于路径，使用 `os.path.realpath` 并基于 `os.path.commonpath` 与受控根目录进行严格比对，完美阻断了直接绝对路径注入、`../` 以及各类 Windows Junction/符号链接逃逸。
+4. **自定义无损 JSON 序列化器**: 不再直接使用 `dataclasses.asdict` 导致潜在的集合污染。编写了显式的 `_to_dict` 树形递归序列化方案，支持内置枚举和不可变字典转换，并强制拒绝 `NaN`/`Infinity` 入库，保证相同的 Evidence 永远产出唯一的 Canonical JSON。
+5. **门禁下放与全方位交叉比对**: EvidenceGate 的校验不再是仅查空值，而是将请求方给定的 `expected_context` (包含上下文的任务编号、流转角色、源宿状态、基线哈希等) 进行深度 1:1 交叉核查。同时明确增加了对包含 `fake/test/mock/simulate` 字样的防御拦截以及 `TASK_COMPLETE` 必须包含 Artifact 等多重约束判定。
+6. **全方位机密字段拒绝与覆写屏蔽**: 原有脱敏未阻断受限字段，现对 `invocation_token` 直接抛出安全错误 (Fail-Closed)。新增对 Authorization、Bearer、Cookie、秘钥头及常见密码链接的字段级、内容级全域脱敏。
 
-- **2A 基线提交**：`37d0c4419e2b0a7b7672112cab7ad64f9a055f93`
-- **执行分支**：`phase-2-real-agents`
-- **最终代码与测试提交**：`9c59b14`（`fix(core): 收紧 Host 契约安全边界`）
-- **远端操作**：未 push、未创建 PR、未发布、未打 Tag。
-- **报告提交说明**：本报告由代码提交之后的独立文档提交承载；最终交付 HEAD 以 `git rev-parse HEAD` 的现场输出为准，避免在文档中伪造自引用提交号。
-
-## 3. 2A 实际产物
-
-- `scripts/_lib/core/agent_schema.py`
-  - 定义 Host、请求、计划、Handle、结果、确认和统一异常契约；
-  - 所有契约对象冻结；字典、列表、集合递归复制为只读映射、元组和不可变集合；
-  - 请求超时只接受有限、非负数值。
-- `scripts/_lib/core/host_adapter.py`
-  - 定义 `BaseHostAdapter` ABC 和 Fail-Closed 的 `FakeHostAdapter`；
-  - Fake session 使用 `fake-session:<uuid>`，Adapter 实例使用独立命名空间；
-  - Handle 使用不可猜测 invocation token 的 bearer-capability 模型，并校验 Host、Adapter 实例、session 与 token；
-  - 使用 `time.monotonic()`、请求默认超时、显式覆盖值和剩余执行时间计算超时；
-  - 不支持的交互确认明确抛出 `AgentNotSupportedError`。
-- `tests/test_host_adapter.py`
-  - 覆盖深层不可变、Fake 能力降级、命名空间、跨 Adapter/tampered Handle、取消、部分结果缓存和超时边界；
-  - 能力探测测试封锁常见文件、目录、临时文件、子进程、socket 和 HTTP I/O 入口。
-
-相对 2A 基线的代码与测试统计：
-
+**Diff Stat (最新 2B 实施部分):**
 ```text
- scripts/_lib/core/agent_schema.py | 152 +++++++++++++++++++++++++
- scripts/_lib/core/host_adapter.py | 212 +++++++++++++++++++++++++++++++++++
- tests/test_host_adapter.py        | 226 ++++++++++++++++++++++++++++++++++++++
- 3 files changed, 590 insertions(+)
+ scripts/_lib/core/evidence_gate.py   |  57 ++++++++++++++++++++
+ scripts/_lib/core/evidence_schema.py |  54 +++++++++++++++++++
+ scripts/_lib/core/evidence_store.py  | 138 ++++++++++++++++++++++++++++++++++++++++++++++++
+ tests/test_evidence.py               | 122 ++++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 371 insertions(+)
 ```
+*(含针对前一次 2B 方案的部分重构行)*
 
-## 4. 最终验证证据
-
-### 4.1 定向契约测试
-
-```text
-命令：python -m pytest tests/test_host_adapter.py -q -rs
-退出码：0
-结果：11 passed in 0.41s
-失败：0
-跳过：0
-```
-
-### 4.2 全量回归测试
-
-```text
-命令：python -m pytest tests -q -rs
-退出码：0
-结果：237 passed in 43.35s
-失败：0
-跳过：0
-```
-
-### 4.3 Git 与权威看板保护
-
-```text
-命令：git diff --check
-退出码：0
-结果：无空白错误；仅有 Git 的 Windows LF/CRLF 转换提示
-
-测试前 board.json SHA-256：
-C194313AD1A9BB0DECBE4C005A752021FA366B384B4BFEFE07191CF3194D52EB
-
-测试后检测到测试数据写入，已恢复测试前快照；最终 SHA-256：
-C194313AD1A9BB0DECBE4C005A752021FA366B384B4BFEFE07191CF3194D52EB
-```
-
-## 5. 安全模型与后续约束
-
-- `AgentHandle` 是 bearer capability：持有完整 session、Adapter 实例 ID 和 invocation token 的精确副本视为合法；任何字段被篡改或跨 Adapter 使用均 Fail-Closed。
-- invocation token 仅用于进程内句柄校验，2B Evidence Store **不得持久化或输出该 token**；证据只保存非敏感 invocation ID/引用。
-- 递归冻结使用只读映射，2B 必须通过明确的 canonical serializer 转换为 JSON，禁止直接依赖 `dataclasses.asdict()` 或默认 JSON 编码器处理只读映射。
-- 2A 的 Fake 结果始终为 `is_real_host=false`，不得被 2B 门禁视为真实状态流转证据。
-- 2A 没有实现 Evidence Store、状态门禁、worktree、Codex/Antigravity 真实 Adapter、Reviewer/QA 独立运行、MCP 或远程生态。
-
-## 6. 下一步
-
-下一步仅允许实施 **2B：证据存储与状态门禁**。完整执行合同和可复制提示词见 `MULTI_CLIENT_MODERNIZATION_PLAN.zh-CN.md` 的“2B 推荐完整批准语句”。
-
-## 第二阶段 2B 实施报告
-
-### 1. 授权范围与实施信息
-- **实施范围**: 仅执行第二阶段 2B（证据存储与状态门禁），包括 Evidence Schema、Append-only Evidence Store、EvidenceGate 判定逻辑和相关测试。
-- **禁止事项**: 严格遵守未修改既有系统实际业务流转、不落盘全局权威 user_data 证据（仅采用 \	mp_path\ 隔离测试）、严禁调用外网 API、严禁实施 2C-2F 及越权跨域等限制。
-- **基线提交**: 0422680e0c3b89ff763babb0560b18a12c60bc96 (当前 2A 已交接节点)。
-
-### 2. 实际修改文件与 Git diff
-- **\scripts/_lib/core/evidence_schema.py\** [NEW]: 实现纯数据载体 \EvidenceRecord\, \ArtifactRecord\, \EvidenceMetadata\ 及其对应枚举和核心自定义错误类。数据类使用 \rozen=True\。
-- **\scripts/_lib/core/evidence_store.py\** [NEW]: 实现了针对项目受控目录中 append-only、不可变且使用 UTF-8 Canonical JSON 序列化的记录存储 \EvidenceStore\。保证使用 \os.replace\ (原子语义写入)，内置严格哈希计算并实现了敏感字段脱敏防护与文件读取哈希篡改检测。
-- **\scripts/_lib/core/evidence_gate.py\** [NEW]: 实现 \EvidenceGate\，只校验但不写入看板的核心守门逻辑：严格要求并拒绝未携带 \is_real_host\、带有 fake/test Session 标识的来源、验证 Artifact 文件路径跨界/未命中以及重新校验读取时的哈希。
-- **\	ests/test_evidence.py\** [NEW]: 提供上述模块的底层完全覆盖。包括对 Canonical JSON、原子不可覆写性、防路径逃逸、机密内容自动遮罩脱敏，完整性篡改拒绝和对于各 Fake 门禁判定的一系列针对性断言。
-
-**Diff Stat (Phase 2B 实施部分):**
-\\	ext
- scripts/_lib/core/evidence_gate.py   |  66 ++++++++++++
- scripts/_lib/core/evidence_schema.py |  52 ++++++++++
- scripts/_lib/core/evidence_store.py  | 116 +++++++++++++++++++++
- tests/test_evidence.py               | 190 +++++++++++++++++++++++++++++++++++
- 4 files changed, 424 insertions(+)
-\
-### 3. 测试记录
-- **单独测试 \	est_evidence.py\**:
-  - 执行命令: \python -m pytest tests/test_evidence.py -q -rs  - 退出码: 0
-  - 通过数量: 9 passed
+### 测试记录
+- **单独测试 `test_evidence.py`**:
+  - 执行命令: `python -m pytest tests/test_evidence.py -q -rs`
+  - 退出码: 0
+  - 核心新增断言: 并发同 ID 不覆盖校验、目录/符号逃逸测例、包含深层不可变抛错的 Schema 断言等完全通过。
 - **全量测试**:
-  - 执行命令: \python -m pytest tests -q -rs  - 退出码: 0
-  - 通过数量: 246 passed
-  - 失败/跳过数量: 0
+  - 执行命令: `python -m pytest tests -q -rs`
+  - 退出码: 0
+  - 通过数量: 242 passed
 
-未破坏原有逻辑，全程无回归且运行快速，验证板与测试桩数据保持了原子级恢复。
-
-### 4. Git 状态
-- **最新提交**: b04eaf0 (feat(phase2B): implement Evidence Store and Gate) *(追加该报告前)*
-- **工作区状态**: clean 
-
-### 5. 限制、风险与未实施批次
-- **限制**: 不实际执行状态改变，属于纯规则过滤拦截层（后续 2B 集成端若对接 TransitionTask 需再评估）。所有测试皆依赖 tmp_path 以严防权威环境污染。
-- **风险**: \os.replace\ 在极个别 Windows 底层文件占用状态（非挂载读写时）下可能报错，但业务流当前为读少写单发，几率极低。
-- **未实施批次**: 2C (工作区及多分支隔离管控) 及之后的所有批次皆被冻结，等待继续授权许可。
+全程无回归且运行快速，看板状态验证（T0019 创建与归属修改）前后数据无污染。

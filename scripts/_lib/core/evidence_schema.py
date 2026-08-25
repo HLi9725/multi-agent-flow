@@ -1,12 +1,20 @@
-from dataclasses import dataclass, field
-from typing import List, Dict, Any, Optional
+from dataclasses import dataclass, field, is_dataclass
+from typing import List, Dict, Any, Optional, Tuple, Mapping
 from enum import Enum
+import types
 
 class EvidenceType(str, Enum):
     TASK_START = "task_start"
     TASK_TRANSITION = "task_transition"
     TASK_COMPLETE = "task_complete"
     USER_CONFIRMATION = "user_confirmation"
+
+def freeze_value(val: Any) -> Any:
+    if isinstance(val, dict):
+        return types.MappingProxyType({k: freeze_value(v) for k, v in val.items()})
+    elif isinstance(val, list):
+        return tuple(freeze_value(v) for v in val)
+    return val
 
 @dataclass(frozen=True)
 class ArtifactRecord:
@@ -16,14 +24,22 @@ class ArtifactRecord:
 
 @dataclass(frozen=True)
 class EvidenceMetadata:
+    project_id: str
+    task_id: str
     actor_role: str
     host_id: str
+    adapter: str
     host_session_id: str
     host_invocation_id: str
     is_real_host: bool
+    workspace_mode: str
     transition_from: str
     transition_to: str
-    extra: Dict[str, Any] = field(default_factory=dict)
+    created_at: float
+    extra: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self):
+        object.__setattr__(self, 'extra', freeze_value(self.extra))
 
 @dataclass(frozen=True)
 class EvidenceRecord:
@@ -31,22 +47,15 @@ class EvidenceRecord:
     evidence_type: EvidenceType
     baseline_commit: str
     result_commit: str
-    artifacts: List[ArtifactRecord]
+    artifacts: Tuple[ArtifactRecord, ...]
     metadata: EvidenceMetadata
     content_hash: Optional[str] = None
 
-class EvidenceError(Exception):
-    """Base class for Evidence exceptions."""
-    pass
+    def __post_init__(self):
+        if isinstance(self.artifacts, list):
+            object.__setattr__(self, 'artifacts', tuple(self.artifacts))
 
-class EvidenceSecurityError(EvidenceError):
-    """Raised when path traversal or sensitive data leak is detected."""
-    pass
-
-class EvidenceIntegrityError(EvidenceError):
-    """Raised when evidence hash or artifact hash mismatches."""
-    pass
-
-class EvidenceGateError(EvidenceError):
-    """Raised when evidence fails the status gating rules."""
-    pass
+class EvidenceError(Exception): pass
+class EvidenceSecurityError(EvidenceError): pass
+class EvidenceIntegrityError(EvidenceError): pass
+class EvidenceGateError(EvidenceError): pass
