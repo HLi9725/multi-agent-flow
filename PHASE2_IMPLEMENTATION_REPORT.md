@@ -71,3 +71,13 @@
 1. **[DEF-T0023-1] 增加 meta.json 完整性校验**: inspect() 中强制断言 bsolute_path、ranch_name 与安全生成的路径及分支完全一致，断绝了跨 Worktree 验证冒充。
 2. **[DEF-T0023-2] 完善 erify() 的 Fail-Closed 机制**: 增加了对 OSError 家族的捕获，遇到无效挂载或篡改导致的 I/O 错误时统一返回无效状态。
 3. **[DEF-T0023-3] 清理了所有尾随空白符**。
+
+## 4. 2D 规划变更（尚未开工）
+
+- **状态**：仅完成文档设计，不构成 2D 开工授权；2C 仍须先完成独立复审、QA 和用户验收。
+- **定位调整**：2D 从单一“Codex 真实 Adapter”调整为“2D-1 通用 AdapterRegistry/Manifest/合规套件 + 2D-2 Codex 参考 Adapter”。
+- **可移植性要求**：核心编排、Evidence 和 Worktree 不得硬编码客户端名称；Builder、Reviewer、QA 通过 `adapter_id` 与能力契约选择平台。
+- **降级语义**：没有合规 Adapter 的平台只能使用单 Agent 人工角色切换或平台自身手工多 Agent，不能声称已接入第二阶段自动派发与可信证据链。
+- **验证等级**：统一使用 `native_verified`、`cli_verified`、`mcp_verified`、`static_only`、`unsupported`；静态配置和模型自述不能升级为 verified。
+- **详细任务书**：`docs/D04-研发过程/D01-任务/Phase2-2D-通用Adapter注册与Codex参考实现任务书.md`。
+- **未实施**：未创建 Registry、Manifest、Codex Adapter，未调用任何客户端/API，未产生费用，未进入 2D～2F。

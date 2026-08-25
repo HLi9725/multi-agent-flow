@@ -965,10 +965,12 @@ class HostAdapter(Protocol):
 ```text
 yy_flow/hosts/base.py
 yy_flow/hosts/detect.py
+yy_flow/hosts/registry.py
+yy_flow/hosts/manifest.py
+yy_flow/hosts/conformance.py
 yy_flow/hosts/codex.py
 yy_flow/hosts/antigravity.py
 yy_flow/hosts/chatgpt.py
-yy_flow/hosts/manifest.py
 ```
 
 执行流程：
@@ -979,6 +981,8 @@ yy_flow/hosts/manifest.py
 4. 不支持真实子 Agent 时 Fail-Closed 或降级单 Agent，不得模拟多个 Agent；
 5. Adapter 返回宿主 session/thread ID，供独立性和审计校验；
 6. 统一超时、取消、失败和部分结果语义。
+7. 核心只按 `adapter_id` 和能力契约解析 Adapter，不导入具体客户端类；
+8. 所有平台使用同一套 Adapter 合规测试与验证等级。
 
 注意事项：
 
@@ -992,27 +996,41 @@ yy_flow/hosts/manifest.py
 - 不同 Adapter 的结果都能归一化为同一 `AgentResult`；
 - 未检测到宿主时不会伪装运行成功。
 
-### 8.2 实现 Codex Adapter
+### 8.2 建立通用 Adapter 生态并实现 Codex 参考 Adapter
 
-Codex 必须区分两条执行路线：
+2D 拆为两个连续验收点：
+
+1. **2D-1 通用 Adapter 基础设施**：`AdapterRegistry`、`AdapterManifest`、验证等级、能力选择和合规测试套件；
+2. **2D-2 Codex 参考 Adapter**：在通用基础设施上实现 `CodexNativeAdapter` 并取得真实 E2E 证据。
+
+核心层不得硬编码 Codex 或 Antigravity。Builder、Reviewer 和 QA 必须分别通过 `adapter_id` 配置；未来更换 Claude Code、Cursor、AutoLaw 等平台时，只新增平台 Adapter 和 E2E，不重写 Evidence、Worktree 或状态机。
+
+平台验证等级统一为 `native_verified`、`cli_verified`、`mcp_verified`、`static_only` 和 `unsupported`。静态 Agent 导出、配置目录存在、单会话角色切换和手工复制提示词只能属于 `static_only`，不能推进真实多 Agent 证据。
+
+没有合规 Adapter 时，平台允许降级为旧版单 Agent 人工模式；必须显式提示用户手工切换角色/交接，禁止宣传为第二阶段完整自动多 Agent。
+
+Codex 必须区分三条执行路线：
 
 | Adapter | 执行位置 | 凭证与用量 | 第二阶段定位 |
 |---|---|---|---|
-| `CodexNativeAdapter` | ChatGPT Desktop、Codex CLI 或 IDE 当前宿主会话 | 使用该客户端当前账户、模型、权限和用量规则 | 默认路线 |
+| `CodexNativeAdapter` | Codex Desktop/IDE 当前宿主明确暴露的原生任务或子 Agent 入口 | 使用当前客户端账户、模型、权限和用量规则 | 只有真实宿主身份链可验证时才实现 |
+| `CodexCliAdapter` | 本机 Codex CLI 的稳定可编程入口 | 使用 CLI 当前登录、沙箱、批准和用量规则 | 只有机器可读结果、退出语义和会话身份真实验证后启用 |
 | `OpenAIResponsesAdapter` | Python 通过 OpenAI Responses API 调用 | 使用单独 API Key，并按 API Token/工具用量计费 | 可选路线，必须单独授权 |
 
-两者不能相互冒充。Python Core 可以生成调度计划和验证结果，但只有宿主实际暴露的原生子 Agent 能力才能创建 Codex 客户端线程；不得假设存在未公开的本地 Python 函数可直接操纵 Codex Desktop。OpenAI 官方文档确认当前 Codex 客户端可运行独立子 Agent 线程，并从 `~/.codex/agents/*.toml` 或项目 `.codex/agents/*.toml` 加载自定义 Agent；Responses API 的 Multi-agent 则是独立的 API 能力。
+三者不能相互冒充。Python Core 可以生成调度计划和验证结果，但不得假设存在未公开的本地 Python 函数可直接操纵 Codex Desktop，也不得把 CLI 登录等同于桌面会话控制。OpenAI 官方资料将 Codex、API 与 Plugin/MCP 作为不同扩展面；Responses API 的 Multi-agent 也是独立 API 能力。因此，2D-2 开工时必须根据当时官方文档和本机真实入口逐条验证，无法证明的路线保持 `static_only/unsupported`。
 
 执行流程：
 
 1. 探测 Codex 多 Agent 是否启用以及并发上限；
 2. 使用 Codex 原生子 Agent 工作流，不在 Python 中伪造角色；
-3. 按官方 TOML Schema 从 `~/.codex/agents/*.toml` 或项目 `.codex/agents/*.toml` 加载角色，至少包含 `name`、`description` 和 `developer_instructions`；
+3. 角色配置路径和 Schema 必须在 2D-2 开工时重新查证官方文档；静态配置加载成功不等于真实调度成功；
 4. Builder 使用 workspace-write，Reviewer 默认 read-only，QA 仅获得测试所需权限；
 5. 保存父任务、子 Agent 线程、模型、权限模式和结果摘要；
 6. 子 Agent 失败时不得自动提交下一状态；
 7. 增加真实 Codex 手工 E2E 清单，并由宿主返回可检查的 Agent thread ID；
 8. 只有用户明确批准 API Key、模型、费用上限和数据边界后，才实现或启用 `OpenAIResponsesAdapter`。
+9. Registry 注册成功、找到 `.codex` 配置或检测到 Codex 可执行文件，都不能代替真实 thread/session 与 invocation E2E；
+10. Codex Adapter 必须通过与其他平台相同的合规测试，不得拥有核心层特权。
 
 注意事项：
 
@@ -1020,11 +1038,12 @@ Codex 必须区分两条执行路线：
 - 子 Agent 会继承部分父会话设置，必须在调度前检查权限；
 - 不要依赖未公开、易变化的内部函数名；优先使用宿主暴露的能力和指令契约。
 - 客户端订阅/额度与 OpenAI API 账单不是同一授权面；报告必须记录实际使用的 Adapter，不推断或伪报 Token 来源。
+- 若当前 Codex surface 没有可稳定调用并返回真实身份的入口，必须停止为 `static_only/unsupported`，不得以 UI 自动化或模型自述伪造 Adapter。
 
 官方依据：
 
-- [Codex Subagents](https://learn.chatgpt.com/docs/agent-configuration/subagents)
-- [OpenAI Responses API Multi-agent](https://developers.openai.com/api/docs/guides/responses-multi-agent)
+- [OpenAI Developers：Codex、API 与 Plugins 扩展入口](https://developers.openai.com/)
+- [OpenAI API Model Guidance：Responses API Multi-agent](https://developers.openai.com/api/docs/guides/latest-model)
 
 ### 8.3 实现 Antigravity Adapter
 
@@ -1162,7 +1181,7 @@ Codex 必须区分两条执行路线：
 | 2A | Host 契约与能力探测 | Schema、`HostAdapter`、`FakeHostAdapter`、契约测试 | 真实客户端调用、worktree 写入、状态推进 |
 | 2B | 证据存储与状态门禁 | Evidence Schema、存储、哈希、门禁测试 | 把 Fake/模拟证据当真实证据 |
 | 2C | worktree 隔离 | `WorktreeManager`、受控路径、冲突/清理保护测试 | 自动合并、自动清理、stash/reset |
-| 2D | Codex 真实 Adapter | `CodexNativeAdapter`、真实线程证据、Codex E2E | 未经批准的 Responses API/API Key 使用 |
+| 2D | 通用 Adapter 生态与 Codex 参考实现 | 2D-1 Registry/Manifest/合规套件；2D-2 `CodexNativeAdapter` 与真实 Codex E2E | 核心硬编码客户端、未经批准的 Responses API/API Key 使用 |
 | 2E | Antigravity 真实 Adapter | `AntigravityAdapter`、真实 invocation 证据、Antigravity E2E | 写全局目录、用静态路径测试代替真实宿主 |
 | 2F | 独立 Reviewer/QA 与验收 | 独立 session 门禁、真实 L2 双宿主验证、验收请求 | 自动用户验收、进入第三阶段 |
 
@@ -1185,11 +1204,12 @@ Codex 必须区分两条执行路线：
 6. 已知限制、风险、偏差和后续建议；
 7. 明确写明“未实施的后续批次”和“待用户验收”。
 
-2A 的完成不代表真实多 Agent 已建立；2D、2E 未分别取得真实宿主证据前，产品文案必须保持“契约/静态能力”，不能宣传为“已支持真实 Codex/Antigravity 多 Agent”。
+2A 的完成不代表真实多 Agent 已建立；每个 Adapter 未取得对应验证等级和真实宿主证据前，产品文案必须保持“契约/静态能力”。Codex/Antigravity 是当前参考实现，不代表核心只支持这两个平台。
 
 第二阶段退出条件：
 
-- Codex 和 Antigravity各完成至少一个真实 L2 任务；
+- AdapterRegistry 和通用合规套件通过验收；
+- 当前版本至少两个相互独立的 verified Adapter 各完成一个真实 L2 任务；默认参考目标为 Codex 和 Antigravity，未来可由用户批准的等价 Adapter 替换；
 - Builder、Reviewer、QA session 独立可证明；
 - worktree 无交叉写入；
 - 无证据不能流转；
@@ -1702,3 +1722,7 @@ PHASE2_IMPLEMENTATION_REPORT.md
 第二阶段 **2C** 的完整批准语句、开发交付合同和 AutoLaw 独立复审合同见：
 
 `docs/D04-研发过程/D01-任务/Phase2-2C-Worktree隔离实施任务书.md`
+
+第二阶段 **2D** 的可移植 Adapter 设计、降级语义和分批合同见：
+
+`docs/D04-研发过程/D01-任务/Phase2-2D-通用Adapter注册与Codex参考实现任务书.md`
