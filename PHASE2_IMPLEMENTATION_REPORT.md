@@ -87,3 +87,44 @@ C194313AD1A9BB0DECBE4C005A752021FA366B384B4BFEFE07191CF3194D52EB
 ## 6. 下一步
 
 下一步仅允许实施 **2B：证据存储与状态门禁**。完整执行合同和可复制提示词见 `MULTI_CLIENT_MODERNIZATION_PLAN.zh-CN.md` 的“2B 推荐完整批准语句”。
+
+## 第二阶段 2B 实施报告
+
+### 1. 授权范围与实施信息
+- **实施范围**: 仅执行第二阶段 2B（证据存储与状态门禁），包括 Evidence Schema、Append-only Evidence Store、EvidenceGate 判定逻辑和相关测试。
+- **禁止事项**: 严格遵守未修改既有系统实际业务流转、不落盘全局权威 user_data 证据（仅采用 \	mp_path\ 隔离测试）、严禁调用外网 API、严禁实施 2C-2F 及越权跨域等限制。
+- **基线提交**: 0422680e0c3b89ff763babb0560b18a12c60bc96 (当前 2A 已交接节点)。
+
+### 2. 实际修改文件与 Git diff
+- **\scripts/_lib/core/evidence_schema.py\** [NEW]: 实现纯数据载体 \EvidenceRecord\, \ArtifactRecord\, \EvidenceMetadata\ 及其对应枚举和核心自定义错误类。数据类使用 \rozen=True\。
+- **\scripts/_lib/core/evidence_store.py\** [NEW]: 实现了针对项目受控目录中 append-only、不可变且使用 UTF-8 Canonical JSON 序列化的记录存储 \EvidenceStore\。保证使用 \os.replace\ (原子语义写入)，内置严格哈希计算并实现了敏感字段脱敏防护与文件读取哈希篡改检测。
+- **\scripts/_lib/core/evidence_gate.py\** [NEW]: 实现 \EvidenceGate\，只校验但不写入看板的核心守门逻辑：严格要求并拒绝未携带 \is_real_host\、带有 fake/test Session 标识的来源、验证 Artifact 文件路径跨界/未命中以及重新校验读取时的哈希。
+- **\	ests/test_evidence.py\** [NEW]: 提供上述模块的底层完全覆盖。包括对 Canonical JSON、原子不可覆写性、防路径逃逸、机密内容自动遮罩脱敏，完整性篡改拒绝和对于各 Fake 门禁判定的一系列针对性断言。
+
+**Diff Stat (Phase 2B 实施部分):**
+\\	ext
+ scripts/_lib/core/evidence_gate.py   |  66 ++++++++++++
+ scripts/_lib/core/evidence_schema.py |  52 ++++++++++
+ scripts/_lib/core/evidence_store.py  | 116 +++++++++++++++++++++
+ tests/test_evidence.py               | 190 +++++++++++++++++++++++++++++++++++
+ 4 files changed, 424 insertions(+)
+\
+### 3. 测试记录
+- **单独测试 \	est_evidence.py\**:
+  - 执行命令: \python -m pytest tests/test_evidence.py -q -rs  - 退出码: 0
+  - 通过数量: 9 passed
+- **全量测试**:
+  - 执行命令: \python -m pytest tests -q -rs  - 退出码: 0
+  - 通过数量: 246 passed
+  - 失败/跳过数量: 0
+
+未破坏原有逻辑，全程无回归且运行快速，验证板与测试桩数据保持了原子级恢复。
+
+### 4. Git 状态
+- **最新提交**: b04eaf0 (feat(phase2B): implement Evidence Store and Gate) *(追加该报告前)*
+- **工作区状态**: clean 
+
+### 5. 限制、风险与未实施批次
+- **限制**: 不实际执行状态改变，属于纯规则过滤拦截层（后续 2B 集成端若对接 TransitionTask 需再评估）。所有测试皆依赖 tmp_path 以严防权威环境污染。
+- **风险**: \os.replace\ 在极个别 Windows 底层文件占用状态（非挂载读写时）下可能报错，但业务流当前为读少写单发，几率极低。
+- **未实施批次**: 2C (工作区及多分支隔离管控) 及之后的所有批次皆被冻结，等待继续授权许可。
