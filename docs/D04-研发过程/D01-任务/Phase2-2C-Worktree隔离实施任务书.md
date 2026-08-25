@@ -21,6 +21,7 @@ tags: [Worktree, 隔离, 安全, 交接]
 
 - 工作目录：`C:\Users\user\Desktop\user\multi-agent-flow-phase2-real-agents`
 - 开发分支：`phase-2-real-agents`
+- 2C 代码工单：`T0023`，当前必须保持【待开始】，由 Antigravity 开工前合法领取
 - 2B 已验收候选提交：`f6b79e903fb39d8724bfe303e817d7a0748cd7b6`
 - 实际 2C 起始基线：包含本任务书的最新本地 `HEAD`；执行提示词必须给出该 SHA，且 `f6b79e9` 必须是其祖先。
 - 权威数据根：上述工作目录内的 `user_data/`；其他 worktree 的看板只读。
@@ -124,7 +125,7 @@ git status --short
 git worktree list --porcelain
 ```
 
-开始前还必须输出预计修改文件、Schema/类接口草案、受控路径与仓库身份方案、并发策略、失败回滚边界、测试计划、风险和未提交文件。领取既有 2C 工单后才能修改文件，不得另建重复代码任务。
+开始前还必须输出预计修改文件、Schema/类接口草案、受控路径与仓库身份方案、并发策略、失败回滚边界、测试计划、风险和未提交文件。将既有 `T0023` 从【待开始】合法领取为【进行中】后才能修改文件，不得另建重复代码任务。
 
 完成后：
 
