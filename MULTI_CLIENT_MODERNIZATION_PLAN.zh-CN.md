@@ -1636,9 +1636,12 @@ PHASE2_IMPLEMENTATION_REPORT.md
    - git rev-parse HEAD
    - git log -5 --oneline
    - git rev-list --left-right --count origin/phase-2-real-agents...HEAD
+   - git merge-base --is-ancestor 9c59b14 HEAD
+   - git merge-base --is-ancestor f403d74 HEAD
    - git status --short
+   预期：两个 merge-base 命令退出码均为 0；left/right 结果的左侧必须为 0。本地领先远端 7 个或更多提交属于当前已知交接状态，不应误判为分叉。
 2. 开始前先输出：基线提交、预计修改文件、Schema 草案、存储根设计、门禁矩阵、测试计划、风险点，以及是否存在未提交/未跟踪文件；输出后再开始合同范围内工作。
-3. 若分支错误、工作区不干净、远端分叉、2A 报告与代码不一致或需要修改 2A 已冻结契约，立即停止，不得自行 merge、rebase、reset、stash、覆盖或清理。
+3. 若分支错误、工作区不干净、远端出现本地尚未包含的新提交、提交历史真正分叉、上述两个基线提交不是 HEAD 祖先、2A 报告与代码不一致或需要修改 2A 已冻结契约，立即停止，不得自行 merge、rebase、reset、stash、覆盖或清理。
 4. 2B 仅允许实现：
    - Evidence Schema 与必要枚举/统一异常；
    - canonical UTF-8 JSON serializer；
