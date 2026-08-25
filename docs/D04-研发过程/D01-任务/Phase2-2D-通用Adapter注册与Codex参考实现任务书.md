@@ -1,15 +1,15 @@
 ---
-title: 第二阶段2D通用Adapter注册与Codex参考实现任务书
+title: 第二阶段2D通用Adapter生态与平台接入总任务书
 module: host-adapter
 stage: Phase-2
 type: task
-status: draft
+status: active
 author: 李文通
 updated_at: 2026-08-25
 tags: [Adapter, Codex, 可移植性, 合规测试]
 ---
 
-# 第二阶段 2D 通用 Adapter 注册与 Codex 参考实现任务书
+# 第二阶段 2D 通用 Adapter 生态与平台接入总任务书
 
 ## 1. 目标与定位
 
@@ -20,7 +20,13 @@ tags: [Adapter, Codex, 可移植性, 合规测试]
 
 Codex 是首个参考实现，不是核心层依赖。未来增加 Claude Code、Cursor、AutoLaw、OpenCode 或其他平台时，只新增平台 Adapter、Manifest 和 E2E，不重写看板、Evidence Gate、WorktreeManager 或编排器。
 
-2D 只有在 2C 正式验收后才能开工。本任务书当前为设计草案，不构成 2D 开工授权。
+2D 只有在 2C 正式验收后才能开工。本任务书是已生效的规划与范围合同，但本身不构成 2D 开工授权。
+
+2D-1 已形成可独立授权的详细实施合同：
+
+`docs/D04-研发过程/D01-任务/Phase2-2D-1-通用Adapter基础设施实施任务书.md`
+
+后续执行以该独立任务书为 2D-1 唯一范围依据。本总任务书继续承担跨批次路线、降级语义和平台接入边界，不得使用“批准 2D”一次性放行 2D-1、2D-2 和 2E。
 
 ## 2. 三档使用与降级语义
 
@@ -47,17 +53,18 @@ Codex 是首个参考实现，不是核心层依赖。未来增加 Claude Code�
 
 ## 4. 通用注册与验证模型
 
-建议新增：
+2D-1 建议新增：
 
 ```text
 scripts/_lib/core/adapter_manifest.py
 scripts/_lib/core/adapter_registry.py
 scripts/_lib/core/adapter_conformance.py
-scripts/_lib/hosts/codex_native_adapter.py
+tests/test_adapter_manifest.py
 tests/test_adapter_registry.py
 tests/test_adapter_conformance.py
-tests/test_codex_native_adapter.py
 ```
+
+`scripts/_lib/hosts/codex_native_adapter.py` 与 `tests/test_codex_native_adapter.py` 仅属于 2D-2，不得在 2D-1 提前创建占位实现。
 
 实际布局可以按仓库现状最小调整，但不得大规模迁移冻结模块。
 
@@ -157,7 +164,7 @@ Codex 路线必须明确分开：
 - 自动发现并执行用户机器上的任意 CLI；
 - 开始 2D-2、2E 或 2F。
 
-2D-1 完成后必须独立复审和用户验收，再批准 2D-2。
+2D-1 的五项内容必须一起实施、一起复审、一起验收，避免 Registry、Manifest 和解析规则各自形成不兼容半成品。2D-1 完成后必须独立复审、QA 和用户验收，再批准 2D-2 或 2E。
 
 ## 9. 2D-2 允许与禁止范围
 

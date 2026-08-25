@@ -1,3 +1,14 @@
+---
+title: 第二阶段实施报告
+module: multi-agent-flow
+stage: Phase-2
+type: test-report
+status: active
+author: Multi-Agent Team
+updated_at: 2026-08-25
+tags: [实施报告, HostAdapter, Evidence, Worktree, Adapter]
+---
+
 # 第二阶段实施报告
 
 ## 1. 2A 阶段报告 (已冻结)
@@ -75,9 +86,10 @@
 ## 4. 2D 规划变更（尚未开工）
 
 - **状态**：仅完成文档设计，不构成 2D 开工授权；2C 仍须先完成独立复审、QA 和用户验收。
-- **定位调整**：2D 从单一“Codex 真实 Adapter”调整为“2D-1 通用 AdapterRegistry/Manifest/合规套件 + 2D-2 Codex 参考 Adapter”。
+- **定位调整**：2D 从单一“Codex 真实 Adapter”调整为“2D-1 统一通用基础批次 + 2D-2 Codex 参考 Adapter”；2D-1 将 Registry、Manifest、验证等级、能力解析和通用合规测试套件一起实施、一起验收。
 - **可移植性要求**：核心编排、Evidence 和 Worktree 不得硬编码客户端名称；Builder、Reviewer、QA 通过 `adapter_id` 与能力契约选择平台。
 - **降级语义**：没有合规 Adapter 的平台只能使用单 Agent 人工角色切换或平台自身手工多 Agent，不能声称已接入第二阶段自动派发与可信证据链。
 - **验证等级**：统一使用 `native_verified`、`cli_verified`、`mcp_verified`、`static_only`、`unsupported`；静态配置和模型自述不能升级为 verified。
 - **详细任务书**：`docs/D04-研发过程/D01-任务/Phase2-2D-通用Adapter注册与Codex参考实现任务书.md`。
+- **2D-1 独立合同**：`docs/D04-研发过程/D01-任务/Phase2-2D-1-通用Adapter基础设施实施任务书.md`，包含范围冻结、Schema、解析顺序、合规测试、准出标准和可直接批准提示词。
 - **未实施**：未创建 Registry、Manifest、Codex Adapter，未调用任何客户端/API，未产生费用，未进入 2D～2F。

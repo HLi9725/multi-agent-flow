@@ -998,12 +998,18 @@ yy_flow/hosts/chatgpt.py
 
 ### 8.2 建立通用 Adapter 生态并实现 Codex 参考 Adapter
 
-2D 拆为两个连续验收点：
+2D 拆为两个连续验收点，其中 2D-1 是一个统一基础批次：
 
-1. **2D-1 通用 Adapter 基础设施**：`AdapterRegistry`、`AdapterManifest`、验证等级、能力选择和合规测试套件；
+1. **2D-1 通用 Adapter 基础设施**：把 `AdapterRegistry`、`AdapterManifest`、验证等级、能力解析和通用合规测试套件作为一个不可拆散的实施与验收单元；
 2. **2D-2 Codex 参考 Adapter**：在通用基础设施上实现 `CodexNativeAdapter` 并取得真实 E2E 证据。
 
 核心层不得硬编码 Codex 或 Antigravity。Builder、Reviewer 和 QA 必须分别通过 `adapter_id` 配置；未来更换 Claude Code、Cursor、AutoLaw 等平台时，只新增平台 Adapter 和 E2E，不重写 Evidence、Worktree 或状态机。
+
+2D-1 的独立实施合同、Schema、确定性解析顺序、测试矩阵、停止条件和可直接批准提示词见：
+
+`docs/D04-研发过程/D01-任务/Phase2-2D-1-通用Adapter基础设施实施任务书.md`
+
+2D-1 禁止创建任何真实平台 Adapter 占位实现。Codex 只在 2D-2 实施，Antigravity 只在 2E 实施；二者都必须复用 2D-1 的同一 Registry、Manifest 和合规测试，不得获得平台特权。
 
 平台验证等级统一为 `native_verified`、`cli_verified`、`mcp_verified`、`static_only` 和 `unsupported`。静态 Agent 导出、配置目录存在、单会话角色切换和手工复制提示词只能属于 `static_only`，不能推进真实多 Agent 证据。
 
@@ -1174,14 +1180,15 @@ Codex 必须区分三条执行路线：
 
 ### 8.8 第二阶段子批次与逐批授权
 
-第二阶段拆为六个可独立验收的子批次。默认一次只批准一个，上一批达到“待用户验收”且经用户明确确认后，下一批才可开工。
+第二阶段拆为七个可独立验收点。默认一次只批准一个，上一依赖批次达到“待用户验收”且经用户明确确认后，下一依赖批次才可开工。
 
 | 批次 | 目标 | 允许的核心产出 | 本批次禁止 |
 |---|---|---|---|
 | 2A | Host 契约与能力探测 | Schema、`HostAdapter`、`FakeHostAdapter`、契约测试 | 真实客户端调用、worktree 写入、状态推进 |
 | 2B | 证据存储与状态门禁 | Evidence Schema、存储、哈希、门禁测试 | 把 Fake/模拟证据当真实证据 |
 | 2C | worktree 隔离 | `WorktreeManager`、受控路径、冲突/清理保护测试 | 自动合并、自动清理、stash/reset |
-| 2D | 通用 Adapter 生态与 Codex 参考实现 | 2D-1 Registry/Manifest/合规套件；2D-2 `CodexNativeAdapter` 与真实 Codex E2E | 核心硬编码客户端、未经批准的 Responses API/API Key 使用 |
+| 2D-1 | 通用 Adapter 基础设施 | Registry、Manifest、验证等级、能力解析、通用合规套件作为统一交付 | 任何真实平台 Adapter、客户端调用、API/凭证/费用 |
+| 2D-2 | Codex 参考 Adapter | `CodexNativeAdapter` 或经批准的明确 Codex surface、真实 Codex E2E | Antigravity 实现、核心平台特权、未经批准的 Responses API/API Key 使用 |
 | 2E | Antigravity 真实 Adapter | `AntigravityAdapter`、真实 invocation 证据、Antigravity E2E | 写全局目录、用静态路径测试代替真实宿主 |
 | 2F | 独立 Reviewer/QA 与验收 | 独立 session 门禁、真实 L2 双宿主验证、验收请求 | 自动用户验收、进入第三阶段 |
 
@@ -1717,7 +1724,7 @@ PHASE2_IMPLEMENTATION_REPORT.md
 16. 遇到范围不明、路径安全无法证明、破坏性操作、依赖升级、外部权限、需要修改冻结 2A/第一阶段或真实 Host 调用时，先请求我的确认。
 ```
 
-后续 2C～2F 必须分别使用同等粒度的批准语句，不能用“继续第二阶段”一次性放行全部子批次。
+后续 2C、2D-1、2D-2、2E、2F 必须分别使用同等粒度的批准语句，不能用“继续第二阶段”或“批准 2D”一次性放行全部子批次。
 
 第二阶段 **2C** 的完整批准语句、开发交付合同和 AutoLaw 独立复审合同见：
 
@@ -1726,3 +1733,7 @@ PHASE2_IMPLEMENTATION_REPORT.md
 第二阶段 **2D** 的可移植 Adapter 设计、降级语义和分批合同见：
 
 `docs/D04-研发过程/D01-任务/Phase2-2D-通用Adapter注册与Codex参考实现任务书.md`
+
+第二阶段 **2D-1** 可直接执行的统一基础批次合同与批准提示词见：
+
+`docs/D04-研发过程/D01-任务/Phase2-2D-1-通用Adapter基础设施实施任务书.md`
