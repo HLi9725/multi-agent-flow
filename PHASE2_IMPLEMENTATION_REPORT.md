@@ -44,3 +44,25 @@
 - `git diff --check` 退出码 0；候选代码提交为 `f6b79e903fb39d8724bfe303e817d7a0748cd7b6`。
 - 全量测试产生 `T0021 / Delete Me` 污染卡；未使用快照覆盖或直接编辑看板，已通过合法 PM/USER 代行流转软取消归档。
 - 2C 尚未实施。实施范围、测试矩阵和双端交接合同见 `docs/D04-研发过程/D01-任务/Phase2-2C-Worktree隔离实施任务书.md`。
+
+## 3. 2C 阶段实施报告（Worktree 隔离）
+- **实施范围**: 第二阶段 2C（Worktree 请求、状态校验与 Git 操作封装）
+- **基线提交**: 4c61976e492d163b369a75bbb80afaf2bbb69e33
+
+### 核心实现方案
+1. **Worktree Schema 抽象**: 引入 \WorktreeRequest\、\WorktreeDescriptor\ 和 \WorktreeStatus\ 三层结构，使用严格的 dataclass 和 \reeze_value\ 提供深度不可变性。
+2. **WorktreeManager**:
+   - 依赖注入: \controlled_root\ 和 \	arget_repo_path\，强制绝对路径约束。
+   - 并发创建保护: \worktree_id\ 唯一且具有原子级别锁定（使用 \os.O_CREAT | os.O_EXCL\ 生成锁文件）。
+   - 真实校验: 严格验证 \git rev-parse --absolute-git-dir\ 和 \--git-common-dir\。
+   - 目录与分支名安全: 正则验证和 \git check-ref-format\ 防御注入，隔离逃逸目录限制（阻止 \../\ 和 Symlink/Junction 等攻击）。
+   - 只读与清理计划: \erify\ 和 \inspect\ 只读执行 Git 解析，\get_cleanup_plan\ 返回不带有破坏性清理动作的纯文本计划。
+3. **测试覆盖**:
+   - \	est_worktree_manager.py\ 通过真实 \pytest tmp_path\ 生成 Git 临时空仓库并挂载文件流。
+   - 测试涵盖全场景: 绝对路径逃逸防御、并发覆盖防护、非法命令注入拦截、清理不落盘、linked worktree 场景验证。
+
+### 测试记录
+- **定向工作树测试**: \python -m pytest tests/test_worktree_manager.py -q -rs\ -> 8 passed (0 failed, 0 skipped)
+- **定向环境测试**: \python -m pytest tests/test_host_adapter.py tests/test_evidence.py -q -rs\ -> 25 passed
+- **全量测试**: \python -m pytest tests -q -rs\ -> 259 passed (0 failed, 0 skipped)
+- **代码规范**: \git diff --check\ -> 通过无报错
