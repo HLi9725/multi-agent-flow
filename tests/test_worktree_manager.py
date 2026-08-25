@@ -238,3 +238,40 @@ def test_list_worktrees(manager, test_repo):
 
     list_c = manager.list_worktrees("projC")
     assert len(list_c) == 0
+
+def test_json_root_types(manager, test_repo):
+    _, commit_hash = test_repo
+    req = WorktreeRequest("p", "t", "DEV", "json", commit_hash)
+    d = manager.create_worktree(req)
+    meta_path = os.path.join(manager.registry_dir, f"{d.worktree_id}.json")
+    import json, pytest
+    from scripts._lib.core.worktree_schema import WorktreeSecurityError
+    for invalid_root in [[], 123, "str", None]:
+        with open(meta_path, 'w', encoding='utf-8') as f:
+            json.dump(invalid_root, f)
+        with pytest.raises(WorktreeSecurityError, match="JSON root must be an object"):
+            manager.inspect(d.worktree_id)
+        status = manager.verify(d.worktree_id)
+        assert not status.is_valid
+
+def test_registry_rollback_on_branch_failure(manager, test_repo):
+    repo_path, commit_hash = test_repo
+    req = WorktreeRequest("p", "t", "DEV", "fail", commit_hash)
+
+    # Intentionally pre-create branch
+    import subprocess
+    worktree_id = f"{req.project_id}-{req.task_id}-{req.actor_role}-{req.host_session_id}"
+    subprocess.run(["git", "branch", f"agent-branch-{worktree_id}", commit_hash], cwd=repo_path, check=True)
+
+    import pytest
+    from scripts._lib.core.worktree_schema import WorktreeSecurityError
+    with pytest.raises(WorktreeSecurityError, match="already exists"):
+        manager.create_worktree(req)
+
+    meta_path = os.path.join(manager.registry_dir, f"{worktree_id}.json")
+    assert not os.path.exists(meta_path)
+
+    # We should be able to retry if the branch was deleted
+    subprocess.run(["git", "branch", "-D", f"agent-branch-{worktree_id}"], cwd=repo_path, check=True)
+    d = manager.create_worktree(req)
+    assert os.path.exists(meta_path)

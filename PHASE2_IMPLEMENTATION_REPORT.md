@@ -76,3 +76,7 @@
 5. **[DEF-T0023-7] 40位 SHA 校验**: 在创建前统一转化为 canonical 小写，并在元数据与请求中拦截短 SHA 与无效引用。
 6. **[DEF-T0023-8] 清理计划结构化**: \get_cleanup_plan\ 不再生成 raw git string，改用安全的纯数据格式。
 7. **[DEF-T0023-9] 只读 list_worktrees**: 实现了无副作用的 \list_worktrees\，并对损坏记录保持 fail-closed。
+
+### 2C 返工修复记录（DEF-T0023-10 ~ 11）
+1. **[DEF-T0023-10] 完善 Registry 根类型校验**: 在 \inspect()\ 中增加 \isinstance(data, dict)\ 的断言，彻底封堵了由于 \json.load\ 解析出列表、整数、字符串或 null 时导致后续字典读取触发 \AttributeError\ 的漏洞。如今面对任意合法的非对象 JSON 亦能稳定返回安全错误（Fail-Closed）。
+2. **[DEF-T0023-11] 修复 Create 失败路径 Registry 残留阻塞重试**: 在 \create_worktree()\ 中，若其后的 Git 分支创建（如已存在）或 Worktree 创建抛出异常失败，会主动将刚建立的 registry 元数据撤销/清理（\os.unlink\），从而防止失败导致的悬挂元数据永久性阻塞后续的重试尝试。

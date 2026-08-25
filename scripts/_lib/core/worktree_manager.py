@@ -128,6 +128,8 @@ class WorktreeManager:
         try:
             self._run_git(self.target_repo_path, ["branch", branch_name, canonical_commit])
         except WorktreeGitError as e:
+            if os.path.exists(meta_path):
+                os.unlink(meta_path)
             if "already exists" in str(e):
                 raise WorktreeSecurityError(f"Branch {branch_name} already exists.")
             raise
@@ -135,6 +137,8 @@ class WorktreeManager:
         try:
             self._run_git(self.target_repo_path, ["worktree", "add", path, branch_name])
         except WorktreeGitError as e:
+            if os.path.exists(meta_path):
+                os.unlink(meta_path)
             raise WorktreeError(f"Git worktree add failed, residual branch '{branch_name}' retained. recovery_required=True. Stderr: {str(e)}")
 
         return desc
@@ -149,6 +153,9 @@ class WorktreeManager:
                 data = json.load(f)
         except Exception as e:
             raise WorktreeSecurityError(f"Corrupt registry for {worktree_id}: {str(e)}")
+
+        if not isinstance(data, dict):
+            raise WorktreeSecurityError("Corrupt registry: JSON root must be an object")
 
         req_data = data.get("request", {})
         if not isinstance(req_data, dict):
