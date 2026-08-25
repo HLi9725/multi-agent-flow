@@ -80,3 +80,7 @@
 ### 2C 返工修复记录（DEF-T0023-10 ~ 11）
 1. **[DEF-T0023-10] 完善 Registry 根类型校验**: 在 \inspect()\ 中增加 \isinstance(data, dict)\ 的断言，彻底封堵了由于 \json.load\ 解析出列表、整数、字符串或 null 时导致后续字典读取触发 \AttributeError\ 的漏洞。如今面对任意合法的非对象 JSON 亦能稳定返回安全错误（Fail-Closed）。
 2. **[DEF-T0023-11] 修复 Create 失败路径 Registry 残留阻塞重试**: 在 \create_worktree()\ 中，若其后的 Git 分支创建（如已存在）或 Worktree 创建抛出异常失败，会主动将刚建立的 registry 元数据撤销/清理（\os.unlink\），从而防止失败导致的悬挂元数据永久性阻塞后续的重试尝试。
+
+### 2C 返工修复记录（DEF-T0023-12 ~ 13）
+1. **[DEF-T0023-12] 严密的 Registry 身份与所有权回滚**: 彻底修正了 \create_worktree()\ 中的文件回滚漏洞。不再使用简单且具有竞态风险的 \os.path.exists()\ 判断。利用 \os.fstat(fd)\ 锁定 O_EXCL 创建时的 inode (\st_ino\) 与 device ID (\st_dev\)，当且仅当 \os.lstat()\ 证实元数据文件身份一致、且严格比对写入二进制内容无篡改后，才准许 \os.unlink()\ 进行安全回滚，对外部恶意替换/Symlink/Junction 免疫。
+2. **[DEF-T0023-13] 高强度的 Schema 与提交真实性防御**: 在 \inspect()\ 加入了极致的字典边界与类型校验。拒绝包含不合理 Float 的假造时间，强制 \isinstance(val, str)\ 检测。对 baseline_commit 进行底层 \git rev-parse\ 严格双重校验，保证内外 commit 与请求绝对一致。对于任何畸变类型强制抛出 \WorktreeSecurityError\，使门禁校验 (\erify()\) 永远返回无效而非抛出异常裸奔（Fail-Closed）。

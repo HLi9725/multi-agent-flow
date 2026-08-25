@@ -275,3 +275,66 @@ def test_registry_rollback_on_branch_failure(manager, test_repo):
     subprocess.run(["git", "branch", "-D", f"agent-branch-{worktree_id}"], cwd=repo_path, check=True)
     d = manager.create_worktree(req)
     assert os.path.exists(meta_path)
+
+import os
+import subprocess
+import pytest
+import time
+import shutil
+import json
+from scripts._lib.core.worktree_schema import WorktreeRequest, WorktreeSecurityError, WorktreeError, WorktreeGitError
+
+def test_registry_rollback_ownership_and_symlink(manager, test_repo):
+    repo_path, commit_hash = test_repo
+    req = WorktreeRequest("p", "t", "DEV", "fail2", commit_hash)
+    worktree_id = f"{req.project_id}-{req.task_id}-{req.actor_role}-{req.host_session_id}"
+    subprocess.run(["git", "branch", f"agent-branch-{worktree_id}", commit_hash], cwd=repo_path, check=True)
+    with pytest.raises(WorktreeSecurityError, match="already exists"):
+        manager.create_worktree(req)
+    meta_path = os.path.join(manager.registry_dir, f"{worktree_id}.json")
+    assert not os.path.exists(meta_path)
+    subprocess.run(["git", "branch", "-D", f"agent-branch-{worktree_id}"], cwd=repo_path, check=True)
+
+    original_run_git = manager._run_git
+    def mocked_run_git(cwd, args):
+        if args[:2] == ["worktree", "add"]:
+            os.remove(meta_path)
+            with open(meta_path, 'w') as f:
+                f.write("fake")
+            raise WorktreeGitError("mock fail")
+        return original_run_git(cwd, args)
+    manager._run_git = mocked_run_git
+    with pytest.raises(WorktreeError, match="recovery_required"):
+        manager.create_worktree(req)
+    assert os.path.exists(meta_path)
+    with open(meta_path, 'r') as f:
+        assert f.read() == "fake"
+    manager._run_git = original_run_git
+
+def test_inspect_schema_validation(manager, test_repo):
+    _, commit_hash = test_repo
+    req = WorktreeRequest("p", "t", "DEV", "s2", commit_hash)
+    d = manager.create_worktree(req)
+    meta_path = os.path.join(manager.registry_dir, f"{d.worktree_id}.json")
+
+    with open(meta_path, 'r', encoding='utf-8') as f:
+        original_data = json.load(f)
+
+    def write_tampered(mod):
+        with open(meta_path, 'w', encoding='utf-8') as f:
+            json.dump(mod, f)
+
+    tampered = dict(original_data)
+    tampered['baseline_commit'] = "0"*40
+    tampered['request']['baseline_commit'] = "0"*40
+    write_tampered(tampered)
+    with pytest.raises(WorktreeError, match="does not exist"):
+        manager.inspect(d.worktree_id)
+
+    tampered = dict(original_data)
+    tampered['created_at'] = "str"
+    write_tampered(tampered)
+    with pytest.raises(WorktreeSecurityError, match="must be a number"):
+        manager.inspect(d.worktree_id)
+
+    assert not manager.verify(d.worktree_id).is_valid

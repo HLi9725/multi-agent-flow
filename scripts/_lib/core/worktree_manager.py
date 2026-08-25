@@ -3,6 +3,7 @@ import re
 import subprocess
 import time
 import json
+import stat
 from typing import List, Dict, Any
 
 from .worktree_schema import (
@@ -69,6 +70,8 @@ class WorktreeManager:
             raise WorktreeSecurityError(f"Invalid branch name format: {branch_name}")
 
     def _verify_commit(self, commit: str) -> str:
+        if not isinstance(commit, str):
+            raise WorktreeSecurityError("Baseline commit must be a string")
         if not re.match(r'^[0-9a-f]{40}$', commit.lower()):
              raise WorktreeSecurityError(f"Baseline commit must be a full 40-char SHA: {commit}")
         try:
@@ -115,21 +118,38 @@ class WorktreeManager:
         }
         meta_bytes = json.dumps(meta_dict, ensure_ascii=False).encode('utf-8')
 
-        # Atomic registry creation
+        file_ino = None
+        file_dev = None
+
         try:
             fd = os.open(meta_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
             try:
+                st = os.fstat(fd)
+                file_ino = st.st_ino
+                file_dev = st.st_dev
                 os.write(fd, meta_bytes)
+                os.fsync(fd)
             finally:
                 os.close(fd)
         except (FileExistsError, OSError):
             raise WorktreeSecurityError(f"Worktree registry already exists for {worktree_id}")
 
+        def _rollback_registry():
+            try:
+                st = os.lstat(meta_path)
+                if stat.S_ISREG(st.st_mode) and st.st_ino == file_ino and st.st_dev == file_dev:
+                    content_match = False
+                    with open(meta_path, 'rb') as f:
+                        content_match = (f.read() == meta_bytes)
+                    if content_match:
+                        os.unlink(meta_path)
+            except OSError:
+                pass
+
         try:
             self._run_git(self.target_repo_path, ["branch", branch_name, canonical_commit])
         except WorktreeGitError as e:
-            if os.path.exists(meta_path):
-                os.unlink(meta_path)
+            _rollback_registry()
             if "already exists" in str(e):
                 raise WorktreeSecurityError(f"Branch {branch_name} already exists.")
             raise
@@ -137,8 +157,7 @@ class WorktreeManager:
         try:
             self._run_git(self.target_repo_path, ["worktree", "add", path, branch_name])
         except WorktreeGitError as e:
-            if os.path.exists(meta_path):
-                os.unlink(meta_path)
+            _rollback_registry()
             raise WorktreeError(f"Git worktree add failed, residual branch '{branch_name}' retained. recovery_required=True. Stderr: {str(e)}")
 
         return desc
@@ -157,20 +176,45 @@ class WorktreeManager:
         if not isinstance(data, dict):
             raise WorktreeSecurityError("Corrupt registry: JSON root must be an object")
 
-        req_data = data.get("request", {})
+        def _assert_str(val, name):
+            if not isinstance(val, str) or not val:
+                raise WorktreeSecurityError(f"Corrupt registry: {name} must be a non-empty string")
+
+        def _assert_float(val, name):
+            if isinstance(val, bool) or not isinstance(val, (int, float)):
+                raise WorktreeSecurityError(f"Corrupt registry: {name} must be a number")
+            import math
+            if math.isnan(val) or math.isinf(val) or val <= 0 or val > time.time() + 86400:
+                raise WorktreeSecurityError(f"Corrupt registry: {name} invalid time")
+
+        _assert_str(data.get("worktree_id"), "worktree_id")
+        _assert_str(data.get("absolute_path"), "absolute_path")
+        _assert_str(data.get("branch_name"), "branch_name")
+        _assert_str(data.get("baseline_commit"), "baseline_commit")
+        _assert_float(data.get("created_at"), "created_at")
+
+        req_data = data.get("request")
         if not isinstance(req_data, dict):
              raise WorktreeSecurityError("Corrupt registry: missing or invalid request object")
 
-        try:
-            req = WorktreeRequest(
-                project_id=req_data["project_id"],
-                task_id=req_data["task_id"],
-                actor_role=req_data["actor_role"],
-                host_session_id=req_data["host_session_id"],
-                baseline_commit=req_data["baseline_commit"]
-            )
-        except KeyError as e:
-             raise WorktreeSecurityError(f"Corrupt registry: missing key {str(e)}")
+        _assert_str(req_data.get("project_id"), "request.project_id")
+        _assert_str(req_data.get("task_id"), "request.task_id")
+        _assert_str(req_data.get("actor_role"), "request.actor_role")
+        _assert_str(req_data.get("host_session_id"), "request.host_session_id")
+        _assert_str(req_data.get("baseline_commit"), "request.baseline_commit")
+
+        if data["baseline_commit"] != req_data["baseline_commit"]:
+            raise WorktreeSecurityError("Corrupt registry: baseline_commit mismatch between outer and request")
+
+        req = WorktreeRequest(
+            project_id=req_data["project_id"],
+            task_id=req_data["task_id"],
+            actor_role=req_data["actor_role"],
+            host_session_id=req_data["host_session_id"],
+            baseline_commit=req_data["baseline_commit"]
+        )
+
+        self._verify_commit(req.baseline_commit)
 
         rebuilt_id = f"{req.project_id}-{req.task_id}-{req.actor_role}-{req.host_session_id}"
         expected_path = self._safe_path(rebuilt_id)
@@ -184,8 +228,6 @@ class WorktreeManager:
             raise WorktreeSecurityError("Registry spoofed: absolute_path mismatch.")
         if data.get("branch_name") != expected_branch:
             raise WorktreeSecurityError("Registry spoofed: branch_name mismatch.")
-        if data.get("baseline_commit") != req.baseline_commit:
-            raise WorktreeSecurityError("Registry spoofed: baseline_commit mismatch.")
 
         return WorktreeDescriptor(
             worktree_id=data["worktree_id"],
