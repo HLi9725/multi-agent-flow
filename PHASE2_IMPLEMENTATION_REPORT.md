@@ -24,7 +24,7 @@
    - 为避免直接修改已冻结的 2A 契约实体 (`AgentHandle`) 导致范围越界，现显式要求调用门禁的校验上下文 `EvidenceValidationContext` 直接携带来自业务最顶层、无可篡改的期望数据：`expected_invocation_id`、`expected_workspace_mode` 和 `expected_adapter`。
    - 这完全废弃了之前 `hasattr` 探测死代码的隐患，并在核心门禁层直接与存盘自报数据作双向不可为空 (`None!=None`) 的严格比较。由于不再仅靠不包含敏感词来放行，彻底断绝了伪造上下文蒙混过关的漏洞。
 2. **[DEF-T0020-4] 证据类型重放拦截**：
-   - 为上下文显式引入了 `expected_evidence_type`。当前每一次对 Evidence 校验不仅核对业务流转和主机属性，更强制核对其本身的类别必须属于所期生命周期事件，杜绝跨证据类型的挂羊头卖狗肉（重放拦截）。
+   - 为上下文显式引入了 `expected_evidence_type`。当前每一次对 Evidence 校验不仅核对业务流转和主机属性，更强制核对其本身的类别必须属于所期生命周期事件，杜结跨证据类型的挂羊头卖狗肉（重放拦截）。
 3. **[DEF-T0020-5] 实施报告统计修正**：
    - 已根据最新执行结果如实登记 `test_host_adapter.py` 为 11 passed。
 
@@ -38,7 +38,7 @@
   - 结果: `251 passed in ~41.03s` (0 failed, 0 skipped)
 
 ### 看板与 Git 状态
-- `T0020` 已依法完成【测试中 → 已完成 → 已验收】，2B 范围正式冻结。
+- `T0020` 已依法完成【测试中 -> 已完成 -> 已验收】，2B 范围正式冻结。
 - Codex 最终验收命令：`python -m pytest tests/test_evidence.py tests/test_host_adapter.py -q -rs`，退出码 0，`25 passed in 0.96s`。
 - Codex 全量命令：`python -m pytest tests -q -rs`，退出码 0，`251 passed in 41.08s`，0 failed，0 skipped。
 - `git diff --check` 退出码 0；候选代码提交为 `f6b79e903fb39d8724bfe303e817d7a0748cd7b6`。
@@ -50,43 +50,65 @@
 - **基线提交**: 4c61976e492d163b369a75bbb80afaf2bbb69e33
 
 ### 核心实现方案
-1. **Worktree Schema 抽象**: 引入 \WorktreeRequest\、\WorktreeDescriptor\ 和 \WorktreeStatus\ 三层结构，使用严格的 dataclass 和 \reeze_value\ 提供深度不可变性。
+1. **Worktree Schema 抽象**: 引入 `WorktreeRequest`、`WorktreeDescriptor` 和 `WorktreeStatus` 三层结构，使用严格的 dataclass 和 `freeze_value` 提供深度不可变性。
 2. **WorktreeManager**:
-   - 依赖注入: \controlled_root\ 和 \	arget_repo_path\，强制绝对路径约束。
-   - 并发创建保护: \worktree_id\ 唯一且具有原子级别锁定（使用 \os.O_CREAT | os.O_EXCL\ 生成锁文件）。
-   - 真实校验: 严格验证 \git rev-parse --absolute-git-dir\ 和 \--git-common-dir\。
-   - 目录与分支名安全: 正则验证和 \git check-ref-format\ 防御注入，隔离逃逸目录限制（阻止 \../\ 和 Symlink/Junction 等攻击）。
-   - 只读与清理计划: \erify\ 和 \inspect\ 只读执行 Git 解析，\get_cleanup_plan\ 返回不带有破坏性清理动作的结构化计划。
-   - 完全抽离注册表: .registry 存储在 Agent worktree 外部，确保 \git status\ 原生干净，实施严格交叉核验。
+   - 依赖注入: `controlled_root` 和 `target_repo_path`，强制绝对路径约束。
+   - 并发创建保护: 先创建唯一 Git branch 作为跨进程原子锁，再以 `os.O_CREAT | os.O_EXCL` 创建 Registry 文件。
+   - 真实校验: 严格验证 `git rev-parse --absolute-git-dir` 和 `--git-common-dir`。
+   - 目录与分支名安全: 正则验证和 `git check-ref-format` 防御注入，隔离逃逸目录限制（阻止 `../` 和 Symlink/Junction 等攻击）。
+   - 只读与清理计划: `verify` 和 `inspect` 只读执行 Git 解析，`get_cleanup_plan` 返回不带有破坏性清理动作的结构化计划。
+   - 完全抽离注册表: `.registry` 存储在 Agent worktree 外部，确保 `git status` 原生干净，实施严格交叉核验。
 3. **测试覆盖**:
-   - \	est_worktree_manager.py\ 通过真实 \pytest tmp_path\ 生成 Git 临时空仓库并挂载文件流。
-   - 测试涵盖全场景: 绝对路径逃逸防御、并发覆盖防护、非法命令注入拦截、清理不落盘、linked worktree 场景验证。
+   - `test_worktree_manager.py` 通过真实 `pytest tmp_path` 生成 Git 临时空仓库并挂载文件流。
+   - 测试涵盖全场景: 绝对路径逃逸防御、并发覆盖防护、非法命令注入拦截、清理不落盘、linked worktree 场景验证、Registry 碰撞保全、短写防护与严格 Schema 校验。
 
-### 测试记录
-- **定向工作树测试**: \python -m pytest tests/test_worktree_manager.py -q -rs\ -> 13 passed (0 failed, 0 skipped)
-- **定向环境测试**: \python -m pytest tests/test_host_adapter.py tests/test_evidence.py -q -rs\ -> 25 passed
-- **全量测试**: \python -m pytest tests -q -rs\ -> 264 passed (0 failed, 0 skipped)
-- **代码规范**: \git diff --check\ -> 通过无报错
+### 测试记录（最新真实数据）
+- **定向工作树测试**: `python -m pytest tests/test_worktree_manager.py -q -rs` -> `22 passed in 12.83s` (0 failed, 0 skipped)
+- **定向环境测试**: `python -m pytest tests/test_host_adapter.py tests/test_evidence.py -q -rs` -> `25 passed in 1.38s` (0 failed, 0 skipped)
+- **全量测试**: `python -m pytest tests -q -rs` -> `273 passed in 56.15s` (0 failed, 0 skipped)
+- **代码规范**: `git diff --check` -> 退出码 0，零尾随空白错误
 
-### 2C 返工修复记录（DEF-T0023-1 ~ 9）
-1. **[DEF-T0023-1, 5, 6] 注册表独立与严格核验**: 将元数据抽离到 .registry 独立目录，不仅恢复了原生 clean 状态，并且实施了最严格的字典交叉核验（重建 ID、对比所有路径和分支）。对损坏或篡改的登记文件强 fail-closed。
-2. **[DEF-T0023-2] 完善 verify() 的 Fail-Closed**: 增加了对 OSError 的捕获。
+### 2C 历次返工修复记录
+
+#### DEF-T0023-1 ~ 9 修复
+1. **[DEF-T0023-1, 5, 6] 注册表独立与严格核验**: 将元数据抽离到 `.registry` 独立目录，恢复原生 clean 状态，并实施字典交叉核验（重建 ID、对比路径和分支），对损坏或篡改强 Fail-Closed。
+2. **[DEF-T0023-2] 完善 verify() 的 Fail-Closed**: 增加了对 OSError 和所有异常的捕获。
 3. **[DEF-T0023-3] 代码格式**: 彻底清除了所有尾随空白。
-4. **[DEF-T0023-4] 失败保留分支**: 移除 \ranch -D\，在 worktree 创建失败时报错提醒 recovery_required。
-5. **[DEF-T0023-7] 40位 SHA 校验**: 在创建前统一转化为 canonical 小写，并在元数据与请求中拦截短 SHA 与无效引用。
-6. **[DEF-T0023-8] 清理计划结构化**: \get_cleanup_plan\ 不再生成 raw git string，改用安全的纯数据格式。
-7. **[DEF-T0023-9] 只读 list_worktrees**: 实现了无副作用的 \list_worktrees\，并对损坏记录保持 fail-closed。
+4. **[DEF-T0023-4] 失败保留分支**: 移除 `branch -D`，在 worktree 创建失败时报错提醒 `recovery_required`。
+5. **[DEF-T0023-7] 40位 SHA 校验**: 在创建前统一验证，在元数据与请求中拦截短 SHA 与无效引用。
+6. **[DEF-T0023-8] 清理计划结构化**: `get_cleanup_plan` 不再生成 raw git string，改用安全的纯数据格式。
+7. **[DEF-T0023-9] 只读 list_worktrees**: 实现了无副作用的 `list_worktrees`，并对损坏记录保持 Fail-Closed。
 
-### 2C 返工修复记录（DEF-T0023-10 ~ 11）
-1. **[DEF-T0023-10] 完善 Registry 根类型校验**: 在 \inspect()\ 中增加 \isinstance(data, dict)\ 的断言，彻底封堵了由于 \json.load\ 解析出列表、整数、字符串或 null 时导致后续字典读取触发 \AttributeError\ 的漏洞。如今面对任意合法的非对象 JSON 亦能稳定返回安全错误（Fail-Closed）。
-2. **[DEF-T0023-11] 修复 Create 失败路径 Registry 残留阻塞重试**: 在 \create_worktree()\ 中，若其后的 Git 分支创建（如已存在）或 Worktree 创建抛出异常失败，会主动将刚建立的 registry 元数据撤销/清理（\os.unlink\），从而防止失败导致的悬挂元数据永久性阻塞后续的重试尝试。
+#### DEF-T0023-10 ~ 11 修复（含历史缺陷标注）
+1. **[DEF-T0023-10] 完善 Registry 根类型校验**: 在 `inspect()` 中增加 `isinstance(data, dict)` 断言，封堵由于非对象 JSON 触发 `AttributeError` 的漏洞。
+2. **[DEF-T0023-11] [历史阶段性尝试/已在 DEF-T0023-14 彻底废弃]**: 该阶段曾尝试在失败路径执行 `os.unlink` 清理元数据；后因引入路径竞态 (TOCTOU)，已在 DEF-T0023-14 及后续版本中彻底废除一切自动 `unlink`，全面转为保留现场的 Fail-Closed 恢复架构。
 
-### 2C 返工修复记录（DEF-T0023-12 ~ 13）
-1. **[DEF-T0023-12] 严密的 Registry 身份与所有权回滚**: 彻底修正了 \create_worktree()\ 中的文件回滚漏洞。不再使用简单且具有竞态风险的 \os.path.exists()\ 判断。利用 \os.fstat(fd)\ 锁定 O_EXCL 创建时的 inode (\st_ino\) 与 device ID (\st_dev\)，当且仅当 \os.lstat()\ 证实元数据文件身份一致、且严格比对写入二进制内容无篡改后，才准许 \os.unlink()\ 进行安全回滚，对外部恶意替换/Symlink/Junction 免疫。
-2. **[DEF-T0023-13] 高强度的 Schema 与提交真实性防御**: 在 \inspect()\ 加入了极致的字典边界与类型校验。拒绝包含不合理 Float 的假造时间，强制 \isinstance(val, str)\ 检测。对 baseline_commit 进行底层 \git rev-parse\ 严格双重校验，保证内外 commit 与请求绝对一致。对于任何畸变类型强制抛出 \WorktreeSecurityError\，使门禁校验 (\erify()\) 永远返回无效而非抛出异常裸奔（Fail-Closed）。
+#### DEF-T0023-12 ~ 13 修复（含历史缺陷标注）
+1. **[DEF-T0023-12] [历史阶段性尝试/已在 DEF-T0023-14 彻底废弃]**: 该阶段曾尝试通过 `lstat/fstat` 校验文件身份后执行回滚；后经独立复现证实路径仍存在读取后删除前的 TOCTOU 窗口，已在 DEF-T0023-14 中彻底弃用回滚删除逻辑。
+2. **[DEF-T0023-13] 高强度的 Schema 与提交真实性防御**: 在 `inspect()` 加入字典边界与类型校验。拒绝包含不合理 Float 的假造时间，对 `baseline_commit` 进行底层 `git rev-parse` 严格双重校验。
 
-### 2C 返工修复记录（DEF-T0023-14 ~ 17）
-1. **[DEF-T0023-14] 彻底消除回滚 TOCTOU 竞态**: 摒弃了基于 lstat 和 hash 比较后删除文件的复杂逻辑。直接确立了无竞态的安全生成顺序：1) 校验通过并生成唯一 Git branch（占位）；2) 使用 O_EXCL 创建 Registry；3) 如果任意后续操作（写入、worktree add）失败，原样保留遗留的分支和 Registry 现场以供追溯和人工干预。在抛出的 WorktreeError 中附带 `recovery_required=True, branch_retained=True` 结构化字段，永不在事后静默抹除外挂资源，全面践行 Fail-Closed。
-2. **[DEF-T0023-15] Registry OS.write 短写保护与持久化**: 使用 `memoryview` 与循环 `write-all` 模式对 `os.write` 的字节数进行严密确认。若出现 0 字节、负数或异常则立即终止并抛出恢复警告；一切数据落盘循环完成后强制 `os.fsync` 确保数据被刷新到介质，最后才启动 `git worktree add`。
-3. **[DEF-T0023-16] 严苛的 Canonical SHA1 同态断言**: 不再主动提供大写转小写的柔性兼容。入参强制进行 `^[0-9a-f]{40}$`（只能是小写完整态）匹配。校验 `git rev-parse` 返回结果时，严格要求与入参 SHA 完全相同；内外 baseline 在各种接口均交叉对齐，从源头上杜绝了注入。
-4. **[DEF-T0023-17] 卫生清理与测试重构**: 彻底清理了三个临时脚本与无效提交。测试用例全系升维：加入了 OS.write 的三种模拟、`copy.deepcopy` 数据防污染改造、多类校验拒绝模拟，所有 `verify` 全面退守至全 False 安全面。
+#### DEF-T0023-14 ~ 17 修复
+1. **[DEF-T0023-14] 彻底消除回滚 TOCTOU 竞态**: 摒弃一切基于路径解析的删除逻辑，确立零 unlink 架构：1) 校验通过并生成唯一 Git branch（跨进程原子锁）；2) 以 `O_EXCL` 创建 Registry；3) 若写入或 worktree add 失败，原样保留已创建的 branch 和 Registry 现场以供审计与人工干预，在 `WorktreeError` 中附带结构化字段 `recovery_required=True, branch_retained=True, registry_retained=True`。
+2. **[DEF-T0023-15] Registry os.write 短写保护与持久化**: 使用 `memoryview` 与循环 `write-all` 模式对 `os.write` 进行字节确认，写完后强制 `os.fsync`，最后才启动 `git worktree add`。
+3. **[DEF-T0023-16] 严苛的小写 Canonical SHA-1 同态断言**: 入参强制使用 `^[0-9a-f]{40}$` 正则严格校验，禁止隐式 `lower()` 宽容转换，`git rev-parse` 解析结果必须与输入 SHA 完全相同。
+4. **[DEF-T0023-17] 卫生清理与测试隔离**: 清理临时脚本与未跟踪残留，测试数据全面使用 `copy.deepcopy` 防污染。
+
+#### DEF-T0023-18 ~ 22 修复（当前最终版本）
+1. **[DEF-T0023-18] Registry 顶层与 Request 精确键集合及控制字符/空白防御**:
+   - `inspect()` 中强制校验顶层 Registry 键集合必须完全等于 `{"worktree_id", "absolute_path", "branch_name", "baseline_commit", "created_at", "request"}`。
+   - `request` 键集合必须完全等于 `{"project_id", "task_id", "actor_role", "host_session_id", "baseline_commit"}`。
+   - 任何多余未知字段、缺失字段均立即抛出 `WorktreeSecurityError` 并使 `verify()` Fail-Closed。
+   - 所有字符串字段强制检查：非字符串类型拒绝、纯空白 (`not val.strip()`) 拒绝、ASCII 控制字符 (`[\x00-\x1f\x7f]`) 拒绝。
+2. **[DEF-T0023-19] 修正 Registry 创建碰撞与准确的现场保留证据**:
+   - 在 `create_worktree()` 中精确区分创建失败的现场状态：
+     - 当 `os.open` 捕获 `FileExistsError`（外部已有 Registry 碰撞，`existing_foreign_registry`）时，现场已成功创建 Git 分支且外部 Registry 实际存在，准确上报 `recovery_required=True, branch_retained=True, registry_retained=True`，绝不误报 `registry_retained=False`，且绝不自动删除外部文件。
+     - 当 `os.open` 捕获其他 `OSError`（如无权限/目录不存在，`no_registry`）时，上报 `recovery_required=True, branch_retained=True, registry_retained=False`。
+     - 当写入循环中途失败（`partial_owned_registry`）或 `git worktree add` 失败时，现场分支与 Registry 均已创建，准确上报 `recovery_required=True, branch_retained=True, registry_retained=True`。
+3. **[DEF-T0023-20] 完整恢复被删除/弱化的测试断言**:
+   - 恢复 `desc.request == req`、`branch_name` 包含工作流命名规则断言。
+   - 恢复 `cleanup_plan` 不含可执行命令断言。
+   - 恢复并发碰撞测试中失败异常必须为 `WorktreeSecurityError` 且包含 `already exists` 语义的严格断言。
+4. **[DEF-T0023-21] 规范化提交证据链**:
+   - 基于基线 `5e8ae06` 正常追加新提交，绝不使用 amend/rebase 改写历史，并由 DEV 角色在看板流转中写入真实候选 SHA。
+5. **[DEF-T0023-22] 实施报告格式与历史结论全面修正**:
+   - 彻底清除报告中的所有控制字符和转义反斜杠，将历史回滚尝试明确标注为历史废弃机制，并更新真实的测试覆盖数据（22 passed / 25 passed / 273 passed）。

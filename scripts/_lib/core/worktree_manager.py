@@ -121,7 +121,7 @@ class WorktreeManager:
         }
         meta_bytes = json.dumps(meta_dict, ensure_ascii=False).encode('utf-8')
 
-        # DEF-T0023-14 & 15: Create Branch FIRST. If it fails, no registry was created.
+        # 1. Create Git branch as atomic cross-process lock
         try:
             self._run_git(self.target_repo_path, ["branch", branch_name, canonical_commit])
         except WorktreeGitError as e:
@@ -129,7 +129,7 @@ class WorktreeManager:
                 raise WorktreeSecurityError(f"Branch {branch_name} already exists.")
             raise
 
-        # Create Registry with write-all and fsync
+        # 2. Create Registry with write-all and fsync
         try:
             fd = os.open(meta_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
             try:
@@ -143,18 +143,22 @@ class WorktreeManager:
                     written += w
                 os.fsync(fd)
             except Exception as e:
-                # Retain branch if registry write fails
-                raise WorktreeError(f"Registry write failed. recovery_required=True, branch_retained=True, registry_retained=True. Stderr: {str(e)}", recovery_required=True, branch_retained=True, registry_retained=True)
+                # File was created, fd opened -> partial_owned_registry
+                raise WorktreeError(f"Registry write failed (partial_owned_registry): {str(e)}. recovery_required=True, branch_retained=True, registry_retained=True", recovery_required=True, branch_retained=True, registry_retained=True)
             finally:
                 os.close(fd)
-        except (FileExistsError, OSError) as e:
-            raise WorktreeError(f"Registry creation failed: {str(e)}. recovery_required=True, branch_retained=True, registry_retained=False", recovery_required=True, branch_retained=True, registry_retained=False)
+        except FileExistsError as e:
+            # File already existed on disk -> existing_foreign_registry
+            raise WorktreeError(f"Registry collision (existing_foreign_registry): {meta_path} already exists. recovery_required=True, branch_retained=True, registry_retained=True", recovery_required=True, branch_retained=True, registry_retained=True)
+        except OSError as e:
+            # Failed to create/open file -> no_registry
+            raise WorktreeError(f"Registry creation failed (no_registry): {str(e)}. recovery_required=True, branch_retained=True, registry_retained=False", recovery_required=True, branch_retained=True, registry_retained=False)
 
-        # Create Worktree
+        # 3. Create Worktree
         try:
             self._run_git(self.target_repo_path, ["worktree", "add", path, branch_name])
         except WorktreeGitError as e:
-            # Retain everything
+            # Branch and Registry retained for audit / recovery
             raise WorktreeError(f"Git worktree add failed. recovery_required=True, branch_retained=True, registry_retained=True. Stderr: {str(e)}", recovery_required=True, branch_retained=True, registry_retained=True)
 
         return desc
@@ -173,9 +177,19 @@ class WorktreeManager:
         if not isinstance(data, dict):
             raise WorktreeSecurityError("Corrupt registry: JSON root must be an object")
 
+        EXPECTED_ROOT_KEYS = {"worktree_id", "absolute_path", "branch_name", "baseline_commit", "created_at", "request"}
+        if set(data.keys()) != EXPECTED_ROOT_KEYS:
+            raise WorktreeSecurityError(f"Corrupt registry: top-level keys mismatch. Expected {EXPECTED_ROOT_KEYS}, got {set(data.keys())}")
+
         def _assert_str(val, name):
-            if not isinstance(val, str) or not val:
-                raise WorktreeSecurityError(f"Corrupt registry: {name} must be a non-empty string")
+            if not isinstance(val, str):
+                raise WorktreeSecurityError(f"Corrupt registry: {name} must be a string, got {type(val).__name__}")
+            if not val:
+                raise WorktreeSecurityError(f"Corrupt registry: {name} cannot be empty")
+            if not val.strip():
+                raise WorktreeSecurityError(f"Corrupt registry: {name} cannot be whitespace-only")
+            if re.search(r'[\x00-\x1f\x7f]', val):
+                raise WorktreeSecurityError(f"Corrupt registry: {name} contains control characters")
 
         def _assert_float(val, name):
             if isinstance(val, bool) or not isinstance(val, (int, float)):
@@ -184,21 +198,25 @@ class WorktreeManager:
             if math.isnan(val) or math.isinf(val) or val <= 0 or val > time.time() + 86400:
                 raise WorktreeSecurityError(f"Corrupt registry: {name} invalid time")
 
-        _assert_str(data.get("worktree_id"), "worktree_id")
-        _assert_str(data.get("absolute_path"), "absolute_path")
-        _assert_str(data.get("branch_name"), "branch_name")
-        _assert_str(data.get("baseline_commit"), "baseline_commit")
-        _assert_float(data.get("created_at"), "created_at")
+        _assert_str(data["worktree_id"], "worktree_id")
+        _assert_str(data["absolute_path"], "absolute_path")
+        _assert_str(data["branch_name"], "branch_name")
+        _assert_str(data["baseline_commit"], "baseline_commit")
+        _assert_float(data["created_at"], "created_at")
 
-        req_data = data.get("request")
+        req_data = data["request"]
         if not isinstance(req_data, dict):
              raise WorktreeSecurityError("Corrupt registry: missing or invalid request object")
 
-        _assert_str(req_data.get("project_id"), "request.project_id")
-        _assert_str(req_data.get("task_id"), "request.task_id")
-        _assert_str(req_data.get("actor_role"), "request.actor_role")
-        _assert_str(req_data.get("host_session_id"), "request.host_session_id")
-        _assert_str(req_data.get("baseline_commit"), "request.baseline_commit")
+        EXPECTED_REQ_KEYS = {"project_id", "task_id", "actor_role", "host_session_id", "baseline_commit"}
+        if set(req_data.keys()) != EXPECTED_REQ_KEYS:
+            raise WorktreeSecurityError(f"Corrupt registry: request keys mismatch. Expected {EXPECTED_REQ_KEYS}, got {set(req_data.keys())}")
+
+        _assert_str(req_data["project_id"], "request.project_id")
+        _assert_str(req_data["task_id"], "request.task_id")
+        _assert_str(req_data["actor_role"], "request.actor_role")
+        _assert_str(req_data["host_session_id"], "request.host_session_id")
+        _assert_str(req_data["baseline_commit"], "request.baseline_commit")
 
         if data["baseline_commit"] != req_data["baseline_commit"]:
             raise WorktreeSecurityError("Corrupt registry: baseline_commit mismatch between outer and request")
@@ -221,11 +239,11 @@ class WorktreeManager:
 
         if rebuilt_id != worktree_id:
             raise WorktreeSecurityError("Registry spoofed: reconstructed ID mismatch.")
-        if data.get("worktree_id") != worktree_id:
+        if data["worktree_id"] != worktree_id:
             raise WorktreeSecurityError("Registry spoofed: worktree_id mismatch.")
-        if data.get("absolute_path") != expected_path:
+        if data["absolute_path"] != expected_path:
             raise WorktreeSecurityError("Registry spoofed: absolute_path mismatch.")
-        if data.get("branch_name") != expected_branch:
+        if data["branch_name"] != expected_branch:
             raise WorktreeSecurityError("Registry spoofed: branch_name mismatch.")
 
         return WorktreeDescriptor(
@@ -271,7 +289,7 @@ class WorktreeManager:
                 untracked_files=untracked,
                 modified_files=modified
             )
-        except (WorktreeGitError, WorktreeError, OSError):
+        except (WorktreeGitError, WorktreeError, OSError, Exception):
             return WorktreeStatus(False, False, "", "", 0, 0)
 
     def list_worktrees(self, project_id: str) -> List[WorktreeDescriptor]:

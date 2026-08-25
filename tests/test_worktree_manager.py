@@ -5,6 +5,7 @@ import time
 import shutil
 import json
 import copy
+import stat
 from concurrent.futures import ThreadPoolExecutor
 
 from scripts._lib.core.worktree_schema import (
@@ -34,8 +35,16 @@ def manager(tmp_path, test_repo):
 
 def test_worktree_creation_and_inspection(manager, test_repo):
     repo_path, commit_hash = test_repo
-    req = WorktreeRequest("proj1", "T001", "DEV", "sess1", commit_hash)
+    req = WorktreeRequest(
+        project_id="proj1",
+        task_id="T001",
+        actor_role="DEV",
+        host_session_id="sess1",
+        baseline_commit=commit_hash
+    )
     desc = manager.create_worktree(req)
+    assert desc.request == req
+    assert "proj1-T001-DEV-sess1" in desc.branch_name
     assert os.path.exists(desc.absolute_path)
 
     # Meta should NOT be inside worktree
@@ -44,6 +53,7 @@ def test_worktree_creation_and_inspection(manager, test_repo):
     # Inspect
     inspected = manager.inspect(desc.worktree_id)
     assert inspected.branch_name == desc.branch_name
+    assert inspected.request == req
 
     # Verify
     status = manager.verify(desc.worktree_id)
@@ -114,7 +124,8 @@ def test_concurrency_collision(manager, test_repo):
     assert len(success) == 1
     assert len(failures) == 4
     for f in failures:
-        assert isinstance(f, WorktreeError)
+        assert isinstance(f, WorktreeSecurityError)
+        assert "already exists" in str(f)
 
 def test_spaces_in_path(tmp_path):
     repo_dir = tmp_path / "my target repo"
@@ -286,9 +297,9 @@ def test_worktree_add_fails_retains_branch_and_registry(manager, test_repo):
     with pytest.raises(WorktreeError) as exc_info:
         manager.create_worktree(req)
 
-    assert exc_info.value.recovery_required
-    assert exc_info.value.branch_retained
-    assert exc_info.value.registry_retained
+    assert exc_info.value.recovery_required is True
+    assert exc_info.value.branch_retained is True
+    assert exc_info.value.registry_retained is True
 
     manager._run_git = original_run_git
     worktree_id = f"{req.project_id}-{req.task_id}-{req.actor_role}-{req.host_session_id}"
@@ -314,9 +325,9 @@ def test_os_write_failures(manager, test_repo, monkeypatch):
     monkeypatch.setattr(os, "write", mock_write_0byte)
     with pytest.raises(WorktreeError) as exc_info:
         manager.create_worktree(req2)
-    assert exc_info.value.recovery_required
-    assert exc_info.value.branch_retained
-    assert exc_info.value.registry_retained
+    assert exc_info.value.recovery_required is True
+    assert exc_info.value.branch_retained is True
+    assert exc_info.value.registry_retained is True
 
     req3 = WorktreeRequest("p", "t", "DEV", "failwt4", commit_hash)
     def mock_write_exc(fd, view):
@@ -324,12 +335,137 @@ def test_os_write_failures(manager, test_repo, monkeypatch):
     monkeypatch.setattr(os, "write", mock_write_exc)
     with pytest.raises(WorktreeError) as exc_info:
         manager.create_worktree(req3)
-    assert exc_info.value.recovery_required
-    assert exc_info.value.branch_retained
-    assert exc_info.value.registry_retained
+    assert exc_info.value.recovery_required is True
+    assert exc_info.value.branch_retained is True
+    assert exc_info.value.registry_retained is True
 
 def test_canonical_commit_uppercase_rejected(manager, test_repo):
     _, commit_hash = test_repo
     req = WorktreeRequest("p", "t", "DEV", "upp", commit_hash.upper())
     with pytest.raises(WorktreeSecurityError, match="lowercase full 40-char SHA"):
         manager.create_worktree(req)
+
+def test_inspect_unknown_and_missing_keys_rejected(manager, test_repo):
+    _, commit_hash = test_repo
+    req = WorktreeRequest("p", "t", "DEV", "keys", commit_hash)
+    d = manager.create_worktree(req)
+    meta_path = os.path.join(manager.registry_dir, f"{d.worktree_id}.json")
+
+    with open(meta_path, 'r', encoding='utf-8') as f:
+        original_data = json.load(f)
+
+    # 1. Extra key in root
+    tampered = copy.deepcopy(original_data)
+    tampered["unexpected_root_key"] = "evil"
+    with open(meta_path, 'w', encoding='utf-8') as f:
+        json.dump(tampered, f)
+    with pytest.raises(WorktreeSecurityError, match="top-level keys mismatch"):
+        manager.inspect(d.worktree_id)
+    assert not manager.verify(d.worktree_id).is_valid
+
+    # 2. Missing key in root
+    tampered = copy.deepcopy(original_data)
+    del tampered["created_at"]
+    with open(meta_path, 'w', encoding='utf-8') as f:
+        json.dump(tampered, f)
+    with pytest.raises(WorktreeSecurityError, match="top-level keys mismatch"):
+        manager.inspect(d.worktree_id)
+    assert not manager.verify(d.worktree_id).is_valid
+
+    # 3. Extra key in request
+    tampered = copy.deepcopy(original_data)
+    tampered["request"]["unexpected_req_key"] = "evil"
+    with open(meta_path, 'w', encoding='utf-8') as f:
+        json.dump(tampered, f)
+    with pytest.raises(WorktreeSecurityError, match="request keys mismatch"):
+        manager.inspect(d.worktree_id)
+    assert not manager.verify(d.worktree_id).is_valid
+
+    # 4. Missing key in request
+    tampered = copy.deepcopy(original_data)
+    del tampered["request"]["actor_role"]
+    with open(meta_path, 'w', encoding='utf-8') as f:
+        json.dump(tampered, f)
+    with pytest.raises(WorktreeSecurityError, match="request keys mismatch"):
+        manager.inspect(d.worktree_id)
+    assert not manager.verify(d.worktree_id).is_valid
+
+def test_inspect_control_chars_and_whitespace_rejected(manager, test_repo):
+    _, commit_hash = test_repo
+    req = WorktreeRequest("p", "t", "DEV", "chars", commit_hash)
+    d = manager.create_worktree(req)
+    meta_path = os.path.join(manager.registry_dir, f"{d.worktree_id}.json")
+
+    with open(meta_path, 'r', encoding='utf-8') as f:
+        original_data = json.load(f)
+
+    # Control chars in fields
+    for ctrl in ["\n", "\r", "\t", "\x00", "\x1f", "\x7f"]:
+        tampered = copy.deepcopy(original_data)
+        tampered["request"]["task_id"] = f"T001{ctrl}evil"
+        with open(meta_path, 'w', encoding='utf-8') as f:
+            json.dump(tampered, f)
+        with pytest.raises(WorktreeSecurityError, match="control characters"):
+            manager.inspect(d.worktree_id)
+        assert not manager.verify(d.worktree_id).is_valid
+
+    # Whitespace-only in string fields
+    tampered = copy.deepcopy(original_data)
+    tampered["request"]["actor_role"] = "   "
+    with open(meta_path, 'w', encoding='utf-8') as f:
+        json.dump(tampered, f)
+    with pytest.raises(WorktreeSecurityError, match="whitespace-only"):
+        manager.inspect(d.worktree_id)
+    assert not manager.verify(d.worktree_id).is_valid
+
+    # Non-string types in string fields
+    for invalid_val in [123, True, ["list"], {"dict": 1}]:
+        tampered = copy.deepcopy(original_data)
+        tampered["request"]["project_id"] = invalid_val
+        with open(meta_path, 'w', encoding='utf-8') as f:
+            json.dump(tampered, f)
+        with pytest.raises(WorktreeSecurityError, match="must be a string"):
+            manager.inspect(d.worktree_id)
+        assert not manager.verify(d.worktree_id).is_valid
+
+def test_registry_collision_foreign_evidence(manager, test_repo):
+    repo_path, commit_hash = test_repo
+    req = WorktreeRequest("pforeign", "t1", "DEV", "sesscoll", commit_hash)
+    worktree_id = f"{req.project_id}-{req.task_id}-{req.actor_role}-{req.host_session_id}"
+    meta_path = os.path.join(manager.registry_dir, f"{worktree_id}.json")
+
+    # Pre-create foreign registry file
+    foreign_content = json.dumps({"foreign": "unauthorized_data"}, ensure_ascii=False).encode('utf-8')
+    with open(meta_path, 'wb') as f:
+        f.write(foreign_content)
+
+    # Calling create_worktree should detect existing_foreign_registry collision
+    with pytest.raises(WorktreeError) as exc_info:
+        manager.create_worktree(req)
+
+    # Assert structured error evidence accurately reflects the site
+    assert exc_info.value.recovery_required is True
+    assert exc_info.value.branch_retained is True
+    assert exc_info.value.registry_retained is True
+    assert "existing_foreign_registry" in str(exc_info.value)
+
+    # Assert foreign file was NOT deleted or overwritten
+    assert os.path.exists(meta_path)
+    with open(meta_path, 'rb') as f:
+        assert f.read() == foreign_content
+
+    # Assert branch was created and retained
+    branch_name = f"agent-branch-{worktree_id}"
+    branch_check = subprocess.run(["git", "rev-parse", "--verify", branch_name], cwd=repo_path, stdout=subprocess.PIPE, text=True)
+    assert branch_check.returncode == 0
+
+def test_no_destructive_operations_in_product_code():
+    manager_file = os.path.join(os.path.dirname(__file__), "..", "scripts", "_lib", "core", "worktree_manager.py")
+    with open(manager_file, "r", encoding="utf-8") as f:
+        code = f.read()
+
+    assert "branch -D" not in code
+    assert "worktree remove" not in code
+    assert "git prune" not in code
+    assert "shell=True" not in code
+    assert "os.unlink" not in code
