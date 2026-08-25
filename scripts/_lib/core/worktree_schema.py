@@ -4,11 +4,12 @@ import types
 
 class WorktreeError(Exception):
     """Base exception for worktree operations."""
-    def __init__(self, message: str, recovery_required: bool = False, branch_retained: bool = False, registry_retained: bool = False):
+    def __init__(self, message: str, recovery_required: bool = False, branch_retained: bool = False, registry_retained: bool = False, tmp_retained: bool = False):
         super().__init__(message)
         self.recovery_required = recovery_required
         self.branch_retained = branch_retained
         self.registry_retained = registry_retained
+        self.tmp_retained = tmp_retained
 
 class WorktreeSecurityError(WorktreeError):
     pass
@@ -40,6 +41,9 @@ class WorktreeDescriptor:
     branch_name: str
     baseline_commit: str
     created_at: float
+    target_repo_root: str
+    git_common_dir: str
+    repository_identity: str
     request: WorktreeRequest
 
 @dataclass(frozen=True)

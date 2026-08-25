@@ -4,6 +4,7 @@ import subprocess
 import time
 import json
 import stat
+import hashlib
 from typing import List, Dict, Any
 
 from .worktree_schema import (
@@ -15,11 +16,43 @@ class WorktreeManager:
     def __init__(self, controlled_root: str, target_repo_path: str):
         self.controlled_root = os.path.realpath(os.path.abspath(controlled_root))
         self.target_repo_path = os.path.realpath(os.path.abspath(target_repo_path))
+        self.target_repo_root = self.target_repo_path
         os.makedirs(self.controlled_root, exist_ok=True)
         self.registry_dir = os.path.join(self.controlled_root, ".registry")
         os.makedirs(self.registry_dir, exist_ok=True)
         self._verify_repo_identity(self.target_repo_path)
         self._repo_git_dir = self._get_absolute_git_dir(self.target_repo_path)
+        self.git_common_dir = self._get_common_dir(self.target_repo_path)
+        self.repository_identity = self._compute_repo_identity(self.target_repo_root, self.git_common_dir)
+
+    def _compute_repo_identity(self, repo_root: str, common_dir: str) -> str:
+        raw = f"root:{os.path.normcase(repo_root)}|common:{os.path.normcase(common_dir)}"
+        digest = hashlib.sha256(raw.encode('utf-8')).hexdigest()
+        return f"repo-identity-{digest[:32]}"
+
+    def _compute_worktree_id(self, project_id: str, task_id: str, actor_role: str, host_session_id: str) -> str:
+        payload = json.dumps({
+            "actor_role": actor_role,
+            "host_session_id": host_session_id,
+            "project_id": project_id,
+            "task_id": task_id
+        }, sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode('utf-8')
+        digest = hashlib.sha256(payload).hexdigest()[:16]
+
+        safe_proj = re.sub(r'[^\w]', '_', project_id)[:16]
+        safe_task = re.sub(r'[^\w]', '_', task_id)[:16]
+        safe_role = re.sub(r'[^\w]', '_', actor_role)[:16]
+        return f"{safe_proj}_{safe_task}_{safe_role}_{digest}"
+
+    def _publish_registry_create_if_absent(self, tmp_path: str, meta_path: str):
+        if os.name == 'nt':
+            os.rename(tmp_path, meta_path)
+        else:
+            os.link(tmp_path, meta_path)
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
     def _run_git(self, cwd: str, args: List[str]) -> str:
         cmd = ["git"] + args
@@ -83,7 +116,12 @@ class WorktreeManager:
             raise WorktreeError(f"Commit {commit} does not exist in target repository.")
 
     def create_worktree(self, request: WorktreeRequest) -> WorktreeDescriptor:
-        worktree_id = f"{request.project_id}-{request.task_id}-{request.actor_role}-{request.host_session_id}"
+        worktree_id = self._compute_worktree_id(
+            request.project_id,
+            request.task_id,
+            request.actor_role,
+            request.host_session_id
+        )
         path = self._safe_path(worktree_id)
         branch_name = f"agent-branch-{worktree_id}"
 
@@ -103,6 +141,9 @@ class WorktreeManager:
             branch_name=branch_name,
             baseline_commit=canonical_commit,
             created_at=time.time(),
+            target_repo_root=self.target_repo_root,
+            git_common_dir=self.git_common_dir,
+            repository_identity=self.repository_identity,
             request=request
         )
         meta_dict = {
@@ -111,6 +152,9 @@ class WorktreeManager:
             "branch_name": desc.branch_name,
             "baseline_commit": desc.baseline_commit,
             "created_at": desc.created_at,
+            "target_repo_root": desc.target_repo_root,
+            "git_common_dir": desc.git_common_dir,
+            "repository_identity": desc.repository_identity,
             "request": {
                 "project_id": request.project_id,
                 "task_id": request.task_id,
@@ -129,9 +173,13 @@ class WorktreeManager:
                 raise WorktreeSecurityError(f"Branch {branch_name} already exists.")
             raise
 
-        # 2. Create Registry with write-all and fsync
+        # 2. Atomic publish of Registry via create-if-absent
+        tmp_filename = f".tmp-{worktree_id}-{os.getpid()}-{time.time_ns()}.json"
+        tmp_path = os.path.join(self.registry_dir, tmp_filename)
+        tmp_created = False
         try:
-            fd = os.open(meta_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            fd = os.open(tmp_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            tmp_created = True
             try:
                 view = memoryview(meta_bytes)
                 total = len(view)
@@ -142,23 +190,22 @@ class WorktreeManager:
                         raise OSError("os.write returned short count")
                     written += w
                 os.fsync(fd)
-            except Exception as e:
-                # File was created, fd opened -> partial_owned_registry
-                raise WorktreeError(f"Registry write failed (partial_owned_registry): {str(e)}. recovery_required=True, branch_retained=True, registry_retained=True", recovery_required=True, branch_retained=True, registry_retained=True)
             finally:
                 os.close(fd)
+        except Exception as e:
+            raise WorktreeError(f"Registry temp write failed (partial_owned_temp): {str(e)}. recovery_required=True, branch_retained=True, registry_retained=False, tmp_retained={tmp_created}", recovery_required=True, branch_retained=True, registry_retained=False, tmp_retained=tmp_created)
+
+        try:
+            self._publish_registry_create_if_absent(tmp_path, meta_path)
         except FileExistsError as e:
-            # File already existed on disk -> existing_foreign_registry
-            raise WorktreeError(f"Registry collision (existing_foreign_registry): {meta_path} already exists. recovery_required=True, branch_retained=True, registry_retained=True", recovery_required=True, branch_retained=True, registry_retained=True)
+            raise WorktreeError(f"Registry collision (existing_foreign_registry): {meta_path} already exists. recovery_required=True, branch_retained=True, registry_retained=True, tmp_retained=True", recovery_required=True, branch_retained=True, registry_retained=True, tmp_retained=True)
         except OSError as e:
-            # Failed to create/open file -> no_registry
-            raise WorktreeError(f"Registry creation failed (no_registry): {str(e)}. recovery_required=True, branch_retained=True, registry_retained=False", recovery_required=True, branch_retained=True, registry_retained=False)
+            raise WorktreeError(f"Registry publish failed: {str(e)}. recovery_required=True, branch_retained=True, registry_retained=False, tmp_retained=True", recovery_required=True, branch_retained=True, registry_retained=False, tmp_retained=True)
 
         # 3. Create Worktree
         try:
             self._run_git(self.target_repo_path, ["worktree", "add", path, branch_name])
         except WorktreeGitError as e:
-            # Branch and Registry retained for audit / recovery
             raise WorktreeError(f"Git worktree add failed. recovery_required=True, branch_retained=True, registry_retained=True. Stderr: {str(e)}", recovery_required=True, branch_retained=True, registry_retained=True)
 
         return desc
@@ -177,7 +224,11 @@ class WorktreeManager:
         if not isinstance(data, dict):
             raise WorktreeSecurityError("Corrupt registry: JSON root must be an object")
 
-        EXPECTED_ROOT_KEYS = {"worktree_id", "absolute_path", "branch_name", "baseline_commit", "created_at", "request"}
+        EXPECTED_ROOT_KEYS = {
+            "worktree_id", "absolute_path", "branch_name", "baseline_commit",
+            "created_at", "target_repo_root", "git_common_dir", "repository_identity",
+            "request"
+        }
         if set(data.keys()) != EXPECTED_ROOT_KEYS:
             raise WorktreeSecurityError(f"Corrupt registry: top-level keys mismatch. Expected {EXPECTED_ROOT_KEYS}, got {set(data.keys())}")
 
@@ -203,6 +254,17 @@ class WorktreeManager:
         _assert_str(data["branch_name"], "branch_name")
         _assert_str(data["baseline_commit"], "baseline_commit")
         _assert_float(data["created_at"], "created_at")
+        _assert_str(data["target_repo_root"], "target_repo_root")
+        _assert_str(data["git_common_dir"], "git_common_dir")
+        _assert_str(data["repository_identity"], "repository_identity")
+
+        # DEF-T0023-24: 1:1 repository identity check
+        if os.path.normcase(os.path.realpath(data["target_repo_root"])) != os.path.normcase(self.target_repo_root):
+            raise WorktreeSecurityError("Registry repository identity mismatch: target_repo_root")
+        if os.path.normcase(os.path.realpath(data["git_common_dir"])) != os.path.normcase(self.git_common_dir):
+            raise WorktreeSecurityError("Registry repository identity mismatch: git_common_dir")
+        if data["repository_identity"] != self.repository_identity:
+            raise WorktreeSecurityError("Registry repository identity mismatch: repository_identity")
 
         req_data = data["request"]
         if not isinstance(req_data, dict):
@@ -233,14 +295,12 @@ class WorktreeManager:
         if parsed_commit != data["baseline_commit"]:
             raise WorktreeSecurityError("Registry spoofed: baseline_commit canonical mismatch")
 
-        rebuilt_id = f"{req.project_id}-{req.task_id}-{req.actor_role}-{req.host_session_id}"
+        rebuilt_id = self._compute_worktree_id(req.project_id, req.task_id, req.actor_role, req.host_session_id)
         expected_path = self._safe_path(rebuilt_id)
         expected_branch = f"agent-branch-{rebuilt_id}"
 
-        if rebuilt_id != worktree_id:
+        if rebuilt_id != worktree_id or data["worktree_id"] != worktree_id:
             raise WorktreeSecurityError("Registry spoofed: reconstructed ID mismatch.")
-        if data["worktree_id"] != worktree_id:
-            raise WorktreeSecurityError("Registry spoofed: worktree_id mismatch.")
         if data["absolute_path"] != expected_path:
             raise WorktreeSecurityError("Registry spoofed: absolute_path mismatch.")
         if data["branch_name"] != expected_branch:
@@ -252,6 +312,9 @@ class WorktreeManager:
             branch_name=data["branch_name"],
             baseline_commit=data["baseline_commit"],
             created_at=data["created_at"],
+            target_repo_root=data["target_repo_root"],
+            git_common_dir=data["git_common_dir"],
+            repository_identity=data["repository_identity"],
             request=req
         )
 
@@ -260,8 +323,7 @@ class WorktreeManager:
             desc = self.inspect(worktree_id)
 
             common_dir = self._get_common_dir(desc.absolute_path)
-            repo_common_dir = self._get_common_dir(self.target_repo_path)
-            if common_dir != repo_common_dir:
+            if common_dir != self.git_common_dir:
                  return WorktreeStatus(False, False, "", "", 0, 0)
 
             current_commit = self._run_git(desc.absolute_path, ["rev-parse", "HEAD"])
@@ -298,13 +360,19 @@ class WorktreeManager:
             return results
 
         for fname in os.listdir(self.registry_dir):
-            if not fname.endswith(".json"): continue
+            if not fname.endswith(".json") or fname.startswith("."):
+                continue
             wid = fname[:-5]
             try:
                 desc = self.inspect(wid)
                 if desc.request.project_id == project_id:
                     results.append(desc)
-            except (WorktreeError, WorktreeSecurityError):
+            except WorktreeSecurityError as e:
+                # If repository identity doesn't match this Manager, skip foreign repo worktree
+                if "repository identity mismatch" in str(e).lower():
+                    continue
+                raise WorktreeError(f"Corrupt registry detected during list: {wid}")
+            except WorktreeError:
                 raise WorktreeError(f"Corrupt registry detected during list: {wid}")
         return results
 

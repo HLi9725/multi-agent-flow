@@ -24,7 +24,7 @@
    - 为避免直接修改已冻结的 2A 契约实体 (`AgentHandle`) 导致范围越界，现显式要求调用门禁的校验上下文 `EvidenceValidationContext` 直接携带来自业务最顶层、无可篡改的期望数据：`expected_invocation_id`、`expected_workspace_mode` 和 `expected_adapter`。
    - 这完全废弃了之前 `hasattr` 探测死代码的隐患，并在核心门禁层直接与存盘自报数据作双向不可为空 (`None!=None`) 的严格比较。由于不再仅靠不包含敏感词来放行，彻底断绝了伪造上下文蒙混过关的漏洞。
 2. **[DEF-T0020-4] 证据类型重放拦截**：
-   - 为上下文显式引入了 `expected_evidence_type`。当前每一次对 Evidence 校验不仅核对业务流转和主机属性，更强制核对其本身的类别必须属于所期生命周期事件，杜结跨证据类型的挂羊头卖狗肉（重放拦截）。
+   - 为上下文显式引入了 `expected_evidence_type`。当前每一次对 Evidence 校验不仅核对业务流转和主机属性，更强制核对其本身的类别必须属于所期生命周期事件，杜绝跨证据类型的挂羊头卖狗肉（重放拦截）。
 3. **[DEF-T0020-5] 实施报告统计修正**：
    - 已根据最新执行结果如实登记 `test_host_adapter.py` 为 11 passed。
 
@@ -53,19 +53,21 @@
 1. **Worktree Schema 抽象**: 引入 `WorktreeRequest`、`WorktreeDescriptor` 和 `WorktreeStatus` 三层结构，使用严格的 dataclass 和 `freeze_value` 提供深度不可变性。
 2. **WorktreeManager**:
    - 依赖注入: `controlled_root` 和 `target_repo_path`，强制绝对路径约束。
-   - 并发创建保护: 先创建唯一 Git branch 作为跨进程原子锁，再以 `os.O_CREAT | os.O_EXCL` 创建 Registry 文件。
+   - 仓库身份绑定: 显式记录并双向核验 `target_repo_root`、`git_common_dir` 和由其唯一计算的 `repository_identity`，杜绝多仓库跨登记冒充。
+   - 隔离 ID 无歧义: 采用 Canonical JSON 字典规范化与 SHA-256 摘要哈希计算隔离标识，根除字段连字符拼接时的边界碰撞。
+   - 并发创建与原子发布保护: 先创建唯一 Git branch 作为跨进程原子锁，写入独立临时文件完成 write-all 和 fsync 后，通过 create-if-absent 原子发布到最终 Registry 路径，确保写入期间并发 inspect/list 绝观察不到半成品文件。
    - 真实校验: 严格验证 `git rev-parse --absolute-git-dir` 和 `--git-common-dir`。
    - 目录与分支名安全: 正则验证和 `git check-ref-format` 防御注入，隔离逃逸目录限制（阻止 `../` 和 Symlink/Junction 等攻击）。
    - 只读与清理计划: `verify` 和 `inspect` 只读执行 Git 解析，`get_cleanup_plan` 返回不带有破坏性清理动作的结构化计划。
    - 完全抽离注册表: `.registry` 存储在 Agent worktree 外部，确保 `git status` 原生干净，实施严格交叉核验。
 3. **测试覆盖**:
    - `test_worktree_manager.py` 通过真实 `pytest tmp_path` 生成 Git 临时空仓库并挂载文件流。
-   - 测试涵盖全场景: 绝对路径逃逸防御、并发覆盖防护、非法命令注入拦截、清理不落盘、linked worktree 场景验证、Registry 碰撞保全、短写防护与严格 Schema 校验。
+   - 测试涵盖全场景: 绝对路径逃逸防御、并发覆盖防护、非法命令注入拦截、清理不落盘、linked worktree 场景验证、Registry 碰撞保全、短写防护、严格 Schema 校验、原子发布并发隔离、双仓库身份绑定校验和无歧义隔离标识边界测试。
 
 ### 测试记录（最新真实数据）
-- **定向工作树测试**: `python -m pytest tests/test_worktree_manager.py -q -rs` -> `22 passed in 12.83s` (0 failed, 0 skipped)
-- **定向环境测试**: `python -m pytest tests/test_host_adapter.py tests/test_evidence.py -q -rs` -> `25 passed in 1.38s` (0 failed, 0 skipped)
-- **全量测试**: `python -m pytest tests -q -rs` -> `273 passed in 56.15s` (0 failed, 0 skipped)
+- **定向工作树测试**: `python -m pytest tests/test_worktree_manager.py -q -rs` -> `25 passed in 16.80s` (0 failed, 0 skipped)
+- **定向环境测试**: `python -m pytest tests/test_host_adapter.py tests/test_evidence.py -q -rs` -> `25 passed in 1.46s` (0 failed, 0 skipped)
+- **全量测试**: `python -m pytest tests -q -rs` -> `276 passed in 59.67s` (0 failed, 0 skipped)
 - **代码规范**: `git diff --check` -> 退出码 0，零尾随空白错误
 
 ### 2C 历次返工修复记录
@@ -93,22 +95,30 @@
 3. **[DEF-T0023-16] 严苛的小写 Canonical SHA-1 同态断言**: 入参强制使用 `^[0-9a-f]{40}$` 正则严格校验，禁止隐式 `lower()` 宽容转换，`git rev-parse` 解析结果必须与输入 SHA 完全相同。
 4. **[DEF-T0023-17] 卫生清理与测试隔离**: 清理临时脚本与未跟踪残留，测试数据全面使用 `copy.deepcopy` 防污染。
 
-#### DEF-T0023-18 ~ 22 修复（当前最终版本）
+#### DEF-T0023-18 ~ 22 修复
 1. **[DEF-T0023-18] Registry 顶层与 Request 精确键集合及控制字符/空白防御**:
-   - `inspect()` 中强制校验顶层 Registry 键集合必须完全等于 `{"worktree_id", "absolute_path", "branch_name", "baseline_commit", "created_at", "request"}`。
-   - `request` 键集合必须完全等于 `{"project_id", "task_id", "actor_role", "host_session_id", "baseline_commit"}`。
-   - 任何多余未知字段、缺失字段均立即抛出 `WorktreeSecurityError` 并使 `verify()` Fail-Closed。
+   - `inspect()` 中强制校验顶层 Registry 键集合与 `request` 键集合必须完全匹配，未知或缺失键均抛出 `WorktreeSecurityError` 并使 `verify()` Fail-Closed。
    - 所有字符串字段强制检查：非字符串类型拒绝、纯空白 (`not val.strip()`) 拒绝、ASCII 控制字符 (`[\x00-\x1f\x7f]`) 拒绝。
 2. **[DEF-T0023-19] 修正 Registry 创建碰撞与准确的现场保留证据**:
-   - 在 `create_worktree()` 中精确区分创建失败的现场状态：
-     - 当 `os.open` 捕获 `FileExistsError`（外部已有 Registry 碰撞，`existing_foreign_registry`）时，现场已成功创建 Git 分支且外部 Registry 实际存在，准确上报 `recovery_required=True, branch_retained=True, registry_retained=True`，绝不误报 `registry_retained=False`，且绝不自动删除外部文件。
-     - 当 `os.open` 捕获其他 `OSError`（如无权限/目录不存在，`no_registry`）时，上报 `recovery_required=True, branch_retained=True, registry_retained=False`。
-     - 当写入循环中途失败（`partial_owned_registry`）或 `git worktree add` 失败时，现场分支与 Registry 均已创建，准确上报 `recovery_required=True, branch_retained=True, registry_retained=True`。
+   - 在 `create_worktree()` 中精确区分 `existing_foreign_registry`、`no_registry`、`partial_owned_registry`，真实上报现场保留证据。
 3. **[DEF-T0023-20] 完整恢复被删除/弱化的测试断言**:
-   - 恢复 `desc.request == req`、`branch_name` 包含工作流命名规则断言。
-   - 恢复 `cleanup_plan` 不含可执行命令断言。
-   - 恢复并发碰撞测试中失败异常必须为 `WorktreeSecurityError` 且包含 `already exists` 语义的严格断言。
+   - 恢复 `desc.request == req`、`branch_name` 命名规范、`cleanup_plan` 不含可执行命令、并发碰撞必须为 `WorktreeSecurityError(already exists)` 的严格断言。
 4. **[DEF-T0023-21] 规范化提交证据链**:
-   - 基于基线 `5e8ae06` 正常追加新提交，绝不使用 amend/rebase 改写历史，并由 DEV 角色在看板流转中写入真实候选 SHA。
+   - 基于基线正常追加新提交，绝不使用 amend/rebase 改写历史。
 5. **[DEF-T0023-22] 实施报告格式与历史结论全面修正**:
-   - 彻底清除报告中的所有控制字符和转义反斜杠，将历史回滚尝试明确标注为历史废弃机制，并更新真实的测试覆盖数据（22 passed / 25 passed / 273 passed）。
+   - 彻底清除报告中的所有控制字符和转义反斜杠，将历史回滚尝试明确标注为历史废弃机制。
+
+#### DEF-T0023-23 ~ 26 修复（当前最新交付）
+1. **[DEF-T0023-23] Registry 原子发布与并发隔离**:
+   - 禁止在最终 Registry 路径中逐步写入文件。先在独立临时文件完成 UTF-8 完整写入、write-all 循环保障与 `os.fsync`。
+   - 采用 `create-if-absent` 原语（Windows 下基于 `os.rename` 目标存在失败，POSIX 下基于 `os.link` + `unlink`）将临时文件原子发布到最终 Registry 路径，不覆盖已有 Registry。
+   - 写入与发布期间并发调用的 `inspect()` 和 `list_worktrees()` 绝不会观察到残缺、半成品或损坏 JSON。
+2. **[DEF-T0023-24] 仓库身份 1:1 强绑定与跨仓库隔离**:
+   - `WorktreeDescriptor` 和 Registry 显式记录规范化的 `target_repo_root`、`git_common_dir` 和由两者计算出的唯一摘要 `repository_identity`。
+   - 即使两个仓库拥有完全相同的提交历史和 commit SHA，因其 `git_common_dir` 物理路径不同，其 `repository_identity` 也完全不同。
+   - `inspect()`、`verify()` 与 `list_worktrees()` 必须进行 1:1 仓库身份核对，不匹配时强制 Fail-Closed。
+3. **[DEF-T0023-25] 隔离 ID 无歧义与边界碰撞防御**:
+   - 废除普通的连字符拼接公式，采用 Canonical JSON（严格排序键与无空白紧凑编码）+ SHA-256 摘要哈希计算 `worktree_id`。
+   - 彻底消除了因不同字段组合（如 `project_id="a-b", task_id="c"` 与 `project_id="a", task_id="b-c"`）在原连字符拼接下产生的歧义碰撞漏洞。
+4. **[DEF-T0023-26] 流程真实性与看板闭环核验**:
+   - 状态流转后显式重新读取权威 `board.json` 校验 status 与 assignee，禁止仅依赖 CLI 成功输出。
