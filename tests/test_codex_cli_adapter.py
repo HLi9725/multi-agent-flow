@@ -139,6 +139,37 @@ def test_codex_cli_adapter_sandbox_role_enforcement():
         adapter.dispatch_agent(req_unknown_sandbox)
 
 
+def test_codex_cli_adapter_command_building_and_no_invalid_a_flag():
+    # DEF-T0050-6: Ensure `-a` is never passed to `codex exec` and valid CLI options are generated
+    adapter = CodexCliAdapter(is_real_host=False)
+
+    # 1. REVIEWER role generates read-only sandbox without -a
+    req_rev = AgentRequest(
+        session_id="sess_rev_cmd",
+        prompt="Check code correctness",
+        role="REVIEWER",
+        workspace_dir=os.path.abspath(".")
+    )
+    cmd_rev = adapter.build_codex_exec_command(req_rev)
+    assert "-a" not in cmd_rev
+    assert "-s" in cmd_rev
+    assert cmd_rev[cmd_rev.index("-s") + 1] == "read-only"
+    assert cmd_rev[cmd_rev.index("-C") + 1] == os.path.abspath(".")
+
+    # 2. DEV role with auto approval generates --approve-for-me
+    req_dev_auto = AgentRequest(
+        session_id="sess_dev_auto",
+        prompt="Build module",
+        role="DEV",
+        workspace_dir=os.path.abspath("."),
+        extra_context={"approval_policy": "auto"}
+    )
+    cmd_dev_auto = adapter.build_codex_exec_command(req_dev_auto)
+    assert "-a" not in cmd_dev_auto
+    assert "--approve-for-me" in cmd_dev_auto
+    assert cmd_dev_auto[cmd_dev_auto.index("-s") + 1] == "workspace-write"
+
+
 def test_codex_cli_adapter_approval_and_confirmation_contract():
     # DEF-T0050-2: Test §7.1 permission approval and confirmation contract
     adapter = CodexCliAdapter(is_real_host=False)
@@ -387,12 +418,19 @@ def test_codex_cli_adapter_timeout_handling(monkeypatch):
         adapter.wait_for_result(handle, timeout_seconds=0.01)
 
 
-def test_codex_cli_real_executable_detection():
-    # Verify discovery of local binary
+def test_codex_cli_real_executable_detection_and_help():
+    # DEF-T0050-6: Verify discovery and parameters against real binary
     exe_path = _find_default_codex_executable()
     if exe_path:
         assert os.path.exists(exe_path)
         # Execute version check
-        proc = subprocess.run([exe_path, "--version"], capture_output=True, text=True)
-        assert proc.returncode == 0
-        assert "codex" in proc.stdout.lower()
+        proc_ver = subprocess.run([exe_path, "--version"], capture_output=True, text=True)
+        assert proc_ver.returncode == 0
+        assert "codex" in proc_ver.stdout.lower()
+
+        # Execute codex exec --help to verify valid parameters
+        proc_help = subprocess.run([exe_path, "exec", "--help"], capture_output=True, text=True)
+        assert proc_help.returncode == 0
+        assert "--sandbox" in proc_help.stdout
+        assert "--json" in proc_help.stdout
+        assert "--approve-for-me" in proc_help.stdout

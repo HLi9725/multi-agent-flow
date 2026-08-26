@@ -151,12 +151,12 @@ class CodexCliAdapter(BaseHostAdapter):
                 f"Workspace '{request.workspace_dir}' is not inside a trusted Git repository."
             )
 
-        session_id = request.session_id
-        invocation_id = f"inv-{uuid.uuid4().hex[:12]}"
+    def build_codex_exec_command(self, request: AgentRequest) -> List[str]:
+        """
+        Build the exact argument list for `codex exec`.
+        Validates sandbox modes, approval flags, and workspace path (DEF-T0050-6).
+        """
         role = (request.role or "").upper().strip()
-
-        # DEF-T0050-1: Role-based sandbox policy and injection defense
-        # Determine sandbox mode: REVIEWER and QA must be strictly read-only by default
         requested_sandbox = None
         if isinstance(request.extra_context, Mapping):
             requested_sandbox = request.extra_context.get("sandbox_mode")
@@ -178,18 +178,13 @@ class CodexCliAdapter(BaseHostAdapter):
             else:
                 sandbox_mode = self._default_sandbox_mode
 
-        # DEF-T0050-2: Approval policy determination
         approval_policy = self._default_approval_policy
         if isinstance(request.extra_context, Mapping):
             custom_policy = request.extra_context.get("approval_policy")
             if custom_policy:
-                if custom_policy not in ALLOWED_APPROVAL_POLICIES:
+                if custom_policy not in ALLOWED_APPROVAL_POLICIES and custom_policy not in ("auto", "approve-for-me"):
                     raise ValueError(f"Invalid approval_policy '{custom_policy}'. Allowed: {ALLOWED_APPROVAL_POLICIES}")
                 approval_policy = custom_policy
-
-        # If real host execution is requested but executable is missing
-        if self._is_real_host and (not self._executable_path or not os.path.exists(self._executable_path)):
-            raise AgentNotSupportedError(f"Codex CLI executable not found at '{self._executable_path}'.")
 
         cmd = [
             self._executable_path or "codex",
@@ -197,9 +192,41 @@ class CodexCliAdapter(BaseHostAdapter):
             "--json",
             "-C", request.workspace_dir,
             "-s", sandbox_mode,
-            "-a", approval_policy,
-            request.prompt
         ]
+
+        if approval_policy in ("auto", "approve-for-me") or (
+            isinstance(request.extra_context, Mapping) and request.extra_context.get("approve_for_me")
+        ):
+            cmd.append("--approve-for-me")
+
+        cmd.append(request.prompt)
+        return cmd
+
+    def dispatch_agent(self, request: AgentRequest) -> AgentHandle:
+        if not isinstance(request, AgentRequest):
+            raise TypeError(f"request must be an AgentRequest instance, got {type(request).__name__}")
+        if not request.session_id or not request.session_id.strip():
+            raise ValueError("request.session_id cannot be empty")
+        if not request.workspace_dir or not os.path.isabs(request.workspace_dir):
+            raise ValueError(f"request.workspace_dir must be an absolute path, got '{request.workspace_dir}'")
+
+        # DEF-T0050-5: Git repository boundary check
+        if not _is_git_repository(request.workspace_dir):
+            raise AgentNotSupportedError(
+                f"Workspace '{request.workspace_dir}' is not inside a trusted Git repository."
+            )
+
+        session_id = request.session_id
+        invocation_id = f"inv-{uuid.uuid4().hex[:12]}"
+
+        # Build and validate command (DEF-T0050-1, DEF-T0050-2, DEF-T0050-6)
+        cmd = self.build_codex_exec_command(request)
+        sandbox_mode = cmd[cmd.index("-s") + 1]
+        approval_policy = "approve-for-me" if "--approve-for-me" in cmd else self._default_approval_policy
+
+        # If real host execution is requested but executable is missing
+        if self._is_real_host and (not self._executable_path or not os.path.exists(self._executable_path)):
+            raise AgentNotSupportedError(f"Codex CLI executable not found at '{self._executable_path}'.")
 
         creationflags = 0
         if sys.platform.startswith("win"):

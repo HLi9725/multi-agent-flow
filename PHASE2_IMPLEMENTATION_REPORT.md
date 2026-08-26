@@ -286,13 +286,13 @@
 ### 3. 测试记录（真实数据）
 
 - **2D-2 定向测试**:
-  - `python -m pytest tests/test_codex_cli_adapter.py -q -rs` -> `12 passed in 0.40s` (0 failed, 0 skipped)
+  - `python -m pytest tests/test_codex_cli_adapter.py -q -rs` -> `13 passed in 0.50s` (0 failed, 0 skipped)
 - **2D-1 通用基础设施回归测试**:
   - `python -m pytest tests/test_adapter_manifest.py tests/test_adapter_registry.py tests/test_adapter_conformance.py -q -rs` -> `37 passed in 1.86s` (0 failed, 0 skipped)
 - **2A/2B/2C 契约与隔离兼容测试**:
-  - `python -m pytest tests/test_host_adapter.py tests/test_evidence.py tests/test_worktree_manager.py -q -rs` -> `60 passed in 23.87s` (0 failed, 0 skipped)
+  - `python -m pytest tests/test_host_adapter.py tests/test_evidence.py tests/test_worktree_manager.py -q -rs` -> `60 passed in 25.82s` (0 failed, 0 skipped)
 - **全量测试套件**:
-  - `python -m pytest tests -q -rs` -> `335 passed in 66.27s (0:01:06)` (0 failed, 0 skipped, 100% 通过)
+  - `python -m pytest tests -q -rs` -> `336 passed in 68.98s (0:01:08)` (0 failed, 0 skipped, 100% 通过)
 - **代码规范检查**:
   - `git diff --check` -> 退出码 0，零尾随空白错误
 
@@ -303,7 +303,7 @@
 - 遵循零副作用合规探测原则，能力探测（`detect_capabilities`）为纯内存计算，通过了 `assert_zero_side_effects` 严格测试。
 - 与 `EvidenceGate`、`EvidenceValidationContext` 及 `WorktreeManager` 无缝集成。
 
-### 5. 2D-2 缺陷返工记录 (DEF-T0050-1 ~ 5)
+### 5. 2D-2 缺陷返工记录 (DEF-T0050-1 ~ 6)
 
 1. **[DEF-T0050-1] 沙箱模式角色强约束与越权注入拦截**:
    - 建立沙箱模式白名单 `ALLOWED_SANDBOX_MODES = {"read-only", "workspace-write"}`，严禁任何 `danger-full-access` 注入或默认开启。
@@ -319,3 +319,6 @@
 5. **[DEF-T0050-5] 错误事件捕获与 Git 仓库受信目录强校验**:
    - JSONL `error` 事件全量保留至 `events` 事件列表，不丢失错误审计信息。
    - `dispatch_agent` 在执行前执行 `_is_git_repository` 校验，非 Git 仓库目录直接拒绝执行（`AgentNotSupportedError`），防止由于脱离受信任目录产生异常。
+6. **[DEF-T0050-6] 移除非法 `-a` 参数并对接真实 `--approve-for-me` 机制**:
+   - 移除 `codex exec` 命令行中不存在的 `-a` 参数，杜绝真实 CLI 运行报错（`rc=2 unexpected argument '-a'`）。
+   - 当 `approval_policy` 为 `"auto"` 或请求明确指定自动审批时，对接 Codex 官方 `--approve-for-me` 真实参数；增加 `build_codex_exec_command` 及针对本机真实 `codex.exe exec --help` 的参数合法性冒烟测试。
