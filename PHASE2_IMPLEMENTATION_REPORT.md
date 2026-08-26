@@ -259,3 +259,46 @@
 - 代码工作树测试数据 `user_data/board.json`：最终全量测试前 `3FD47FA4038F1B0B1B381148CB075CE49D0ADCAE00F1C214F1725D886B843295`，测试后 `914EFEF6B3CFA872398EB311A278045E93D2A0D0F59FC274A3AF547CC25DD27F`。
 - 该文件属于代码工作树的非权威测试数据且未进入 Git 修改集；未直接编辑、覆盖或物理删除。
 - 权威看板位于阶段集成工作树，T0049 在本轮开发期间保持 `进行中 / 李开发`。
+
+---
+
+## 2D-2 Codex 参考 Adapter 实施记录
+
+### 1. 范围与定位
+
+依据 `docs/D04-研发过程/D01-任务/Phase2-2D-通用Adapter注册与Codex参考实现任务书.md` 与 `MULTI_CLIENT_MODERNIZATION_PLAN.zh-CN.md` 第 8.2 节：
+- **Task ID**: `T0050`
+- **代码工作树**: `C:\Users\user\Desktop\user\multi-agent-flow-phase2d-codex-adapter`
+- **开发分支**: `feature/phase2d-2-codex-adapter`
+- **固定基线**: `b9c426a7c5d9226f2816fbe62ded3fb4a58d1e3c`
+- **选定的 Codex Surface**: `CodexCliAdapter` (`adapter_id: codex_cli`, `host_surface: cli`)。
+  - 基于本机真实安装的 `codex.exe`（`0.149.0-alpha.4.1`，路径位于 `%LOCALAPPDATA%\OpenAI\Codex\bin\110b3d66a02d864e\codex.exe`）。
+  - 使用非交互式、机器可读的 JSONL 事件流通道（`codex exec --json -C <workspace_dir> -s <sandbox_mode>`）。
+  - 支持 Windows 独立进程组创建（`CREATE_NEW_PROCESS_GROUP`）与进程树可靠终结（`taskkill /F /T /PID`）。
+  - 严格保持 macOS / Linux 为 `static_only` 静态配置等级，Windows 标记为 `cli_verified`。
+
+### 2. 交付物清单
+
+- `scripts/_lib/hosts/__init__.py`: 平台适配器包初始化。
+- `scripts/_lib/hosts/codex_cli_adapter.py`: `CodexCliAdapter` 及 `create_codex_cli_manifest()` 实现。
+- `tests/test_codex_cli_adapter.py`: 针对 Codex CLI 的全套单元测试、合规接入、对抗测试与 Windows E2E 验证。
+
+### 3. 测试记录（真实数据）
+
+- **2D-2 定向测试**:
+  - `python -m pytest tests/test_codex_cli_adapter.py -q -rs` -> `13 passed in 0.35s` (0 failed, 0 skipped)
+- **2D-1 通用基础设施回归测试**:
+  - `python -m pytest tests/test_adapter_manifest.py tests/test_adapter_registry.py tests/test_adapter_conformance.py -q -rs` -> `37 passed in 1.86s` (0 failed, 0 skipped)
+- **2A/2B/2C 契约与隔离兼容测试**:
+  - `python -m pytest tests/test_host_adapter.py tests/test_evidence.py tests/test_worktree_manager.py -q -rs` -> `60 passed in 27.57s` (0 failed, 0 skipped)
+- **全量测试套件**:
+  - `python -m pytest tests -q -rs` -> `336 passed in 72.08s (0:01:12)` (0 failed, 0 skipped, 100% 通过)
+- **代码规范检查**:
+  - `git diff --check` -> 退出码 0，零尾随空白错误
+
+### 4. 安全、认证与计费边界
+
+- 认证边界采用 `USER_LOCAL`（本地已登录客户端会话），不读取、存储或提交任何 API Key、Token、Cookie 或凭证缓存。
+- 计费边界采用 `USER_SUBSCRIPTION`（用户桌面客户端订阅/本地配额），不启用未经批准的 OpenAI Responses API，不产生额外 API 费用。
+- 遵循零副作用合规探测原则，能力探测（`detect_capabilities`）为纯内存计算，通过了 `assert_zero_side_effects` 严格测试。
+- 与 `EvidenceGate`、`EvidenceValidationContext` 及 `WorktreeManager` 无缝集成。
