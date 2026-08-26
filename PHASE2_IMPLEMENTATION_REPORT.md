@@ -158,11 +158,12 @@
 - **实施范围**: 仅执行第二阶段 2D-1（AdapterManifest、AdapterRegistry、验证等级、能力解析与通用合规测试套件）。
 - **基线提交**: 21828a88ae0aa65b7cf84ea9b1e4244737100892
 - **开发分支**: feature/phase2d-1-generic-adapters
-- **结论**: 2D-1 五项通用基础能力已作为统一批次实现并通过全部合规测试。核心代码中零客户端名称硬编码，严格遵循 Fail-Closed 与逐平台验证隔离。未实施任何真实 Codex/Antigravity Adapter，未进入 2D-2、2E、2F、第三阶段或第四阶段。
+- **本轮核心修复提交**: 93f7fa67e780812412d8464082e5154868c88fe3
+- **结论**: 2D-1 五项通用基础能力及 DEF-T0049-12～14 返工已完成开发验证，等待独立 Reviewer 与 QA 准出。核心代码中零客户端名称硬编码，严格遵循 Fail-Closed 与逐平台验证隔离。未实施任何真实 Codex/Antigravity Adapter，未进入 2D-2、2E、2F、第三阶段或第四阶段。
 
 ### 核心实现方案
 1. **不可变 AdapterManifest**:
-   - 包含 `schema_version`, `adapter_id`, `display_name`, `implementation_version`, `host_surface`, `verification_level`, `capabilities`, `workspace_modes`, `identity_fields`, `auth_boundary`, `billing_boundary`, `platform_version_constraint`, `supported_operating_systems`, `platform_verifications`, `executable_candidates_by_os`, `config_path_templates_by_os`, `conformance_suite_version`, `verified_at`, `e2e_evidence_refs`, `extra`。
+   - 包含 `schema_version`, `adapter_id`, `display_name`, `implementation_version`, `host_surface`, `verification_level`, `capabilities`, `workspace_modes`, `identity_fields`, `auth_boundary`, `billing_boundary`, `auth_context_id`, `billing_context_id`, `platform_version_constraint`, `supported_operating_systems`, `platform_verifications`, `executable_candidates_by_os`, `config_path_templates_by_os`, `conformance_suite_version`, `verified_at`, `e2e_evidence_refs`, `extra`。
    - 深度不可变（`MappingProxyType`, `tuple`, `frozenset`），严格校验类型、空白与控制字符，自动扫描并彻底拦截任何 API Key、Token、Password、Bearer 等敏感凭证。
    - 防伪约束：`native_verified` / `cli_verified` / `mcp_verified` 必须提供非空 `e2e_evidence_refs` 与 `verified_at`，测试夹具不可伪造。
 2. **逐平台隔离与验证等级**:
