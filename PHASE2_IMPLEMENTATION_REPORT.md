@@ -153,14 +153,39 @@
 2. **[DEF-T0023-37] 单个 Registry 文件链接替换拒绝**:
    - `inspect()` 要求目标 JSON 的绝对路径与 `realpath` 完全一致；单个登记文件被符号链接或 reparse point 重定向时，在 `exists/open` 前直接拒绝。
 
-## 4. 2D-1 开工准备（尚未实施代码）
+## 4. 2D-1 阶段实施报告（通用 Adapter 基础设施）
 
-- **2C 终态**：候选 `fa548d8d73704168b2dcc99f8944f4e5d03936a2` 已完成 Reviewer、最终 QA 与用户终态验收，2C 正式冻结。
-- **定位调整**：2D 拆分为“2D-1 通用 Adapter 基础设施 + 2D-2 Codex 参考 Adapter”；2D-1 将 `AdapterManifest`、`AdapterRegistry`、验证等级、能力解析和通用合规测试套件作为一个整体实施与验收。
-- **可移植性要求**：核心编排、Evidence 和 Worktree 不得硬编码客户端名称；Builder、Reviewer、QA 通过开放 `adapter_id` 与能力契约选择平台。
-- **验证等级**：统一使用 `native_verified`、`cli_verified`、`mcp_verified`、`static_only`、`unsupported`；静态配置、人工窗口输出和模型自述不能升级为 verified。
-- **跨平台目标**：Windows 后续真实 Adapter 目标为真实验证；macOS 当前保持 `static_only` 并纳入 Schema、Manifest、路径模板与静态测试；Linux 按平台能力声明 `static_only` 或 `unsupported`，验证状态不得跨平台继承。
-- **运行边界**：仅打开 Codex/Antigravity 两个桌面窗口仍属于人工模式；只有后续真实 Adapter 与 2F 编排完成后，持续运行的编排入口才能自动执行 Builder → Reviewer → QA。最终验收、破坏性操作、费用/权限扩张和 main 合并仍需用户确认。
-- **详细任务书**：`docs/D04-研发过程/D01-任务/Phase2-2D-通用Adapter注册与Codex参考实现任务书.md`。
-- **2D-1 独立合同**：`docs/D04-研发过程/D01-任务/Phase2-2D-1-通用Adapter基础设施实施任务书.md`。
-- **未实施范围**：尚未创建 Registry、Manifest 或真实平台 Adapter，未调用任何客户端/API，未产生费用，未进入 2D-2、2E、2F、第三阶段或第四阶段。
+- **实施范围**: 仅执行第二阶段 2D-1（AdapterManifest、AdapterRegistry、验证等级、能力解析与通用合规测试套件）。
+- **基线提交**: 21828a88ae0aa65b7cf84ea9b1e4244737100892
+- **开发分支**: feature/phase2d-1-generic-adapters
+- **结论**: 2D-1 五项通用基础能力已作为统一批次实现并通过全部合规测试。核心代码中零客户端名称硬编码，严格遵循 Fail-Closed 与逐平台验证隔离。未实施任何真实 Codex/Antigravity Adapter，未进入 2D-2、2E、2F、第三阶段或第四阶段。
+
+### 核心实现方案
+1. **不可变 AdapterManifest**:
+   - 包含 `schema_version`, `adapter_id`, `display_name`, `implementation_version`, `host_surface`, `verification_level`, `capabilities`, `workspace_modes`, `identity_fields`, `auth_boundary`, `billing_boundary`, `platform_version_constraint`, `supported_operating_systems`, `platform_verifications`, `executable_candidates_by_os`, `config_path_templates_by_os`, `conformance_suite_version`, `verified_at`, `e2e_evidence_refs`, `extra`。
+   - 深度不可变（`MappingProxyType`, `tuple`, `frozenset`），严格校验类型、空白与控制字符，自动扫描并彻底拦截任何 API Key、Token、Password、Bearer 等敏感凭证。
+   - 防伪约束：`native_verified` / `cli_verified` / `mcp_verified` 必须提供非空 `e2e_evidence_refs` 与 `verified_at`，测试夹具不可伪造。
+2. **逐平台隔离与验证等级**:
+   - 统一使用 `native_verified`, `cli_verified`, `mcp_verified`, `static_only`, `unsupported` 枚举集合，不做数值大小排序。
+   - Windows, macOS, Linux 平台验证相互隔离，单平台验证等级不传播到其他平台；macOS 保持 `static_only`，Linux 为 `static_only` / `unsupported`，不进入真实自动派发。
+   - 明确 `manual`, `assisted`, `verified_automatic` 三种运行边界，双窗口操作不冒充自动工作流。
+3. **AdapterRegistry 与确定性能力解析**:
+   - 纯内存操作，零文件写入、零锁、零进程、零网络、零会话、零计费。
+   - 上下文隔离，显式注册，重复 ID 与身份不符 Fail-Closed。
+   - 确定性解析流水线：Schema 校验 → 精确 ID 匹配 → 目标 OS 过滤 → 验证等级集合过滤 → 全部能力过滤（`UNKNOWN != SUPPORTED`）→ workspace 模式过滤 → 唯一性与歧义判定（多匹配返回 `ambiguous`，无匹配返回 `unsupported` 或 `manual_fallback`）。
+4. **通用合规测试套件 (Adapter Conformance Suite)**:
+   - 提供通用断言：`assert_manifest_conformance`, `assert_capabilities_conformance`, `assert_zero_side_effects`, `assert_handle_conformance`, `assert_lifecycle_conformance`。
+   - 包含标准 Fake 测试夹具（`is_real_host=False`）与针对能力不匹配、假冒真实 Handle、非法接受外来 Handle、副作用检测的恶意 Adapter 夹具，证明合规套件具备主动拦截违规 Adapter 的有效性。
+
+### 测试记录（最新真实数据）
+- **2D-1 定向测试**:
+  - `python -m pytest tests/test_adapter_manifest.py -q -rs` -> `5 passed in 0.05s`
+  - `python -m pytest tests/test_adapter_registry.py -q -rs` -> `8 passed in 0.07s`
+  - `python -m pytest tests/test_adapter_conformance.py -q -rs` -> `6 passed in 0.05s`
+  - **总计**: `19 passed in 0.08s` (0 failed, 0 skipped)
+- **2A/2B/2C 关联兼容测试**:
+  - `python -m pytest tests/test_host_adapter.py tests/test_evidence.py tests/test_worktree_manager.py -q -rs` -> `60 passed in 25.17s` (0 failed, 0 skipped)
+- **全量测试**:
+  - `python -m pytest tests -q -rs` -> `305 passed in 64.83s` (0 failed, 0 skipped, 100% 通过)
+- **代码规范**:
+  - `git diff --check` -> 退出码 0，零尾随空白错误
