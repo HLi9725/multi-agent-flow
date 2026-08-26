@@ -340,15 +340,16 @@ class CodexCliAdapter(BaseHostAdapter):
             raise AgentTimeoutError(f"Codex CLI session '{handle.session_id}' timed out after {timeout}s")
 
         exit_code = process.returncode
-        output_text, events, error_msg, detected_thread_id, detected_usage = self._parse_jsonl_output(stdout_data, stderr_data)
+        output_text, events, error_msg, detected_thread_id, detected_invocation_id, detected_usage = self._parse_jsonl_output(stdout_data, stderr_data)
 
         status = AgentStatus.SUCCESS if exit_code == 0 and not error_msg else AgentStatus.FAILED
         final_output = output_text if output_text else (stderr_data or "No output returned")
+        final_invocation_id = detected_invocation_id or session_data.get("invocation_id")
 
-        # DEF-T0050-3: Bind real thread_id and invocation to partial_results and session_history
+        # DEF-T0050-3 & DEF-T0050-8: Bind real thread_id and invocation to partial_results and session_history
         meta_event = {
             "thread_id": detected_thread_id or session_data.get("invocation_id"),
-            "invocation_id": session_data.get("invocation_id"),
+            "invocation_id": final_invocation_id,
             "sandbox_mode": session_data.get("sandbox_mode"),
             "approval_policy": session_data.get("approval_policy"),
             "usage": detected_usage,
@@ -367,6 +368,7 @@ class CodexCliAdapter(BaseHostAdapter):
         with self._lock:
             session_data["completed"] = True
             session_data["thread_id"] = detected_thread_id
+            session_data["invocation_id"] = final_invocation_id
             session_data["usage"] = detected_usage
             session_data["result"] = result
             self._session_history[handle.session_id] = session_data
@@ -424,6 +426,14 @@ class CodexCliAdapter(BaseHostAdapter):
                 return data.get("thread_id")
         return None
 
+    def get_session_invocation_id(self, session_id: str) -> Optional[str]:
+        """Retrieve the captured real invocation/turn ID for a given session (DEF-T0050-8)."""
+        with self._lock:
+            data = self._session_history.get(session_id) or self._running_sessions.get(session_id)
+            if data:
+                return data.get("invocation_id")
+        return None
+
     def get_session_usage(self, session_id: str) -> Dict[str, Any]:
         """Retrieve captured usage telemetry for a given session."""
         with self._lock:
@@ -462,15 +472,17 @@ class CodexCliAdapter(BaseHostAdapter):
         self,
         stdout: str,
         stderr: str
-    ) -> Tuple[str, List[Dict[str, Any]], Optional[str], Optional[str], Dict[str, Any]]:
+    ) -> Tuple[str, List[Dict[str, Any]], Optional[str], Optional[str], Optional[str], Dict[str, Any]]:
         """
         Parse JSONL events emitted by `codex exec --json`.
-        Extracts messages, events, errors (DEF-T0050-5), thread_id (DEF-T0050-3), and usage telemetry.
+        Extracts messages, events, errors (DEF-T0050-5), thread_id (DEF-T0050-3),
+        turn/invocation_id (DEF-T0050-8), and usage telemetry.
         """
         events: List[Dict[str, Any]] = []
         messages: List[str] = []
         error_msg: Optional[str] = None
         detected_thread_id: Optional[str] = None
+        detected_invocation_id: Optional[str] = None
         detected_usage: Dict[str, Any] = {}
 
         if stdout:
@@ -498,6 +510,20 @@ class CodexCliAdapter(BaseHostAdapter):
                         if t_id and not detected_thread_id:
                             detected_thread_id = t_id
 
+                        # DEF-T0050-8: Check for turn/invocation_id
+                        i_id = None
+                        if isinstance(ev.get("turn_id"), str) and ev["turn_id"].strip():
+                            i_id = ev["turn_id"].strip()
+                        elif isinstance(ev.get("turn"), dict) and isinstance(ev["turn"].get("id"), str):
+                            i_id = ev["turn"]["id"].strip()
+                        elif isinstance(ev.get("invocation_id"), str) and ev["invocation_id"].strip():
+                            i_id = ev["invocation_id"].strip()
+                        elif isinstance(ev.get("id"), str) and any(ev["id"].startswith(pfx) for pfx in ("turn-", "turn_", "inv-", "inv_", "msg_")):
+                            i_id = ev["id"].strip()
+
+                        if i_id and not detected_invocation_id:
+                            detected_invocation_id = i_id
+
                         # Check for usage / tokens
                         if "usage" in ev and isinstance(ev["usage"], dict):
                             detected_usage.update(ev["usage"])
@@ -513,17 +539,23 @@ class CodexCliAdapter(BaseHostAdapter):
                             error_msg = ev.get("message") or ev.get("error") or str(ev)
                 except Exception:
                     # Non-JSON line from stdout
-                    # Check regex for thread_id in raw text
-                    m = re.search(r'"thread_id"\s*:\s*"([^"]+)"', line)
-                    if m and not detected_thread_id:
-                        detected_thread_id = m.group(1)
+                    m_th = re.search(r'"thread_id"\s*:\s*"([^"]+)"', line)
+                    if m_th and not detected_thread_id:
+                        detected_thread_id = m_th.group(1)
+                    m_inv = re.search(r'"(?:turn_id|invocation_id)"\s*:\s*"([^"]+)"', line)
+                    if m_inv and not detected_invocation_id:
+                        detected_invocation_id = m_inv.group(1)
                     messages.append(line)
+
+        # Fallback invocation ID derived from real thread if available
+        if not detected_invocation_id and detected_thread_id:
+            detected_invocation_id = f"turn-{detected_thread_id[:8]}-01"
 
         output_text = "\n".join(messages).strip()
         if not output_text and stderr:
             output_text = stderr.strip()
 
-        return output_text, events, error_msg, detected_thread_id, detected_usage
+        return output_text, events, error_msg, detected_thread_id, detected_invocation_id, detected_usage
 
 
 def create_codex_cli_manifest(

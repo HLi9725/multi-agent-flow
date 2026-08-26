@@ -212,17 +212,18 @@ def test_codex_cli_adapter_approval_and_confirmation_contract():
 
 
 def test_codex_cli_adapter_real_thread_id_and_telemetry_binding():
-    # DEF-T0050-3: Test parsing and binding real thread_id and token usage from JSONL stream
+    # DEF-T0050-3 & DEF-T0050-8: Test parsing and binding real thread_id, turn/invocation_id, and token usage
     adapter = CodexCliAdapter(is_real_host=False)
     sample_stdout = (
         '{"type":"session_start","session_id":"s_999","thread_id":"01a03cdc-d21c-77d1-a3b4-aa9081287b6d"}\n'
-        '{"type":"assistant_message","content":"Review completed."}\n'
+        '{"type":"assistant_message","turn_id":"turn-01a03cdc-01","content":"Review completed."}\n'
         '{"type":"usage","usage":{"input_tokens":15814,"cached_tokens":11008,"output_tokens":8}}\n'
         '{"type":"turn_complete"}\n'
     )
-    text, events, err, thread_id, usage = adapter._parse_jsonl_output(sample_stdout, "")
+    text, events, err, thread_id, inv_id, usage = adapter._parse_jsonl_output(sample_stdout, "")
 
     assert thread_id == "01a03cdc-d21c-77d1-a3b4-aa9081287b6d"
+    assert inv_id == "turn-01a03cdc-01"
     assert usage.get("input_tokens") == 15814
     assert usage.get("cached_tokens") == 11008
     assert usage.get("output_tokens") == 8
@@ -240,7 +241,7 @@ def test_codex_cli_adapter_error_events_and_git_repo_check(tmp_path):
         '{"type":"session_start","thread_id":"t_err_01"}\n'
         '{"type":"error","message":"permission_denied: outside sandbox"}\n'
     )
-    text, events, err, thread_id, usage = adapter._parse_jsonl_output(sample_err_stdout, "")
+    text, events, err, thread_id, inv_id, usage = adapter._parse_jsonl_output(sample_err_stdout, "")
     assert len(events) == 2  # Error event is properly appended!
     assert err == "permission_denied: outside sandbox"
 
@@ -257,11 +258,28 @@ def test_codex_cli_adapter_error_events_and_git_repo_check(tmp_path):
         adapter.dispatch_agent(req_non_git)
 
 
-def test_codex_cli_evidence_gate_real_judgment(tmp_path):
-    # DEF-T0050-4: Test real EvidenceGate judgment with CodexCliAdapter handle and records
+def test_codex_cli_evidence_gate_real_judgment(tmp_path, monkeypatch):
+    # DEF-T0050-4 & DEF-T0050-8: Test real EvidenceGate judgment with CodexCliAdapter handle, real thread & turn
     adapter = CodexCliAdapter(is_real_host=True)
     manifest = create_codex_cli_manifest()
     caps = adapter.detect_capabilities()
+
+    sample_stdout = (
+        '{"type":"session_start","session_id":"s_999","thread_id":"01a03cdc-d21c-77d1-a3b4-aa9081287b6d"}\n'
+        '{"type":"assistant_message","turn_id":"turn-01a03cdc-01","content":"Implemented adapter features."}\n'
+        '{"type":"usage","usage":{"input_tokens":15814,"cached_tokens":11008,"output_tokens":8}}\n'
+        '{"type":"turn_complete"}\n'
+    )
+
+    class MockCodexProcess:
+        pid = 12345
+        returncode = 0
+        def communicate(self, timeout=None):
+            return sample_stdout, ""
+        def poll(self):
+            return 0
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: MockCodexProcess())
 
     req = AgentRequest(
         session_id="sess_ev_02",
@@ -270,6 +288,13 @@ def test_codex_cli_evidence_gate_real_judgment(tmp_path):
         workspace_dir=os.path.abspath(".")
     )
     handle = adapter.dispatch_agent(req)
+    result = adapter.wait_for_result(handle)
+
+    # Retrieve dynamically bound real thread_id and invocation_id (DEF-T0050-8)
+    real_thread_id = adapter.get_session_thread_id(handle.session_id)
+    real_inv_id = adapter.get_session_invocation_id(handle.session_id)
+    assert real_thread_id == "01a03cdc-d21c-77d1-a3b4-aa9081287b6d"
+    assert real_inv_id == "turn-01a03cdc-01"
 
     store_dir = str(tmp_path / "evidence_store")
     store = EvidenceStore(root_dir=store_dir)
@@ -282,17 +307,18 @@ def test_codex_cli_evidence_gate_real_judgment(tmp_path):
         transition_from="进行中",
         transition_to="审查中",
         baseline_commit="b9c426a7c5d9226f2816fbe62ded3fb4a58d1e3c",
-        result_commit="63b9f7b2aad19bff2dbfc534209641edc9221e48",
-        expected_invocation_id="inv_codex_e2e_real",
+        result_commit="3b0a870f67f487f2f37cbede3f2291684868fdc4",
+        expected_invocation_id=real_inv_id,
         expected_adapter="codex_cli",
         expected_workspace_mode="worktree",
         expected_evidence_type=EvidenceType.TASK_TRANSITION,
         host_handle=handle,
-        expected_capabilities=caps
+        expected_capabilities=caps,
+        agent_result=result
     )
 
     meta_extra = {f"capability_{k}": v for k, v in caps.__dict__.items() if k != "extra"}
-    meta_extra["thread_id"] = "01a03cdc-d21c-77d1-a3b4-aa9081287b6d"
+    meta_extra["thread_id"] = real_thread_id
 
     metadata = EvidenceMetadata(
         project_id="phase2_proj",
@@ -301,7 +327,7 @@ def test_codex_cli_evidence_gate_real_judgment(tmp_path):
         host_id="codex_cli",
         adapter="codex_cli",
         host_session_id=handle.session_id,
-        host_invocation_id="inv_codex_e2e_real",
+        host_invocation_id=real_inv_id,
         is_real_host=True,
         workspace_mode="worktree",
         transition_from="进行中",
@@ -314,7 +340,7 @@ def test_codex_cli_evidence_gate_real_judgment(tmp_path):
         evidence_id="ev-codex-e2e-001",
         evidence_type=EvidenceType.TASK_TRANSITION,
         baseline_commit="b9c426a7c5d9226f2816fbe62ded3fb4a58d1e3c",
-        result_commit="63b9f7b2aad19bff2dbfc534209641edc9221e48",
+        result_commit="3b0a870f67f487f2f37cbede3f2291684868fdc4",
         artifacts=(),
         metadata=metadata
     )
