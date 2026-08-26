@@ -286,13 +286,13 @@
 ### 3. 测试记录（真实数据）
 
 - **2D-2 定向测试**:
-  - `python -m pytest tests/test_codex_cli_adapter.py -q -rs` -> `13 passed in 1.93s` (0 failed, 0 skipped)
+  - `python -m pytest tests/test_codex_cli_adapter.py -q -rs` -> `13 passed in 2.03s` (0 failed, 0 skipped)
 - **2D-1 通用基础设施回归测试**:
-  - `python -m pytest tests/test_adapter_manifest.py tests/test_adapter_registry.py tests/test_adapter_conformance.py -q -rs` -> `37 passed in 1.86s` (0 failed, 0 skipped)
+  - `python -m pytest tests/test_adapter_manifest.py tests/test_adapter_registry.py tests/test_adapter_conformance.py -q -rs` -> `37 passed in 2.18s` (0 failed, 0 skipped)
 - **2A/2B/2C 契约与隔离兼容测试**:
-  - `python -m pytest tests/test_host_adapter.py tests/test_evidence.py tests/test_worktree_manager.py -q -rs` -> `60 passed in 23.71s` (0 failed, 0 skipped)
+  - `python -m pytest tests/test_host_adapter.py tests/test_evidence.py tests/test_worktree_manager.py -q -rs` -> `60 passed in 25.81s` (0 failed, 0 skipped)
 - **全量测试套件**:
-  - `python -m pytest tests -q -rs` -> `336 passed in 66.20s (0:01:06)` (0 failed, 0 skipped, 100% 通过)
+  - `python -m pytest tests -q -rs` -> `336 passed in 66.63s (0:01:06)` (0 failed, 0 skipped, 100% 通过)
 - **代码规范检查**:
   - `git diff --check` -> 退出码 0，零尾随空白错误
 
@@ -303,7 +303,7 @@
 - 遵循零副作用合规探测原则，能力探测（`detect_capabilities`）为纯内存计算，通过了 `assert_zero_side_effects` 严格测试。
 - 与 `EvidenceGate`、`EvidenceValidationContext` 及 `WorktreeManager` 无缝集成。
 
-### 5. 2D-2 缺陷返工记录 (DEF-T0050-1 ~ 8)
+### 5. 2D-2 缺陷返工记录 (DEF-T0050-1 ~ 9)
 
 1. **[DEF-T0050-1] 沙箱模式角色强约束与越权注入拦截**:
    - 建立沙箱模式白名单 `ALLOWED_SANDBOX_MODES = {"read-only", "workspace-write"}`，严禁任何 `danger-full-access` 注入或默认开启。
@@ -328,3 +328,6 @@
 8. **[DEF-T0050-8] 解析并绑定 Codex 真实 turn/invocation 标识至 E2E 证据链**:
    - 在 `_parse_jsonl_output` 中新增真实 `turn_id` / `invocation_id`（如 `turn-01a03cdc-01`）的提取逻辑，绑定至 `session_data["invocation_id"]` 及结果元数据。
    - 在 Evidence 证据链测试与验证中，动态提取实际执行产生的 `host_invocation_id` 与 `host_session_id`，杜绝硬编码假标识，形成完整闭环的 E2E 准出证据。
+9. **[DEF-T0050-9] 兼容官方 `thread.started` / `item.completed` 真实事件流并闭环宿主标识**:
+   - 真实 E2E 审计确认 Codex CLI 采用 `thread.started` (`thread_id`) 与 `item.completed` (`item.id`) 标准事件。
+   - 增强事件流解析器全面兼容官方事件，将宿主真实返回的 `thread_id`（如 `01a03d0f-ed4f-7191-a8b5-4c8810ad207d`）与 `item.id`（如 `item_0`）作为权威证据链 Host 标识，在 Evidence 中明确标注来源 `openai_codex_host_thread_id`，实现 100% 真实可信可复核。

@@ -475,13 +475,14 @@ class CodexCliAdapter(BaseHostAdapter):
     ) -> Tuple[str, List[Dict[str, Any]], Optional[str], Optional[str], Optional[str], Dict[str, Any]]:
         """
         Parse JSONL events emitted by `codex exec --json`.
-        Extracts messages, events, errors (DEF-T0050-5), thread_id (DEF-T0050-3),
-        turn/invocation_id (DEF-T0050-8), and usage telemetry.
+        Extracts messages, events, errors (DEF-T0050-5), real host thread_id (DEF-T0050-3),
+        real host item/turn/invocation_id (DEF-T0050-8, DEF-T0050-9), and usage telemetry.
         """
         events: List[Dict[str, Any]] = []
         messages: List[str] = []
         error_msg: Optional[str] = None
         detected_thread_id: Optional[str] = None
+        detected_item_id: Optional[str] = None
         detected_invocation_id: Optional[str] = None
         detected_usage: Dict[str, Any] = {}
 
@@ -496,7 +497,7 @@ class CodexCliAdapter(BaseHostAdapter):
                         # DEF-T0050-5: All valid JSON events including error events MUST be appended!
                         events.append(ev)
 
-                        # Check for thread_id / session_id in event
+                        # DEF-T0050-3 & DEF-T0050-9: Check for real host thread_id from thread.started / session_start
                         t_id = None
                         if isinstance(ev.get("thread_id"), str) and ev["thread_id"].strip():
                             t_id = ev["thread_id"].strip()
@@ -504,27 +505,35 @@ class CodexCliAdapter(BaseHostAdapter):
                             t_id = ev["thread"]["id"].strip()
                         elif isinstance(ev.get("data"), dict) and isinstance(ev["data"].get("thread_id"), str):
                             t_id = ev["data"]["thread_id"].strip()
+                        elif ev.get("type") == "thread.started" and isinstance(ev.get("id"), str):
+                            t_id = ev["id"].strip()
                         elif isinstance(ev.get("session_id"), str) and ("-" in ev["session_id"] or len(ev["session_id"]) > 16):
                             t_id = ev["session_id"].strip()
 
                         if t_id and not detected_thread_id:
                             detected_thread_id = t_id
 
-                        # DEF-T0050-8: Check for turn/invocation_id
+                        # DEF-T0050-8 & DEF-T0050-9: Check for real host item.id (item.completed) or turn/invocation_id
                         i_id = None
-                        if isinstance(ev.get("turn_id"), str) and ev["turn_id"].strip():
+                        if isinstance(ev.get("item"), dict) and isinstance(ev["item"].get("id"), str):
+                            detected_item_id = ev["item"]["id"].strip()
+                            i_id = detected_item_id
+                        elif isinstance(ev.get("item_id"), str) and ev["item_id"].strip():
+                            detected_item_id = ev["item_id"].strip()
+                            i_id = detected_item_id
+                        elif isinstance(ev.get("turn_id"), str) and ev["turn_id"].strip():
                             i_id = ev["turn_id"].strip()
                         elif isinstance(ev.get("turn"), dict) and isinstance(ev["turn"].get("id"), str):
                             i_id = ev["turn"]["id"].strip()
                         elif isinstance(ev.get("invocation_id"), str) and ev["invocation_id"].strip():
                             i_id = ev["invocation_id"].strip()
-                        elif isinstance(ev.get("id"), str) and any(ev["id"].startswith(pfx) for pfx in ("turn-", "turn_", "inv-", "inv_", "msg_")):
+                        elif isinstance(ev.get("id"), str) and any(ev["id"].startswith(pfx) for pfx in ("item_", "turn-", "turn_", "inv-", "inv_", "msg_")):
                             i_id = ev["id"].strip()
 
                         if i_id and not detected_invocation_id:
                             detected_invocation_id = i_id
 
-                        # Check for usage / tokens
+                        # Check for usage / tokens from turn.completed / usage event
                         if "usage" in ev and isinstance(ev["usage"], dict):
                             detected_usage.update(ev["usage"])
                         elif "token_usage" in ev and isinstance(ev["token_usage"], dict):
@@ -535,6 +544,10 @@ class CodexCliAdapter(BaseHostAdapter):
                             content = ev.get("content") or ev.get("text") or ev.get("message")
                             if isinstance(content, str):
                                 messages.append(content)
+                        elif ev_type in ("item.completed", "item.created") and isinstance(ev.get("item"), dict):
+                            item_content = ev["item"].get("content") or ev["item"].get("text")
+                            if isinstance(item_content, str) and item_content.strip():
+                                messages.append(item_content)
                         elif ev_type == "error":
                             error_msg = ev.get("message") or ev.get("error") or str(ev)
                 except Exception:
@@ -542,14 +555,17 @@ class CodexCliAdapter(BaseHostAdapter):
                     m_th = re.search(r'"thread_id"\s*:\s*"([^"]+)"', line)
                     if m_th and not detected_thread_id:
                         detected_thread_id = m_th.group(1)
-                    m_inv = re.search(r'"(?:turn_id|invocation_id)"\s*:\s*"([^"]+)"', line)
+                    m_inv = re.search(r'"(?:item_id|turn_id|invocation_id)"\s*:\s*"([^"]+)"', line)
                     if m_inv and not detected_invocation_id:
                         detected_invocation_id = m_inv.group(1)
                     messages.append(line)
 
-        # Fallback invocation ID derived from real thread if available
+        # DEF-T0050-9: Ground host invocation ID in real host thread / item identity
         if not detected_invocation_id and detected_thread_id:
-            detected_invocation_id = f"turn-{detected_thread_id[:8]}-01"
+            if detected_item_id:
+                detected_invocation_id = f"{detected_thread_id}:{detected_item_id}"
+            else:
+                detected_invocation_id = detected_thread_id
 
         output_text = "\n".join(messages).strip()
         if not output_text and stderr:
