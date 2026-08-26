@@ -152,3 +152,15 @@
    - 初始化前同时保留调用方请求的绝对路径与 `realpath`，两者不完全一致即 Fail-Closed；创建目录后再次复核，防止初始化窗口内被替换。Windows Junction 与 POSIX 符号链接均覆盖“根自身”和“父链”两种场景。
 2. **[DEF-T0023-37] 单个 Registry 文件链接替换拒绝**:
    - `inspect()` 要求目标 JSON 的绝对路径与 `realpath` 完全一致；单个登记文件被符号链接或 reparse point 重定向时，在 `exists/open` 前直接拒绝。
+
+## 4. 2D-1 开工准备（尚未实施代码）
+
+- **2C 终态**：候选 `fa548d8d73704168b2dcc99f8944f4e5d03936a2` 已完成 Reviewer、最终 QA 与用户终态验收，2C 正式冻结。
+- **定位调整**：2D 拆分为“2D-1 通用 Adapter 基础设施 + 2D-2 Codex 参考 Adapter”；2D-1 将 `AdapterManifest`、`AdapterRegistry`、验证等级、能力解析和通用合规测试套件作为一个整体实施与验收。
+- **可移植性要求**：核心编排、Evidence 和 Worktree 不得硬编码客户端名称；Builder、Reviewer、QA 通过开放 `adapter_id` 与能力契约选择平台。
+- **验证等级**：统一使用 `native_verified`、`cli_verified`、`mcp_verified`、`static_only`、`unsupported`；静态配置、人工窗口输出和模型自述不能升级为 verified。
+- **跨平台目标**：Windows 后续真实 Adapter 目标为真实验证；macOS 当前保持 `static_only` 并纳入 Schema、Manifest、路径模板与静态测试；Linux 按平台能力声明 `static_only` 或 `unsupported`，验证状态不得跨平台继承。
+- **运行边界**：仅打开 Codex/Antigravity 两个桌面窗口仍属于人工模式；只有后续真实 Adapter 与 2F 编排完成后，持续运行的编排入口才能自动执行 Builder → Reviewer → QA。最终验收、破坏性操作、费用/权限扩张和 main 合并仍需用户确认。
+- **详细任务书**：`docs/D04-研发过程/D01-任务/Phase2-2D-通用Adapter注册与Codex参考实现任务书.md`。
+- **2D-1 独立合同**：`docs/D04-研发过程/D01-任务/Phase2-2D-1-通用Adapter基础设施实施任务书.md`。
+- **未实施范围**：尚未创建 Registry、Manifest 或真实平台 Adapter，未调用任何客户端/API，未产生费用，未进入 2D-2、2E、2F、第三阶段或第四阶段。
