@@ -93,3 +93,5 @@ tags: [实施报告, HostAdapter, Evidence, Worktree, Adapter]
 - **详细任务书**：`docs/D04-研发过程/D01-任务/Phase2-2D-通用Adapter注册与Codex参考实现任务书.md`。
 - **2D-1 独立合同**：`docs/D04-研发过程/D01-任务/Phase2-2D-1-通用Adapter基础设施实施任务书.md`，包含范围冻结、Schema、解析顺序、合规测试、准出标准和可直接批准提示词。
 - **未实施**：未创建 Registry、Manifest、Codex Adapter，未调用任何客户端/API，未产生费用，未进入 2D～2F。
+- **跨平台目标（2026-08-26 用户确认）**：Windows 目标为真实 `verified`；macOS 当前为 `static_only` 并立即纳入 Schema、Manifest、路径模板与静态测试；Linux 按平台能力标记 `static_only/unsupported`。验证等级按操作系统和 host surface 隔离，不跨平台继承。
+- **运行边界（2026-08-26 用户确认）**：仅打开 Codex/Antigravity 两个桌面窗口仍属于人工模式；只有后续真实 Adapter 和 2F 编排完成后，持续运行的编排入口才能自动执行 Builder → Reviewer → QA。最终验收、破坏性操作、费用/权限扩张和 main 合并仍需用户确认。

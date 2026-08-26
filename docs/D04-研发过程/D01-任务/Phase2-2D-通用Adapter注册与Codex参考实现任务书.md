@@ -5,8 +5,8 @@ stage: Phase-2
 type: task
 status: active
 author: 李文通
-updated_at: 2026-08-25
-tags: [Adapter, Codex, 可移植性, 合规测试]
+updated_at: 2026-08-26
+tags: [Adapter, Codex, 可移植性, 跨平台, 自动化边界, 合规测试]
 ---
 
 # 第二阶段 2D 通用 Adapter 生态与平台接入总任务书
@@ -37,6 +37,24 @@ Codex 是首个参考实现，不是核心层依赖。未来增加 Claude Code�
 | Adapter 已实现并通过合规与真实 E2E | 自动派发、独立会话、worktree、证据门禁和状态联动 | 第二阶段完整多 Agent 体验 |
 
 没有 Adapter 时允许明确降级，但必须向用户展示降级等级；禁止把同一会话角色切换、静态 Agent 文件导出或手工复制提示词宣传为真实自动多 Agent。
+
+### 2.1 当前平台目标
+
+| 平台 | 当前目标 | 说明 |
+|---|---|---|
+| Windows | `verified` | 真实 Adapter 批次必须在真实客户端/CLI/宿主上完成 E2E |
+| macOS | `static_only` | 现在完成通用 Schema、Manifest、路径模板和静态测试，真实 Mac E2E 后才能升级 |
+| Linux | `static_only` 或 `unsupported` | 依据具体平台入口逐项声明，不从其他操作系统继承能力 |
+
+验证等级按“Adapter + 操作系统 + host surface”记录。某 Adapter 在 Windows 为 `native_verified`，不代表同一 Adapter 在 macOS 或 Linux 已验证。
+
+### 2.2 双窗口运行方式
+
+同时打开 Codex 与 Antigravity 两个桌面窗口，并分别设置开发/审核角色，只能形成 `manual` 人工双窗口模式。窗口之间不会自动监听看板、互相启动任务或交换可信证据。
+
+第二阶段完整实现后的目标是由一个持续运行的 yy-flow 编排入口接收用户需求，通过 verified Adapter 自动创建并等待独立 Builder、Reviewer 和 QA 会话。自动链为“开发 → 审核 → 退回后再开发/复审 → QA → 等待用户验收”。最终验收、破坏性操作、权限或费用扩张和合并 main 始终需要用户确认。
+
+若桌面客户端没有公开且可验证的程序化入口，即使窗口已经打开，也只能保持 `manual/assisted + static_only`，不得使用 UI 自动点击冒充真实自动 Adapter。
 
 ## 3. 架构不变量
 
@@ -89,6 +107,7 @@ unsupported      # 不支持或能力未知
 - 平台版本约束；
 - 合规套件版本；
 - 真实 E2E 证据引用。
+- 支持的操作系统、逐操作系统验证记录、可执行文件候选和配置路径模板。
 
 `AdapterRegistry` 至少支持：
 

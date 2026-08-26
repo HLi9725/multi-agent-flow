@@ -1013,6 +1013,14 @@ yy_flow/hosts/chatgpt.py
 
 平台验证等级统一为 `native_verified`、`cli_verified`、`mcp_verified`、`static_only` 和 `unsupported`。静态 Agent 导出、配置目录存在、单会话角色切换和手工复制提示词只能属于 `static_only`，不能推进真实多 Agent 证据。
 
+当前跨平台目标如下，验证等级必须绑定到具体 Adapter、操作系统和 host surface，禁止跨平台继承：
+
+| 平台 | 当前目标 | 第二阶段处理方式 |
+|---|---|---|
+| Windows | `verified` | 真实客户端/CLI/宿主 E2E 与身份链验证 |
+| macOS | `static_only` | 现在完成接口、Manifest、路径模板和静态测试；真实 Mac E2E 后升级 |
+| Linux | `static_only` 或 `unsupported` | 按具体客户端是否存在稳定入口声明 |
+
 没有合规 Adapter 时，平台允许降级为旧版单 Agent 人工模式；必须显式提示用户手工切换角色/交接，禁止宣传为第二阶段完整自动多 Agent。
 
 Codex 必须区分三条执行路线：
@@ -1161,6 +1169,18 @@ Codex 必须区分三条执行路线：
 4. Reviewer 通过后，QA 在候选提交上独立运行；
 5. QA 失败则退回并附失败证据；
 6. QA 通过后只能进入“已完成/待用户验收”。
+
+#### 8.6.1 双客户端窗口与自动调度边界
+
+仅打开 Codex 和 Antigravity 两个桌面窗口并设置不同角色，不会自动形成跨客户端调度。没有 verified Adapter 和持续运行的编排入口时，用户仍需手工启动窗口、粘贴交接包并触发下一步。
+
+运行模式分为：
+
+1. `manual`：用户手工启动开发/审核窗口和复制交接；
+2. `assisted`：系统生成提示词、检查状态并提醒，用户确认或点击启动；
+3. `verified_automatic`：编排器通过 verified Adapter 自动创建、等待和取证独立会话。
+
+第二阶段完整目标流程为：用户确认执行 → Builder 开发 → Reviewer 审核 → 有缺陷则自动退回并重新调度 Builder → Reviewer 复审 → QA 测试 → 等待用户最终验收。自动调度不等于自动验收；破坏性操作、外部发布、权限/费用扩张、合并 main 和最终验收必须暂停等待用户。
 
 ### 8.7 最终验收默认要求用户确认
 
@@ -1473,7 +1493,7 @@ tenant_id / user_id / project_id / task_id
 ### 11.2 CI 建议
 
 ```text
-OS: Windows + Linux，后续补 macOS
+OS: Windows 真实验证；Linux 执行 POSIX 契约测试；macOS 现在纳入 Schema/Manifest/静态测试，真实 Mac E2E 后升级
 Python: 3.11 + 当前稳定版本
 模式: local board + fake host + git worktree
 门禁: 单测、类型检查、格式检查、安全扫描、文档链接检查

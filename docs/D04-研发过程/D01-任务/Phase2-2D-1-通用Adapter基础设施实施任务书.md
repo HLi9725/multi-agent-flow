@@ -5,8 +5,8 @@ stage: Phase-2
 type: task
 status: active
 author: 李文通
-updated_at: 2026-08-25
-tags: [AdapterRegistry, AdapterManifest, 验证等级, 能力解析, 合规测试]
+updated_at: 2026-08-26
+tags: [AdapterRegistry, AdapterManifest, 验证等级, 跨平台, 自动化边界, 能力解析, 合规测试]
 ---
 
 # 第二阶段 2D-1 通用 Adapter 基础设施实施任务书
@@ -107,6 +107,9 @@ MULTI_CLIENT_MODERNIZATION_PLAN.zh-CN.md
 - `identity_fields`；
 - `auth_boundary` 和 `billing_boundary`，只描述类别，不保存凭证；
 - `platform_version_constraint`；
+- `supported_operating_systems`，仅允许显式声明 `windows`、`macos`、`linux`；
+- `platform_verifications`，按“操作系统 + host surface”分别记录验证等级、版本、时间和 E2E 引用；
+- `executable_candidates_by_os` 和 `config_path_templates_by_os`，只保存可移植模板，不执行探测、不保存登录数据；
 - `conformance_suite_version`；
 - `verified_at`；
 - `e2e_evidence_refs`；
@@ -122,6 +125,8 @@ MULTI_CLIENT_MODERNIZATION_PLAN.zh-CN.md
 6. verified 等级必须具有对应非空 E2E 引用；2D-1 测试夹具不得伪造 verified；
 7. Manifest 与 Adapter 实例的 `adapter_id`、Host 身份和能力必须一致；
 8. 序列化不得包含秘密、原始 Authorization Header 或登录缓存路径。
+9. 验证等级必须绑定到具体操作系统和 host surface；Windows 的真实 E2E 不得让 macOS/Linux 自动继承 verified；
+10. 当前操作系统没有对应声明时必须返回 `unsupported`，不得退回任意默认路径或使用另一平台的可执行文件。
 
 ## 6. 验证等级
 
@@ -146,6 +151,16 @@ unsupported
 - `unsupported`：不支持、不可用或无法证明。
 
 `static_only`、`unsupported`、Fake、Mock、Test、Simulate 和人工复制结果不得作为真实状态流转证据。验证等级不得由 Adapter 自述直接升级，必须由后续平台批次的真实 E2E 和用户批准完成。
+
+### 6.1 当前跨平台目标
+
+| 平台 | 2D 当前目标 | 准出边界 |
+|---|---|---|
+| Windows | `verified` | 后续真实 Adapter 必须完成真实客户端/CLI/宿主集成测试并保存身份链证据 |
+| macOS | `static_only` | 2D-1 现在完成 Schema、路径模板、Manifest 和静态契约测试；取得真实 Mac E2E 前不得升级 |
+| Linux | `static_only` 或 `unsupported` | 按具体客户端是否存在稳定入口逐项声明，不得从 Windows/macOS 推断 |
+
+2D-1 的核心实现必须保持操作系统无关，不得出现把 Windows 盘符、反斜杠、用户目录或可执行文件名写死在 Registry/Resolver 中的逻辑。平台路径只能存在于 Manifest 数据中，并通过显式当前平台解析。macOS 的 `static_only` 不阻塞 Windows 的真实 Adapter 开发，但也不能参与真实任务派发、Evidence Gate 放行或 verified 候选选择。
 
 ## 7. AdapterRegistry 契约
 
@@ -200,6 +215,22 @@ resolve(resolution_request)
 
 解析顺序必须确定：Schema 校验 → 精确 ID 过滤 → 验证等级过滤 → 全部能力过滤 → workspace/边界过滤 → 唯一性判定 → 结构化决策。任何 `UNKNOWN` 能力不得当成 `SUPPORTED`。
 
+### 8.1 双客户端窗口与自动化边界
+
+仅仅打开 Codex 和 Antigravity 两个桌面窗口，并分别提示“开发”和“审核”，仍属于人工多窗口模式。两个窗口不会因为看板状态变化自动互相唤醒，也不会天然共享可信 session、invocation、worktree 或 Evidence。
+
+统一分为三种运行模式：
+
+| 模式 | 用户操作 | 系统能力 |
+|---|---|---|
+| `manual` | 用户分别打开窗口、粘贴交接包并手工启动下一角色 | 看板和规则可用，但没有自动 dispatch/wait/evidence |
+| `assisted` | 编排器生成提示词、检查状态并提醒，用户点击或确认启动客户端任务 | 半自动交接；任何人工结果必须明确标记来源 |
+| `verified_automatic` | 用户向持续运行的编排入口提交一次需求；编排器通过 verified Adapter 创建/等待独立会话 | 可自动执行 Builder → Reviewer → QA 链路并提交真实证据 |
+
+`verified_automatic` 不是 2D-1 的交付能力。2D-1 只定义 Manifest、Registry、解析和合规门禁；2D-2、2E 分别提供真实平台 Adapter，2F 才实现独立 Reviewer/QA 编排。即使第二阶段完整实现，以下节点仍必须暂停等待用户：首次写入授权未包含在原始命令中、高风险或破坏性操作、权限/费用扩张、平台能力不确定、合并 main，以及最终业务验收。
+
+完整自动链的目标顺序为：用户下发并确认执行 → Builder 开发 → Reviewer 独立审核 → 审核退回则重新唤起 Builder → Reviewer 复审 → QA 独立测试 → 等待用户最终验收。禁止出现“审核尚未取得候选提交就先运行”或“审核结束后无条件重新开发”的机械循环。
+
 ## 9. 通用合规测试套件
 
 合规套件必须通过 Adapter 工厂/夹具复用同一组断言，不允许各平台复制后弱化。2D-1 仅用 Fake、Static 和恶意测试 Adapter 验证套件本身。
@@ -224,6 +255,9 @@ resolve(resolution_request)
 16. 并发注册、查询、解析不串项目、不串上下文；
 17. 合规单测通过不等于真实平台 E2E；
 18. 套件必须能对故意违规 Adapter 产生预期失败，证明测试不是空壳。
+19. Windows、macOS、Linux 的验证记录彼此隔离，单平台 verified 不得污染另一平台；
+20. macOS `static_only` 和 Linux `static_only/unsupported` 不得被 Resolver 选入真实自动派发；
+21. `manual`、`assisted`、`verified_automatic` 三种运行模式不得互相冒充，人工窗口输出不能伪造成 Adapter invocation。
 
 零副作用测试应拦截 `open`、目录创建、文件锁、网络、子进程和真实 Adapter dispatch，而不只是比较测试目录树。
 
@@ -290,6 +324,8 @@ git diff --check
 10. 实施报告与 Git、测试和看板证据一致；
 11. 未实施 Codex、Antigravity、2F、第三阶段或第四阶段；
 12. 最终停在用户验收门前。
+13. Windows/macOS/Linux 平台矩阵和逐平台验证记录可确定解析，macOS 未经真实 E2E 保持 `static_only`；
+14. 文档和决策明确说明：打开两个客户端窗口本身不会自动形成跨客户端工作流。
 
 ## 13. 后续批次关系
 
@@ -356,6 +392,9 @@ docs/D04-研发过程/D01-任务/Phase2-2D-1-通用Adapter基础设施实施任�
 10. 2A/2B/2C 契约和全量测试无回归；
 11. 未实现或调用任何真实 Codex/Antigravity Adapter；
 12. 报告、Git、测试和看板证据一致。
+13. Windows verified 不会传播到 macOS/Linux，macOS static_only 不会进入真实派发；
+14. Manifest 路径模板无 Windows-only 核心硬编码，Resolver 按当前平台 Fail-Closed；
+15. 两个桌面窗口、人工复制提示词或模型自述不会被标记为 verified_automatic。
 
 复跑任务书要求的定向测试、关联回归、全量测试和 git diff --check，记录实际命令、退出码、数量和耗时。测试污染卡只能合法软取消，不得编辑或快照覆盖 board.json。
 
