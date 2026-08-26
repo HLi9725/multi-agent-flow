@@ -1,4 +1,5 @@
 from collections.abc import Mapping
+import contextlib
 import io
 import multiprocessing
 import os
@@ -121,34 +122,54 @@ def _isolated_capability_probe_worker(
     sys.addaudithook(_isolated_probe_audit_hook)
     baseline_threads = {thread.ident for thread in threading.enumerate()}
     _ISOLATED_PROBE_ACTIVE = True
+    captured_stdout = io.StringIO()
+    captured_stderr = io.StringIO()
 
-    try:
-        isolated_adapter = adapter_class(*constructor_args, **constructor_kwargs)
-        caps = isolated_adapter.detect_capabilities()
-        if not isinstance(caps, HostCapabilities):
-            raise ConformanceError("detect_capabilities did not return HostCapabilities instance")
+    with contextlib.redirect_stdout(captured_stdout), contextlib.redirect_stderr(captured_stderr):
+        try:
+            isolated_adapter = adapter_class(*constructor_args, **constructor_kwargs)
+            caps = isolated_adapter.detect_capabilities()
+            if not isinstance(caps, HostCapabilities):
+                raise ConformanceError("detect_capabilities did not return HostCapabilities instance")
 
-        lingering_threads = [
-            thread.name
-            for thread in threading.enumerate()
-            if thread.ident not in baseline_threads and thread.is_alive()
-        ]
-        if lingering_threads:
-            _ISOLATED_INTERCEPTED_CALLS.append(
-                f"lingering adapter threads: {sorted(lingering_threads)}"
-            )
-        if _ISOLATED_INTERCEPTED_CALLS:
-            raise ConformanceError(
-                f"Zero side-effect violation: intercepted {_ISOLATED_INTERCEPTED_CALLS}"
-            )
-        message = {"status": "ok"}
-    except BaseException as exc:
-        message = {
-            "status": "error",
-            "error_type": type(exc).__name__,
-            "message": str(exc),
-            "intercepted_calls": tuple(_ISOLATED_INTERCEPTED_CALLS),
-        }
+            lingering_threads = [
+                thread.name
+                for thread in threading.enumerate()
+                if thread.ident not in baseline_threads and thread.is_alive()
+            ]
+            if lingering_threads:
+                _ISOLATED_INTERCEPTED_CALLS.append(
+                    f"lingering adapter threads: {sorted(lingering_threads)}"
+                )
+            if _ISOLATED_INTERCEPTED_CALLS:
+                raise ConformanceError(
+                    f"Zero side-effect violation: intercepted {_ISOLATED_INTERCEPTED_CALLS}"
+                )
+            message = {"status": "ok"}
+        except BaseException as exc:
+            message = {
+                "status": "error",
+                "error_type": type(exc).__name__,
+                "message": str(exc),
+                "intercepted_calls": tuple(_ISOLATED_INTERCEPTED_CALLS),
+            }
+
+    output_channels = []
+    if captured_stdout.getvalue():
+        output_channels.append("stdout")
+    if captured_stderr.getvalue():
+        output_channels.append("stderr")
+    if output_channels:
+        _ISOLATED_INTERCEPTED_CALLS.append(
+            f"adapter output intercepted on {','.join(output_channels)}"
+        )
+        if message["status"] == "ok":
+            message = {
+                "status": "error",
+                "error_type": "ConformanceError",
+                "message": "Zero side-effect violation: adapter emitted console output",
+                "intercepted_calls": tuple(_ISOLATED_INTERCEPTED_CALLS),
+            }
 
     try:
         connection.send(message)
@@ -609,4 +630,11 @@ class FaultySideEffectUtimeAdapter(StandardTestFakeAdapter):
 
     def detect_capabilities(self) -> HostCapabilities:
         os.utime(self.target_path, (1, 1))
+        return self._capabilities
+
+
+class FaultySideEffectOutputAdapter(StandardTestFakeAdapter):
+    """Attempts to emit console/log output during capability detection."""
+    def detect_capabilities(self) -> HostCapabilities:
+        print("unauthorized capability probe output")
         return self._capabilities

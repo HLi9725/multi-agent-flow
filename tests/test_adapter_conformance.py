@@ -36,6 +36,7 @@ from scripts._lib.core.adapter_conformance import (
     FaultyCapabilitiesMismatchAdapter,
     FaultyForgedRealHostHandleAdapter,
     FaultySideEffectIoOpenAdapter,
+    FaultySideEffectOutputAdapter,
     FaultySideEffectChildThreadAdapter,
     FaultySideEffectHardlinkAdapter,
     FaultySideEffectPathlibWriteTextAdapter,
@@ -159,7 +160,7 @@ def test_zero_side_effect_guard_does_not_pollute_unrelated_threads(tmp_path):
     assert unrelated_file.read_text(encoding="utf-8") == "allowed"
 
 
-def test_zero_side_effects_blocks_adapter_child_thread_write(tmp_path):
+def test_zero_side_effects_blocks_adapter_child_thread_write(tmp_path, capsys):
     target = tmp_path / "child-thread-write.txt"
     adapter = FaultySideEffectChildThreadAdapter(str(target))
 
@@ -167,6 +168,9 @@ def test_zero_side_effects_blocks_adapter_child_thread_write(tmp_path):
         assert_zero_side_effects(adapter)
 
     assert not target.exists()
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
 
 
 def test_zero_side_effects_blocks_hardlink_and_utime(tmp_path):
@@ -202,6 +206,15 @@ def test_zero_side_effects_rejects_local_unspawnable_adapter():
 
     with pytest.raises(ConformanceError, match="module-level"):
         assert_zero_side_effects(LocalAdapter("local_adapter"))
+
+
+def test_zero_side_effects_blocks_and_suppresses_console_output(capsys):
+    with pytest.raises(ConformanceError, match="console output"):
+        assert_zero_side_effects(FaultySideEffectOutputAdapter("output_adapter"))
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
 
 
 def test_adapter_timeout_and_cancel_lifecycle():
