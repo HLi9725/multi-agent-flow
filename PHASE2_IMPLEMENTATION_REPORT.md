@@ -363,3 +363,94 @@
    - 取消结果进入历史记录，重复取消返回 `False`，同时继续阻止 Session ID 被重新占用。
 5. **独立对抗复现**:
    - 仓库外脚本覆盖 thread-only、单元素 allow、自授权缓存、重复 Session、同实例伪造 Handle 五项场景；修复前 `0/5`，修复后 `5/5`。
+
+---
+
+## 六、第二阶段 2E：Antigravity 真实 Adapter 开发实施报告 (Task T0052)
+
+### 1. 目标与完成情况
+
+- **实施目标**: 在 2A～2D-2 基础设施上实现真实 `AntigravityAdapter`，取得 Windows 宿主（`agy.exe` 1.1.8）的真实 session、invocation、workspace 与 Evidence 身份链。macOS 保持 `static_only`，Linux 保持 `static_only`。
+- **权限与审批优化**: 完整落实 §3.1 五类权限档（`safe_local`、`controlled_external`、`destructive`、`billing`、`acceptance`），对工作区内稳定命令实现 7 元组精确缓存，消除日常开发中重复授权痛点，同时杜绝 `Always Proceed`、`command(*)`、`python -c` 误放行与权限跨边界复用。
+- **任务编号**: `T0052`
+- **代码基线**: `e4550d4d0a87226adc7da67785700c1fdc7a2e44`
+
+### 2. 核心架构与安全机制
+
+1. **Host Surface 与验证等级**:
+   - 适配器标识: `antigravity`
+   - 宿主 Surface: `HostSurface.CLI`（`agy.exe` 1.1.8）
+   - Windows: `VerificationLevel.CLI_VERIFIED`（版本 >=1.0.0，实测 1.1.8）
+   - macOS: `VerificationLevel.STATIC_ONLY`
+   - Linux: `VerificationLevel.STATIC_ONLY`
+   - 认证边界: `USER_LOCAL`（本地已登录账户会话，不读取、保存或提交凭证）
+   - 计费边界: `USER_SUBSCRIPTION`（用户桌面客户端配额，不启用外部付费 API）
+
+2. **角色路由与沙箱强隔离**:
+   - `DEV` / `BUILDER` 角色: 路由至 `flow-dev` 专家子代理，默认启用 `--sandbox` 与 `--mode accept-edits`，支持 worktree 隔离。
+   - `REVIEWER` 角色: 路由至 `flow-reviewer`，强制执行 `--mode plan`（只读），请求写操作直接抛出 `AgentNotSupportedError` 拦截。
+   - `QA` 角色: 路由至 `flow-qa`，默认只读模式。
+   - `ARCHITECT` / `PM` / `DOCS` / `DEVOPS`: 路由至对应专业子代理（`flow-architect`, `flow-pm`, `flow-docs`, `flow-devops`）。
+
+3. **五类权限分级与精确 7 元组缓存**:
+   - `safe_local`: 工作区内 Git 只读查询、pytest、yy-flow CLI 工具（`heartbeat.py`, `quick_task.py`, `transition_task.py`, `check_stage_gate.py`）。首次批准后在相同 7 元组上下文自动免密执行。
+   - `controlled_external`: 网络请求、依赖下载、外部目录访问 -> 强制 Ask。
+   - `destructive`: `git reset/clean/rebase/branch -D`、文件递归删除 -> Deny / 逐次 Ask。
+   - `billing`: API Key、付费 API -> 显式独立确认。
+   - `acceptance`: `git push`, `git merge`, 发布验收 -> 显式用户授权。
+   - 缓存唯一键: `(project_id, auth_context, adapter_instance_id, session_id, workspace_dir, command_family, permission_boundary)` 7 元组，禁止跨项目、跨账号、跨会话、跨工作区扩散。
+   - 严禁 `Always Proceed`、`--dangerously-skip-permissions`、`command(*)`、`python -c` 任意代码内联执行。
+
+4. **Session / Handle 与 Invocation 真实性与防伪**:
+   - 启动真实进程前原子占位 `session_id`；若启动失败立即回滚占位。
+   - 派发句柄携带 32 字节不可预测 `invocation_token`；`wait_for_result` 与 `cancel_agent` 实行完整 Handle 强相等校验。
+   - 宿主调用标识绑定 canonical 规范复合格式: `<conversation_id>:<step_id>`（例如 `conv-6e9f4305-real:step_1`）。
+   - 缺失真实会话或步骤身份时严格 Fail-Closed，拒绝冒充宿主身份，拒绝生成假 Evidence。
+   - 非交互 CLI 模式下 `request_confirmation` 抛出 `AgentNotSupportedError`，不伪造用户确认。
+
+### 3. 交付物清单
+
+- `scripts/_lib/hosts/antigravity_adapter.py`: `AntigravityAdapter`、`create_antigravity_manifest()` 及 5 档权限风险评估函数 `evaluate_command_risk()`。
+- `scripts/_lib/hosts/__init__.py`: 导出 `AntigravityAdapter` 与 `create_antigravity_manifest`。
+- `tests/test_antigravity_adapter.py`: 针对 Antigravity 适配器的单元测试、集成测试、5 档权限评估测试、并发与生命周期测试、对抗防伪测试与 EvidenceGate 验证。
+- `PHASE2_IMPLEMENTATION_REPORT.md`: 完整实施与测试报告。
+
+### 4. 测试记录（真实数据）
+
+- **2E 定向测试**:
+  - `python -m pytest tests/test_antigravity_adapter.py -q -rs` -> `19 passed in 0.74s` (0 failed, 0 skipped)
+- **2D-1 通用基础设施回归测试**:
+  - `python -m pytest tests/test_adapter_manifest.py tests/test_adapter_registry.py tests/test_adapter_conformance.py -q -rs` -> `37 passed in 3.11s` (0 failed, 0 skipped)
+- **2A～2D-2 兼容性与 Codex 适配器测试**:
+  - `python -m pytest tests/test_host_adapter.py tests/test_evidence.py tests/test_worktree_manager.py tests/test_codex_cli_adapter.py -q -rs` -> `80 passed in 23.08s` (0 failed, 0 skipped)
+- **全量测试套件**:
+  - `python -m pytest tests -q -rs` -> `362 passed in 64.60s (0:01:04)` (0 failed, 0 skipped, 100% 通过)
+- **代码规范检查**:
+  - `git diff --check` -> 退出码 0，零尾随空白错误
+
+### 5. 真实 E2E 证据与 EvidenceGate 闭环
+
+```yaml
+e2e_record:
+  antigravity_surface: "agy.exe (Google Antigravity CLI)"
+  version: "1.1.8"
+  verification_level: "cli_verified"
+  project_folders:
+    - "C:\\Users\\user\\Desktop\\user\\multi-agent-flow-phase2e-antigravity-adapter"
+    - "C:\\Users\\user\\Desktop\\user\\multi-agent-flow-phase2-real-agents"
+  host_session_id: "sess_ag_ev_01"
+  canonical_conversation_id: "conv-6e9f4305-real"
+  canonical_invocation_id: "conv-6e9f4305-real:step_1"
+  host_identity_source: "antigravity_host_conversation_id"
+  auth_boundary: "USER_LOCAL"
+  billing_boundary: "USER_SUBSCRIPTION"
+  evidence_id: "ev-antigravity-cli-001"
+  evidence_gate_judgment: "PASS"
+```
+
+### 6. 未实施范围说明
+
+- 独立 Reviewer/QA 真实自动编排与双宿主自动仲裁（属于 2F）
+- main 分支合流与双 Adapter 联调（属于 2F 准出范围）
+- 第三阶段（Skill 拆分与复杂度控制）
+- 第四阶段（多平台打包与发布）
