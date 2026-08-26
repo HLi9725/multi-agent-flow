@@ -158,8 +158,8 @@
 - **实施范围**: 仅执行第二阶段 2D-1（AdapterManifest、AdapterRegistry、验证等级、能力解析与通用合规测试套件）。
 - **基线提交**: 21828a88ae0aa65b7cf84ea9b1e4244737100892
 - **开发分支**: feature/phase2d-1-generic-adapters
-- **本轮核心修复提交**: 8f9c36d2d90edbfd575a16af4f0243d95ff7d656
-- **结论**: 2D-1 五项通用基础能力及 DEF-T0049-15～16 返工已完成开发验证，等待角色隔离 Reviewer 与 QA 准出。核心代码中零客户端名称硬编码，严格遵循 Fail-Closed 与逐平台验证隔离。未实施任何真实 Codex/Antigravity Adapter，未进入 2D-2、2E、2F、第三阶段或第四阶段。
+- **本轮核心修复提交**: 8f9c36d2d90edbfd575a16af4f0243d95ff7d656、ff86ea3e8dce17de109f9e2948fc565281b622ea
+- **结论**: 2D-1 五项通用基础能力及 DEF-T0049-15～17 返工已完成开发验证，等待角色隔离 Reviewer 与 QA 准出。核心代码中零客户端名称硬编码，严格遵循 Fail-Closed 与逐平台验证隔离。未实施任何真实 Codex/Antigravity Adapter，未进入 2D-2、2E、2F、第三阶段或第四阶段。
 
 ### 核心实现方案
 1. **不可变 AdapterManifest**:
@@ -180,12 +180,12 @@
 
 ### 测试记录（最新真实数据）
 - **2D-1 定向测试**:
-  - `python -m pytest tests/test_adapter_manifest.py tests/test_adapter_registry.py tests/test_adapter_conformance.py -q -rs` -> `36 passed in 1.68s`
-  - **总计**: `36 passed in 1.68s` (0 failed, 0 skipped)
+  - `python -m pytest tests/test_adapter_conformance.py tests/test_adapter_manifest.py tests/test_adapter_registry.py -q -rs` -> `37 passed in 3.20s`
+  - **总计**: `37 passed in 3.20s` (0 failed, 0 skipped)
 - **2A/2B/2C 关联兼容测试**:
   - `python -m pytest tests/test_host_adapter.py tests/test_evidence.py tests/test_worktree_manager.py -q -rs` -> `60 passed in 20.20s` (0 failed, 0 skipped)
 - **全量测试**:
-  - `python -m pytest tests -q -rs` -> `322 passed in 62.50s` (0 failed, 0 skipped, 100% 通过)
+  - `python -m pytest tests -q -rs` -> `323 passed in 62.36s` (0 failed, 0 skipped, 100% 通过)
 - **代码规范**:
   - `git diff --check` -> 退出码 0，零尾随空白错误
 
@@ -250,8 +250,12 @@
 2. **[DEF-T0049-16] 文件系统变更审计事件补齐**:
    - 拦截集合覆盖写模式 `open`、`mkdir/remove/rmdir/rename/chmod/truncate`，并补齐 `link/symlink/utime/chown`、环境变更、进程创建、注册表写入和网络事件。
    - 新增 Adapter 子线程写入、hardlink、symlink、utime、不可 spawn 类五组对抗测试；所有操作均在 OS 实际执行前被阻断，临时目录文件树和 mtime 保持不变。
+3. **[DEF-T0049-17] 隔离进程控制台与日志输出阻断**:
+   - 专用探测进程使用独立内存流捕获 stdout/stderr，Adapter 的显式 `print()`、日志输出及子线程未捕获异常回溯均不得传播至宿主终端。
+   - 任一输出通道出现内容即记录零副作用违规并 Fail-Closed；错误消息只报告通道，不回传可能包含敏感信息的原始输出。
+   - 新增显式控制台输出与子线程异常回溯测试，并通过 `capsys` 断言宿主 stdout/stderr 均保持空白。
 
 ### 本轮测试看板哈希说明
-- 代码工作树测试数据 `user_data/board.json`：本轮全量测试前 `9CFC14BE2A04C4D64F015932ECFBFF4B017821DBFEFD87B69875F21B8B8A4B19`，测试后 `3FD47FA4038F1B0B1B381148CB075CE49D0ADCAE00F1C214F1725D886B843295`。
+- 代码工作树测试数据 `user_data/board.json`：最终全量测试前 `3FD47FA4038F1B0B1B381148CB075CE49D0ADCAE00F1C214F1725D886B843295`，测试后 `914EFEF6B3CFA872398EB311A278045E93D2A0D0F59FC274A3AF547CC25DD27F`。
 - 该文件属于代码工作树的非权威测试数据且未进入 Git 修改集；未直接编辑、覆盖或物理删除。
 - 权威看板位于阶段集成工作树，T0049 在本轮开发期间保持 `进行中 / 李开发`。
