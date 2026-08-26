@@ -183,36 +183,50 @@ def test_codex_cli_adapter_command_building_and_no_invalid_a_flag():
 
 
 def test_codex_cli_adapter_approval_and_confirmation_contract():
-    # DEF-T0050-2: Test §7.1 permission approval and confirmation contract
+    # DEF-T0050-2 & DEF-T0050-13: Test §7.1 permission approval without faked confirmation
     adapter = CodexCliAdapter(is_real_host=False)
 
-    # 1. Valid positive confirmation
-    conf_approve = ConfirmationRequest(
+    # 1. Multi-option request without user confirmation token must NOT pick options[0] (DEF-T0050-13)
+    conf_prompt = ConfirmationRequest(
         request_id="req_conf_01",
         prompt="Execute git clean?",
         options=("approve", "deny")
     )
-    res_approve = adapter.request_confirmation(conf_approve)
-    assert res_approve.is_confirmed is True
-    assert res_approve.selected_option == "approve"
+    res_prompt = adapter.request_confirmation(conf_prompt)
+    assert res_prompt.is_confirmed is False
+    assert res_prompt.selected_option == "deny"
 
-    # 2. Explicit denial
-    conf_deny = ConfirmationRequest(
+    # 2. Verified user approval token
+    conf_user = ConfirmationRequest(
         request_id="req_conf_02",
         prompt="Delete production database?",
-        options=("deny", "approve")
+        options=("user_confirmed",)
     )
-    res_deny = adapter.request_confirmation(conf_deny)
-    assert res_deny.is_confirmed is False
-    assert res_deny.selected_option == "deny"
+    res_user = adapter.request_confirmation(conf_user)
+    assert res_user.is_confirmed is True
+    assert res_user.selected_option == "user_confirmed"
 
-    # 3. Empty options or whitespace request_id validation
+    # 3. 5-tuple permission approval caching strictly forbids cross-boundary reuse (DEF-T0050-13)
+    adapter.record_permission_approval("proj1", "/ws1", "sess1", "inv1", "op_write")
+    assert adapter.has_permission_approval("proj1", "/ws1", "sess1", "inv1", "op_write") is True
+    # Cross-project boundary
+    assert adapter.has_permission_approval("proj2", "/ws1", "sess1", "inv1", "op_write") is False
+    # Cross-workspace boundary
+    assert adapter.has_permission_approval("proj1", "/ws2", "sess1", "inv1", "op_write") is False
+    # Cross-session boundary
+    assert adapter.has_permission_approval("proj1", "/ws1", "sess2", "inv1", "op_write") is False
+    # Cross-invocation boundary
+    assert adapter.has_permission_approval("proj1", "/ws1", "sess1", "inv2", "op_write") is False
+    # Cross-operation boundary
+    assert adapter.has_permission_approval("proj1", "/ws1", "sess1", "inv1", "op_delete") is False
+
+    # 4. Whitespace request_id validation
     with pytest.raises(ValueError, match="cannot be empty"):
         adapter.request_confirmation(ConfirmationRequest(request_id="", prompt="p", options=()))
 
 
 def test_codex_cli_adapter_real_thread_id_and_telemetry_binding():
-    # DEF-T0050-3, DEF-T0050-8 & DEF-T0050-9: Test parsing real OpenAI event sequence (thread.started, item.completed, turn.completed)
+    # DEF-T0050-3, DEF-T0050-8, DEF-T0050-9 & DEF-T0050-10: Test parsing canonical composite invocation
     adapter = CodexCliAdapter(is_real_host=False)
     sample_stdout = (
         '{"type":"thread.started","thread_id":"01a03d0f-ed4f-7191-a8b5-4c8810ad207d"}\n'
@@ -223,13 +237,104 @@ def test_codex_cli_adapter_real_thread_id_and_telemetry_binding():
     text, events, err, thread_id, inv_id, usage = adapter._parse_jsonl_output(sample_stdout, "")
 
     assert thread_id == "01a03d0f-ed4f-7191-a8b5-4c8810ad207d"
-    assert inv_id == "item_0"
+    assert inv_id == "01a03d0f-ed4f-7191-a8b5-4c8810ad207d:item_0"
     assert usage.get("input_tokens") == 15800
     assert usage.get("output_tokens") == 5
     assert usage.get("cached_tokens") == 11008
     assert len(events) == 4
     assert err is None
     assert "Review completed." in text
+
+
+def test_codex_cli_adapter_distinct_thread_invocations_no_collision():
+    # DEF-T0050-10: Two different threads returning item_0 must NOT collide
+    adapter = CodexCliAdapter(is_real_host=False)
+    stdout_a = (
+        '{"type":"thread.started","thread_id":"01a03d0f-ed4f-7191-a8b5-4c8810ad207d"}\n'
+        '{"type":"item.completed","item":{"id":"item_0","content":"Result A"}}\n'
+    )
+    stdout_b = (
+        '{"type":"thread.started","thread_id":"02b14e1a-fa5e-8202-b9c6-5d9921be318e"}\n'
+        '{"type":"item.completed","item":{"id":"item_0","content":"Result B"}}\n'
+    )
+    _, _, _, th_a, inv_a, _ = adapter._parse_jsonl_output(stdout_a, "")
+    _, _, _, th_b, inv_b, _ = adapter._parse_jsonl_output(stdout_b, "")
+
+    assert inv_a == "01a03d0f-ed4f-7191-a8b5-4c8810ad207d:item_0"
+    assert inv_b == "02b14e1a-fa5e-8202-b9c6-5d9921be318e:item_0"
+    assert inv_a != inv_b
+
+
+def test_codex_cli_adapter_exit_zero_missing_canonical_identity_fails_closed(monkeypatch):
+    # DEF-T0050-11: Process exits with rc=0 but missing canonical identity -> Fail-Closed!
+    adapter = CodexCliAdapter(is_real_host=True)
+
+    class MockExitZeroNoIdentityProcess:
+        pid = 12345
+        returncode = 0
+        def communicate(self, timeout=None):
+            return "Some generic non-JSONL text output without thread.started\n", ""
+        def poll(self):
+            return 0
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: MockExitZeroNoIdentityProcess())
+
+    req = AgentRequest(
+        session_id="sess_no_identity",
+        prompt="Task prompt",
+        role="DEV",
+        workspace_dir=os.path.abspath(".")
+    )
+    handle = adapter.dispatch_agent(req)
+    result = adapter.wait_for_result(handle)
+
+    # Must Fail-Closed
+    assert result.status == AgentStatus.FAILED
+    assert "Fail-Closed" in (result.error_message or "")
+    assert adapter.get_session_thread_id(handle.session_id) is None
+    assert adapter.get_session_invocation_id(handle.session_id) is None
+
+
+def test_codex_cli_adapter_cancel_handle_ownership_validation():
+    # DEF-T0050-12: cancel_agent must enforce identical handle ownership validation as wait_for_result
+    adapter = CodexCliAdapter(is_real_host=True)
+
+    # 1. Non-AgentHandle type
+    with pytest.raises(AgentInvalidHandleError, match="AgentHandle instance"):
+        adapter.cancel_agent("invalid_handle")  # type: ignore
+
+    # 2. Foreign adapter instance
+    h_foreign_inst = AgentHandle(
+        session_id="sess_cancel_chk",
+        host_id=adapter.adapter_id,
+        status="running",
+        is_real_host=True,
+        adapter_instance_id="foreign_inst_xyz"
+    )
+    with pytest.raises(AgentInvalidHandleError, match="foreign adapter instance"):
+        adapter.cancel_agent(h_foreign_inst)
+
+    # 3. Foreign host_id
+    h_foreign_host = AgentHandle(
+        session_id="sess_cancel_chk",
+        host_id="antigravity_cli",
+        status="running",
+        is_real_host=True,
+        adapter_instance_id=adapter._instance_id
+    )
+    with pytest.raises(AgentInvalidHandleError, match="does not match adapter"):
+        adapter.cancel_agent(h_foreign_host)
+
+    # 4. Mismatched is_real_host
+    h_mismatch_real = AgentHandle(
+        session_id="sess_cancel_chk",
+        host_id=adapter.adapter_id,
+        status="running",
+        is_real_host=False,
+        adapter_instance_id=adapter._instance_id
+    )
+    with pytest.raises(AgentInvalidHandleError, match="does not match adapter"):
+        adapter.cancel_agent(h_mismatch_real)
 
 
 def test_codex_cli_adapter_error_events_and_git_repo_check(tmp_path):
@@ -259,7 +364,7 @@ def test_codex_cli_adapter_error_events_and_git_repo_check(tmp_path):
 
 
 def test_codex_cli_evidence_gate_real_judgment(tmp_path, monkeypatch):
-    # DEF-T0050-4, DEF-T0050-8 & DEF-T0050-9: Test real EvidenceGate judgment with CodexCliAdapter handle, real thread & item
+    # DEF-T0050-4, DEF-T0050-8, DEF-T0050-9 & DEF-T0050-10: Test real EvidenceGate judgment with composite host identity
     adapter = CodexCliAdapter(is_real_host=True)
     manifest = create_codex_cli_manifest()
     caps = adapter.detect_capabilities()
@@ -290,11 +395,11 @@ def test_codex_cli_evidence_gate_real_judgment(tmp_path, monkeypatch):
     handle = adapter.dispatch_agent(req)
     result = adapter.wait_for_result(handle)
 
-    # Retrieve dynamically bound real thread_id and item/invocation_id (DEF-T0050-9)
+    # Retrieve dynamically bound real thread_id and composite invocation_id (DEF-T0050-10)
     real_thread_id = adapter.get_session_thread_id(handle.session_id)
     real_inv_id = adapter.get_session_invocation_id(handle.session_id)
     assert real_thread_id == "01a03d0f-ed4f-7191-a8b5-4c8810ad207d"
-    assert real_inv_id == "item_0"
+    assert real_inv_id == "01a03d0f-ed4f-7191-a8b5-4c8810ad207d:item_0"
 
     store_dir = str(tmp_path / "evidence_store")
     store = EvidenceStore(root_dir=store_dir)
@@ -307,7 +412,7 @@ def test_codex_cli_evidence_gate_real_judgment(tmp_path, monkeypatch):
         transition_from="进行中",
         transition_to="审查中",
         baseline_commit="b9c426a7c5d9226f2816fbe62ded3fb4a58d1e3c",
-        result_commit="574b8e4366a68b362022b8ffce2a76e30c57aacd",
+        result_commit="de9c4a60de22bbe6fc007952b409a85c5b2a09f7",
         expected_invocation_id=real_inv_id,
         expected_adapter="codex_cli",
         expected_workspace_mode="worktree",
@@ -341,7 +446,7 @@ def test_codex_cli_evidence_gate_real_judgment(tmp_path, monkeypatch):
         evidence_id="ev-codex-e2e-001",
         evidence_type=EvidenceType.TASK_TRANSITION,
         baseline_commit="b9c426a7c5d9226f2816fbe62ded3fb4a58d1e3c",
-        result_commit="574b8e4366a68b362022b8ffce2a76e30c57aacd",
+        result_commit="de9c4a60de22bbe6fc007952b409a85c5b2a09f7",
         artifacts=(),
         metadata=metadata
     )

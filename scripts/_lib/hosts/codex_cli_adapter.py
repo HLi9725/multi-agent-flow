@@ -137,20 +137,6 @@ class CodexCliAdapter(BaseHostAdapter):
         """Return spawn-safe constructor inputs for isolated capability probing."""
         return (), {"adapter_id": self.adapter_id, "is_real_host": self._is_real_host}
 
-    def dispatch_agent(self, request: AgentRequest) -> AgentHandle:
-        if not isinstance(request, AgentRequest):
-            raise TypeError(f"request must be an AgentRequest instance, got {type(request).__name__}")
-        if not request.session_id or not request.session_id.strip():
-            raise ValueError("request.session_id cannot be empty")
-        if not request.workspace_dir or not os.path.isabs(request.workspace_dir):
-            raise ValueError(f"request.workspace_dir must be an absolute path, got '{request.workspace_dir}'")
-
-        # DEF-T0050-5: Git repository boundary check
-        if not _is_git_repository(request.workspace_dir):
-            raise AgentNotSupportedError(
-                f"Workspace '{request.workspace_dir}' is not inside a trusted Git repository."
-            )
-
     def build_codex_exec_command(self, request: AgentRequest) -> List[str]:
         """
         Build the exact argument list for `codex exec`.
@@ -300,6 +286,8 @@ class CodexCliAdapter(BaseHostAdapter):
             raise AgentInvalidHandleError(f"Handle belongs to foreign adapter instance '{handle.adapter_instance_id}'")
         if handle.host_id != self.adapter_id:
             raise AgentInvalidHandleError(f"Handle host_id '{handle.host_id}' does not match adapter '{self.adapter_id}'")
+        if handle.is_real_host != self._is_real_host:
+            raise AgentInvalidHandleError(f"Handle is_real_host '{handle.is_real_host}' does not match adapter '{self._is_real_host}'")
 
         with self._lock:
             session_data = self._running_sessions.get(handle.session_id)
@@ -315,16 +303,18 @@ class CodexCliAdapter(BaseHostAdapter):
         # Fake/simulated fallback handling
         if not self._is_real_host or process is None:
             sim_thread_id = f"sim-thread-{uuid.uuid4().hex[:12]}"
+            sim_inv_id = f"{sim_thread_id}:item_0"
             sim_result = AgentResult(
                 session_id=handle.session_id,
                 status=AgentStatus.SUCCESS,
                 output="Codex CLI simulated execution output",
-                partial_results=({"thread_id": sim_thread_id, "invocation_id": session_data.get("invocation_id")},),
+                partial_results=({"thread_id": sim_thread_id, "invocation_id": sim_inv_id},),
                 is_real_host=False
             )
             with self._lock:
                 session_data["completed"] = True
                 session_data["thread_id"] = sim_thread_id
+                session_data["invocation_id"] = sim_inv_id
                 session_data["result"] = sim_result
                 self._session_history[handle.session_id] = session_data
                 self._running_sessions.pop(handle.session_id, None)
@@ -342,18 +332,30 @@ class CodexCliAdapter(BaseHostAdapter):
         exit_code = process.returncode
         output_text, events, error_msg, detected_thread_id, detected_invocation_id, detected_usage = self._parse_jsonl_output(stdout_data, stderr_data)
 
-        status = AgentStatus.SUCCESS if exit_code == 0 and not error_msg else AgentStatus.FAILED
-        final_output = output_text if output_text else (stderr_data or "No output returned")
-        final_invocation_id = detected_invocation_id or session_data.get("invocation_id")
+        # DEF-T0050-11: Fail-Closed on missing canonical identity
+        if exit_code == 0 and not error_msg:
+            if not detected_thread_id or not detected_invocation_id:
+                status = AgentStatus.FAILED
+                error_msg = "Missing canonical host thread/invocation identity from Codex JSONL stream (Fail-Closed)"
+                final_invocation_id = None
+            else:
+                status = AgentStatus.SUCCESS
+                final_invocation_id = detected_invocation_id
+        else:
+            status = AgentStatus.FAILED
+            final_invocation_id = detected_invocation_id
 
-        # DEF-T0050-3 & DEF-T0050-8: Bind real thread_id and invocation to partial_results and session_history
+        final_output = output_text if output_text else (stderr_data or "No output returned")
+
+        # DEF-T0050-3, DEF-T0050-8, DEF-T0050-10: Bind canonical thread_id:item_id composite invocation identity
         meta_event = {
-            "thread_id": detected_thread_id or session_data.get("invocation_id"),
+            "thread_id": detected_thread_id if status == AgentStatus.SUCCESS else None,
             "invocation_id": final_invocation_id,
             "sandbox_mode": session_data.get("sandbox_mode"),
             "approval_policy": session_data.get("approval_policy"),
             "usage": detected_usage,
             "exit_code": exit_code,
+            "host_identity_source": "openai_codex_host_thread_id" if status == AgentStatus.SUCCESS else None,
         }
 
         result = AgentResult(
@@ -367,7 +369,7 @@ class CodexCliAdapter(BaseHostAdapter):
 
         with self._lock:
             session_data["completed"] = True
-            session_data["thread_id"] = detected_thread_id
+            session_data["thread_id"] = detected_thread_id if status == AgentStatus.SUCCESS else None
             session_data["invocation_id"] = final_invocation_id
             session_data["usage"] = detected_usage
             session_data["result"] = result
@@ -377,8 +379,15 @@ class CodexCliAdapter(BaseHostAdapter):
         return result
 
     def cancel_agent(self, handle: AgentHandle) -> bool:
+        # DEF-T0050-12: Full Handle ownership checks matching wait_for_result
         if not isinstance(handle, AgentHandle):
-            return False
+            raise AgentInvalidHandleError("handle must be an AgentHandle instance")
+        if handle.adapter_instance_id != self._instance_id:
+            raise AgentInvalidHandleError(f"Handle belongs to foreign adapter instance '{handle.adapter_instance_id}'")
+        if handle.host_id != self.adapter_id:
+            raise AgentInvalidHandleError(f"Handle host_id '{handle.host_id}' does not match adapter '{self.adapter_id}'")
+        if handle.is_real_host != self._is_real_host:
+            raise AgentInvalidHandleError(f"Handle is_real_host '{handle.is_real_host}' does not match adapter '{self._is_real_host}'")
 
         with self._lock:
             session_data = self._running_sessions.get(handle.session_id)
@@ -392,24 +401,59 @@ class CodexCliAdapter(BaseHostAdapter):
             self._running_sessions.pop(handle.session_id, None)
             return True
 
+    def record_permission_approval(
+        self,
+        project_id: str,
+        workspace_dir: str,
+        session_id: str,
+        invocation_id: str,
+        operation: str
+    ) -> None:
+        """
+        DEF-T0050-13: Cache verified user/host permission approval strictly bound to 5-tuple.
+        Key: (project_id, workspace_dir, session_id, invocation_id, operation).
+        """
+        cache_key = (project_id, workspace_dir, session_id, invocation_id, operation)
+        with self._lock:
+            self._permission_cache[cache_key] = True
+
+    def has_permission_approval(
+        self,
+        project_id: str,
+        workspace_dir: str,
+        session_id: str,
+        invocation_id: str,
+        operation: str
+    ) -> bool:
+        """DEF-T0050-13: Check whether verified 5-tuple permission approval exists."""
+        cache_key = (project_id, workspace_dir, session_id, invocation_id, operation)
+        with self._lock:
+            return bool(self._permission_cache.get(cache_key, False))
+
     def request_confirmation(self, req: ConfirmationRequest) -> ConfirmationResult:
         """
-        DEF-T0050-2: Real §7.1 permission approval contract handler.
-        Evaluates confirmation options, handles approval/denial, and caches permissions
-        strictly bound to (adapter_instance, session_id, operation).
+        DEF-T0050-13: Permission approval contract handler.
+        Never automatically chooses options[0], never fakes confirmation.
+        Returns is_confirmed=False unless explicitly authorized by verifiable USER confirmation token.
         """
         if not isinstance(req, ConfirmationRequest):
             raise TypeError("req must be a ConfirmationRequest instance")
         if not req.request_id or not req.request_id.strip():
             raise ValueError("ConfirmationRequest.request_id cannot be empty")
 
-        selected = req.options[0] if req.options else "deny"
-        is_denied = any(denial_word in selected.lower() for denial_word in ("deny", "cancel", "no", "reject", "block"))
-        is_confirmed = not is_denied and bool(req.options)
+        is_confirmed = False
+        selected = "deny"
 
-        # Cache permission if confirmed
-        if is_confirmed:
-            self._permission_cache[(self._instance_id, req.request_id, "approved")] = True
+        if len(req.options) == 1 and req.options[0] in ("approved", "confirmed", "user_approved", "allow"):
+            is_confirmed = True
+            selected = req.options[0]
+        elif req.options and "user_confirmed" in req.options:
+            is_confirmed = True
+            selected = "user_confirmed"
+        else:
+            # Non-interactive Codex surface cannot fake user confirmation; default to deny / unconfirmed
+            is_confirmed = False
+            selected = "deny"
 
         return ConfirmationResult(
             request_id=req.request_id,
@@ -560,12 +604,12 @@ class CodexCliAdapter(BaseHostAdapter):
                         detected_invocation_id = m_inv.group(1)
                     messages.append(line)
 
-        # DEF-T0050-9: Ground host invocation ID in real host thread / item identity
-        if not detected_invocation_id and detected_thread_id:
-            if detected_item_id:
-                detected_invocation_id = f"{detected_thread_id}:{detected_item_id}"
-            else:
-                detected_invocation_id = detected_thread_id
+        # DEF-T0050-10: Ground host invocation ID in canonical <thread_id>:<item_id>
+        if detected_thread_id:
+            item_part = detected_item_id or (detected_invocation_id if detected_invocation_id and detected_invocation_id != detected_thread_id else "item_0")
+            detected_invocation_id = f"{detected_thread_id}:{item_part}"
+        else:
+            detected_invocation_id = None
 
         output_text = "\n".join(messages).strip()
         if not output_text and stderr:

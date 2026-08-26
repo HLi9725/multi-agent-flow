@@ -286,13 +286,11 @@
 ### 3. 测试记录（真实数据）
 
 - **2D-2 定向测试**:
-  - `python -m pytest tests/test_codex_cli_adapter.py -q -rs` -> `13 passed in 2.03s` (0 failed, 0 skipped)
-- **2D-1 通用基础设施回归测试**:
-  - `python -m pytest tests/test_adapter_manifest.py tests/test_adapter_registry.py tests/test_adapter_conformance.py -q -rs` -> `37 passed in 2.18s` (0 failed, 0 skipped)
-- **2A/2B/2C 契约与隔离兼容测试**:
-  - `python -m pytest tests/test_host_adapter.py tests/test_evidence.py tests/test_worktree_manager.py -q -rs` -> `60 passed in 25.81s` (0 failed, 0 skipped)
+  - `python -m pytest tests/test_codex_cli_adapter.py -q -rs` -> `16 passed in 0.48s` (0 failed, 0 skipped)
+- **2D-1 通用基础设施与契约兼容回归测试**:
+  - `python -m pytest tests/test_adapter_manifest.py tests/test_adapter_registry.py tests/test_adapter_conformance.py tests/test_host_adapter.py tests/test_evidence.py tests/test_worktree_manager.py -q -rs` -> `97 passed in 24.40s` (0 failed, 0 skipped)
 - **全量测试套件**:
-  - `python -m pytest tests -q -rs` -> `336 passed in 66.63s (0:01:06)` (0 failed, 0 skipped, 100% 通过)
+  - `python -m pytest tests -q -rs` -> `339 passed in 65.87s (0:01:05)` (0 failed, 0 skipped, 100% 通过)
 - **代码规范检查**:
   - `git diff --check` -> 退出码 0，零尾随空白错误
 
@@ -302,8 +300,9 @@
 - 计费边界采用 `USER_SUBSCRIPTION`（用户桌面客户端订阅/本地配额），不启用未经批准的 OpenAI Responses API，不产生额外 API 费用。
 - 遵循零副作用合规探测原则，能力探测（`detect_capabilities`）为纯内存计算，通过了 `assert_zero_side_effects` 严格测试。
 - 与 `EvidenceGate`、`EvidenceValidationContext` 及 `WorktreeManager` 无缝集成。
+- **环境限制说明**: WindowsApps 路径下的 `codex.exe` 二进制若因当前运行沙箱权限受限而无法直接拉起时，记录为操作系统环境权限限制，代码严格保证不通过 skip 或假异常弱化任何门禁。
 
-### 5. 2D-2 缺陷返工记录 (DEF-T0050-1 ~ 9)
+### 5. 2D-2 缺陷返工记录 (DEF-T0050-1 ~ 13)
 
 1. **[DEF-T0050-1] 沙箱模式角色强约束与越权注入拦截**:
    - 建立沙箱模式白名单 `ALLOWED_SANDBOX_MODES = {"read-only", "workspace-write"}`，严禁任何 `danger-full-access` 注入或默认开启。
@@ -331,3 +330,16 @@
 9. **[DEF-T0050-9] 兼容官方 `thread.started` / `item.completed` 真实事件流并闭环宿主标识**:
    - 真实 E2E 审计确认 Codex CLI 采用 `thread.started` (`thread_id`) 与 `item.completed` (`item.id`) 标准事件。
    - 增强事件流解析器全面兼容官方事件，将宿主真实返回的 `thread_id`（如 `01a03d0f-ed4f-7191-a8b5-4c8810ad207d`）与 `item.id`（如 `item_0`）作为权威证据链 Host 标识，在 Evidence 中明确标注来源 `openai_codex_host_thread_id`，实现 100% 真实可信可复核。
+10. **[DEF-T0050-10] 强制绑定 `<thread_id>:<item_id>` 复合全局唯一标识**:
+    - 鉴于 `item_0` 仅在单个 Thread 内局部唯一，`host_invocation_id` 强制采用 `<thread_id>:<item_id>`（如 `01a03d0f-ed4f-7191-a8b5-4c8810ad207d:item_0`）规范复合格式，杜绝不同 Thread 间 invocation ID 碰撞。
+    - 增加双 Thread 返回相同 `item_0` 时 invocation 零碰撞对抗测试。
+11. **[DEF-T0050-11] 进程退出码 0 但缺失规范宿主身份时 Fail-Closed**:
+    - 若真实进程返回码为 0，但 JSONL 事件流中缺失 canonical `thread.started` / `thread_id` 或有效 item 标识，强制判定为 `AgentStatus.FAILED`（Fail-Closed）。
+    - 严禁返回 `is_real_host=True` 的成功态，严禁伪造本地 `inv-*` 冒充宿主身份，严禁进入 EvidenceGate。
+12. **[DEF-T0050-12] `cancel_agent` 强化 Handle 属主校验**:
+    - `cancel_agent` 与 `wait_for_result` 执行完全对等的 4 重属主校验：`isinstance` 检查、`adapter_instance_id` 精确匹配、`host_id` 精确匹配、`is_real_host` 一致性检查。
+    - 任何外来、伪造或跨模式 Handle 立即拒绝并抛出 `AgentInvalidHandleError`，不影响真实运行中会话。
+13. **[DEF-T0050-13] 废除伪造用户确认，确认缓存严格绑定 5 元组**:
+    - `request_confirmation` 严禁自动选择 `options[0]`；在非交互 CLI 环境下，若无明确经过验证的 USER 确认凭据（`user_confirmed`），一律返回 `is_confirmed=False`（拒绝）。
+    - 权限缓存与判定严格绑定 `(project_id, workspace_dir, session_id, invocation_id, operation)` 5 元组，严禁跨项目、跨工作区、跨会话或跨操作复用。
+14. **[死代码清理]**: 清理了 `codex_cli_adapter.py` 中重复定义的 `dispatch_agent` 桩代码，保持代码简洁规范与契约不变。
