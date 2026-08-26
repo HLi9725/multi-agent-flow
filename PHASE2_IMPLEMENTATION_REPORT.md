@@ -68,12 +68,12 @@
    - 测试涵盖全场景: 绝对路径逃逸防御、并发覆盖防护、非法命令注入拦截、清理不落盘、linked worktree 场景验证、Registry 碰撞保全、短写防护、严格 Schema 校验、原子发布并发隔离、双仓库身份绑定校验、无歧义隔离标识边界测试、非法 ID 零文件系统访问验证和仓库子目录初始化规范化核对。
 
 ### 测试记录（最新真实数据）
-- **定向工作树测试**: `python -m pytest tests/test_worktree_manager.py -q -rs` -> `33 passed in 20.71s` (0 failed, 0 skipped, exit code 0)
-- **定向环境测试**: `python -m pytest tests/test_host_adapter.py tests/test_evidence.py -q -rs` -> `25 passed in 1.49s` (0 failed, 0 skipped, exit code 0)
-- **全量测试**: `python -m pytest tests -q -rs` -> `284 passed in 62.70s` (0 failed, 0 skipped, exit code 0)
+- **定向工作树测试**: `python -m pytest tests/test_worktree_manager.py -q -rs` -> `35 passed in 20.08s` (0 failed, 0 skipped, exit code 0)
+- **定向环境测试**: `python -m pytest tests/test_host_adapter.py tests/test_evidence.py -q -rs` -> `25 passed in 1.90s` (0 failed, 0 skipped, exit code 0)
+- **全量测试**: `python -m pytest tests -q -rs` -> `286 passed in 59.25s` (0 failed, 0 skipped, exit code 0)
 - **代码规范**: `git diff --check` -> 退出码 0，零尾随空白错误
-- **独立对抗复现**: 仓库外脚本验证合法长字段、2A `fake-session:<uuid>` 和 `.registry` Junction 三条攻击/兼容路径；修复前 `3 failed`，修复后 `0 failed`。
-- **看板哈希链**: 测试前 `FDEA4E67D8D4ECFF194AE23A33E74C28E7E9BC9C649101C070E42E905C6444FB`；全量测试后 `38B7325955F6E7FACC5ABEE4149FBA9185BB33EE5084F72FA2FBC75A540794E7`；测试污染卡 T0045 经合法 CLI 软取消后 `B46B68AE6BD479BCEB25F41D0368B29FD41C3AB5AB6974E263DC81973F74A398`，未复制或直接编辑 `board.json`。
+- **独立对抗复现**: 仓库外脚本在首轮验证合法长字段、2A `fake-session:<uuid>` 和 `.registry` Junction，修复前 `3 failed`、修复后 `0 failed`；第二次扩大复审真实复现 `controlled_root` Junction 修复前 `1 failed`、修复后 `0 failed`，并以确定性回归断言覆盖单个 Registry 文件链接替换。
+- **看板哈希链（第二次扩大复审）**: 全量测试前 `22C5A4CBF10765F1A87194183A143E8E3E061C4EFB2785EF46B3350261FA3090`；全量测试后 `DA0543E4BB9C15EC1FB8C3765D3A93548A7F28BA58DD9E7C9B97CEBB850A5F9E`；测试污染卡 T0046 经合法 CLI 软取消后 `9B0C6B9710D350FFAE07C620115856832C2787A0A827569F4BB20258945ED2B0`，未复制或直接编辑 `board.json`。
 
 ### 2C 历次返工修复记录
 
@@ -146,3 +146,9 @@
    - 构造、创建、检查和列举入口均重新验证 `.registry` 的绝对路径与 `realpath` 完全一致；即使 Junction 目标仍位于 `controlled_root` 内，也会 Fail-Closed 拒绝。
 4. **[DEF-T0023-35] POSIX 临时硬链接清理证据准确化**:
    - 原子发布成功后若本进程临时硬链接名称清理失败，不再吞掉异常；改为报告 `registry_retained=True`、`tmp_retained=True` 并停止后续 Worktree 创建，保留真实现场供审计。
+
+#### DEF-T0023-36 ~ 37 修复（Codex 第二次扩大复审返工）
+1. **[DEF-T0023-36] 受控根自身与父链 Junction/Symlink 拒绝**:
+   - 初始化前同时保留调用方请求的绝对路径与 `realpath`，两者不完全一致即 Fail-Closed；创建目录后再次复核，防止初始化窗口内被替换。Windows Junction 与 POSIX 符号链接均覆盖“根自身”和“父链”两种场景。
+2. **[DEF-T0023-37] 单个 Registry 文件链接替换拒绝**:
+   - `inspect()` 要求目标 JSON 的绝对路径与 `realpath` 完全一致；单个登记文件被符号链接或 reparse point 重定向时，在 `exists/open` 前直接拒绝。

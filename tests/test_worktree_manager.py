@@ -309,6 +309,25 @@ def test_junction_escape(tmp_path, test_repo):
     with pytest.raises(WorktreeSecurityError, match="traversal|already exists"):
         manager.create_worktree(req)
 
+def test_controlled_root_and_parent_junction_are_rejected(tmp_path, test_repo):
+    repo_path, _ = test_repo
+    external_root = tmp_path / "external-root"
+    external_root.mkdir()
+    alias_root = tmp_path / "controlled-alias"
+
+    if os.name == 'nt':
+        subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(alias_root), str(external_root)],
+            check=True,
+        )
+    else:
+        os.symlink(external_root, alias_root, target_is_directory=True)
+
+    with pytest.raises(WorktreeSecurityError, match="Controlled root.*symbolic link or Junction"):
+        WorktreeManager(str(alias_root), repo_path)
+    with pytest.raises(WorktreeSecurityError, match="Controlled root.*symbolic link or Junction"):
+        WorktreeManager(str(alias_root / "nested"), repo_path)
+
 def test_registry_junction_within_controlled_root_is_rejected(tmp_path, test_repo):
     repo_path, _ = test_repo
     root_dir = tmp_path / "controlled-registry"
@@ -328,6 +347,21 @@ def test_registry_junction_within_controlled_root_is_rejected(tmp_path, test_rep
 
     with pytest.raises(WorktreeSecurityError, match="symbolic link or Junction"):
         manager.list_worktrees("proj")
+
+def test_registry_file_symlink_resolution_is_rejected_before_open(manager, monkeypatch):
+    worktree_id = manager._compute_worktree_id("proj", "task", "DEV", "session1")
+    meta_path = os.path.join(manager.registry_dir, f"{worktree_id}.json")
+    redirected_path = os.path.join(manager.registry_dir, "foreign.json")
+    original_realpath = os.path.realpath
+
+    def redirected_realpath(path):
+        if os.path.normcase(os.path.abspath(path)) == os.path.normcase(os.path.abspath(meta_path)):
+            return redirected_path
+        return original_realpath(path)
+
+    monkeypatch.setattr(os.path, "realpath", redirected_realpath)
+    with pytest.raises(WorktreeSecurityError, match="Registry file is a symbolic link"):
+        manager.inspect(worktree_id)
 
 def test_posix_temp_unlink_failure_is_reported_with_real_retention(manager, tmp_path, monkeypatch):
     tmp_file = tmp_path / "owned-temp.json"

@@ -55,7 +55,13 @@ def _validate_host_session_id(val: Any) -> str:
 
 class WorktreeManager:
     def __init__(self, controlled_root: str, target_repo_path: str):
-        self.controlled_root = os.path.normcase(os.path.realpath(os.path.abspath(controlled_root)))
+        requested_controlled_root = os.path.normcase(os.path.abspath(controlled_root))
+        resolved_controlled_root = os.path.normcase(os.path.realpath(requested_controlled_root))
+        if requested_controlled_root != resolved_controlled_root:
+            raise WorktreeSecurityError(
+                "Controlled root itself or one of its parents is a symbolic link or Junction."
+            )
+        self.controlled_root = requested_controlled_root
         if not os.path.isdir(target_repo_path):
             raise WorktreeError(f"Target repo path does not exist or is not a directory: {target_repo_path}")
         self._verify_repo_identity(target_repo_path)
@@ -67,6 +73,10 @@ class WorktreeManager:
         self.target_repo_path = self.target_repo_root
 
         os.makedirs(self.controlled_root, exist_ok=True)
+        if os.path.normcase(os.path.realpath(self.controlled_root)) != self.controlled_root:
+            raise WorktreeSecurityError(
+                "Controlled root changed to a symbolic link or Junction during initialization."
+            )
         self.registry_dir = os.path.join(self.controlled_root, ".registry")
         os.makedirs(self.registry_dir, exist_ok=True)
         self._validate_registry_boundary()
@@ -294,7 +304,10 @@ class WorktreeManager:
 
         registry_root = self._validate_registry_boundary()
         meta_path = os.path.join(self.registry_dir, f"{worktree_id}.json")
+        expected_meta_path = os.path.normcase(os.path.abspath(meta_path))
         real_meta_path = os.path.normcase(os.path.realpath(meta_path))
+        if real_meta_path != expected_meta_path:
+            raise WorktreeSecurityError("Registry file is a symbolic link or reparse-point escape.")
         if os.path.commonpath([registry_root, real_meta_path]) != registry_root:
             raise WorktreeSecurityError("Registry path traversal detected.")
 
