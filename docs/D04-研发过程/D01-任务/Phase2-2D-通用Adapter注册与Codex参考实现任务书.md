@@ -170,6 +170,20 @@ Codex 路线必须明确分开：
 
 2D-2 开工前必须重新查证官方 OpenAI 文档和本机可调用入口；不得依赖本任务书中的历史命令或未公开内部函数。官方资料将 Codex、API 与 Plugin/MCP 作为不同扩展面，因此每条路线必须分别认证。
 
+### 7.1 Codex 权限与重复审批优化
+
+Codex 与 Antigravity 必须遵守同一 Host 权限契约。Adapter 的职责是预检、请求、记录并正确映射宿主权限，而不是绕过 Codex Sandbox 或自动点击授权。
+
+1. 记录实际 `sandbox_mode`、`approval_policy`、writable roots、网络策略和规则来源，不记录认证秘密；
+2. 工作区内读取、稳定 yy-flow CLI、受控测试和 Git 只读检查可使用项目级最小权限预授权；
+3. 网络、依赖安装、工作区外访问、用户级配置、API/费用、删除、危险 Git、Push/Merge/发布和最终验收必须 Ask/Deny；
+4. 禁止把 `danger-full-access`、`approval_policy=never`、宽泛命令前缀或跳过权限作为默认配置和验收前提；
+5. 禁止为常规操作反复生成不同的 `python -c`、动态 Shell、heredoc 或临时补丁脚本；缺少查询能力时应增加稳定参数化 CLI；
+6. 权限不足、用户拒绝或无交互环境无法批准时，返回结构化 `approval_required`/`permission_denied`，不得伪报成功；
+7. 权限缓存不得跨项目、账号、Adapter instance、session 或 worktree 复用；
+8. Windows E2E 必须证明：同一已批准安全命令重复执行不再询问，危险命令和权限边界变化仍会停下请求确认；
+9. 已经完成开发但尚未验收的 2D-2 候选，Reviewer 必须将本节作为准出核对项；缺失时在原 2D-2 工单打回修复。
+
 ## 8. 2D-1 允许与禁止范围
 
 允许：Registry、Manifest、验证等级、能力选择、合规套件、Fake/静态 Adapter 的负面测试和必要文档。
@@ -215,6 +229,8 @@ Codex 参考 Adapter 的真实 E2E 至少记录：
 - 调用使用的账户/认证类别，不记录秘密；
 - 实际命令或宿主动作、退出码、测试数量和时间；
 - 无法获取的用量数据明确标为 unknown，不推断 Token。
+- Sandbox/approval 配置来源、预授权规则作用域和实际审批次数；
+- 安全命令重复执行与危险命令继续 Ask/Deny 的对照结果。
 
 ## 11. 多平台扩展准入
 

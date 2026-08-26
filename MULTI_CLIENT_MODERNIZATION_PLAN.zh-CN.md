@@ -1053,6 +1053,11 @@ Codex 必须区分三条执行路线：
 - 不要依赖未公开、易变化的内部函数名；优先使用宿主暴露的能力和指令契约。
 - 客户端订阅/额度与 OpenAI API 账单不是同一授权面；报告必须记录实际使用的 Adapter，不推断或伪报 Token 来源。
 - 若当前 Codex surface 没有可稳定调用并返回真实身份的入口，必须停止为 `static_only/unsupported`，不得以 UI 自动化或模型自述伪造 Adapter。
+- Codex 与 Antigravity 共用同一最小权限原则：工作区内稳定、安全、可审计的命令允许项目级预授权；网络、外部目录、依赖安装、全局配置、费用、破坏性操作、Push/Merge/发布和最终验收必须保持 Ask/Deny；
+- Codex Adapter 必须探测并记录 `sandbox_mode`、`approval_policy` 或对应宿主权限档，但不得静默修改用户设置、扩大 writable roots 或关闭 Sandbox；
+- 常规看板查询、状态流转和测试必须复用稳定 CLI，禁止不断生成不同的 `python -c`、动态 Shell 或临时补丁脚本来规避命令级审批；
+- 不得默认启用 `danger-full-access`、`approval_policy=never` 或任何跳过权限模式；安全命令重复执行免审批与危险命令继续询问必须分别进入 Windows 真实 E2E；
+- 权限不足或等待用户批准必须返回结构化 `approval_required`/`permission_denied`，不得记为成功、自动换 Adapter 或推进看板。
 
 官方依据：
 

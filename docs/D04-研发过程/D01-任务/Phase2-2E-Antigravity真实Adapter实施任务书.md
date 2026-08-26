@@ -35,6 +35,8 @@ tags: [Antigravity, Adapter, 权限, Sandbox, 自动化, E2E]
 
 ## 3. 权限与审批优化契约
 
+本节不是 Antigravity 专属的放宽策略，而是 Codex 2D-2 与 Antigravity 2E 共用的 Host/Adapter 最小权限契约。Codex 的具体 `sandbox_mode`、`approval_policy` 和 writable roots 要求见《Phase2-2D-通用Adapter注册与Codex参考实现任务书》§7.1；两端必须使用相同风险分类和 Fail-Closed 语义。
+
 ### 3.1 五类权限档
 
 | 档位 | 典型操作 | 默认策略 |
