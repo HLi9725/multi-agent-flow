@@ -63,19 +63,29 @@ SAFE_LOCAL_SCRIPT_PREFIXES: Tuple[str, ...] = (
     "scripts/check_stage_gate.py",
 )
 
+RISK_LEVEL_PRIORITY: Dict[str, int] = {
+    "destructive": 5,
+    "billing": 4,
+    "acceptance": 3,
+    "controlled_external": 2,
+    "safe_local": 1,
+}
 
-def evaluate_command_risk(cmd_line: str, workspace_dir: Optional[str] = None) -> str:
-    """
-    Evaluate command risk according to §3.1 5-tier permission hierarchy:
-    - safe_local: Project-level Allow, can be executed without repeated prompts once approved.
-    - controlled_external: Network, dependencies, external paths -> Ask.
-    - destructive: Clean, reset, rebase, branch -D, deletion -> Deny/Ask.
-    - billing: API Key, paid endpoints -> Explicit prompt.
-    - acceptance: Push, merge main, release -> Explicit user confirmation.
-    - Note: `python -c` and inline scripts are NEVER classified as safe_local.
-    """
+FORBIDDEN_PYTEST_FLAGS: Tuple[str, ...] = (
+    "-p", "--plugin", "--pyargs", "-c", "--config-file", "--ini",
+    "-o", "--override-ini", "--import-mode", "--assert", "--basetemp",
+    "--doctest-modules", "--cov", "--cov-config", "--trace", "--pdb",
+    "-w", "--warnings"
+)
+
+
+def _evaluate_single_command_risk(cmd_line: str, workspace_dir: Optional[str] = None) -> str:
+    """Evaluate risk level for a single unchained command."""
     cmd_norm = cmd_line.strip().replace("\\", "/")
     cmd_lower = cmd_norm.lower()
+
+    if not cmd_norm:
+        return "safe_local"
 
     # 1. Acceptance operations
     if any(p in cmd_lower for p in ("git push", "git merge", "release", "publish")):
@@ -98,27 +108,78 @@ def evaluate_command_risk(cmd_line: str, workspace_dir: Optional[str] = None) ->
     )):
         return "controlled_external"
 
-    # Reject inline python execution from safe_local
+    # Reject inline python execution / subshell from safe_local
     if "python -c" in cmd_lower or "python -" in cmd_lower.split() or "eval(" in cmd_lower or "exec(" in cmd_lower:
         return "controlled_external"
 
     # 5. Check safe_local candidates
+    # A. Git read-only commands
     if cmd_lower.startswith("git "):
         parts = cmd_norm.split()
         if len(parts) >= 2 and parts[1].lower() in SAFE_LOCAL_GIT_CMDS:
-            # Ensure no destructive flags
-            if not any(f in cmd_lower for f in ("-f", "--force", "--hard")):
+            if not any(f in cmd_lower for f in ("-f", "--force", "--hard", "--delete", "-d")):
                 return "safe_local"
 
+    # B. Pytest commands with strict flag validation (DEF-T0052-3)
     if cmd_lower.startswith("python -m pytest") or cmd_lower.startswith("pytest"):
+        parts = cmd_norm.split()
+        pytest_idx = 1 if parts[0].lower() == "pytest" else 3
+        pytest_args = parts[pytest_idx:]
+
+        for arg in pytest_args:
+            arg_lower = arg.lower()
+            # If argument matches or starts with any forbidden flag
+            for f in FORBIDDEN_PYTEST_FLAGS:
+                if arg_lower == f or arg_lower.startswith(f + "="):
+                    return "controlled_external"
+            # Disallow .ini, .cfg, or arbitrary config files passed as positional arguments
+            if arg_lower.endswith(".ini") or arg_lower.endswith(".cfg"):
+                return "controlled_external"
+            # Disallow shell metacharacters in arguments
+            if any(ch in arg for ch in ("`", "$", ">", "<", "|", "&", ";")):
+                return "controlled_external"
+            # Disallow non-test python scripts executed via pytest positional args
+            if arg_lower.endswith(".py") and not (
+                "test" in os.path.basename(arg_lower) or arg_lower.startswith("tests/")
+            ):
+                return "controlled_external"
+
         return "safe_local"
 
+    # C. Safe local scripts
     if cmd_lower.startswith("python scripts/") or cmd_lower.startswith("powershell -executionpolicy bypass -file scripts/"):
         for prefix in SAFE_LOCAL_SCRIPT_PREFIXES:
             if prefix in cmd_norm:
                 return "safe_local"
 
     return "controlled_external"
+
+
+def evaluate_command_risk(cmd_line: str, workspace_dir: Optional[str] = None) -> str:
+    """
+    Evaluate command risk according to §3.1 5-tier permission hierarchy with command chaining support:
+    - safe_local: Project-level Allow, can be executed without repeated prompts once approved.
+    - controlled_external: Network, dependencies, external paths -> Ask.
+    - destructive: Clean, reset, rebase, branch -D, deletion -> Deny/Ask.
+    - billing: API Key, paid endpoints -> Explicit prompt.
+    - acceptance: Push, merge main, release -> Explicit user confirmation.
+    - Note: Command chains (;, &&, ||, |, &) evaluate all sub-commands and return the highest risk level.
+    """
+    tokens = re.split(r"(?:;|&&|\|\||\||&|\r?\n)", cmd_line)
+    max_risk = "safe_local"
+    max_score = 0
+
+    for token in tokens:
+        sub_cmd = token.strip()
+        if not sub_cmd:
+            continue
+        risk = _evaluate_single_command_risk(sub_cmd, workspace_dir)
+        score = RISK_LEVEL_PRIORITY.get(risk, 2)
+        if score > max_score:
+            max_score = score
+            max_risk = risk
+
+    return max_risk
 
 
 def _find_default_antigravity_executable() -> Optional[str]:
@@ -200,7 +261,7 @@ class AntigravityAdapter(BaseHostAdapter):
             supports_parallelism=CapabilitySupport.SUPPORTED,
             supports_isolated_context=CapabilitySupport.SUPPORTED,
             supports_worktree=CapabilitySupport.SUPPORTED,
-            supports_permission_approval=CapabilitySupport.SUPPORTED,
+            supports_permission_approval=CapabilitySupport.UNSUPPORTED,
             supports_mcp=CapabilitySupport.SUPPORTED,
             supports_interactive_confirmation=CapabilitySupport.UNSUPPORTED,
             supports_usage_telemetry=CapabilitySupport.SUPPORTED,
@@ -221,6 +282,40 @@ class AntigravityAdapter(BaseHostAdapter):
     def get_conformance_probe_spec(self) -> Tuple[Tuple[Any, ...], Dict[str, Any]]:
         """Return spawn-safe constructor inputs for isolated capability probing."""
         return (), {"adapter_id": self.adapter_id, "is_real_host": self._is_real_host}
+
+    def validate_workspace_roots(self, request: AgentRequest) -> None:
+        """
+        Validate primary workspace and all secondary project folders (DEF-T0052-4).
+        All roots must be absolute paths, exist, and be inside trusted Git repositories.
+        """
+        if not request.workspace_dir or not os.path.isabs(request.workspace_dir):
+            raise ValueError(f"request.workspace_dir must be an absolute path, got '{request.workspace_dir}'")
+
+        if not _is_git_repository(request.workspace_dir):
+            raise AgentNotSupportedError(
+                f"Workspace '{request.workspace_dir}' is not inside a trusted Git repository."
+            )
+
+        # Check secondary project folders / kanban_dir in extra_context
+        if isinstance(request.extra_context, Mapping):
+            folders = request.extra_context.get("project_folders")
+            if folders:
+                if isinstance(folders, str):
+                    folders = [folders]
+                for folder in folders:
+                    folder_path = str(folder).strip()
+                    if not folder_path or not os.path.isabs(folder_path) or not _is_git_repository(folder_path):
+                        raise AgentNotSupportedError(
+                            f"Project folder '{folder_path}' is not inside a trusted Git repository (Dual-root Fail-Closed)."
+                        )
+
+            kanban_dir = request.extra_context.get("kanban_dir")
+            if kanban_dir:
+                kanban_path = str(kanban_dir).strip()
+                if not kanban_path or not os.path.isabs(kanban_path) or not _is_git_repository(kanban_path):
+                    raise AgentNotSupportedError(
+                        f"Kanban folder '{kanban_path}' is not inside a trusted Git repository (Dual-root Fail-Closed)."
+                    )
 
     def build_antigravity_exec_command(self, request: AgentRequest) -> List[str]:
         """
@@ -279,13 +374,9 @@ class AntigravityAdapter(BaseHostAdapter):
             raise TypeError(f"request must be an AgentRequest instance, got {type(request).__name__}")
         if not request.session_id or not request.session_id.strip():
             raise ValueError("request.session_id cannot be empty")
-        if not request.workspace_dir or not os.path.isabs(request.workspace_dir):
-            raise ValueError(f"request.workspace_dir must be an absolute path, got '{request.workspace_dir}'")
 
-        if not _is_git_repository(request.workspace_dir):
-            raise AgentNotSupportedError(
-                f"Workspace '{request.workspace_dir}' is not inside a trusted Git repository."
-            )
+        # DEF-T0052-4: Dual-root and workspace validation
+        self.validate_workspace_roots(request)
 
         session_id = request.session_id.strip()
         invocation_id = f"inv-{uuid.uuid4().hex[:12]}"
@@ -731,7 +822,7 @@ def create_antigravity_manifest(
             "parallelism": "supported",
             "isolated_context": "supported",
             "worktree": "supported",
-            "permission_approval": "supported",
+            "permission_approval": "unsupported",
             "mcp": "supported",
             "interactive_confirmation": "unsupported",
             "usage_telemetry": "supported"

@@ -86,7 +86,9 @@ def test_antigravity_adapter_capabilities_detection_zero_side_effects():
     assert caps.supports_worktree == CapabilitySupport.SUPPORTED
     assert caps.supports_isolated_context == CapabilitySupport.SUPPORTED
     assert caps.supports_parallelism == CapabilitySupport.SUPPORTED
-    assert caps.supports_permission_approval == CapabilitySupport.SUPPORTED
+    # Non-interactive CLI surface does not support in-band permission approval / interactive confirmation (DEF-T0052-1)
+    assert caps.supports_permission_approval == CapabilitySupport.UNSUPPORTED
+    assert caps.supports_interactive_confirmation == CapabilitySupport.UNSUPPORTED
 
 
 def test_antigravity_adapter_role_based_routing_and_sandbox():
@@ -571,9 +573,25 @@ def test_antigravity_adapter_five_tier_command_risk_evaluation():
     assert evaluate_command_risk("git diff --shortstat") == "safe_local"
     assert evaluate_command_risk("git log -n 5") == "safe_local"
     assert evaluate_command_risk("python -m pytest tests/test_antigravity_adapter.py -q") == "safe_local"
+    assert evaluate_command_risk("pytest tests -s -v") == "safe_local"
     assert evaluate_command_risk("python scripts/heartbeat.py") == "safe_local"
     assert evaluate_command_risk("python scripts/quick_task.py ...") == "safe_local"
     assert evaluate_command_risk("python scripts/transition_task.py --role DEV --task-id T0052 ...") == "safe_local"
+
+    # DEF-T0052-3: Pytest dangerous flags must be rejected from safe_local
+    assert evaluate_command_risk("pytest -p evil_plugin") == "controlled_external"
+    assert evaluate_command_risk("python -m pytest --pyargs evil") == "controlled_external"
+    assert evaluate_command_risk("pytest -c /tmp/evil.ini") == "controlled_external"
+    assert evaluate_command_risk("pytest -o python_files=evil.py") == "controlled_external"
+    assert evaluate_command_risk("pytest --override-ini=addopts=--evil") == "controlled_external"
+    assert evaluate_command_risk("pytest --import-mode=importlib evil_script.py") == "controlled_external"
+    assert evaluate_command_risk("pytest --cov=secret") == "controlled_external"
+
+    # DEF-T0052-3: Command chaining evaluation
+    assert evaluate_command_risk("git status && rm -rf .") == "destructive"
+    assert evaluate_command_risk("git status; curl https://external.api") == "controlled_external"
+    assert evaluate_command_risk("git status && git push origin main") == "acceptance"
+    assert evaluate_command_risk("git status && git diff") == "safe_local"
 
     # 2. controlled_external
     assert evaluate_command_risk("pip install some-package") == "controlled_external"
@@ -595,6 +613,57 @@ def test_antigravity_adapter_five_tier_command_risk_evaluation():
     # 5. acceptance
     assert evaluate_command_risk("git push origin main") == "acceptance"
     assert evaluate_command_risk("git merge feature/phase2e-antigravity-adapter") == "acceptance"
+
+
+def test_antigravity_adapter_dual_root_validation(tmp_path):
+    adapter = AntigravityAdapter(is_real_host=False)
+
+    # 1. Valid workspace and valid secondary kanban folder passes
+    req_valid = AgentRequest(
+        session_id="sess_dual_ok",
+        prompt="Dual root valid test",
+        role="DEV",
+        workspace_dir=os.path.abspath("."),
+        extra_context={"project_folders": [os.path.abspath(".")]}
+    )
+    handle = adapter.dispatch_agent(req_valid)
+    assert handle.session_id == "sess_dual_ok"
+
+    # 2. Workspace not in git repository fails closed
+    non_git_ws = str(tmp_path / "not_git_dir")
+    os.makedirs(non_git_ws, exist_ok=True)
+    req_bad_ws = AgentRequest(
+        session_id="sess_bad_ws",
+        prompt="Bad ws test",
+        role="DEV",
+        workspace_dir=non_git_ws
+    )
+    with pytest.raises(AgentNotSupportedError, match="not inside a trusted Git repository"):
+        adapter.dispatch_agent(req_bad_ws)
+
+    # 3. Project folder outside git repository fails closed (DEF-T0052-4)
+    non_git_folder = str(tmp_path / "external_folder")
+    os.makedirs(non_git_folder, exist_ok=True)
+    req_bad_folder = AgentRequest(
+        session_id="sess_bad_folder",
+        prompt="Bad project folder test",
+        role="DEV",
+        workspace_dir=os.path.abspath("."),
+        extra_context={"project_folders": [non_git_folder]}
+    )
+    with pytest.raises(AgentNotSupportedError, match="Dual-root Fail-Closed"):
+        adapter.dispatch_agent(req_bad_folder)
+
+    # 4. Kanban dir outside git repository fails closed (DEF-T0052-4)
+    req_bad_kanban = AgentRequest(
+        session_id="sess_bad_kanban",
+        prompt="Bad kanban dir test",
+        role="DEV",
+        workspace_dir=os.path.abspath("."),
+        extra_context={"kanban_dir": non_git_folder}
+    )
+    with pytest.raises(AgentNotSupportedError, match="Dual-root Fail-Closed"):
+        adapter.dispatch_agent(req_bad_kanban)
 
 
 def test_antigravity_adapter_safe_local_second_execution_no_prompt():

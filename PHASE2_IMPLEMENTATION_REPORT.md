@@ -418,17 +418,25 @@
 ### 4. 测试记录（真实数据）
 
 - **2E 定向测试**:
-  - `python -m pytest tests/test_antigravity_adapter.py -q -rs` -> `19 passed in 0.74s` (0 failed, 0 skipped)
+  - `python -m pytest tests/test_antigravity_adapter.py -q -rs` -> `20 passed in 0.63s` (0 failed, 0 skipped)
 - **2D-1 通用基础设施回归测试**:
-  - `python -m pytest tests/test_adapter_manifest.py tests/test_adapter_registry.py tests/test_adapter_conformance.py -q -rs` -> `37 passed in 3.11s` (0 failed, 0 skipped)
+  - `python -m pytest tests/test_adapter_manifest.py tests/test_adapter_registry.py tests/test_adapter_conformance.py -q -rs` -> `37 passed in 3.19s` (0 failed, 0 skipped)
 - **2A～2D-2 兼容性与 Codex 适配器测试**:
-  - `python -m pytest tests/test_host_adapter.py tests/test_evidence.py tests/test_worktree_manager.py tests/test_codex_cli_adapter.py -q -rs` -> `80 passed in 23.08s` (0 failed, 0 skipped)
+  - `python -m pytest tests/test_host_adapter.py tests/test_evidence.py tests/test_worktree_manager.py tests/test_codex_cli_adapter.py -q -rs` -> `80 passed in 26.30s` (0 failed, 0 skipped)
 - **全量测试套件**:
-  - `python -m pytest tests -q -rs` -> `362 passed in 64.60s (0:01:04)` (0 failed, 0 skipped, 100% 通过)
+  - `python -m pytest tests -q -rs` -> `363 passed in 69.30s (0:01:09)` (0 failed, 0 skipped, 100% 通过)
 - **代码规范检查**:
   - `git diff --check` -> 退出码 0，零尾随空白错误
 
-### 5. 真实 E2E 证据与 EvidenceGate 闭环
+### 5. 真实 E2E 证据与认证环境说明
+
+1. **真实宿主可执行文件与环境约束**:
+   - 真实宿主二进制: `C:\Users\user\AppData\Local\agy\bin\agy.exe`（Google Antigravity CLI 版本 1.1.8）。
+   - 认证与会话约束: Antigravity CLI 需要用户完成 Google OAuth 认证。
+   - **用户操作边界约束**: 当需要打开浏览器进行登录或认证验证时，**必须使用 Firefox（火狐）浏览器**，不得使用微软 Edge 或其他微软系浏览器。
+   - 当 CLI 处于未认证或云端端点返回受限时，Adapter 严格执行 Fail-Closed 机制，拒绝伪造假成功状态。
+
+2. **证据闭环数据**:
 
 ```yaml
 e2e_record:
@@ -448,7 +456,26 @@ e2e_record:
   evidence_gate_judgment: "PASS"
 ```
 
-### 6. 未实施范围说明
+### 6. 2E 缺陷返工记录 (DEF-T0052-1 ~ 4)
+
+1. **[DEF-T0052-1] 修复能力声明与 `request_confirmation` 行为不一致 (P1)**:
+   - `AntigravityAdapter` 的 `_capabilities` 与 `create_antigravity_manifest()` 统一将 `supports_permission_approval` 与 `supports_interactive_confirmation` 声明为 `CapabilitySupport.UNSUPPORTED` / `"unsupported"`。
+   - 彻底解决由于非交互 CLI surface 下 `request_confirmation` 抛出 `AgentNotSupportedError` 导致的能力声明与实际行为矛盾，实现 100% 真实契约对齐。
+
+2. **[DEF-T0052-2] 真实宿主身份绑定与认证环境边界澄清 (P1)**:
+   - 真实检测并对接 `LOCALAPPDATA\agy\bin\agy.exe` (1.1.8)。
+   - 在报告中如实记录 OAuth 认证需求与环境限制，明确记录**浏览器登录测试必须使用 Firefox（火狐）**。
+   - 门禁测试采用结构化 Mock Fixture 与契约验证，杜绝在未登录环境下虚构真实线上调用。
+
+3. **[DEF-T0052-3] 封堵 `pytest` 危险参数与多命令链绕过漏洞 (P2)**:
+   - 在 `evaluate_command_risk()` 中实现命令链式解析（支持 `;`、`&&`、`||`、`|`、`&`、换行符），对所有子命令评估风险并取最高危险级别（`destructive > billing > acceptance > controlled_external > safe_local`）。
+   - 增加对 `pytest` 参数的严格白名单与黑名单过滤：严禁 `-p`（插件注入）、`--pyargs`（任意模块加载）、`-c`（任意配置文件）、`-o` / `--override-ini`、`--import-mode`、`--assert`、`--cov` 等危险参数进入 `safe_local`。上述命令统一归入 `controlled_external`。
+
+4. **[DEF-T0052-4] 实现双根目录与多工作区 Fail-Closed 校验 (P2)**:
+   - 新增 `validate_workspace_roots()` 方法，对主工作区 `workspace_dir` 及 `extra_context` 中的 `project_folders` / `kanban_dir` 进行严格校验。
+   - 任何非绝对路径、不存在或脱离受信任 Git 仓库的目录直接触发 Fail-Closed 并抛出 `AgentNotSupportedError`。
+
+### 7. 未实施范围说明
 
 - 独立 Reviewer/QA 真实自动编排与双宿主自动仲裁（属于 2F）
 - main 分支合流与双 Adapter 联调（属于 2F 准出范围）
