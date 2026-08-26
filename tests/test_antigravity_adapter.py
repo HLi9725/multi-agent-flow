@@ -259,7 +259,7 @@ def test_antigravity_adapter_spawn_failure_rollback(monkeypatch):
 
 
 def test_antigravity_adapter_handle_forgery_rejection():
-    adapter = AntigravityAdapter(is_real_host=True)
+    adapter = AntigravityAdapter(is_real_host=False)
 
     # 1. Non-AgentHandle instance
     with pytest.raises(AgentInvalidHandleError):
@@ -270,7 +270,7 @@ def test_antigravity_adapter_handle_forgery_rejection():
         session_id="sess_f",
         host_id=adapter.adapter_id,
         status="running",
-        is_real_host=True,
+        is_real_host=False,
         adapter_instance_id="foreign_inst",
         invocation_token="tok1"
     )
@@ -282,7 +282,7 @@ def test_antigravity_adapter_handle_forgery_rejection():
         session_id="sess_f",
         host_id="other_host",
         status="running",
-        is_real_host=True,
+        is_real_host=False,
         adapter_instance_id=adapter._instance_id,
         invocation_token="tok1"
     )
@@ -600,10 +600,10 @@ def test_antigravity_adapter_five_tier_command_risk_evaluation():
     assert evaluate_command_risk("pytest tests -s -v") == "safe_local"
     assert evaluate_command_risk("python scripts/heartbeat.py") == "safe_local"
     assert evaluate_command_risk("python scripts/quick_task.py ...") == "safe_local"
-    assert evaluate_command_risk("python scripts/transition_task.py --role DEV --task-id T0052 ...") == "safe_local"
+    assert evaluate_command_risk("python scripts/transition_task.py --role DEV --task-id T0052 --to-status 进行中") == "safe_local"
     assert evaluate_command_risk("Review codebase and suggest improvements") == "safe_local"
 
-    # DEF-T0052-3: Pytest dangerous flags and external paths must be rejected from safe_local
+    # DEF-T0052-3 & DEF-T0052-19: Pytest dangerous flags and external paths must be rejected from safe_local
     assert evaluate_command_risk("pytest -p evil_plugin") == "controlled_external"
     assert evaluate_command_risk("python -m pytest --pyargs evil") == "controlled_external"
     assert evaluate_command_risk("pytest -c /tmp/evil.ini") == "controlled_external"
@@ -614,7 +614,7 @@ def test_antigravity_adapter_five_tier_command_risk_evaluation():
     assert evaluate_command_risk("pytest /outside/path/test.py") == "controlled_external"
     assert evaluate_command_risk("pytest ../outside/test.py") == "controlled_external"
 
-    # DEF-T0052-3 & Reviewer bypass checks: Branch creation/deletion, worktree add, git diff output redirection, natural language deletion
+    # DEF-T0052-3 & DEF-T0052-19: Branch creation/deletion, worktree add, git diff output redirection, natural language deletion & empty
     assert evaluate_command_risk("git branch feature/phase2e-new") == "destructive"
     assert evaluate_command_risk("git branch -d feature/old") == "destructive"
     assert evaluate_command_risk("git branch -D feature/old") == "destructive"
@@ -624,8 +624,15 @@ def test_antigravity_adapter_five_tier_command_risk_evaluation():
     assert evaluate_command_risk("git diff --output=patch.diff") == "destructive"
     assert evaluate_command_risk("Delete all temporary files") == "destructive"
     assert evaluate_command_risk("Please remove old checkpoints") == "destructive"
+    assert evaluate_command_risk("Empty repository and discard all files") == "destructive"
+    assert evaluate_command_risk("Move uncommitted files to recycle bin") == "destructive"
     assert evaluate_command_risk("删除过期日志") == "destructive"
     assert evaluate_command_risk("清理临时目录") == "destructive"
+    assert evaluate_command_risk("清空所有未提交内容") == "destructive"
+    assert evaluate_command_risk("丢弃本次修改") == "destructive"
+    assert evaluate_command_risk("移到回收站") == "destructive"
+    assert evaluate_command_risk("python scripts/transition_task.py --role DEV --task-id T0052 --to-status 已取消") == "destructive"
+    assert evaluate_command_risk("python scripts/quick_task.py --task-id T0052 --to-status 已废弃") == "destructive"
     assert evaluate_command_risk("python scripts/evil.py scripts/heartbeat.py") == "controlled_external"
     assert evaluate_command_risk("python evil.py") == "controlled_external"
 
@@ -673,7 +680,7 @@ def test_antigravity_adapter_dispatch_zero_self_authorization():
     with pytest.raises(AgentNotSupportedError, match="strictly forbidden"):
         adapter.dispatch_agent(req_self_auth)
 
-    # 2. Safe local operation succeeds and automatically records 6-tuple approval
+    # 2. Safe local operation succeeds without auto-faking approval in permission cache (DEF-T0052-18)
     req_safe_1 = AgentRequest(
         session_id="sess_safe_chk_01",
         prompt="git status",
@@ -684,7 +691,23 @@ def test_antigravity_adapter_dispatch_zero_self_authorization():
     handle_1 = adapter.dispatch_agent(req_safe_1)
     assert handle_1.session_id == "sess_safe_chk_01"
 
-    # 3. Next session in the same project/workspace finds approval already in cache (Reusable session-independent cache)
+    # Permission cache is NOT auto-written
+    assert adapter.has_permission_approval(
+        project_id="proj_p2",
+        auth_context="auth_01",
+        workspace_dir=os.path.abspath("."),
+        command_family="safe_local:DEV",
+        permission_boundary="workspace_read"
+    ) is False
+
+    # 3. When outer host explicitly records approval, subsequent session finds approval cached
+    adapter.record_permission_approval(
+        project_id="proj_p2",
+        auth_context="auth_01",
+        workspace_dir=os.path.abspath("."),
+        command_family="safe_local:DEV",
+        permission_boundary="workspace_read"
+    )
     assert adapter.has_permission_approval(
         project_id="proj_p2",
         auth_context="auth_01",
@@ -745,7 +768,25 @@ def test_antigravity_adapter_dual_root_and_cross_project_isolation(tmp_path):
     handle = adapter.dispatch_agent(req_valid)
     assert handle.session_id == "sess_dual_ok"
 
-    # 2. Workspace not in git repository fails closed
+    # 2. Linked worktree sharing the same git-common-dir passes (DEF-T0052-20)
+    from scripts._lib.hosts.antigravity_adapter import _find_git_common_dir
+    fake_wt = str(tmp_path / "linked_worktree")
+    os.makedirs(fake_wt, exist_ok=True)
+    cur_common_dir = _find_git_common_dir(os.path.abspath("."))
+    with open(os.path.join(fake_wt, ".git"), "w", encoding="utf-8") as f:
+        f.write(f"gitdir: {cur_common_dir}\n")
+
+    req_wt = AgentRequest(
+        session_id="sess_wt_ok",
+        prompt="Worktree sharing common dir test",
+        role="DEV",
+        workspace_dir=os.path.abspath("."),
+        extra_context={"project_folders": [fake_wt]}
+    )
+    handle_wt = adapter.dispatch_agent(req_wt)
+    assert handle_wt.session_id == "sess_wt_ok"
+
+    # 3. Workspace not in git repository fails closed
     non_git_ws = str(tmp_path / "not_git_dir")
     os.makedirs(non_git_ws, exist_ok=True)
     req_bad_ws = AgentRequest(
@@ -757,7 +798,7 @@ def test_antigravity_adapter_dual_root_and_cross_project_isolation(tmp_path):
     with pytest.raises(AgentNotSupportedError, match="not inside a trusted Git repository"):
         adapter.dispatch_agent(req_bad_ws)
 
-    # 3. Project folder outside git repository fails closed (DEF-T0052-4)
+    # 4. Project folder outside git repository fails closed (DEF-T0052-4)
     non_git_folder = str(tmp_path / "external_folder")
     os.makedirs(non_git_folder, exist_ok=True)
     req_bad_folder = AgentRequest(
@@ -770,7 +811,7 @@ def test_antigravity_adapter_dual_root_and_cross_project_isolation(tmp_path):
     with pytest.raises(AgentNotSupportedError, match="Dual-root Fail-Closed"):
         adapter.dispatch_agent(req_bad_folder)
 
-    # 4. Cross-Project Isolation Violation: An outside Git repository cannot be mixed in
+    # 5. Cross-Project Isolation Violation: An outside Git repository cannot be mixed in
     outside_git_dir = str(tmp_path / "outside_git_repo")
     os.makedirs(os.path.join(outside_git_dir, ".git"), exist_ok=True)
     req_cross_proj = AgentRequest(
@@ -824,3 +865,16 @@ def test_antigravity_adapter_user_rejection_halts_execution():
     )
     with pytest.raises(AgentNotSupportedError, match="non-interactive"):
         adapter.request_confirmation(conf_req)
+
+
+def test_antigravity_adapter_static_only_blocks_real_process_spawn():
+    adapter = AntigravityAdapter(is_real_host=True, verification_level=VerificationLevel.STATIC_ONLY)
+
+    req = AgentRequest(
+        session_id="sess_block_real",
+        prompt="git status",
+        role="DEV",
+        workspace_dir=os.path.abspath(".")
+    )
+    with pytest.raises(AgentNotSupportedError, match="declared STATIC_ONLY"):
+        adapter.dispatch_agent(req)

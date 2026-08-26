@@ -370,8 +370,8 @@
 
 ### 1. 目标与完成情况
 
-- **实施目标**: 在 2A～2D-2 基础设施上实现真实 `AntigravityAdapter`，取得 Windows 宿主（`agy.exe` 1.1.8）的真实 session、invocation、workspace 与 Evidence 身份链。macOS 保持 `static_only`，Linux 保持 `static_only`。
-- **权限与审批优化**: 完整落实 §3.1 五类权限档（`safe_local`、`controlled_external`、`destructive`、`billing`、`acceptance`），对工作区内稳定命令实现 7 元组精确缓存，消除日常开发中重复授权痛点，同时杜绝 `Always Proceed`、`command(*)`、`python -c` 误放行与权限跨边界复用。
+- **实施目标**: 在 2A～2D-2 基础设施上实现真实 `AntigravityAdapter`。在未完成真实浏览器 OAuth 登录前，Manifest 在所有操作系统平台（Windows, macOS, Linux）上如实声明 `STATIC_ONLY`（版本 >=1.0.0，实测 Google 签名版本 1.1.21）。
+- **权限与审批优化**: 完整落实 §3.1 五类权限档（`safe_local`、`controlled_external`、`destructive`、`billing`、`acceptance`），对工作区内稳定命令实现 6 元组精确缓存，消除日常开发中重复授权痛点，同时杜绝 `Always Proceed`、`command(*)`、`python -c` 误放行与权限跨边界复用。
 - **任务编号**: `T0052`
 - **代码基线**: `e4550d4d0a87226adc7da67785700c1fdc7a2e44`
 
@@ -379,8 +379,8 @@
 
 1. **Host Surface 与验证等级**:
    - 适配器标识: `antigravity`
-   - 宿主 Surface: `HostSurface.CLI`（`agy.exe` 1.1.8）
-   - Windows: `VerificationLevel.CLI_VERIFIED`（版本 >=1.0.0，实测 1.1.8）
+   - 宿主 Surface: `HostSurface.CLI`（`agy.exe` 1.1.21）
+   - Windows: `VerificationLevel.STATIC_ONLY`（版本 >=1.0.0，实测 1.1.21）
    - macOS: `VerificationLevel.STATIC_ONLY`
    - Linux: `VerificationLevel.STATIC_ONLY`
    - 认证边界: `USER_LOCAL`（本地已登录账户会话，不读取、保存或提交凭证）
@@ -392,13 +392,13 @@
    - `QA` 角色: 路由至 `flow-qa`，默认只读模式。
    - `ARCHITECT` / `PM` / `DOCS` / `DEVOPS`: 路由至对应专业子代理（`flow-architect`, `flow-pm`, `flow-docs`, `flow-devops`）。
 
-3. **五类权限分级与精确 7 元组缓存**:
-   - `safe_local`: 工作区内 Git 只读查询、pytest、yy-flow CLI 工具（`heartbeat.py`, `quick_task.py`, `transition_task.py`, `check_stage_gate.py`）。首次批准后在相同 7 元组上下文自动免密执行。
+3. **五类权限分级与精确 6 元组缓存**:
+   - `safe_local`: 工作区内 Git 只读查询、pytest、yy-flow CLI 工具（`heartbeat.py`, `quick_task.py`, `transition_task.py`）。经用户/外部可信 Host 显式授权后在相同 6 元组上下文免密执行。
    - `controlled_external`: 网络请求、依赖下载、外部目录访问 -> 强制 Ask。
-   - `destructive`: `git reset/clean/rebase/branch -D`、文件递归删除 -> Deny / 逐次 Ask。
+   - `destructive`: `git reset/clean/rebase/branch -D`、文件递归删除、清空/丢弃/移到回收站、取消/废弃任务 -> Deny / 逐次 Ask。
    - `billing`: API Key、付费 API -> 显式独立确认。
-   - `acceptance`: `git push`, `git merge`, 发布验收 -> 显式用户授权。
-   - 缓存唯一键: `(project_id, auth_context, adapter_instance_id, session_id, workspace_dir, command_family, permission_boundary)` 7 元组，禁止跨项目、跨账号、跨会话、跨工作区扩散。
+   - `acceptance`: `git push`, `git merge`, 发布上线 -> 显式用户授权。
+   - 缓存唯一键: `(project_id, auth_context, adapter_instance_id, workspace_dir, command_family, permission_boundary)` 6 元组（解除瞬态 `session_id` 耦合，严格绑定项目与工作区），禁止跨项目、跨账号、跨工作区扩散。
    - 严禁 `Always Proceed`、`--dangerously-skip-permissions`、`command(*)`、`python -c` 任意代码内联执行。
 
 4. **Session / Handle 与 Invocation 真实性与防伪**:
@@ -418,13 +418,13 @@
 ### 4. 测试记录（真实数据）
 
 - **2E 定向测试**:
-  - `python -m pytest tests/test_antigravity_adapter.py -q -rs` -> `22 passed in 0.62s` (0 failed, 0 skipped)
+  - `python -m pytest tests/test_antigravity_adapter.py -q -rs` -> `23 passed in 0.68s` (0 failed, 0 skipped)
 - **2D-1 通用基础设施回归测试**:
-  - `python -m pytest tests/test_adapter_manifest.py tests/test_adapter_registry.py tests/test_adapter_conformance.py -q -rs` -> `37 passed in 2.78s` (0 failed, 0 skipped)
+  - `python -m pytest tests/test_adapter_manifest.py tests/test_adapter_registry.py tests/test_adapter_conformance.py -q -rs` -> `37 passed in 1.70s` (0 failed, 0 skipped)
 - **2A～2D-2 兼容性与 Codex 适配器测试**:
-  - `python -m pytest tests/test_host_adapter.py tests/test_evidence.py tests/test_worktree_manager.py tests/test_codex_cli_adapter.py -q -rs` -> `80 passed in 23.23s` (0 failed, 0 skipped)
+  - `python -m pytest tests/test_host_adapter.py tests/test_evidence.py tests/test_worktree_manager.py tests/test_codex_cli_adapter.py -q -rs` -> `80 passed in 23.45s` (0 failed, 0 skipped)
 - **全量测试套件**:
-  - `python -m pytest tests -q -rs` -> `365 passed in 68.44s (0:01:08)` (0 failed, 0 skipped, 100% 通过)
+  - `python -m pytest tests -q -rs` -> `366 passed in 63.28s (0:01:03)` (0 failed, 0 skipped, 100% 通过)
 - **代码规范检查**:
   - `git diff --check` -> 退出码 0，零尾随空白错误
 
@@ -472,7 +472,7 @@ e2e_record:
 
 5. **[DEF-T0052-5] 严格跨项目边界隔离与 Popen 工作目录注入 (P1)**:
    - `subprocess.Popen` 严格显式指定 `cwd=request.workspace_dir`。
-   - `validate_workspace_roots()` 引入 `_find_git_root`，严禁将任意外部 Git 仓库混入 `project_folders` / `kanban_dir`（违反跨项目隔离直接抛出 `AgentNotSupportedError`）。
+   - `validate_workspace_roots()` 引入 `_find_git_root` 与 `_find_git_common_dir`，严禁将任意外部 Git 仓库混入 `project_folders` / `kanban_dir`（违反跨项目隔离直接抛出 `AgentNotSupportedError`）。
 
 6. **[DEF-T0052-6] 验证等级如实降级与版本校准 (P1/P2)**:
    - 在真实 OAuth 交互会话产出前，Windows/macOS/Linux 统一如实声明为 `STATIC_ONLY`，清空虚假 E2E 引用，杜绝证据等级虚高。
@@ -481,6 +481,29 @@ e2e_record:
 7. **[DEF-T0052-7] 测试环境隔离与操作边界约束明确 (P3)**:
    - 单元测试与回归套件采用完全隔离的 Mock Fixture，杜绝自动化测试触发真实 OAuth 浏览器拉起。
    - 记录用户操作边界：若后续明确授权进行真实登录，**必须显式使用 Firefox（火狐）浏览器**。
+
+8. **[DEF-T0052-17] 彻底隔离测试用例与消灭后台残留进程 (P1)**:
+   - 修复 `test_antigravity_adapter_handle_forgery_rejection`，改用 `is_real_host=False` 纯内存测试，杜绝未 mock `Popen` 导致拉起真实 `agy.exe` 进程并弹出 OAuth 页面。
+   - 所有测试会话均确保显式取消或等待结束，测试运行后系统 0 残留 `agy.exe` 进程。
+
+9. **[DEF-T0052-18] 废除 dispatch 内隐式自动伪造已批准记录 (P1)**:
+   - `dispatch_agent()` 执行 `safe_local` 时不再在未获得授权前隐式调用 `record_permission_approval()` 假造已批准记录。
+   - `_permission_cache` 仅能通过显式 `record_permission_approval()` 登记真实授权凭据。
+
+10. **[DEF-T0052-19] 关键词风险分类全量补全 (P1)**:
+    - 自然语言 `empty`、`discard`、`recycle`、`trash`、`清空`、`丢弃`、`废弃`、`回收站`、`撤销`、`抹掉`、`移到回收站` 精确归为 `destructive`。
+    - `transition_task.py` / `quick_task.py` 流转至 `已取消`、`已废弃`、`已退回`、`已阻塞` 精确归为 `destructive`。
+    - `pytest` 解析路径与 Directory Junction / 软链接逃逸检测（`commonpath` 比对）归为 `controlled_external`。
+
+11. **[DEF-T0052-20] 递归解析 `git-common-dir` 支持多 Worktree 共享仓库场景 (P1)**:
+    - `_find_git_common_dir()` 能够解析主仓库 `.git/` 目录以及各 Linked Worktree 中的 `.git` 文件与 `commondir` 引用。
+    - 代码 Worktree 与权威看板 Worktree 共享同一 `git-common-dir` 时正常通过双根校验，同时继续拦截无关外部 Git 仓库。
+
+12. **[DEF-T0052-21] 落实 `STATIC_ONLY` 运行态安全门禁 (P2)**:
+    - 当适配器声明为 `STATIC_ONLY` 时，`dispatch_agent()` 对未 Mock 的真实子进程调用执行 Fail-Closed 拦截，严格符合 Registry 的 `verified_automatic` 门禁契约。
+
+13. **[DEF-T0052-22] 实施报告历史矛盾结论全量清理 (P3)**:
+    - 报告全文清理旧的 `1.1.8`、`CLI_VERIFIED` 和 7 元组残留，全面对齐为 `1.1.21`、`STATIC_ONLY` 与 6 元组架构。
 
 ### 7. 未实施范围说明
 

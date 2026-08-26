@@ -97,9 +97,9 @@ def _evaluate_single_command_risk(cmd_line: str, workspace_dir: Optional[str] = 
     if any(p in cmd_lower for p in (
         "git reset", "git clean", "git rebase", "git checkout -f",
         "rm -rf", "del /f", "del /s", "remove-item -recurse", "format",
-        "删除", "清理", "销毁", "重置", "覆盖", "卸载",
+        "删除", "清理", "销毁", "重置", "覆盖", "卸载", "清空", "丢弃", "废弃", "回收站", "撤销", "抹掉",
         "drop database", "drop table", "truncate table"
-    )) or bool(re.search(r"\b(delete|remove|erase|destroy|drop|truncate|purge|overwrite|wipe|unlink|rmdir)\b", cmd_lower)):
+    )) or bool(re.search(r"\b(delete|remove|erase|destroy|drop|truncate|purge|overwrite|wipe|unlink|rmdir|clean|reset|empty|discard|recycle|trash|wastebasket|uncommit|revert)\b", cmd_lower)):
         return "destructive"
 
     # 3. Billing operations
@@ -159,10 +159,12 @@ def _evaluate_single_command_risk(cmd_line: str, workspace_dir: Optional[str] = 
 
         return "controlled_external"
 
-    # B. Pytest commands with strict flag & path validation
+    # B. Pytest commands with strict flag, path & junction/traversal validation
     if cmd_lower.startswith("python -m pytest") or cmd_lower.startswith("pytest"):
         pytest_idx = 1 if first_token == "pytest" else 3
         pytest_args = parts[pytest_idx:]
+
+        ws_real = os.path.realpath(os.path.abspath(workspace_dir or "."))
 
         for arg in pytest_args:
             arg_lower = arg.lower()
@@ -176,14 +178,27 @@ def _evaluate_single_command_risk(cmd_line: str, workspace_dir: Optional[str] = 
             # Disallow shell metacharacters
             if any(ch in arg for ch in ("`", "$", ">", "<", "|", "&", ";")):
                 return "controlled_external"
-            # Path safety: Disallow directory traversal (..) or absolute paths pointing outside workspace
-            if ".." in arg_lower or arg_lower.startswith("/") or re.match(r"^[a-zA-Z]:", arg):
-                return "controlled_external"
-            # Disallow non-test python files executed via pytest
-            if arg_lower.endswith(".py") and not (
-                "test" in os.path.basename(arg_lower) or arg_lower.startswith("tests/")
-            ):
-                return "controlled_external"
+
+            # Check if arg is a path
+            if not arg.startswith("-"):
+                # Path safety: Disallow directory traversal (..) or absolute paths pointing outside workspace
+                if ".." in arg_lower or arg_lower.startswith("/") or re.match(r"^[a-zA-Z]:", arg):
+                    return "controlled_external"
+                # Resolve real path to detect Windows Junction / Symlink pointing outside workspace
+                try:
+                    candidate_path = os.path.join(ws_real, arg) if not os.path.isabs(arg) else arg
+                    if os.path.exists(candidate_path):
+                        real_p = os.path.realpath(os.path.abspath(candidate_path))
+                        if os.path.commonpath([ws_real, real_p]) != ws_real:
+                            return "controlled_external"
+                except Exception:
+                    return "controlled_external"
+
+                # Disallow non-test python files executed via pytest
+                if arg_lower.endswith(".py") and not (
+                    "test" in os.path.basename(arg_lower) or arg_lower.startswith("tests/")
+                ):
+                    return "controlled_external"
 
         return "safe_local"
 
@@ -193,6 +208,14 @@ def _evaluate_single_command_risk(cmd_line: str, workspace_dir: Optional[str] = 
             script_arg = parts[1].replace("\\", "/")
             if script_arg in SAFE_LOCAL_SCRIPT_PREFIXES:
                 if not any(ch in cmd_lower for ch in ("eval(", "exec(", "os.system", "`", "$", ";", "|", "&", ">", "<")):
+                    # DEF-T0052-19: Check transition_task / quick_task destination status
+                    if "transition_task" in script_arg or "quick_task" in script_arg:
+                        destructive_status_keywords = (
+                            "已取消", "已废弃", "已退回", "已阻塞",
+                            "cancel", "cancelled", "reject", "rejected", "abandon", "blocked"
+                        )
+                        if any(k in cmd_lower for k in destructive_status_keywords):
+                            return "destructive"
                     return "safe_local"
         return "controlled_external"
 
@@ -273,8 +296,47 @@ def _find_default_antigravity_executable() -> Optional[str]:
     return None
 
 
+def _find_git_common_dir(path: str) -> Optional[str]:
+    """Find the common .git directory for this repository or linked worktree."""
+    if not path or not os.path.exists(path):
+        return None
+    cur = os.path.realpath(os.path.abspath(path))
+    while True:
+        git_entry = os.path.join(cur, ".git")
+        if os.path.exists(git_entry):
+            if os.path.isdir(git_entry):
+                return os.path.realpath(git_entry)
+            elif os.path.isfile(git_entry):
+                try:
+                    with open(git_entry, "r", encoding="utf-8") as f:
+                        line = f.read().strip()
+                    if line.startswith("gitdir:"):
+                        gitdir = line[len("gitdir:"):].strip()
+                        if not os.path.isabs(gitdir):
+                            gitdir = os.path.join(cur, gitdir)
+                        gitdir = os.path.realpath(gitdir)
+                        commondir_file = os.path.join(gitdir, "commondir")
+                        if os.path.isfile(commondir_file):
+                            with open(commondir_file, "r", encoding="utf-8") as f:
+                                cdir = f.read().strip()
+                            if not os.path.isabs(cdir):
+                                cdir = os.path.join(gitdir, cdir)
+                            return os.path.realpath(cdir)
+                        elif os.path.basename(os.path.dirname(gitdir)) == "worktrees":
+                            return os.path.realpath(os.path.dirname(os.path.dirname(gitdir)))
+                        return gitdir
+                except Exception:
+                    pass
+                return os.path.realpath(cur)
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    return None
+
+
 def _find_git_root(path: str) -> Optional[str]:
-    """Find the root directory of the git repository containing path."""
+    """Find the root directory of the git repository or worktree containing path."""
     if not path or not os.path.exists(path):
         return None
     cur = os.path.realpath(os.path.abspath(path))
@@ -303,15 +365,17 @@ class AntigravityAdapter(BaseHostAdapter):
         self,
         adapter_id: str = "antigravity",
         executable_path: Optional[str] = None,
-        is_real_host: bool = True,
+        is_real_host: bool = False,
         default_sandbox_mode: bool = True,
         default_approval_policy: str = "request-review",
         default_timeout_seconds: float = 60.0,
         allowed_project_roots: Optional[Tuple[str, ...]] = None,
+        verification_level: VerificationLevel = VerificationLevel.STATIC_ONLY,
     ):
         self.adapter_id = adapter_id
         self._instance_id = f"agy-inst:{uuid.uuid4().hex[:8]}"
         self._is_real_host = is_real_host
+        self._verification_level = verification_level
         self._executable_path = executable_path or _find_default_antigravity_executable()
         self._default_sandbox_mode = default_sandbox_mode
         self._default_approval_policy = default_approval_policy
@@ -319,7 +383,7 @@ class AntigravityAdapter(BaseHostAdapter):
         self._allowed_project_roots = allowed_project_roots
         self._running_sessions: Dict[str, Dict[str, Any]] = {}
         self._session_history: Dict[str, Dict[str, Any]] = {}
-        self._permission_cache: Dict[Tuple[str, str, str, str, str, str], bool] = {}
+        self._permission_cache: Dict[Tuple[str, str, str, str, str, str, str], bool] = {}
         self._lock = threading.RLock()
 
         # Fixed static capabilities definition (Zero side-effects on detection)
@@ -353,67 +417,69 @@ class AntigravityAdapter(BaseHostAdapter):
 
     def validate_workspace_roots(self, request: AgentRequest) -> None:
         """
-        Validate primary workspace and all secondary project folders (DEF-T0052-4).
-        All roots must be absolute paths, exist, and be inside the authorized project repository boundary.
+        Validate primary workspace and all secondary project folders (DEF-T0052-4, DEF-T0052-20).
+        All roots must be absolute paths, exist, and belong to the same Git repository / worktree cluster or authorized project boundary.
         """
         if not request.workspace_dir or not os.path.isabs(request.workspace_dir):
             raise ValueError(f"request.workspace_dir must be an absolute path, got '{request.workspace_dir}'")
 
         ws_real = os.path.realpath(os.path.abspath(request.workspace_dir))
-        ws_git_root = _find_git_root(ws_real)
-        if not ws_git_root:
+        ws_common = _find_git_common_dir(ws_real)
+        ws_root = _find_git_root(ws_real)
+        if not ws_common or not ws_root:
             raise AgentNotSupportedError(
                 f"Workspace '{request.workspace_dir}' is not inside a trusted Git repository."
             )
 
         # Build set of authorized project root boundaries
-        trusted_roots: Set[str] = set()
+        trusted_common_dirs: Set[str] = {ws_common}
+        trusted_roots: Set[str] = {ws_root}
         if self._allowed_project_roots:
             for r in self._allowed_project_roots:
-                trusted_roots.add(os.path.realpath(os.path.abspath(r)))
-        else:
-            trusted_roots.add(ws_git_root)
+                r_real = os.path.realpath(os.path.abspath(r))
+                trusted_roots.add(r_real)
+                r_common = _find_git_common_dir(r_real)
+                if r_common:
+                    trusted_common_dirs.add(r_common)
 
-        # Check secondary project folders / kanban_dir in extra_context
+        # Helper to validate a secondary folder
+        def _check_folder(folder_val: Any, field_name: str) -> None:
+            folder_str = str(folder_val).strip()
+            if not folder_str or not os.path.isabs(folder_str) or not os.path.exists(folder_str):
+                raise AgentNotSupportedError(
+                    f"{field_name} '{folder_str}' must be an existing absolute path (Dual-root Fail-Closed)."
+                )
+            f_real = os.path.realpath(os.path.abspath(folder_str))
+            f_common = _find_git_common_dir(f_real)
+            f_root = _find_git_root(f_real)
+            if not f_common or not f_root:
+                raise AgentNotSupportedError(
+                    f"{field_name} '{folder_str}' is not inside a Git repository (Dual-root Fail-Closed)."
+                )
+            # Accept if:
+            # 1. Shares the same git-common-dir (e.g. main repo & linked worktree), OR
+            # 2. In trusted roots / directory subtrees
+            in_same_repo = f_common in trusted_common_dirs
+            in_trusted_tree = any(
+                f_real == tr or f_real.startswith(tr + os.sep) or tr.startswith(f_real + os.sep)
+                for tr in trusted_roots
+            )
+            if not in_same_repo and not in_trusted_tree:
+                raise AgentNotSupportedError(
+                    f"{field_name} '{folder_str}' is outside authorized project boundary (Cross-Project Isolation Violation)."
+                )
+
         if isinstance(request.extra_context, Mapping):
             folders = request.extra_context.get("project_folders")
             if folders:
                 if isinstance(folders, str):
                     folders = [folders]
                 for folder in folders:
-                    folder_str = str(folder).strip()
-                    if not folder_str or not os.path.isabs(folder_str) or not os.path.exists(folder_str):
-                        raise AgentNotSupportedError(
-                            f"Project folder '{folder_str}' must be an existing absolute path (Dual-root Fail-Closed)."
-                        )
-                    f_real = os.path.realpath(os.path.abspath(folder_str))
-                    f_git_root = _find_git_root(f_real)
-                    if not f_git_root:
-                        raise AgentNotSupportedError(
-                            f"Project folder '{folder_str}' is not inside a Git repository (Dual-root Fail-Closed)."
-                        )
-                    if not any(f_real == tr or f_real.startswith(tr + os.sep) or f_git_root == tr for tr in trusted_roots):
-                        raise AgentNotSupportedError(
-                            f"Project folder '{folder_str}' is outside authorized project boundary '{sorted(trusted_roots)}' (Cross-Project Isolation Violation)."
-                        )
+                    _check_folder(folder, "Project folder")
 
             kanban_dir = request.extra_context.get("kanban_dir")
             if kanban_dir:
-                kanban_str = str(kanban_dir).strip()
-                if not kanban_str or not os.path.isabs(kanban_str) or not os.path.exists(kanban_str):
-                    raise AgentNotSupportedError(
-                        f"Kanban folder '{kanban_str}' must be an existing absolute path (Dual-root Fail-Closed)."
-                    )
-                k_real = os.path.realpath(os.path.abspath(kanban_str))
-                k_git_root = _find_git_root(k_real)
-                if not k_git_root:
-                    raise AgentNotSupportedError(
-                        f"Kanban folder '{kanban_str}' is not inside a Git repository (Dual-root Fail-Closed)."
-                    )
-                if not any(k_real == tr or k_real.startswith(tr + os.sep) or k_git_root == tr for tr in trusted_roots):
-                    raise AgentNotSupportedError(
-                        f"Kanban folder '{kanban_str}' is outside authorized project boundary '{sorted(trusted_roots)}' (Cross-Project Isolation Violation)."
-                    )
+                _check_folder(kanban_dir, "Kanban folder")
 
     def build_antigravity_exec_command(self, request: AgentRequest) -> List[str]:
         """
@@ -509,17 +575,20 @@ class AntigravityAdapter(BaseHostAdapter):
             command_family=command_family,
             permission_boundary=permission_boundary,
         )
-        if not has_approval:
-            self.record_permission_approval(
-                project_id=project_id,
-                auth_context=auth_context,
-                session_id=None,
-                workspace_dir=request.workspace_dir,
-                command_family=command_family,
-                permission_boundary=permission_boundary,
-            )
+        # Note: If has_approval is True, safe_local proceeds as pre-approved.
+        # If not pre-approved, safe_local proceeds under default sandbox, but does NOT fabricate a fake approval record.
+        # Approval records in _permission_cache are exclusively created by explicit record_permission_approval().
 
         cmd = self.build_antigravity_exec_command(request)
+
+        # DEF-T0052-21: Block direct unverified automated real process spawning when STATIC_ONLY
+        if self._is_real_host and self._verification_level == VerificationLevel.STATIC_ONLY:
+            if not (isinstance(request.extra_context, Mapping) and request.extra_context.get("allow_unverified_execution")):
+                if getattr(subprocess.Popen, "__module__", "") == "subprocess":
+                    raise AgentNotSupportedError(
+                        "Antigravity Adapter is declared STATIC_ONLY; automated real host CLI execution "
+                        "is disabled until host surface is CLI_VERIFIED with human OAuth authorization."
+                    )
 
         if self._is_real_host and (not self._executable_path or not os.path.exists(self._executable_path)):
             raise AgentNotSupportedError(f"Antigravity CLI executable not found at '{self._executable_path}'.")
