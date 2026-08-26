@@ -286,13 +286,13 @@
 ### 3. 测试记录（真实数据）
 
 - **2D-2 定向测试**:
-  - `python -m pytest tests/test_codex_cli_adapter.py -q -rs` -> `13 passed in 0.50s` (0 failed, 0 skipped)
+  - `python -m pytest tests/test_codex_cli_adapter.py -q -rs` -> `13 passed in 1.85s` (0 failed, 0 skipped)
 - **2D-1 通用基础设施回归测试**:
   - `python -m pytest tests/test_adapter_manifest.py tests/test_adapter_registry.py tests/test_adapter_conformance.py -q -rs` -> `37 passed in 1.86s` (0 failed, 0 skipped)
 - **2A/2B/2C 契约与隔离兼容测试**:
-  - `python -m pytest tests/test_host_adapter.py tests/test_evidence.py tests/test_worktree_manager.py -q -rs` -> `60 passed in 25.82s` (0 failed, 0 skipped)
+  - `python -m pytest tests/test_host_adapter.py tests/test_evidence.py tests/test_worktree_manager.py -q -rs` -> `60 passed in 25.40s` (0 failed, 0 skipped)
 - **全量测试套件**:
-  - `python -m pytest tests -q -rs` -> `336 passed in 68.98s (0:01:08)` (0 failed, 0 skipped, 100% 通过)
+  - `python -m pytest tests -q -rs` -> `336 passed in 65.46s (0:01:05)` (0 failed, 0 skipped, 100% 通过)
 - **代码规范检查**:
   - `git diff --check` -> 退出码 0，零尾随空白错误
 
@@ -303,7 +303,7 @@
 - 遵循零副作用合规探测原则，能力探测（`detect_capabilities`）为纯内存计算，通过了 `assert_zero_side_effects` 严格测试。
 - 与 `EvidenceGate`、`EvidenceValidationContext` 及 `WorktreeManager` 无缝集成。
 
-### 5. 2D-2 缺陷返工记录 (DEF-T0050-1 ~ 6)
+### 5. 2D-2 缺陷返工记录 (DEF-T0050-1 ~ 7)
 
 1. **[DEF-T0050-1] 沙箱模式角色强约束与越权注入拦截**:
    - 建立沙箱模式白名单 `ALLOWED_SANDBOX_MODES = {"read-only", "workspace-write"}`，严禁任何 `danger-full-access` 注入或默认开启。
@@ -322,3 +322,6 @@
 6. **[DEF-T0050-6] 移除非法 `-a` 参数并对接真实 `--approve-for-me` 机制**:
    - 移除 `codex exec` 命令行中不存在的 `-a` 参数，杜绝真实 CLI 运行报错（`rc=2 unexpected argument '-a'`）。
    - 当 `approval_policy` 为 `"auto"` 或请求明确指定自动审批时，对接 Codex 官方 `--approve-for-me` 真实参数；增加 `build_codex_exec_command` 及针对本机真实 `codex.exe exec --help` 的参数合法性冒烟测试。
+7. **[DEF-T0050-7] 修复 `--approve-for-me` 与 `-s` 命令行参数互斥**:
+   - 依据 Codex CLI 官方语法，`--approve-for-me` 自带 `workspace-write` 沙箱，与 `-s / --sandbox` 严格互斥。
+   - 在生成 `--approve-for-me` 时完全排除 `-s` 参数；同时禁止只读角色（`REVIEWER`）使用 `--approve-for-me`（若请求则 Fail-Closed 拦截），确保参数合法且权限不越权。

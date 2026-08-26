@@ -154,7 +154,7 @@ class CodexCliAdapter(BaseHostAdapter):
     def build_codex_exec_command(self, request: AgentRequest) -> List[str]:
         """
         Build the exact argument list for `codex exec`.
-        Validates sandbox modes, approval flags, and workspace path (DEF-T0050-6).
+        Validates sandbox modes, approval flags, workspace path, and mutual exclusivity (DEF-T0050-6, DEF-T0050-7).
         """
         role = (request.role or "").upper().strip()
         requested_sandbox = None
@@ -179,27 +179,41 @@ class CodexCliAdapter(BaseHostAdapter):
                 sandbox_mode = self._default_sandbox_mode
 
         approval_policy = self._default_approval_policy
+        is_auto_approval = False
         if isinstance(request.extra_context, Mapping):
             custom_policy = request.extra_context.get("approval_policy")
             if custom_policy:
                 if custom_policy not in ALLOWED_APPROVAL_POLICIES and custom_policy not in ("auto", "approve-for-me"):
                     raise ValueError(f"Invalid approval_policy '{custom_policy}'. Allowed: {ALLOWED_APPROVAL_POLICIES}")
                 approval_policy = custom_policy
+            if custom_policy in ("auto", "approve-for-me") or request.extra_context.get("approve_for_me"):
+                is_auto_approval = True
 
-        cmd = [
-            self._executable_path or "codex",
-            "exec",
-            "--json",
-            "-C", request.workspace_dir,
-            "-s", sandbox_mode,
-        ]
+        if is_auto_approval:
+            # DEF-T0050-7: REVIEWER cannot use --approve-for-me because it implies workspace-write
+            if role == "REVIEWER":
+                raise AgentNotSupportedError(
+                    f"Role '{role}' is strictly read-only and cannot use '--approve-for-me' (which forces workspace-write)"
+                )
+            # DEF-T0050-7: --approve-for-me is mutually exclusive with -s / --sandbox in Codex CLI
+            cmd = [
+                self._executable_path or "codex",
+                "exec",
+                "--json",
+                "-C", request.workspace_dir,
+                "--approve-for-me",
+                request.prompt
+            ]
+        else:
+            cmd = [
+                self._executable_path or "codex",
+                "exec",
+                "--json",
+                "-C", request.workspace_dir,
+                "-s", sandbox_mode,
+                request.prompt
+            ]
 
-        if approval_policy in ("auto", "approve-for-me") or (
-            isinstance(request.extra_context, Mapping) and request.extra_context.get("approve_for_me")
-        ):
-            cmd.append("--approve-for-me")
-
-        cmd.append(request.prompt)
         return cmd
 
     def dispatch_agent(self, request: AgentRequest) -> AgentHandle:
@@ -219,10 +233,14 @@ class CodexCliAdapter(BaseHostAdapter):
         session_id = request.session_id
         invocation_id = f"inv-{uuid.uuid4().hex[:12]}"
 
-        # Build and validate command (DEF-T0050-1, DEF-T0050-2, DEF-T0050-6)
+        # Build and validate command (DEF-T0050-1, DEF-T0050-2, DEF-T0050-6, DEF-T0050-7)
         cmd = self.build_codex_exec_command(request)
-        sandbox_mode = cmd[cmd.index("-s") + 1]
-        approval_policy = "approve-for-me" if "--approve-for-me" in cmd else self._default_approval_policy
+        if "--approve-for-me" in cmd:
+            sandbox_mode = "workspace-write"
+            approval_policy = "approve-for-me"
+        else:
+            sandbox_mode = cmd[cmd.index("-s") + 1]
+            approval_policy = self._default_approval_policy
 
         # If real host execution is requested but executable is missing
         if self._is_real_host and (not self._executable_path or not os.path.exists(self._executable_path)):

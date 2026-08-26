@@ -140,10 +140,10 @@ def test_codex_cli_adapter_sandbox_role_enforcement():
 
 
 def test_codex_cli_adapter_command_building_and_no_invalid_a_flag():
-    # DEF-T0050-6: Ensure `-a` is never passed to `codex exec` and valid CLI options are generated
+    # DEF-T0050-6, DEF-T0050-7: Ensure `-a` is never passed, and `--approve-for-me` is mutually exclusive with `-s`
     adapter = CodexCliAdapter(is_real_host=False)
 
-    # 1. REVIEWER role generates read-only sandbox without -a
+    # 1. REVIEWER role generates read-only sandbox without -a and without --approve-for-me
     req_rev = AgentRequest(
         session_id="sess_rev_cmd",
         prompt="Check code correctness",
@@ -153,10 +153,11 @@ def test_codex_cli_adapter_command_building_and_no_invalid_a_flag():
     cmd_rev = adapter.build_codex_exec_command(req_rev)
     assert "-a" not in cmd_rev
     assert "-s" in cmd_rev
+    assert "--approve-for-me" not in cmd_rev
     assert cmd_rev[cmd_rev.index("-s") + 1] == "read-only"
     assert cmd_rev[cmd_rev.index("-C") + 1] == os.path.abspath(".")
 
-    # 2. DEV role with auto approval generates --approve-for-me
+    # 2. DEV role with auto approval generates --approve-for-me WITHOUT -s (DEF-T0050-7)
     req_dev_auto = AgentRequest(
         session_id="sess_dev_auto",
         prompt="Build module",
@@ -167,7 +168,18 @@ def test_codex_cli_adapter_command_building_and_no_invalid_a_flag():
     cmd_dev_auto = adapter.build_codex_exec_command(req_dev_auto)
     assert "-a" not in cmd_dev_auto
     assert "--approve-for-me" in cmd_dev_auto
-    assert cmd_dev_auto[cmd_dev_auto.index("-s") + 1] == "workspace-write"
+    assert "-s" not in cmd_dev_auto  # Mutually exclusive: -s must NOT be present!
+
+    # 3. REVIEWER attempting auto approval / approve_for_me must be rejected!
+    req_rev_auto = AgentRequest(
+        session_id="sess_rev_auto",
+        prompt="Attempting auto write as reviewer",
+        role="REVIEWER",
+        workspace_dir=os.path.abspath("."),
+        extra_context={"approval_policy": "auto"}
+    )
+    with pytest.raises(AgentNotSupportedError, match="strictly read-only"):
+        adapter.build_codex_exec_command(req_rev_auto)
 
 
 def test_codex_cli_adapter_approval_and_confirmation_contract():
