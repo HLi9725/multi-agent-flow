@@ -164,3 +164,9 @@
 - **详细任务书**：`docs/D04-研发过程/D01-任务/Phase2-2D-通用Adapter注册与Codex参考实现任务书.md`。
 - **2D-1 独立合同**：`docs/D04-研发过程/D01-任务/Phase2-2D-1-通用Adapter基础设施实施任务书.md`。
 - **未实施范围**：尚未创建 Registry、Manifest 或真实平台 Adapter，未调用任何客户端/API，未产生费用，未进入 2D-2、2E、2F、第三阶段或第四阶段。
+ 
+ # # #   Q A   ԏ�]  ( T 0 0 4 9   �OY)  
+ -   * * s^�S�S�O�Xf���y* * :   �](W  P l a t f o r m V e r i f i c a t i o n . _ _ p o s t _ i n i t _ _   N  A d a p t e r M a n i f e s t . _ _ p o s t _ i n i t _ _   :_6R�h��  n a t i v e _ v e r i f i e d ,   c l i _ v e r i f i e d ,   m c p _ v e r i f i e d   �_{�Nw�[�v  H o s t S u r f a c e   �v9SM�0 
+ -   * * 2�bk  S i m u l a t e d   ��Cg* * :   %N<h�b*b  H o s t S u r f a c e . S I M U L A T E D   v^�����[�~N��:d&^  v e r i f i e d   �Q��0 
+ -   * * M a n i f e s t   �T  P l a t f o r m V e r i f i c a t i o n   �v  H o s t   �~ N* * :   :_!h��  M a n i f e s t   �Xf�v  h o s t _ s u r f a c e   NR�S  p l a t f o r m _ v e r i f i c a t i o n s   �_{�T` N�0 
+ 
