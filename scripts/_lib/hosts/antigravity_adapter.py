@@ -87,29 +87,34 @@ def _evaluate_single_command_risk(cmd_line: str, workspace_dir: Optional[str] = 
     if not cmd_norm:
         return "safe_local"
 
-    # 1. Acceptance operations
-    if any(p in cmd_lower for p in ("git push", "git merge", "release", "publish")):
+    # 1. Acceptance operations (Chinese + English)
+    if any(p in cmd_lower for p in (
+        "git push", "git merge", "release", "publish", "发布", "推送", "合流", "上线"
+    )):
         return "acceptance"
 
-    # 2. Destructive operations
+    # 2. Destructive operations (Command syntax + Natural language deletion + Chinese keywords)
     if any(p in cmd_lower for p in (
         "git reset", "git clean", "git rebase", "git checkout -f",
-        "rm -rf", "del /f", "del /s", "remove-item -recurse"
-    )):
+        "rm -rf", "del /f", "del /s", "remove-item -recurse", "format",
+        "删除", "清理", "销毁", "重置", "覆盖", "卸载",
+        "drop database", "drop table", "truncate table"
+    )) or bool(re.search(r"\b(delete|remove|erase|destroy|drop|truncate|purge|overwrite|wipe|unlink|rmdir)\b", cmd_lower)):
         return "destructive"
 
     # 3. Billing operations
-    if any(p in cmd_lower for p in ("api_key", "billing", "purchase", "subscription_upgrade")):
+    if any(p in cmd_lower for p in ("api_key", "billing", "purchase", "subscription", "充值", "账单", "购买")):
         return "billing"
 
-    # 4. Controlled external operations (Network, package managers, external paths)
+    # 4. Controlled external operations (Network, package managers, external downloads)
     if any(p in cmd_lower for p in (
-        "pip install", "npm install", "curl ", "wget ", "git clone", "git fetch", "http://", "https://"
+        "pip install", "npm install", "curl ", "wget ", "git clone", "git fetch",
+        "http://", "https://", "download", "fetch", "联网", "外网", "下载"
     )):
         return "controlled_external"
 
     # Reject inline python execution / subshell from safe_local
-    if "python -c" in cmd_lower or "python -" in cmd_lower.split() or "eval(" in cmd_lower or "exec(" in cmd_lower:
+    if "python -c" in cmd_lower or "python -" in cmd_lower.split() or "eval(" in cmd_lower or "exec(" in cmd_lower or "os.system" in cmd_lower:
         return "controlled_external"
 
     # 5. Check safe_local candidates
@@ -117,9 +122,18 @@ def _evaluate_single_command_risk(cmd_line: str, workspace_dir: Optional[str] = 
     if not parts:
         return "safe_local"
 
+    first_token = parts[0].lower()
+
     # A. Git read-only commands
-    if parts[0].lower() == "git" and len(parts) >= 2:
+    if first_token == "git" and len(parts) >= 2:
         git_sub = parts[1].lower()
+
+        # Reject any git command that writes output to arbitrary file (e.g. git diff --output=...)
+        for arg in parts[2:]:
+            arg_l = arg.lower()
+            if arg_l.startswith("--output") or arg_l.startswith("-o") or arg_l.startswith("--file") or ">" in arg_l:
+                return "destructive"
+
         if git_sub in ("status", "diff", "log", "show", "rev-parse"):
             if not any(f in cmd_lower for f in ("-f", "--force", "--hard", "--delete", "-d")):
                 return "safe_local"
@@ -143,24 +157,29 @@ def _evaluate_single_command_risk(cmd_line: str, workspace_dir: Optional[str] = 
                     return "safe_local"
             return "destructive"
 
-    # B. Pytest commands with strict flag validation (DEF-T0052-3)
+        return "controlled_external"
+
+    # B. Pytest commands with strict flag & path validation
     if cmd_lower.startswith("python -m pytest") or cmd_lower.startswith("pytest"):
-        pytest_idx = 1 if parts[0].lower() == "pytest" else 3
+        pytest_idx = 1 if first_token == "pytest" else 3
         pytest_args = parts[pytest_idx:]
 
         for arg in pytest_args:
             arg_lower = arg.lower()
-            # If argument matches or starts with any forbidden flag
+            # Forbidden flags
             for f in FORBIDDEN_PYTEST_FLAGS:
                 if arg_lower == f or arg_lower.startswith(f + "="):
                     return "controlled_external"
-            # Disallow .ini, .cfg, or arbitrary config files passed as positional arguments
+            # Disallow .ini, .cfg config files
             if arg_lower.endswith(".ini") or arg_lower.endswith(".cfg"):
                 return "controlled_external"
-            # Disallow shell metacharacters in arguments
+            # Disallow shell metacharacters
             if any(ch in arg for ch in ("`", "$", ">", "<", "|", "&", ";")):
                 return "controlled_external"
-            # Disallow non-test python scripts executed via pytest positional args
+            # Path safety: Disallow directory traversal (..) or absolute paths pointing outside workspace
+            if ".." in arg_lower or arg_lower.startswith("/") or re.match(r"^[a-zA-Z]:", arg):
+                return "controlled_external"
+            # Disallow non-test python files executed via pytest
             if arg_lower.endswith(".py") and not (
                 "test" in os.path.basename(arg_lower) or arg_lower.startswith("tests/")
             ):
@@ -169,13 +188,15 @@ def _evaluate_single_command_risk(cmd_line: str, workspace_dir: Optional[str] = 
         return "safe_local"
 
     # C. Safe local scripts (Must match exact script path as first argument)
-    if parts[0].lower() in ("python", "python3", "python.exe"):
+    if first_token in ("python", "python3", "python.exe"):
         if len(parts) >= 2:
             script_arg = parts[1].replace("\\", "/")
             if script_arg in SAFE_LOCAL_SCRIPT_PREFIXES:
-                if not any(ch in cmd_lower for ch in ("eval(", "exec(", "os.system", "`", "$", ";", "|", "&")):
+                if not any(ch in cmd_lower for ch in ("eval(", "exec(", "os.system", "`", "$", ";", "|", "&", ">", "<")):
                     return "safe_local"
-    elif cmd_lower.startswith("powershell"):
+        return "controlled_external"
+
+    elif first_token.startswith("powershell"):
         file_idx = -1
         for i, p in enumerate(parts):
             if p.lower() == "-file" and i + 1 < len(parts):
@@ -183,16 +204,18 @@ def _evaluate_single_command_risk(cmd_line: str, workspace_dir: Optional[str] = 
                 break
         if file_idx > 0:
             ps_script = parts[file_idx].replace("\\", "/")
+            if ps_script in SAFE_LOCAL_SCRIPT_PREFIXES:
+                return "safe_local"
+        return "controlled_external"
+
     # If it starts with an executable or command that did not pass safe whitelist
-    first_token = parts[0].lower() if parts else ""
     if first_token in (
         "pip", "npm", "curl", "wget", "sh", "bash", "cmd", "cmd.exe",
-        "node", "ruby", "perl", "sudo", "apt", "brew", "yum", "cargo", "go", "make",
-        "python", "python3", "python.exe", "powershell", "powershell.exe", "git", "pytest"
+        "node", "ruby", "perl", "sudo", "apt", "brew", "yum", "cargo", "go", "make"
     ) or any(first_token.endswith(ext) for ext in (".exe", ".bat", ".cmd", ".ps1", ".sh", ".py")):
         return "controlled_external"
 
-    # Standard natural language task prompt within workspace sandbox
+    # Standard benign natural language task prompt within workspace sandbox
     return "safe_local"
 
 
@@ -250,22 +273,24 @@ def _find_default_antigravity_executable() -> Optional[str]:
     return None
 
 
-def _is_git_repository(path: str) -> bool:
-    """Check if the given directory is inside or is a Git repository/worktree."""
-    if not os.path.isdir(path):
-        return False
-    git_entry = os.path.join(path, ".git")
-    if os.path.exists(git_entry):
-        return True
-    cur = os.path.abspath(path)
+def _find_git_root(path: str) -> Optional[str]:
+    """Find the root directory of the git repository containing path."""
+    if not path or not os.path.exists(path):
+        return None
+    cur = os.path.realpath(os.path.abspath(path))
     while True:
         if os.path.exists(os.path.join(cur, ".git")):
-            return True
+            return cur
         parent = os.path.dirname(cur)
         if parent == cur:
             break
         cur = parent
-    return False
+    return None
+
+
+def _is_git_repository(path: str) -> bool:
+    """Check if the given directory is inside or is a Git repository/worktree."""
+    return _find_git_root(path) is not None
 
 
 class AntigravityAdapter(BaseHostAdapter):
@@ -281,7 +306,8 @@ class AntigravityAdapter(BaseHostAdapter):
         is_real_host: bool = True,
         default_sandbox_mode: bool = True,
         default_approval_policy: str = "request-review",
-        default_timeout_seconds: float = 60.0
+        default_timeout_seconds: float = 60.0,
+        allowed_project_roots: Optional[Tuple[str, ...]] = None,
     ):
         self.adapter_id = adapter_id
         self._instance_id = f"agy-inst:{uuid.uuid4().hex[:8]}"
@@ -290,9 +316,10 @@ class AntigravityAdapter(BaseHostAdapter):
         self._default_sandbox_mode = default_sandbox_mode
         self._default_approval_policy = default_approval_policy
         self._default_timeout_seconds = default_timeout_seconds
+        self._allowed_project_roots = allowed_project_roots
         self._running_sessions: Dict[str, Dict[str, Any]] = {}
         self._session_history: Dict[str, Dict[str, Any]] = {}
-        self._permission_cache: Dict[Tuple[str, str, str, str, str, str, str], bool] = {}
+        self._permission_cache: Dict[Tuple[str, str, str, str, str, str], bool] = {}
         self._lock = threading.RLock()
 
         # Fixed static capabilities definition (Zero side-effects on detection)
@@ -327,15 +354,25 @@ class AntigravityAdapter(BaseHostAdapter):
     def validate_workspace_roots(self, request: AgentRequest) -> None:
         """
         Validate primary workspace and all secondary project folders (DEF-T0052-4).
-        All roots must be absolute paths, exist, and be inside trusted Git repositories.
+        All roots must be absolute paths, exist, and be inside the authorized project repository boundary.
         """
         if not request.workspace_dir or not os.path.isabs(request.workspace_dir):
             raise ValueError(f"request.workspace_dir must be an absolute path, got '{request.workspace_dir}'")
 
-        if not _is_git_repository(request.workspace_dir):
+        ws_real = os.path.realpath(os.path.abspath(request.workspace_dir))
+        ws_git_root = _find_git_root(ws_real)
+        if not ws_git_root:
             raise AgentNotSupportedError(
                 f"Workspace '{request.workspace_dir}' is not inside a trusted Git repository."
             )
+
+        # Build set of authorized project root boundaries
+        trusted_roots: Set[str] = set()
+        if self._allowed_project_roots:
+            for r in self._allowed_project_roots:
+                trusted_roots.add(os.path.realpath(os.path.abspath(r)))
+        else:
+            trusted_roots.add(ws_git_root)
 
         # Check secondary project folders / kanban_dir in extra_context
         if isinstance(request.extra_context, Mapping):
@@ -344,18 +381,38 @@ class AntigravityAdapter(BaseHostAdapter):
                 if isinstance(folders, str):
                     folders = [folders]
                 for folder in folders:
-                    folder_path = str(folder).strip()
-                    if not folder_path or not os.path.isabs(folder_path) or not _is_git_repository(folder_path):
+                    folder_str = str(folder).strip()
+                    if not folder_str or not os.path.isabs(folder_str) or not os.path.exists(folder_str):
                         raise AgentNotSupportedError(
-                            f"Project folder '{folder_path}' is not inside a trusted Git repository (Dual-root Fail-Closed)."
+                            f"Project folder '{folder_str}' must be an existing absolute path (Dual-root Fail-Closed)."
+                        )
+                    f_real = os.path.realpath(os.path.abspath(folder_str))
+                    f_git_root = _find_git_root(f_real)
+                    if not f_git_root:
+                        raise AgentNotSupportedError(
+                            f"Project folder '{folder_str}' is not inside a Git repository (Dual-root Fail-Closed)."
+                        )
+                    if not any(f_real == tr or f_real.startswith(tr + os.sep) or f_git_root == tr for tr in trusted_roots):
+                        raise AgentNotSupportedError(
+                            f"Project folder '{folder_str}' is outside authorized project boundary '{sorted(trusted_roots)}' (Cross-Project Isolation Violation)."
                         )
 
             kanban_dir = request.extra_context.get("kanban_dir")
             if kanban_dir:
-                kanban_path = str(kanban_dir).strip()
-                if not kanban_path or not os.path.isabs(kanban_path) or not _is_git_repository(kanban_path):
+                kanban_str = str(kanban_dir).strip()
+                if not kanban_str or not os.path.isabs(kanban_str) or not os.path.exists(kanban_str):
                     raise AgentNotSupportedError(
-                        f"Kanban folder '{kanban_path}' is not inside a trusted Git repository (Dual-root Fail-Closed)."
+                        f"Kanban folder '{kanban_str}' must be an existing absolute path (Dual-root Fail-Closed)."
+                    )
+                k_real = os.path.realpath(os.path.abspath(kanban_str))
+                k_git_root = _find_git_root(k_real)
+                if not k_git_root:
+                    raise AgentNotSupportedError(
+                        f"Kanban folder '{kanban_str}' is not inside a Git repository (Dual-root Fail-Closed)."
+                    )
+                if not any(k_real == tr or k_real.startswith(tr + os.sep) or k_git_root == tr for tr in trusted_roots):
+                    raise AgentNotSupportedError(
+                        f"Kanban folder '{kanban_str}' is outside authorized project boundary '{sorted(trusted_roots)}' (Cross-Project Isolation Violation)."
                     )
 
     def build_antigravity_exec_command(self, request: AgentRequest) -> List[str]:
@@ -425,7 +482,7 @@ class AntigravityAdapter(BaseHostAdapter):
         invocation_id = f"inv-{uuid.uuid4().hex[:12]}"
         invocation_token = secrets.token_urlsafe(32)
 
-        # 5-Tier Permission check & 7-tuple cache integration
+        # 5-Tier Permission check & 6-tuple cache integration
         risk = evaluate_command_risk(request.prompt, request.workspace_dir)
         project_id = "default_project"
         auth_context = "user_local_ctx"
@@ -436,6 +493,14 @@ class AntigravityAdapter(BaseHostAdapter):
             permission_boundary = str(request.extra_context.get("permission_boundary", permission_boundary))
 
         command_family = f"{risk}:{request.role or 'default'}"
+
+        if risk != "safe_local":
+            # Non-interactive CLI surface strictly forbids self-authorization / non-safe operations (Fail-Closed)
+            raise AgentNotSupportedError(
+                f"Operation classified as '{risk}' is strictly forbidden on non-interactive Antigravity CLI surface (Fail-Closed)."
+            )
+
+        # safe_local: Check permission cache (specific session or project/workspace scope)
         has_approval = self.has_permission_approval(
             project_id=project_id,
             auth_context=auth_context,
@@ -444,38 +509,15 @@ class AntigravityAdapter(BaseHostAdapter):
             command_family=command_family,
             permission_boundary=permission_boundary,
         )
-
-        if risk == "safe_local":
-            if not has_approval:
-                self.record_permission_approval(
-                    project_id=project_id,
-                    auth_context=auth_context,
-                    session_id=session_id,
-                    workspace_dir=request.workspace_dir,
-                    command_family=command_family,
-                    permission_boundary=permission_boundary,
-                )
-        else:
-            explicit_approved = False
-            if isinstance(request.extra_context, Mapping):
-                explicit_approved = bool(
-                    request.extra_context.get("approved")
-                    or request.extra_context.get("user_confirmed")
-                    or request.extra_context.get("approval_token")
-                )
-            if not has_approval and not explicit_approved:
-                raise AgentNotSupportedError(
-                    f"Operation classified as '{risk}' requires explicit user permission approval for session '{session_id}'."
-                )
-            elif explicit_approved and not has_approval:
-                self.record_permission_approval(
-                    project_id=project_id,
-                    auth_context=auth_context,
-                    session_id=session_id,
-                    workspace_dir=request.workspace_dir,
-                    command_family=command_family,
-                    permission_boundary=permission_boundary,
-                )
+        if not has_approval:
+            self.record_permission_approval(
+                project_id=project_id,
+                auth_context=auth_context,
+                session_id=None,
+                workspace_dir=request.workspace_dir,
+                command_family=command_family,
+                permission_boundary=permission_boundary,
+            )
 
         cmd = self.build_antigravity_exec_command(request)
 
@@ -677,20 +719,20 @@ class AntigravityAdapter(BaseHostAdapter):
         self,
         project_id: str,
         auth_context: str,
-        session_id: str,
-        workspace_dir: str,
-        command_family: str,
-        permission_boundary: str,
+        session_id: Optional[str] = None,
+        workspace_dir: str = "",
+        command_family: str = "",
+        permission_boundary: str = "",
     ) -> None:
         """
-        Cache verified permission approval strictly bound to 7-tuple.
-        Key: (project_id, auth_context, adapter_instance_id, session_id, workspace_dir, command_family, permission_boundary).
+        Cache verified permission approval bound to 7-tuple (or 6-tuple when session_id is None).
+        Key: (project_id, auth_context, adapter_instance_id, session_id or "*", workspace_dir, command_family, permission_boundary).
         """
         cache_key = (
             project_id,
             auth_context,
             self._instance_id,
-            session_id,
+            session_id or "*",
             workspace_dir,
             command_family,
             permission_boundary,
@@ -702,23 +744,35 @@ class AntigravityAdapter(BaseHostAdapter):
         self,
         project_id: str,
         auth_context: str,
-        session_id: str,
-        workspace_dir: str,
-        command_family: str,
-        permission_boundary: str,
+        session_id: Optional[str] = None,
+        workspace_dir: str = "",
+        command_family: str = "",
+        permission_boundary: str = "",
     ) -> bool:
-        """Check whether exact 7-tuple has verified permission approval."""
-        cache_key = (
-            project_id,
-            auth_context,
-            self._instance_id,
-            session_id,
-            workspace_dir,
-            command_family,
-            permission_boundary,
-        )
+        """Check whether exact 7-tuple (or project-wide wildcard) has verified permission approval."""
         with self._lock:
-            return bool(self._permission_cache.get(cache_key, False))
+            if session_id:
+                specific_key = (
+                    project_id,
+                    auth_context,
+                    self._instance_id,
+                    session_id,
+                    workspace_dir,
+                    command_family,
+                    permission_boundary,
+                )
+                if self._permission_cache.get(specific_key, False):
+                    return True
+            wildcard_key = (
+                project_id,
+                auth_context,
+                self._instance_id,
+                "*",
+                workspace_dir,
+                command_family,
+                permission_boundary,
+            )
+            return bool(self._permission_cache.get(wildcard_key, False))
 
     def request_confirmation(self, req: ConfirmationRequest) -> ConfirmationResult:
         """
@@ -888,10 +942,8 @@ def create_antigravity_manifest(
     pv_win = PlatformVerification(
         operating_system="windows",
         host_surface=HostSurface.CLI,
-        verification_level=VerificationLevel.CLI_VERIFIED,
+        verification_level=VerificationLevel.STATIC_ONLY,
         verified_version=verified_version,
-        verified_at="2026-08-26T17:00:00Z",
-        e2e_evidence_refs=("evidence-antigravity-cli-win-01",)
     )
     pv_mac = PlatformVerification(
         operating_system="macos",
@@ -912,7 +964,7 @@ def create_antigravity_manifest(
         display_name="Google Antigravity Reference Adapter",
         implementation_version="1.0.0",
         host_surface=HostSurface.CLI,
-        verification_level=VerificationLevel.CLI_VERIFIED,
+        verification_level=VerificationLevel.STATIC_ONLY,
         capabilities={
             "real_subagents": "supported",
             "parallelism": "supported",
@@ -943,7 +995,5 @@ def create_antigravity_manifest(
         conformance_suite_version="2.0",
         auth_context_id="user_local_ctx",
         billing_context_id="user_sub_ctx",
-        verified_at="2026-08-26T17:00:00Z",
-        e2e_evidence_refs=("evidence-antigravity-cli-win-01",),
         extra={"priority": 90}
     )

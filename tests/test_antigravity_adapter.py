@@ -63,11 +63,11 @@ def test_antigravity_manifest_structure_and_anti_forgery():
     manifest = create_antigravity_manifest()
     assert manifest.adapter_id == "antigravity"
     assert manifest.host_surface == HostSurface.CLI
-    assert manifest.verification_level == VerificationLevel.CLI_VERIFIED
+    assert manifest.verification_level == VerificationLevel.STATIC_ONLY
     assert manifest.auth_boundary == AuthBoundaryType.USER_LOCAL
     assert manifest.billing_boundary == BillingBoundaryType.USER_SUBSCRIPTION
     assert "windows" in manifest.platform_verifications
-    assert manifest.platform_verifications["windows"].verification_level == VerificationLevel.CLI_VERIFIED
+    assert manifest.platform_verifications["windows"].verification_level == VerificationLevel.STATIC_ONLY
     assert manifest.platform_verifications["windows"].verified_version == "1.1.21"
     assert manifest.platform_verifications["macos"].verification_level == VerificationLevel.STATIC_ONLY
     assert manifest.platform_verifications["linux"].verification_level == VerificationLevel.STATIC_ONLY
@@ -540,19 +540,19 @@ def test_antigravity_adapter_registration_and_resolution():
     registry.register(adapter, manifest)
     assert registry.get("antigravity") is adapter
 
-    # Resolution on Windows
+    # Resolution on Windows (Truthfully STATIC_ONLY until live OAuth session)
     req_win = AdapterResolutionRequest(
         project_id="p_ag",
         adapter_id="antigravity",
         target_os="windows",
-        allowed_verification_levels=(VerificationLevel.CLI_VERIFIED,),
+        allowed_verification_levels=(VerificationLevel.STATIC_ONLY,),
         auth_context_id="user_local_ctx",
         billing_context_id="user_sub_ctx"
     )
     decision_win = registry.resolve(req_win)
     assert decision_win.decision_status == ResolutionStatus.SELECTED
     assert decision_win.selected_adapter_id == "antigravity"
-    assert decision_win.verification_level == VerificationLevel.CLI_VERIFIED
+    assert decision_win.verification_level == VerificationLevel.STATIC_ONLY
 
     # Resolution on macOS returns STATIC_ONLY
     req_mac = AdapterResolutionRequest(
@@ -601,8 +601,9 @@ def test_antigravity_adapter_five_tier_command_risk_evaluation():
     assert evaluate_command_risk("python scripts/heartbeat.py") == "safe_local"
     assert evaluate_command_risk("python scripts/quick_task.py ...") == "safe_local"
     assert evaluate_command_risk("python scripts/transition_task.py --role DEV --task-id T0052 ...") == "safe_local"
+    assert evaluate_command_risk("Review codebase and suggest improvements") == "safe_local"
 
-    # DEF-T0052-3: Pytest dangerous flags must be rejected from safe_local
+    # DEF-T0052-3: Pytest dangerous flags and external paths must be rejected from safe_local
     assert evaluate_command_risk("pytest -p evil_plugin") == "controlled_external"
     assert evaluate_command_risk("python -m pytest --pyargs evil") == "controlled_external"
     assert evaluate_command_risk("pytest -c /tmp/evil.ini") == "controlled_external"
@@ -610,13 +611,21 @@ def test_antigravity_adapter_five_tier_command_risk_evaluation():
     assert evaluate_command_risk("pytest --override-ini=addopts=--evil") == "controlled_external"
     assert evaluate_command_risk("pytest --import-mode=importlib evil_script.py") == "controlled_external"
     assert evaluate_command_risk("pytest --cov=secret") == "controlled_external"
+    assert evaluate_command_risk("pytest /outside/path/test.py") == "controlled_external"
+    assert evaluate_command_risk("pytest ../outside/test.py") == "controlled_external"
 
-    # DEF-T0052-3 & Reviewer bypass checks: Branch creation/deletion, worktree add, and evil script passing allowed script as arg
+    # DEF-T0052-3 & Reviewer bypass checks: Branch creation/deletion, worktree add, git diff output redirection, natural language deletion
     assert evaluate_command_risk("git branch feature/phase2e-new") == "destructive"
     assert evaluate_command_risk("git branch -d feature/old") == "destructive"
     assert evaluate_command_risk("git branch -D feature/old") == "destructive"
     assert evaluate_command_risk("git worktree add ../wt-new") == "destructive"
     assert evaluate_command_risk("git worktree remove ../wt-old") == "destructive"
+    assert evaluate_command_risk("git diff --output=/tmp/patch.diff") == "destructive"
+    assert evaluate_command_risk("git diff --output=patch.diff") == "destructive"
+    assert evaluate_command_risk("Delete all temporary files") == "destructive"
+    assert evaluate_command_risk("Please remove old checkpoints") == "destructive"
+    assert evaluate_command_risk("删除过期日志") == "destructive"
+    assert evaluate_command_risk("清理临时目录") == "destructive"
     assert evaluate_command_risk("python scripts/evil.py scripts/heartbeat.py") == "controlled_external"
     assert evaluate_command_risk("python evil.py") == "controlled_external"
 
@@ -642,45 +651,57 @@ def test_antigravity_adapter_five_tier_command_risk_evaluation():
 
     # 4. billing
     assert evaluate_command_risk("request_billing_expansion(tier=Pro)") == "billing"
+    assert evaluate_command_risk("API_KEY 充值") == "billing"
 
     # 5. acceptance
     assert evaluate_command_risk("git push origin main") == "acceptance"
     assert evaluate_command_risk("git merge feature/phase2e-antigravity-adapter") == "acceptance"
+    assert evaluate_command_risk("发布上线版本") == "acceptance"
 
 
-def test_antigravity_adapter_dispatch_permission_cache_integration():
+def test_antigravity_adapter_dispatch_zero_self_authorization():
     adapter = AntigravityAdapter(is_real_host=False)
 
-    # 1. Destructive operation without approval is rejected
-    req_unapproved = AgentRequest(
+    # 1. Destructive operation is strictly forbidden even if caller attempts self-authorization
+    req_self_auth = AgentRequest(
         session_id="sess_perm_chk_01",
         prompt="git reset --hard HEAD",
         role="DEV",
-        workspace_dir=os.path.abspath(".")
+        workspace_dir=os.path.abspath("."),
+        extra_context={"approved": True, "user_confirmed": True, "approval_token": "arbitrary_token"}
     )
-    with pytest.raises(AgentNotSupportedError, match="requires explicit user permission approval"):
-        adapter.dispatch_agent(req_unapproved)
+    with pytest.raises(AgentNotSupportedError, match="strictly forbidden"):
+        adapter.dispatch_agent(req_self_auth)
 
-    # 2. Destructive operation with explicit approval succeeds and caches 7-tuple
-    req_approved = AgentRequest(
-        session_id="sess_perm_chk_02",
-        prompt="git reset --hard HEAD",
+    # 2. Safe local operation succeeds and automatically records 6-tuple approval
+    req_safe_1 = AgentRequest(
+        session_id="sess_safe_chk_01",
+        prompt="git status",
         role="DEV",
         workspace_dir=os.path.abspath("."),
-        extra_context={"approved": True, "project_id": "proj_p2", "auth_context": "auth_01"}
+        extra_context={"project_id": "proj_p2", "auth_context": "auth_01"}
     )
-    handle = adapter.dispatch_agent(req_approved)
-    assert handle.session_id == "sess_perm_chk_02"
+    handle_1 = adapter.dispatch_agent(req_safe_1)
+    assert handle_1.session_id == "sess_safe_chk_01"
 
-    # Verify 7-tuple is now recorded in permission cache
+    # 3. Next session in the same project/workspace finds approval already in cache (Reusable session-independent cache)
     assert adapter.has_permission_approval(
         project_id="proj_p2",
         auth_context="auth_01",
-        session_id="sess_perm_chk_02",
         workspace_dir=os.path.abspath("."),
-        command_family="destructive:DEV",
-        permission_boundary="workspace_write"
+        command_family="safe_local:DEV",
+        permission_boundary="workspace_read"
     ) is True
+
+    req_safe_2 = AgentRequest(
+        session_id="sess_safe_chk_02",
+        prompt="git status",
+        role="DEV",
+        workspace_dir=os.path.abspath("."),
+        extra_context={"project_id": "proj_p2", "auth_context": "auth_01"}
+    )
+    handle_2 = adapter.dispatch_agent(req_safe_2)
+    assert handle_2.session_id == "sess_safe_chk_02"
 
 
 def test_antigravity_adapter_popen_sets_cwd_for_project_isolation(monkeypatch):
@@ -710,10 +731,10 @@ def test_antigravity_adapter_popen_sets_cwd_for_project_isolation(monkeypatch):
     assert captured_kwargs.get("cwd") == target_ws
 
 
-def test_antigravity_adapter_dual_root_validation(tmp_path):
+def test_antigravity_adapter_dual_root_and_cross_project_isolation(tmp_path):
     adapter = AntigravityAdapter(is_real_host=False)
 
-    # 1. Valid workspace and valid secondary kanban folder passes
+    # 1. Valid workspace and valid same-repo folder passes
     req_valid = AgentRequest(
         session_id="sess_dual_ok",
         prompt="Dual root valid test",
@@ -749,45 +770,46 @@ def test_antigravity_adapter_dual_root_validation(tmp_path):
     with pytest.raises(AgentNotSupportedError, match="Dual-root Fail-Closed"):
         adapter.dispatch_agent(req_bad_folder)
 
-    # 4. Kanban dir outside git repository fails closed (DEF-T0052-4)
-    req_bad_kanban = AgentRequest(
-        session_id="sess_bad_kanban",
-        prompt="Bad kanban dir test",
+    # 4. Cross-Project Isolation Violation: An outside Git repository cannot be mixed in
+    outside_git_dir = str(tmp_path / "outside_git_repo")
+    os.makedirs(os.path.join(outside_git_dir, ".git"), exist_ok=True)
+    req_cross_proj = AgentRequest(
+        session_id="sess_cross_proj",
+        prompt="Cross project test",
         role="DEV",
         workspace_dir=os.path.abspath("."),
-        extra_context={"kanban_dir": non_git_folder}
+        extra_context={"project_folders": [outside_git_dir]}
     )
-    with pytest.raises(AgentNotSupportedError, match="Dual-root Fail-Closed"):
-        adapter.dispatch_agent(req_bad_kanban)
+    with pytest.raises(AgentNotSupportedError, match="Cross-Project Isolation Violation"):
+        adapter.dispatch_agent(req_cross_proj)
 
 
 def test_antigravity_adapter_safe_local_second_execution_no_prompt():
     adapter = AntigravityAdapter(is_real_host=False)
     project_id = "phase2_proj"
     auth_ctx = "user_local_ctx"
-    sess_id = "sess_safe_01"
     ws_dir = os.path.abspath(".")
     cmd_family = "safe_local:pytest"
     perm_boundary = "workspace_read"
 
     # Initially unapproved
     assert adapter.has_permission_approval(
-        project_id, auth_ctx, sess_id, ws_dir, cmd_family, perm_boundary
+        project_id, auth_ctx, ws_dir, cmd_family, perm_boundary
     ) is False
 
     # User approves once
     adapter.record_permission_approval(
-        project_id, auth_ctx, sess_id, ws_dir, cmd_family, perm_boundary
+        project_id, auth_ctx, ws_dir, cmd_family, perm_boundary
     )
 
-    # Second execution is approved automatically without prompt
+    # Second execution in same project/workspace is approved automatically without prompt
     assert adapter.has_permission_approval(
-        project_id, auth_ctx, sess_id, ws_dir, cmd_family, perm_boundary
+        project_id, auth_ctx, ws_dir, cmd_family, perm_boundary
     ) is True
 
-    # But changing workspace or session requires prompt
+    # But changing workspace requires prompt
     assert adapter.has_permission_approval(
-        project_id, auth_ctx, "sess_safe_02", ws_dir, cmd_family, perm_boundary
+        project_id, auth_ctx, os.path.abspath(".."), cmd_family, perm_boundary
     ) is False
 
 

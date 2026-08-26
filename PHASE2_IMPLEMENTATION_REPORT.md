@@ -418,13 +418,13 @@
 ### 4. 测试记录（真实数据）
 
 - **2E 定向测试**:
-  - `python -m pytest tests/test_antigravity_adapter.py -q -rs` -> `22 passed in 2.02s` (0 failed, 0 skipped)
+  - `python -m pytest tests/test_antigravity_adapter.py -q -rs` -> `22 passed in 0.62s` (0 failed, 0 skipped)
 - **2D-1 通用基础设施回归测试**:
-  - `python -m pytest tests/test_adapter_manifest.py tests/test_adapter_registry.py tests/test_adapter_conformance.py -q -rs` -> `37 passed in 3.10s` (0 failed, 0 skipped)
+  - `python -m pytest tests/test_adapter_manifest.py tests/test_adapter_registry.py tests/test_adapter_conformance.py -q -rs` -> `37 passed in 2.78s` (0 failed, 0 skipped)
 - **2A～2D-2 兼容性与 Codex 适配器测试**:
-  - `python -m pytest tests/test_host_adapter.py tests/test_evidence.py tests/test_worktree_manager.py tests/test_codex_cli_adapter.py -q -rs` -> `80 passed in 23.93s` (0 failed, 0 skipped)
+  - `python -m pytest tests/test_host_adapter.py tests/test_evidence.py tests/test_worktree_manager.py tests/test_codex_cli_adapter.py -q -rs` -> `80 passed in 23.23s` (0 failed, 0 skipped)
 - **全量测试套件**:
-  - `python -m pytest tests -q -rs` -> `365 passed in 63.14s (0:01:03)` (0 failed, 0 skipped, 100% 通过)
+  - `python -m pytest tests -q -rs` -> `365 passed in 68.44s (0:01:08)` (0 failed, 0 skipped, 100% 通过)
 - **代码规范检查**:
   - `git diff --check` -> 退出码 0，零尾随空白错误
 
@@ -432,58 +432,55 @@
 
 1. **真实宿主可执行文件与环境约束**:
    - 真实宿主二进制: `C:\Users\user\AppData\Local\agy\bin\agy.exe`（Google Antigravity CLI 签名版本 1.1.21）。
-   - 认证与会话约束: Antigravity CLI 需要用户完成 Google OAuth 认证。
+   - 认证与会话约束: Antigravity CLI 需要用户完成 Google OAuth 认证。在未完成真实浏览器 OAuth 登录前，Manifest 在所有操作系统平台（Windows, macOS, Linux）上如实声明 `VerificationLevel.STATIC_ONLY`。
    - **用户操作边界约束**: 当需要打开浏览器进行登录或认证验证时，**必须显式使用 Firefox（火狐）浏览器**，严禁让 CLI 自行调用微软 Edge 或其他微软系浏览器。
    - 当 CLI 处于未认证或云端端点返回受限时，Adapter 严格执行 Fail-Closed 机制，拒绝伪造假成功状态。
 
-2. **证据闭环数据**:
+2. **状态与元数据闭环**:
 
 ```yaml
 e2e_record:
   antigravity_surface: "agy.exe (Google Antigravity CLI)"
   version: "1.1.21"
-  verification_level: "cli_verified"
+  verification_level: "static_only"
   project_folders:
     - "C:\\Users\\user\\Desktop\\user\\multi-agent-flow-phase2e-antigravity-adapter"
     - "C:\\Users\\user\\Desktop\\user\\multi-agent-flow-phase2-real-agents"
-  host_session_id: "sess_ag_ev_01"
-  canonical_conversation_id: "conv-6e9f4305-real"
-  canonical_invocation_id: "conv-6e9f4305-real:step_1"
-  host_identity_source: "antigravity_host_conversation_id"
   auth_boundary: "USER_LOCAL"
   billing_boundary: "USER_SUBSCRIPTION"
-  evidence_id: "ev-antigravity-cli-001"
-  evidence_gate_judgment: "PASS"
+  tested_via: "Isolated Mock & Static Contract Suite"
 ```
 
 ### 6. 2E 缺陷返工记录 (DEF-T0052 全量闭环)
 
 1. **[DEF-T0052-1] 修复能力声明与 `request_confirmation` 行为不一致 (P1)**:
    - `AntigravityAdapter` 的 `_capabilities` 与 `create_antigravity_manifest()` 统一将 `supports_permission_approval` 与 `supports_interactive_confirmation` 声明为 `CapabilitySupport.UNSUPPORTED` / `"unsupported"`。
-   - 彻底解决由于非交互 CLI surface 下 `request_confirmation` 抛出 `AgentNotSupportedError` 导致的能力声明与实际行为矛盾，实现 100% 真实契约对齐。
+   - 彻底解决非交互 CLI surface 下能力声明与实际行为矛盾。
 
 2. **[DEF-T0052-2] 修复真实 CLI 启动命令语法与参数顺序 (P1)**:
    - 依据 Go flag 语法规则，所有选项参数（`--output-format stream-json`, `--add-dir`, `--agent`, `--mode`, `--sandbox`, `--project`）严格置于 `--print` 之前，解决裸 `--print` 吞掉后续参数导致 CLI 返回退出码 2 的阻断问题。
 
-3. **[DEF-T0052-3] 授权缓存全面接入派发流程 (P1)**:
-   - 在 `dispatch_agent()` 中完整接入 5 档权限评估与 7 元组缓存（`project_id, auth_context, adapter_instance_id, session_id, workspace_dir, command_family, permission_boundary`）。
-   - `safe_local` 首次执行自动入库，高风险操作验证显式授权并落库缓存，实现权限审批闭环并消除重复弹窗。
+3. **[DEF-T0052-3] 彻底封堵自授权漏洞并实现可复用 6 元组缓存 (P1)**:
+   - 移除 `dispatch_agent()` 中任何对调用方自报 `approved=True`、`user_confirmed=True` 或 `approval_token` 的自授权绕过逻辑。非 `safe_local` 命令在非交互 CLI surface 下一律执行 Fail-Closed 抛出 `AgentNotSupportedError`。
+   - 权限缓存重构为项目与工作区作用域的 6 元组（`project_id, auth_context, adapter_instance_id, workspace_dir, command_family, permission_boundary`），使合法的 safe-local 操作在后续 Session 中真正实现免重复确认。
 
-4. **[DEF-T0052-4] 修复 `git branch`、`git worktree` 与脚本参数安全分类绕过漏洞 (P1)**:
-   - `git branch` 只读查询（`-l`, `-a`, `--list`）归为 `safe_local`，分支创建/删除/重命名（`git branch <name>`, `-d`, `-D`）精确归为 `destructive`。
-   - `git worktree list` 归为 `safe_local`，`git worktree add/remove/prune` 精确归为 `destructive`。
-   - Python 脚本安全判定改为严格首参匹配，封堵 `python scripts/evil.py scripts/heartbeat.py` 参数伪装注入漏洞。
+4. **[DEF-T0052-4] 全面补全自然语言删除、`git diff --output` 与外部 pytest 风险分类防御 (P1)**:
+   - 自然语言删除指令（如 `Delete all temporary files`、`Please remove ...`、`删除过期日志`、`清理临时目录`）精确归为 `destructive`。
+   - `git diff --output=...` 以及带任意文件写重定向标志的 git 命令精确归为 `destructive`。
+   - 外部测试文件或带路径遍历（`..`、`/outside/...`）的 pytest 命令精确归为 `controlled_external`。
+   - `git branch <name>` / `git branch -d` / `git worktree add` 精确归为 `destructive`；`python scripts/evil.py scripts/heartbeat.py` 首参严格匹配拦截。
 
-5. **[DEF-T0052-5] 项目隔离与工作目录安全注入 (P1)**:
-   - `subprocess.Popen` 严格显式指定 `cwd=request.workspace_dir`，确保子进程始终在受控工作区内运行。
-   - 实现 `validate_workspace_roots()` 严格双根目录与多工作区 Fail-Closed 校验。
+5. **[DEF-T0052-5] 严格跨项目边界隔离与 Popen 工作目录注入 (P1)**:
+   - `subprocess.Popen` 严格显式指定 `cwd=request.workspace_dir`。
+   - `validate_workspace_roots()` 引入 `_find_git_root`，严禁将任意外部 Git 仓库混入 `project_folders` / `kanban_dir`（违反跨项目隔离直接抛出 `AgentNotSupportedError`）。
 
-6. **[DEF-T0052-6] 签名版本校准与不支持模式拦截 (P1/P2)**:
-   - 将 Manifest 与适配器默认签名版本对齐为本机真实检测的 `1.1.21`。
-   - `ALLOWED_EXECUTION_MODES` 白名单严格限制为 `{"accept-edits", "plan"}`，拦截不支持的 `read-only` 与 `workspace-write` 模式。
+6. **[DEF-T0052-6] 验证等级如实降级与版本校准 (P1/P2)**:
+   - 在真实 OAuth 交互会话产出前，Windows/macOS/Linux 统一如实声明为 `STATIC_ONLY`，清空虚假 E2E 引用，杜绝证据等级虚高。
+   - `ALLOWED_EXECUTION_MODES` 严格锁定为 `{"accept-edits", "plan"}`，拦截不支持的 `read-only` 与 `workspace-write` 模式。
 
-7. **[DEF-T0052-7] 操作边界与浏览器约束明确**:
-   - 记录用户操作边界：**浏览器登录测试必须使用 Firefox（火狐）**，严禁让 CLI 自行拉起微软 Edge。
+7. **[DEF-T0052-7] 测试环境隔离与操作边界约束明确 (P3)**:
+   - 单元测试与回归套件采用完全隔离的 Mock Fixture，杜绝自动化测试触发真实 OAuth 浏览器拉起。
+   - 记录用户操作边界：若后续明确授权进行真实登录，**必须显式使用 Firefox（火狐）浏览器**。
 
 ### 7. 未实施范围说明
 
