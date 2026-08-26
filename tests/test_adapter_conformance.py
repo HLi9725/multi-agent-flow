@@ -1,6 +1,7 @@
 import builtins
+import io
 import os
-import subprocess
+import pathlib
 import pytest
 
 from scripts._lib.core.agent_schema import (
@@ -33,6 +34,8 @@ from scripts._lib.core.adapter_conformance import (
     FaultyAcceptForeignHandleAdapter,
     FaultyCapabilitiesMismatchAdapter,
     FaultyForgedRealHostHandleAdapter,
+    FaultySideEffectIoOpenAdapter,
+    FaultySideEffectPathlibWriteTextAdapter,
     FaultySideEffectSubprocessAdapter,
     FaultySideEffectWriteFileAdapter,
     StandardTestFakeAdapter,
@@ -89,14 +92,34 @@ def test_faulty_foreign_handle_acceptance_intercepted():
 
 
 def test_zero_side_effects_active_interception_write_file():
-    # DEF-T0049-3: Malicious adapter writing file during detect_capabilities must be intercepted
+    # DEF-T0049-3: Malicious adapter writing file via builtins.open during detect_capabilities must be intercepted
     adp = FaultySideEffectWriteFileAdapter("faulty_writer")
 
-    with pytest.raises(ConformanceError, match="Side-effect intercepted: builtins.open write attempt"):
+    with pytest.raises(ConformanceError, match="Side-effect intercepted: file open write attempt"):
         assert_zero_side_effects(adp)
 
     # Ensure no side effect file actually persisted
     assert not os.path.exists("unauthorized_side_effect.tmp")
+
+
+def test_zero_side_effects_active_interception_io_open():
+    # DEF-T0049-9: Malicious adapter writing file via io.open during detect_capabilities must be intercepted
+    adp = FaultySideEffectIoOpenAdapter("faulty_io_writer")
+
+    with pytest.raises(ConformanceError, match="Side-effect intercepted: file open write attempt"):
+        assert_zero_side_effects(adp)
+
+    assert not os.path.exists("unauthorized_io_effect.tmp")
+
+
+def test_zero_side_effects_active_interception_pathlib_write_text():
+    # DEF-T0049-9: Malicious adapter writing file via pathlib.Path.write_text during detect_capabilities must be intercepted
+    adp = FaultySideEffectPathlibWriteTextAdapter("faulty_pathlib_writer")
+
+    with pytest.raises(ConformanceError, match="Side-effect intercepted: Path.write_text attempt"):
+        assert_zero_side_effects(adp)
+
+    assert not os.path.exists("unauthorized_pathlib_effect.tmp")
 
 
 def test_zero_side_effects_active_interception_subprocess():

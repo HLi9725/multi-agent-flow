@@ -1,13 +1,20 @@
 import builtins
 from collections.abc import Mapping
 import http.client
+import io
 import os
+import pathlib
 import socket
 import subprocess
 import sys
 import urllib.request
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
+
+try:
+    import _io
+except ImportError:
+    _io = None
 
 from .agent_schema import (
     AgentCancelledError,
@@ -68,6 +75,9 @@ def assert_capabilities_conformance(adapter: BaseHostAdapter, manifest: AdapterM
     if caps.is_real_host is False:
         if manifest.verification_level in (VerificationLevel.NATIVE_VERIFIED, VerificationLevel.CLI_VERIFIED, VerificationLevel.MCP_VERIFIED):
             raise ConformanceError("Fake/non-real host adapter cannot claim native/cli/mcp verified level in manifest.")
+        for pv_os, pv in manifest.platform_verifications.items():
+            if pv.verification_level in (VerificationLevel.NATIVE_VERIFIED, VerificationLevel.CLI_VERIFIED, VerificationLevel.MCP_VERIFIED):
+                raise ConformanceError(f"Fake/non-real host adapter cannot claim {pv.verification_level.value} on platform '{pv_os}'.")
 
     # Cross check individual capabilities
     for cap_k, cap_v in manifest.capabilities.items():
@@ -88,15 +98,34 @@ def assert_capabilities_conformance(adapter: BaseHostAdapter, manifest: AdapterM
 
 def assert_zero_side_effects(adapter: BaseHostAdapter) -> None:
     """
-    DEF-T0049-3: Actively intercepts and guarantees that calling detect_capabilities()
-    has zero filesystem write, network, process, or logging/billing side-effects.
+    DEF-T0049-3, DEF-T0049-9: Actively intercepts and guarantees that calling detect_capabilities()
+    has zero filesystem write, network, process, or logging/billing side-effects across
+    builtins, io, _io, os, and pathlib.Path APIs.
     """
     intercepted_calls: List[str] = []
 
-    orig_open = builtins.open
+    orig_builtin_open = builtins.open
+    orig_io_open = io.open
+    orig_raw_io_open = getattr(_io, "open", None) if _io else None
     orig_os_open = os.open
     orig_mkdir = os.mkdir
     orig_makedirs = os.makedirs
+    orig_remove = os.remove
+    orig_unlink = os.unlink
+    orig_rename = os.rename
+    orig_replace = os.replace
+
+    orig_path_open = pathlib.Path.open
+    orig_path_write_text = pathlib.Path.write_text
+    orig_path_write_bytes = pathlib.Path.write_bytes
+    orig_path_touch = pathlib.Path.touch
+    orig_path_mkdir = pathlib.Path.mkdir
+    orig_path_unlink = pathlib.Path.unlink
+    orig_path_rmdir = pathlib.Path.rmdir
+    orig_path_rename = pathlib.Path.rename
+    orig_path_replace = pathlib.Path.replace
+    orig_path_chmod = pathlib.Path.chmod
+
     orig_subprocess_run = subprocess.run
     orig_subprocess_popen = subprocess.Popen
     orig_socket_connect = socket.socket.connect
@@ -104,9 +133,9 @@ def assert_zero_side_effects(adapter: BaseHostAdapter) -> None:
 
     def guarded_open(file, mode="r", *args, **kwargs):
         if any(w in mode for w in ("w", "a", "x", "+")):
-            intercepted_calls.append(f"builtins.open(mode='{mode}', file='{file}')")
-            raise ConformanceError(f"Side-effect intercepted: builtins.open write attempt on {file}")
-        return orig_open(file, mode, *args, **kwargs)
+            intercepted_calls.append(f"open(mode='{mode}', file='{file}')")
+            raise ConformanceError(f"Side-effect intercepted: file open write attempt on {file}")
+        return orig_builtin_open(file, mode, *args, **kwargs)
 
     def guarded_os_open(path, flags, *args, **kwargs):
         write_flags = os.O_WRONLY | os.O_RDWR | os.O_CREAT | getattr(os, "O_APPEND", 0) | getattr(os, "O_TRUNC", 0)
@@ -123,6 +152,66 @@ def assert_zero_side_effects(adapter: BaseHostAdapter) -> None:
         intercepted_calls.append(f"os.makedirs(name='{name}')")
         raise ConformanceError(f"Side-effect intercepted: os.makedirs attempt on {name}")
 
+    def guarded_remove(path, *args, **kwargs):
+        intercepted_calls.append(f"os.remove(path='{path}')")
+        raise ConformanceError(f"Side-effect intercepted: os.remove attempt on {path}")
+
+    def guarded_unlink(path, *args, **kwargs):
+        intercepted_calls.append(f"os.unlink(path='{path}')")
+        raise ConformanceError(f"Side-effect intercepted: os.unlink attempt on {path}")
+
+    def guarded_rename(src, dst, *args, **kwargs):
+        intercepted_calls.append(f"os.rename({src} -> {dst})")
+        raise ConformanceError(f"Side-effect intercepted: os.rename attempt on {src}")
+
+    def guarded_replace(src, dst, *args, **kwargs):
+        intercepted_calls.append(f"os.replace({src} -> {dst})")
+        raise ConformanceError(f"Side-effect intercepted: os.replace attempt on {src}")
+
+    # Pathlib guards (DEF-T0049-9)
+    def guarded_path_open(self, mode="r", *args, **kwargs):
+        if any(w in mode for w in ("w", "a", "x", "+")):
+            intercepted_calls.append(f"Path.open(mode='{mode}', path='{self}')")
+            raise ConformanceError(f"Side-effect intercepted: Path.open write attempt on {self}")
+        return orig_path_open(self, mode, *args, **kwargs)
+
+    def guarded_path_write_text(self, data, *args, **kwargs):
+        intercepted_calls.append(f"Path.write_text(path='{self}')")
+        raise ConformanceError(f"Side-effect intercepted: Path.write_text attempt on {self}")
+
+    def guarded_path_write_bytes(self, data, *args, **kwargs):
+        intercepted_calls.append(f"Path.write_bytes(path='{self}')")
+        raise ConformanceError(f"Side-effect intercepted: Path.write_bytes attempt on {self}")
+
+    def guarded_path_touch(self, *args, **kwargs):
+        intercepted_calls.append(f"Path.touch(path='{self}')")
+        raise ConformanceError(f"Side-effect intercepted: Path.touch attempt on {self}")
+
+    def guarded_path_mkdir(self, *args, **kwargs):
+        intercepted_calls.append(f"Path.mkdir(path='{self}')")
+        raise ConformanceError(f"Side-effect intercepted: Path.mkdir attempt on {self}")
+
+    def guarded_path_unlink(self, *args, **kwargs):
+        intercepted_calls.append(f"Path.unlink(path='{self}')")
+        raise ConformanceError(f"Side-effect intercepted: Path.unlink attempt on {self}")
+
+    def guarded_path_rmdir(self, *args, **kwargs):
+        intercepted_calls.append(f"Path.rmdir(path='{self}')")
+        raise ConformanceError(f"Side-effect intercepted: Path.rmdir attempt on {self}")
+
+    def guarded_path_rename(self, target, *args, **kwargs):
+        intercepted_calls.append(f"Path.rename({self} -> {target})")
+        raise ConformanceError(f"Side-effect intercepted: Path.rename attempt on {self}")
+
+    def guarded_path_replace(self, target, *args, **kwargs):
+        intercepted_calls.append(f"Path.replace({self} -> {target})")
+        raise ConformanceError(f"Side-effect intercepted: Path.replace attempt on {self}")
+
+    def guarded_path_chmod(self, mode, *args, **kwargs):
+        intercepted_calls.append(f"Path.chmod(path='{self}')")
+        raise ConformanceError(f"Side-effect intercepted: Path.chmod attempt on {self}")
+
+    # Process and network guards
     def guarded_subprocess_run(*args, **kwargs):
         intercepted_calls.append(f"subprocess.run({args})")
         raise ConformanceError("Side-effect intercepted: subprocess.run attempt")
@@ -141,9 +230,29 @@ def assert_zero_side_effects(adapter: BaseHostAdapter) -> None:
 
     try:
         builtins.open = guarded_open
+        io.open = guarded_open
+        if _io is not None and hasattr(_io, "open"):
+            _io.open = guarded_open
+
         os.open = guarded_os_open
         os.mkdir = guarded_mkdir
         os.makedirs = guarded_makedirs
+        os.remove = guarded_remove
+        os.unlink = guarded_unlink
+        os.rename = guarded_rename
+        os.replace = guarded_replace
+
+        pathlib.Path.open = guarded_path_open
+        pathlib.Path.write_text = guarded_path_write_text
+        pathlib.Path.write_bytes = guarded_path_write_bytes
+        pathlib.Path.touch = guarded_path_touch
+        pathlib.Path.mkdir = guarded_path_mkdir
+        pathlib.Path.unlink = guarded_path_unlink
+        pathlib.Path.rmdir = guarded_path_rmdir
+        pathlib.Path.rename = guarded_path_rename
+        pathlib.Path.replace = guarded_path_replace
+        pathlib.Path.chmod = guarded_path_chmod
+
         subprocess.run = guarded_subprocess_run
         subprocess.Popen = guarded_subprocess_popen
         socket.socket.connect = guarded_socket_connect
@@ -153,10 +262,30 @@ def assert_zero_side_effects(adapter: BaseHostAdapter) -> None:
         if not isinstance(caps, HostCapabilities):
             raise ConformanceError("detect_capabilities did not return HostCapabilities instance")
     finally:
-        builtins.open = orig_open
+        builtins.open = orig_builtin_open
+        io.open = orig_io_open
+        if _io is not None and hasattr(_io, "open"):
+            _io.open = orig_raw_io_open
+
         os.open = orig_os_open
         os.mkdir = orig_mkdir
         os.makedirs = orig_makedirs
+        os.remove = orig_remove
+        os.unlink = orig_unlink
+        os.rename = orig_rename
+        os.replace = orig_replace
+
+        pathlib.Path.open = orig_path_open
+        pathlib.Path.write_text = orig_path_write_text
+        pathlib.Path.write_bytes = orig_path_write_bytes
+        pathlib.Path.touch = orig_path_touch
+        pathlib.Path.mkdir = orig_path_mkdir
+        pathlib.Path.unlink = orig_path_unlink
+        pathlib.Path.rmdir = orig_path_rmdir
+        pathlib.Path.rename = orig_path_rename
+        pathlib.Path.replace = orig_path_replace
+        pathlib.Path.chmod = orig_path_chmod
+
         subprocess.run = orig_subprocess_run
         subprocess.Popen = orig_subprocess_popen
         socket.socket.connect = orig_socket_connect
@@ -386,11 +515,28 @@ class FaultyAcceptForeignHandleAdapter(StandardTestFakeAdapter):
 
 
 class FaultySideEffectWriteFileAdapter(StandardTestFakeAdapter):
-    """DEF-T0049-3: A malicious adapter that attempts file writing during detect_capabilities."""
+    """DEF-T0049-3: A malicious adapter that attempts file writing via open() during detect_capabilities."""
     def detect_capabilities(self) -> HostCapabilities:
         # VIOLATION: attempts file write during capability detection
         with open("unauthorized_side_effect.tmp", "w") as f:
             f.write("malicious payload")
+        return self._capabilities
+
+
+class FaultySideEffectIoOpenAdapter(StandardTestFakeAdapter):
+    """DEF-T0049-9: A malicious adapter that attempts file writing via io.open() during detect_capabilities."""
+    def detect_capabilities(self) -> HostCapabilities:
+        # VIOLATION: attempts io.open write during capability detection
+        with io.open("unauthorized_io_effect.tmp", "w") as f:
+            f.write("malicious io payload")
+        return self._capabilities
+
+
+class FaultySideEffectPathlibWriteTextAdapter(StandardTestFakeAdapter):
+    """DEF-T0049-9: A malicious adapter that attempts file writing via pathlib.Path.write_text() during detect_capabilities."""
+    def detect_capabilities(self) -> HostCapabilities:
+        # VIOLATION: attempts pathlib write_text during capability detection
+        pathlib.Path("unauthorized_pathlib_effect.tmp").write_text("malicious pathlib payload")
         return self._capabilities
 
 

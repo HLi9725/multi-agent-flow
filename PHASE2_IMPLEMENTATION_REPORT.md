@@ -180,13 +180,13 @@
 ### 测试记录（最新真实数据）
 - **2D-1 定向测试**:
   - `python -m pytest tests/test_adapter_manifest.py -q -rs` -> `7 passed in 0.05s`
-  - `python -m pytest tests/test_adapter_registry.py -q -rs` -> `12 passed in 0.06s`
-  - `python -m pytest tests/test_adapter_conformance.py -q -rs` -> `8 passed in 0.06s`
-  - **总计**: `27 passed in 0.17s` (0 failed, 0 skipped)
+  - `python -m pytest tests/test_adapter_registry.py -q -rs` -> `12 passed in 0.09s`
+  - `python -m pytest tests/test_adapter_conformance.py -q -rs` -> `10 passed in 0.07s`
+  - **总计**: `29 passed in 0.21s` (0 failed, 0 skipped)
 - **2A/2B/2C 关联兼容测试**:
-  - `python -m pytest tests/test_host_adapter.py tests/test_evidence.py tests/test_worktree_manager.py -q -rs` -> `60 passed in 23.68s` (0 failed, 0 skipped)
+  - `python -m pytest tests/test_host_adapter.py tests/test_evidence.py tests/test_worktree_manager.py -q -rs` -> `60 passed in 23.18s` (0 failed, 0 skipped)
 - **全量测试**:
-  - `python -m pytest tests -q -rs` -> `313 passed in 66.02s` (0 failed, 0 skipped, 100% 通过)
+  - `python -m pytest tests -q -rs` -> `315 passed in 62.49s` (0 failed, 0 skipped, 100% 通过)
 - **代码规范**:
   - `git diff --check` -> 退出码 0，零尾随空白错误
 
@@ -214,3 +214,18 @@
 7. **[DEF-T0049-7] 精确 ID 拒绝静默回退与合规生命周期套件补齐**:
    - 当请求指定了精确 `adapter_id` 时，未注册或不匹配一律返回 `UNSUPPORTED`，严禁静默回退或降级为 `manual_fallback`。
    - `selection_strategy` 纳入严格白名单校验；合规套件补齐超时、取消、部分结果、异常映射、Handle 属主及与 `EvidenceValidationContext` / `WorktreeDescriptor` 的端到端兼容校验。
+
+#### DEF-T0049-8 ~ 11 修复（第二轮独立复审返工）
+1. **[DEF-T0049-8] 封堵全维度 Fake/Simulated 适配器真实验证冒充漏洞**:
+   - 在 `AdapterRegistry.register()` 中，对 `caps.is_real_host is False` 的适配器执行全维度真实验证拦截：既不允许顶层 `manifest.verification_level` 为 verified 等级，也不允许任何 `manifest.platform_verifications` 包含 verified 等级，且严禁声明 NATIVE/CLI/MCP 等真实 surface。
+   - 在 `_evaluate_candidate()` 中确立双重防线：`is_real_host is False` 的适配器永不可在 `VERIFIED_AUTOMATIC` 模式下被 selected，且永不可输出 verified 等级。
+2. **[DEF-T0049-9] 零副作用合规拦截覆盖 pathlib / io 写入路径**:
+   - `assert_zero_side_effects()` 拦截哨兵全面扩充，覆盖 `pathlib.Path.open`、`Path.write_text`、`Path.write_bytes`、`Path.touch`、`Path.mkdir`、`Path.unlink`、`Path.rmdir`、`Path.rename`、`Path.replace`、`Path.chmod` 以及 `io.open` / `_io.open`。
+   - 增加 `FaultySideEffectPathlibWriteTextAdapter` 与 `FaultySideEffectIoOpenAdapter` 负向测试，实测拦截成功且磁盘零文件残留。
+3. **[DEF-T0049-10] 完整实现多候选策略解析器 (deterministic / priority / first_match)**:
+   - `first_match` 策略：按 `adapter_id` 字母序确定性选取首个匹配候选。
+   - `priority` 策略：按 Manifest `extra.priority` 权重优先决策；若最高分存在并列平局，则返回 `AMBIGUOUS`。
+   - `deterministic` 策略：多阶段严格排序（验证等级权重 -> 优先级），若顶层仍平局则 Fail-Closed 返回 `AMBIGUOUS`。
+4. **[DEF-T0049-11] 增加 Auth 与 Billing 边界声明与过滤**:
+   - `AdapterResolutionRequest` 引入 `allowed_auth_boundaries` 与 `allowed_billing_boundaries` 强类型白名单校验。
+   - `resolve()` 严格对比 Manifest 的 `auth_boundary` 与 `billing_boundary`，不符合请求边界声明的候选一律被排除。

@@ -14,6 +14,7 @@ from .adapter_manifest import (
     AuthBoundaryType,
     BillingBoundaryType,
     ExecutionMode,
+    HostSurface,
     PlatformVerification,
     VerificationLevel,
     _assert_valid_string,
@@ -30,6 +31,14 @@ class ResolutionStatus(str, Enum):
 
 
 ALLOWED_SELECTION_STRATEGIES: FrozenSet[str] = frozenset({"deterministic", "priority", "first_match"})
+
+VERIFICATION_LEVEL_WEIGHTS: TMapping[VerificationLevel, int] = {
+    VerificationLevel.NATIVE_VERIFIED: 4,
+    VerificationLevel.CLI_VERIFIED: 3,
+    VerificationLevel.MCP_VERIFIED: 2,
+    VerificationLevel.STATIC_ONLY: 1,
+    VerificationLevel.UNSUPPORTED: 0,
+}
 
 
 def _normalize_current_os() -> str:
@@ -54,6 +63,8 @@ class AdapterResolutionRequest:
     execution_mode: ExecutionMode = ExecutionMode.MANUAL
     allow_manual_fallback: bool = False
     selection_strategy: str = "deterministic"
+    allowed_auth_boundaries: Optional[Tuple[AuthBoundaryType, ...]] = None
+    allowed_billing_boundaries: Optional[Tuple[BillingBoundaryType, ...]] = None
     audit_context: TMapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -89,6 +100,19 @@ class AdapterResolutionRequest:
         for m in frozen_wm:
             _assert_valid_string(m, "required_workspace_mode")
         object.__setattr__(self, "required_workspace_modes", frozen_wm)
+
+        # DEF-T0049-11: Auth and Billing boundaries validation
+        if self.allowed_auth_boundaries is not None:
+            frozen_ab = _freeze_manifest_value(self.allowed_auth_boundaries)
+            if not isinstance(frozen_ab, tuple) or not frozen_ab or not all(isinstance(b, AuthBoundaryType) for b in frozen_ab):
+                raise ValueError("allowed_auth_boundaries must be a non-empty tuple of AuthBoundaryType enums")
+            object.__setattr__(self, "allowed_auth_boundaries", frozen_ab)
+
+        if self.allowed_billing_boundaries is not None:
+            frozen_bb = _freeze_manifest_value(self.allowed_billing_boundaries)
+            if not isinstance(frozen_bb, tuple) or not frozen_bb or not all(isinstance(b, BillingBoundaryType) for b in frozen_bb):
+                raise ValueError("allowed_billing_boundaries must be a non-empty tuple of BillingBoundaryType enums")
+            object.__setattr__(self, "allowed_billing_boundaries", frozen_bb)
 
         frozen_audit = _freeze_manifest_value(self.audit_context)
         if not isinstance(frozen_audit, Mapping):
@@ -162,15 +186,32 @@ class AdapterRegistry:
             if not isinstance(caps, HostCapabilities):
                 raise AdapterRegistryError("adapter.detect_capabilities() must return HostCapabilities instance")
 
-            # Check if adapter is fake / simulated
-            if caps.is_real_host is False and manifest.verification_level in (
-                VerificationLevel.NATIVE_VERIFIED,
-                VerificationLevel.CLI_VERIFIED,
-                VerificationLevel.MCP_VERIFIED
-            ):
-                raise AdapterRegistryError(
-                    f"Adapter detect_capabilities indicates is_real_host=False, which cannot be registered as {manifest.verification_level.value}."
-                )
+            # DEF-T0049-8: Exhaustive fake / simulated adapter verification check
+            if caps.is_real_host is False:
+                # 1. Top level verification level
+                if manifest.verification_level in (
+                    VerificationLevel.NATIVE_VERIFIED,
+                    VerificationLevel.CLI_VERIFIED,
+                    VerificationLevel.MCP_VERIFIED
+                ):
+                    raise AdapterRegistryError(
+                        f"Adapter detect_capabilities indicates is_real_host=False, which cannot be registered as {manifest.verification_level.value}."
+                    )
+                # 2. Platform level verification levels
+                for pv_os, pv in manifest.platform_verifications.items():
+                    if pv.verification_level in (
+                        VerificationLevel.NATIVE_VERIFIED,
+                        VerificationLevel.CLI_VERIFIED,
+                        VerificationLevel.MCP_VERIFIED
+                    ):
+                        raise AdapterRegistryError(
+                            f"Adapter detect_capabilities indicates is_real_host=False, which cannot have platform verification for '{pv_os}' claiming {pv.verification_level.value}."
+                        )
+                # 3. Manifest surface
+                if manifest.host_surface in (HostSurface.NATIVE, HostSurface.CLI, HostSurface.MCP):
+                    raise AdapterRegistryError(
+                        f"Adapter detect_capabilities indicates is_real_host=False, which cannot declare host_surface '{manifest.host_surface.value}'."
+                    )
 
             self._adapters[manifest.adapter_id] = adapter
             self._manifests[manifest.adapter_id] = manifest
@@ -303,17 +344,111 @@ class AdapterRegistry:
                     audit_context=request.audit_context
                 )
             else:
-                # Multiple candidates match -> ambiguous
-                candidate_ids = [c[0].adapter_id for c in matching_candidates]
-                return AdapterResolutionDecision(
-                    decision_status=ResolutionStatus.AMBIGUOUS,
-                    selected_adapter_id=None,
-                    matched_capabilities=(),
-                    missing_capabilities=(),
-                    reason=f"Multiple adapters satisfy criteria without a tie-breaker: {candidate_ids}. Resolution is ambiguous.",
-                    execution_mode=request.execution_mode,
-                    audit_context=request.audit_context
-                )
+                # DEF-T0049-10: Multi-candidate resolution based on selection_strategy
+                if request.selection_strategy == "first_match":
+                    matching_candidates.sort(key=lambda c: c[0].adapter_id)
+                    sel_man, sel_adp, sel_matched, sel_pv = matching_candidates[0]
+                    return AdapterResolutionDecision(
+                        decision_status=ResolutionStatus.SELECTED,
+                        selected_adapter_id=sel_man.adapter_id,
+                        matched_capabilities=sel_matched,
+                        missing_capabilities=(),
+                        verification_level=sel_pv.verification_level,
+                        reason=f"Selected '{sel_man.adapter_id}' via first_match strategy among {len(matching_candidates)} candidates.",
+                        auth_boundary_summary=sel_man.auth_boundary.value,
+                        billing_boundary_summary=sel_man.billing_boundary.value,
+                        workspace_modes=sel_man.workspace_modes,
+                        execution_mode=request.execution_mode,
+                        is_real_host=sel_adp.detect_capabilities().is_real_host,
+                        audit_context=request.audit_context,
+                        manifest=sel_man
+                    )
+                elif request.selection_strategy == "priority":
+                    def priority_key(cand):
+                        man, adp, matched, pv = cand
+                        prio = 0
+                        if isinstance(man.extra, Mapping):
+                            raw_p = man.extra.get("priority", 0)
+                            if isinstance(raw_p, (int, float)):
+                                prio = raw_p
+                        vl_weight = VERIFICATION_LEVEL_WEIGHTS.get(pv.verification_level, 0)
+                        return (prio, vl_weight)
+
+                    sorted_by_prio = sorted(matching_candidates, key=priority_key, reverse=True)
+                    top_cand = sorted_by_prio[0]
+                    second_cand = sorted_by_prio[1]
+
+                    if priority_key(top_cand) > priority_key(second_cand):
+                        sel_man, sel_adp, sel_matched, sel_pv = top_cand
+                        return AdapterResolutionDecision(
+                            decision_status=ResolutionStatus.SELECTED,
+                            selected_adapter_id=sel_man.adapter_id,
+                            matched_capabilities=sel_matched,
+                            missing_capabilities=(),
+                            verification_level=sel_pv.verification_level,
+                            reason=f"Selected '{sel_man.adapter_id}' via priority strategy with score {priority_key(top_cand)}.",
+                            auth_boundary_summary=sel_man.auth_boundary.value,
+                            billing_boundary_summary=sel_man.billing_boundary.value,
+                            workspace_modes=sel_man.workspace_modes,
+                            execution_mode=request.execution_mode,
+                            is_real_host=sel_adp.detect_capabilities().is_real_host,
+                            audit_context=request.audit_context,
+                            manifest=sel_man
+                        )
+                    else:
+                        candidate_ids = [c[0].adapter_id for c in matching_candidates]
+                        return AdapterResolutionDecision(
+                            decision_status=ResolutionStatus.AMBIGUOUS,
+                            selected_adapter_id=None,
+                            matched_capabilities=(),
+                            missing_capabilities=(),
+                            reason=f"Priority tie between candidates: {candidate_ids}. Resolution is ambiguous.",
+                            execution_mode=request.execution_mode,
+                            audit_context=request.audit_context
+                        )
+                else:  # deterministic
+                    def deterministic_key(cand):
+                        man, adp, matched, pv = cand
+                        prio = 0
+                        if isinstance(man.extra, Mapping):
+                            raw_p = man.extra.get("priority", 0)
+                            if isinstance(raw_p, (int, float)):
+                                prio = raw_p
+                        vl_weight = VERIFICATION_LEVEL_WEIGHTS.get(pv.verification_level, 0)
+                        return (vl_weight, prio)
+
+                    sorted_by_det = sorted(matching_candidates, key=deterministic_key, reverse=True)
+                    top_cand = sorted_by_det[0]
+                    second_cand = sorted_by_det[1]
+
+                    if deterministic_key(top_cand) > deterministic_key(second_cand):
+                        sel_man, sel_adp, sel_matched, sel_pv = top_cand
+                        return AdapterResolutionDecision(
+                            decision_status=ResolutionStatus.SELECTED,
+                            selected_adapter_id=sel_man.adapter_id,
+                            matched_capabilities=sel_matched,
+                            missing_capabilities=(),
+                            verification_level=sel_pv.verification_level,
+                            reason=f"Adapter '{sel_man.adapter_id}' uniquely ranked highest via deterministic resolution.",
+                            auth_boundary_summary=sel_man.auth_boundary.value,
+                            billing_boundary_summary=sel_man.billing_boundary.value,
+                            workspace_modes=sel_man.workspace_modes,
+                            execution_mode=request.execution_mode,
+                            is_real_host=sel_adp.detect_capabilities().is_real_host,
+                            audit_context=request.audit_context,
+                            manifest=sel_man
+                        )
+                    else:
+                        candidate_ids = [c[0].adapter_id for c in matching_candidates]
+                        return AdapterResolutionDecision(
+                            decision_status=ResolutionStatus.AMBIGUOUS,
+                            selected_adapter_id=None,
+                            matched_capabilities=(),
+                            missing_capabilities=(),
+                            reason=f"Multiple adapters satisfy criteria with equal deterministic rank: {candidate_ids}. Resolution is ambiguous.",
+                            execution_mode=request.execution_mode,
+                            audit_context=request.audit_context
+                        )
 
     def _evaluate_candidate(
         self,
@@ -338,9 +473,27 @@ class AdapterRegistry:
         if pv.verification_level not in request.allowed_verification_levels:
             return False, request.required_capabilities, (), pv, f"Platform verification level '{pv.verification_level.value}' not in allowed levels."
 
+        # DEF-T0049-8: Non-real host safety
+        is_real = adapter.detect_capabilities().is_real_host
+        if is_real is False:
+            if request.execution_mode == ExecutionMode.VERIFIED_AUTOMATIC:
+                return False, request.required_capabilities, (), pv, "Non-real host adapter (is_real_host=False) cannot be selected for verified_automatic execution mode."
+            if pv.verification_level in (VerificationLevel.NATIVE_VERIFIED, VerificationLevel.CLI_VERIFIED, VerificationLevel.MCP_VERIFIED):
+                return False, request.required_capabilities, (), pv, "Non-real host adapter (is_real_host=False) cannot provide verified execution level."
+
         # DEF-T0049-1: STATIC_ONLY cannot be selected for VERIFIED_AUTOMATIC execution mode
         if request.execution_mode == ExecutionMode.VERIFIED_AUTOMATIC and pv.verification_level == VerificationLevel.STATIC_ONLY:
             return False, request.required_capabilities, (), pv, "STATIC_ONLY verification cannot be used for verified_automatic execution mode."
+
+        # DEF-T0049-11: Auth boundary filtering
+        if request.allowed_auth_boundaries is not None:
+            if manifest.auth_boundary not in request.allowed_auth_boundaries:
+                return False, request.required_capabilities, (), pv, f"Auth boundary '{manifest.auth_boundary.value}' not in allowed auth boundaries."
+
+        # DEF-T0049-11: Billing boundary filtering
+        if request.allowed_billing_boundaries is not None:
+            if manifest.billing_boundary not in request.allowed_billing_boundaries:
+                return False, request.required_capabilities, (), pv, f"Billing boundary '{manifest.billing_boundary.value}' not in allowed billing boundaries."
 
         # c. Workspace modes check
         for req_wm in request.required_workspace_modes:

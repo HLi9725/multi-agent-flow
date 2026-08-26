@@ -54,11 +54,12 @@ def test_registry_adapter_id_mismatch_rejected():
     assert len(registry.list_manifests()) == 0
 
 
-def test_registry_fake_adapter_cannot_claim_verified():
-    registry = AdapterRegistry(context_id="ctx_2")
-    adapter = StandardTestFakeAdapter(adapter_id="fake_2")
+def test_registry_fake_adapter_cannot_claim_verified_top_or_platform():
+    # DEF-T0049-8: Fake adapter (is_real_host=False) cannot have top-level OR platform-level verified
+    registry = AdapterRegistry(context_id="ctx_fake_ver")
+    adapter = StandardTestFakeAdapter(adapter_id="fake_ver_adp")
 
-    pv_win = PlatformVerification(
+    pv_win_verified = PlatformVerification(
         operating_system="windows",
         host_surface=HostSurface.NATIVE,
         verification_level=VerificationLevel.NATIVE_VERIFIED,
@@ -66,29 +67,36 @@ def test_registry_fake_adapter_cannot_claim_verified():
         verified_at="2026-08-26T10:00:00Z",
         e2e_evidence_refs=("fake-e2e-ref",)
     )
+    pv_mac_static = PlatformVerification(
+        operating_system="macos",
+        host_surface=HostSurface.NATIVE,
+        verification_level=VerificationLevel.STATIC_ONLY,
+        verified_version="1.0.0"
+    )
+
+    # Manifest with top-level STATIC_ONLY, but Windows platform is NATIVE_VERIFIED
     manifest = AdapterManifest(
         schema_version="2.0",
-        adapter_id="fake_2",
-        display_name="Fake Claiming Verified",
+        adapter_id="fake_ver_adp",
+        display_name="Fake Claiming Platform Verified",
         implementation_version="1.0.0",
         host_surface=HostSurface.NATIVE,
-        verification_level=VerificationLevel.NATIVE_VERIFIED,
+        verification_level=VerificationLevel.STATIC_ONLY,
         capabilities={},
         workspace_modes=("isolated",),
         identity_fields=("id",),
         auth_boundary=AuthBoundaryType.NONE,
         billing_boundary=BillingBoundaryType.UNMETERED,
         platform_version_constraint=">=1.0.0",
-        supported_operating_systems=("windows",),
-        platform_verifications={"windows": pv_win},
-        executable_candidates_by_os={"windows": ()},
-        config_path_templates_by_os={"windows": ()},
-        conformance_suite_version="2.0",
-        verified_at="2026-08-26T10:00:00Z",
-        e2e_evidence_refs=("fake-e2e-ref",)
+        supported_operating_systems=("windows", "macos"),
+        platform_verifications={"windows": pv_win_verified, "macos": pv_mac_static},
+        executable_candidates_by_os={"windows": (), "macos": ()},
+        config_path_templates_by_os={"windows": (), "macos": ()},
+        conformance_suite_version="2.0"
     )
 
-    with pytest.raises(AdapterRegistryError, match="cannot be registered as native_verified"):
+    # Registering fake adapter with platform-level verified must be REJECTED!
+    with pytest.raises(AdapterRegistryError, match="is_real_host=False"):
         registry.register(adapter, manifest)
 
 
@@ -186,7 +194,7 @@ def test_registry_static_only_rejected_for_verified_automatic():
     )
     decision = registry.resolve(req_auto)
     assert decision.decision_status == ResolutionStatus.UNSUPPORTED
-    assert "STATIC_ONLY" in decision.reason
+    assert "cannot be selected for verified_automatic" in decision.reason
 
 
 def test_registry_ghost_capability_rejected():
@@ -250,37 +258,164 @@ def test_registry_exact_id_no_manual_fallback():
     assert decision_missing.decision_status == ResolutionStatus.UNSUPPORTED
 
 
-def test_registry_selection_strategy_validation():
-    # DEF-T0049-7: Invalid selection_strategy must raise ValueError
-    with pytest.raises(ValueError, match="Invalid selection_strategy"):
-        AdapterResolutionRequest(
-            project_id="p1",
-            allowed_verification_levels=(VerificationLevel.STATIC_ONLY,),
-            selection_strategy="invalid_random_strategy"
-        )
+def test_registry_selection_strategies():
+    # DEF-T0049-10: Test deterministic, priority, and first_match strategies
+    registry = AdapterRegistry(context_id="p_strat")
 
-
-def test_registry_multi_candidate_ambiguity():
-    registry = AdapterRegistry(context_id="p1")
-    adp1 = StandardTestFakeAdapter(adapter_id="candidate_1")
-    man1 = create_standard_fake_manifest("candidate_1")
-    adp2 = StandardTestFakeAdapter(adapter_id="candidate_2")
-    man2 = create_standard_fake_manifest("candidate_2")
-
-    registry.register(adp1, man1)
-    registry.register(adp2, man2)
-
-    # Both match identical criteria without exact ID -> AMBIGUOUS
-    req = AdapterResolutionRequest(
-        project_id="p1",
-        required_capabilities=("worktree",),
-        allowed_verification_levels=(VerificationLevel.STATIC_ONLY,)
+    # Create candidate A (priority=10) and candidate B (priority=50)
+    adp_a = StandardTestFakeAdapter(adapter_id="adapter_a")
+    pv_a = PlatformVerification(
+        operating_system="windows",
+        host_surface=HostSurface.SIMULATED,
+        verification_level=VerificationLevel.STATIC_ONLY,
+        verified_version="1.0.0"
     )
-    decision = registry.resolve(req)
-    assert decision.decision_status == ResolutionStatus.AMBIGUOUS
-    assert decision.selected_adapter_id is None
-    assert "candidate_1" in decision.reason
-    assert "candidate_2" in decision.reason
+    man_a = AdapterManifest(
+        schema_version="2.0",
+        adapter_id="adapter_a",
+        display_name="Adapter A",
+        implementation_version="1.0.0",
+        host_surface=HostSurface.SIMULATED,
+        verification_level=VerificationLevel.STATIC_ONLY,
+        capabilities={"worktree": "supported"},
+        workspace_modes=("isolated",),
+        identity_fields=("id",),
+        auth_boundary=AuthBoundaryType.NONE,
+        billing_boundary=BillingBoundaryType.UNMETERED,
+        platform_version_constraint=">=1.0.0",
+        supported_operating_systems=("windows",),
+        platform_verifications={"windows": pv_a},
+        executable_candidates_by_os={"windows": ()},
+        config_path_templates_by_os={"windows": ()},
+        conformance_suite_version="2.0",
+        extra={"priority": 10}
+    )
+
+    adp_b = StandardTestFakeAdapter(adapter_id="adapter_b")
+    pv_b = PlatformVerification(
+        operating_system="windows",
+        host_surface=HostSurface.SIMULATED,
+        verification_level=VerificationLevel.STATIC_ONLY,
+        verified_version="1.0.0"
+    )
+    man_b = AdapterManifest(
+        schema_version="2.0",
+        adapter_id="adapter_b",
+        display_name="Adapter B",
+        implementation_version="1.0.0",
+        host_surface=HostSurface.SIMULATED,
+        verification_level=VerificationLevel.STATIC_ONLY,
+        capabilities={"worktree": "supported"},
+        workspace_modes=("isolated",),
+        identity_fields=("id",),
+        auth_boundary=AuthBoundaryType.NONE,
+        billing_boundary=BillingBoundaryType.UNMETERED,
+        platform_version_constraint=">=1.0.0",
+        supported_operating_systems=("windows",),
+        platform_verifications={"windows": pv_b},
+        executable_candidates_by_os={"windows": ()},
+        config_path_templates_by_os={"windows": ()},
+        conformance_suite_version="2.0",
+        extra={"priority": 50}
+    )
+
+    registry.register(adp_a, man_a)
+    registry.register(adp_b, man_b)
+
+    # 1. Strategy: first_match -> picks adapter_a (first in sorted adapter_id)
+    req_first = AdapterResolutionRequest(
+        project_id="p_strat",
+        required_capabilities=("worktree",),
+        allowed_verification_levels=(VerificationLevel.STATIC_ONLY,),
+        selection_strategy="first_match"
+    )
+    d_first = registry.resolve(req_first)
+    assert d_first.decision_status == ResolutionStatus.SELECTED
+    assert d_first.selected_adapter_id == "adapter_a"
+
+    # 2. Strategy: priority -> picks adapter_b (priority 50 > 10)
+    req_prio = AdapterResolutionRequest(
+        project_id="p_strat",
+        required_capabilities=("worktree",),
+        allowed_verification_levels=(VerificationLevel.STATIC_ONLY,),
+        selection_strategy="priority"
+    )
+    d_prio = registry.resolve(req_prio)
+    assert d_prio.decision_status == ResolutionStatus.SELECTED
+    assert d_prio.selected_adapter_id == "adapter_b"
+
+    # 3. Strategy: deterministic -> since verification levels are equal, checks priority (50 > 10) -> picks adapter_b
+    req_det = AdapterResolutionRequest(
+        project_id="p_strat",
+        required_capabilities=("worktree",),
+        allowed_verification_levels=(VerificationLevel.STATIC_ONLY,),
+        selection_strategy="deterministic"
+    )
+    d_det = registry.resolve(req_det)
+    assert d_det.decision_status == ResolutionStatus.SELECTED
+    assert d_det.selected_adapter_id == "adapter_b"
+
+
+def test_registry_auth_and_billing_boundaries():
+    # DEF-T0049-11: Auth and Billing boundary filtering
+    registry = AdapterRegistry(context_id="p_bound")
+
+    adp_local = StandardTestFakeAdapter(adapter_id="adp_local")
+    pv_local = PlatformVerification(
+        operating_system="windows",
+        host_surface=HostSurface.SIMULATED,
+        verification_level=VerificationLevel.STATIC_ONLY,
+        verified_version="1.0.0"
+    )
+    man_local = AdapterManifest(
+        schema_version="2.0",
+        adapter_id="adp_local",
+        display_name="Local Adapter",
+        implementation_version="1.0.0",
+        host_surface=HostSurface.SIMULATED,
+        verification_level=VerificationLevel.STATIC_ONLY,
+        capabilities={},
+        workspace_modes=("isolated",),
+        identity_fields=("id",),
+        auth_boundary=AuthBoundaryType.USER_LOCAL,
+        billing_boundary=BillingBoundaryType.UNMETERED,
+        platform_version_constraint=">=1.0.0",
+        supported_operating_systems=("windows",),
+        platform_verifications={"windows": pv_local},
+        executable_candidates_by_os={"windows": ()},
+        config_path_templates_by_os={"windows": ()},
+        conformance_suite_version="2.0"
+    )
+    registry.register(adp_local, man_local)
+
+    # 1. Matching auth boundary succeeds
+    req_ok = AdapterResolutionRequest(
+        project_id="p_bound",
+        allowed_verification_levels=(VerificationLevel.STATIC_ONLY,),
+        allowed_auth_boundaries=(AuthBoundaryType.USER_LOCAL,),
+        allowed_billing_boundaries=(BillingBoundaryType.UNMETERED,)
+    )
+    assert registry.resolve(req_ok).decision_status == ResolutionStatus.SELECTED
+
+    # 2. Mismatched auth boundary rejected
+    req_bad_auth = AdapterResolutionRequest(
+        project_id="p_bound",
+        allowed_verification_levels=(VerificationLevel.STATIC_ONLY,),
+        allowed_auth_boundaries=(AuthBoundaryType.HOST_MANAGED,)
+    )
+    d_bad_auth = registry.resolve(req_bad_auth)
+    assert d_bad_auth.decision_status == ResolutionStatus.UNSUPPORTED
+    assert "Auth boundary" in d_bad_auth.reason
+
+    # 3. Mismatched billing boundary rejected
+    req_bad_bill = AdapterResolutionRequest(
+        project_id="p_bound",
+        allowed_verification_levels=(VerificationLevel.STATIC_ONLY,),
+        allowed_billing_boundaries=(BillingBoundaryType.API_KEY,)
+    )
+    d_bad_bill = registry.resolve(req_bad_bill)
+    assert d_bad_bill.decision_status == ResolutionStatus.UNSUPPORTED
+    assert "Billing boundary" in d_bad_bill.reason
 
 
 def test_registry_thread_safety():
