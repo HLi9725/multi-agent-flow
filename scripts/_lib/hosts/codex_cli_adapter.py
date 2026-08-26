@@ -4,6 +4,7 @@ import json
 import os
 import platform
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -106,7 +107,6 @@ class CodexCliAdapter(BaseHostAdapter):
         self._default_timeout_seconds = default_timeout_seconds
         self._running_sessions: Dict[str, Dict[str, Any]] = {}
         self._session_history: Dict[str, Dict[str, Any]] = {}
-        self._permission_cache: Dict[Tuple[str, str, str], bool] = {}
         self._lock = threading.RLock()
 
         # Fixed static capabilities definition (Zero side-effects on detection)
@@ -118,7 +118,9 @@ class CodexCliAdapter(BaseHostAdapter):
             supports_worktree=CapabilitySupport.SUPPORTED,
             supports_permission_approval=CapabilitySupport.SUPPORTED,
             supports_mcp=CapabilitySupport.SUPPORTED,
-            supports_interactive_confirmation=CapabilitySupport.SUPPORTED,
+            # `codex exec` is non-interactive. User confirmation must be
+            # supplied by a trusted outer host, never inferred from options.
+            supports_interactive_confirmation=CapabilitySupport.UNSUPPORTED,
             supports_usage_telemetry=CapabilitySupport.SUPPORTED,
             max_concurrent_agents=4,
             extra=MappingProxyType({
@@ -216,8 +218,9 @@ class CodexCliAdapter(BaseHostAdapter):
                 f"Workspace '{request.workspace_dir}' is not inside a trusted Git repository."
             )
 
-        session_id = request.session_id
+        session_id = request.session_id.strip()
         invocation_id = f"inv-{uuid.uuid4().hex[:12]}"
+        invocation_token = secrets.token_urlsafe(32)
 
         # Build and validate command (DEF-T0050-1, DEF-T0050-2, DEF-T0050-6, DEF-T0050-7)
         cmd = self.build_codex_exec_command(request)
@@ -237,7 +240,36 @@ class CodexCliAdapter(BaseHostAdapter):
             # CREATE_NEW_PROCESS_GROUP for clean process tree termination
             creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
 
-        process = None
+        handle = AgentHandle(
+            session_id=session_id,
+            host_id=self.adapter_id,
+            status="running",
+            is_real_host=self._is_real_host,
+            adapter_instance_id=self._instance_id,
+            invocation_token=invocation_token,
+        )
+
+        # Reserve the session before launching the subprocess. This makes the
+        # duplicate check atomic and prevents an overwritten entry from
+        # orphaning a previously launched process.
+        with self._lock:
+            if session_id in self._running_sessions or session_id in self._session_history:
+                raise AgentInvalidHandleError(f"Session '{session_id}' already exists in this adapter instance")
+            self._running_sessions[session_id] = {
+                "handle": handle,
+                "request": request,
+                "invocation_id": invocation_id,
+                "thread_id": None,
+                "usage": {},
+                "process": None,
+                "start_time": time.time(),
+                "sandbox_mode": sandbox_mode,
+                "approval_policy": approval_policy,
+                "workspace_dir": request.workspace_dir,
+                "completed": False,
+                "result": None,
+            }
+
         if self._is_real_host:
             try:
                 process = subprocess.Popen(
@@ -251,35 +283,23 @@ class CodexCliAdapter(BaseHostAdapter):
                     creationflags=creationflags
                 )
             except Exception as e:
+                with self._lock:
+                    current = self._running_sessions.get(session_id)
+                    if current and current.get("handle") == handle:
+                        self._running_sessions.pop(session_id, None)
                 raise RuntimeError(f"Failed to launch Codex CLI process: {e}") from e
 
-        handle = AgentHandle(
-            session_id=session_id,
-            host_id=self.adapter_id,
-            status="running",
-            is_real_host=self._is_real_host,
-            adapter_instance_id=self._instance_id
-        )
-
-        with self._lock:
-            self._running_sessions[session_id] = {
-                "handle": handle,
-                "request": request,
-                "invocation_id": invocation_id,
-                "thread_id": None,
-                "usage": {},
-                "process": process,
-                "start_time": time.time(),
-                "sandbox_mode": sandbox_mode,
-                "approval_policy": approval_policy,
-                "workspace_dir": request.workspace_dir,
-                "completed": False,
-                "result": None,
-            }
+            with self._lock:
+                current = self._running_sessions.get(session_id)
+                if not current or current.get("handle") != handle:
+                    self._terminate_process_tree(process)
+                    raise AgentInvalidHandleError(f"Session reservation for '{session_id}' was lost")
+                current["process"] = process
 
         return handle
 
-    def wait_for_result(self, handle: AgentHandle, timeout_seconds: Optional[float] = None) -> AgentResult:
+    def _validate_handle(self, handle: AgentHandle, *, include_history: bool = False) -> Dict[str, Any]:
+        """Validate handle ownership and its unguessable invocation token."""
         if not isinstance(handle, AgentHandle):
             raise AgentInvalidHandleError("handle must be an AgentHandle instance")
         if handle.adapter_instance_id != self._instance_id:
@@ -288,14 +308,28 @@ class CodexCliAdapter(BaseHostAdapter):
             raise AgentInvalidHandleError(f"Handle host_id '{handle.host_id}' does not match adapter '{self.adapter_id}'")
         if handle.is_real_host != self._is_real_host:
             raise AgentInvalidHandleError(f"Handle is_real_host '{handle.is_real_host}' does not match adapter '{self._is_real_host}'")
+        if not handle.invocation_token:
+            raise AgentInvalidHandleError("Handle invocation_token is missing")
 
         with self._lock:
             session_data = self._running_sessions.get(handle.session_id)
-            if not session_data:
-                # Check completed history
-                if handle.session_id in self._session_history:
-                    return self._session_history[handle.session_id]["result"]
-                raise AgentInvalidHandleError(f"Session '{handle.session_id}' not found in active sessions")
+            if session_data is None and include_history:
+                session_data = self._session_history.get(handle.session_id)
+            if session_data is None:
+                raise AgentInvalidHandleError(f"Session '{handle.session_id}' not found in this adapter instance")
+            stored_handle = session_data.get("handle")
+            if not isinstance(stored_handle, AgentHandle):
+                raise AgentInvalidHandleError(f"Session '{handle.session_id}' has no valid owned handle")
+            if not secrets.compare_digest(handle.invocation_token, stored_handle.invocation_token):
+                raise AgentInvalidHandleError("Handle invocation_token does not match the owned session")
+            if handle != stored_handle:
+                raise AgentInvalidHandleError("Handle fields do not match the owned session handle")
+            return session_data
+
+    def wait_for_result(self, handle: AgentHandle, timeout_seconds: Optional[float] = None) -> AgentResult:
+        session_data = self._validate_handle(handle, include_history=True)
+        if session_data.get("completed") and session_data.get("result") is not None:
+            return session_data["result"]
 
         timeout = timeout_seconds if timeout_seconds is not None else self._default_timeout_seconds
         process: Optional[subprocess.Popen] = session_data.get("process")
@@ -379,87 +413,43 @@ class CodexCliAdapter(BaseHostAdapter):
         return result
 
     def cancel_agent(self, handle: AgentHandle) -> bool:
-        # DEF-T0050-12: Full Handle ownership checks matching wait_for_result
-        if not isinstance(handle, AgentHandle):
-            raise AgentInvalidHandleError("handle must be an AgentHandle instance")
-        if handle.adapter_instance_id != self._instance_id:
-            raise AgentInvalidHandleError(f"Handle belongs to foreign adapter instance '{handle.adapter_instance_id}'")
-        if handle.host_id != self.adapter_id:
-            raise AgentInvalidHandleError(f"Handle host_id '{handle.host_id}' does not match adapter '{self.adapter_id}'")
-        if handle.is_real_host != self._is_real_host:
-            raise AgentInvalidHandleError(f"Handle is_real_host '{handle.is_real_host}' does not match adapter '{self._is_real_host}'")
+        # DEF-T0050-12/17: validate both adapter ownership and the exact
+        # unguessable token issued for this invocation.
+        session_data = self._validate_handle(handle, include_history=True)
 
         with self._lock:
-            session_data = self._running_sessions.get(handle.session_id)
-            if not session_data:
+            if handle.session_id not in self._running_sessions:
                 return False
-
             process: Optional[subprocess.Popen] = session_data.get("process")
             if process is not None and process.poll() is None:
                 self._terminate_process_tree(process)
 
+            session_data["completed"] = True
+            session_data["result"] = AgentResult(
+                session_id=handle.session_id,
+                status=AgentStatus.CANCELLED,
+                output="Codex CLI execution cancelled",
+                is_real_host=self._is_real_host,
+            )
+            self._session_history[handle.session_id] = session_data
             self._running_sessions.pop(handle.session_id, None)
             return True
 
-    def record_permission_approval(
-        self,
-        project_id: str,
-        workspace_dir: str,
-        session_id: str,
-        invocation_id: str,
-        operation: str
-    ) -> None:
-        """
-        DEF-T0050-13: Cache verified user/host permission approval strictly bound to 5-tuple.
-        Key: (project_id, workspace_dir, session_id, invocation_id, operation).
-        """
-        cache_key = (project_id, workspace_dir, session_id, invocation_id, operation)
-        with self._lock:
-            self._permission_cache[cache_key] = True
-
-    def has_permission_approval(
-        self,
-        project_id: str,
-        workspace_dir: str,
-        session_id: str,
-        invocation_id: str,
-        operation: str
-    ) -> bool:
-        """DEF-T0050-13: Check whether verified 5-tuple permission approval exists."""
-        cache_key = (project_id, workspace_dir, session_id, invocation_id, operation)
-        with self._lock:
-            return bool(self._permission_cache.get(cache_key, False))
-
     def request_confirmation(self, req: ConfirmationRequest) -> ConfirmationResult:
         """
-        DEF-T0050-13: Permission approval contract handler.
-        Never automatically chooses options[0], never fakes confirmation.
-        Returns is_confirmed=False unless explicitly authorized by verifiable USER confirmation token.
+        The selected non-interactive CLI surface cannot prove a human choice.
+
+        A trusted outer host must collect and persist user confirmation as
+        evidence. Strings supplied in ``options`` are choices, not proof.
         """
         if not isinstance(req, ConfirmationRequest):
             raise TypeError("req must be a ConfirmationRequest instance")
         if not req.request_id or not req.request_id.strip():
             raise ValueError("ConfirmationRequest.request_id cannot be empty")
 
-        is_confirmed = False
-        selected = "deny"
-
-        if len(req.options) == 1 and req.options[0] in ("approved", "confirmed", "user_approved", "allow"):
-            is_confirmed = True
-            selected = req.options[0]
-        elif req.options and "user_confirmed" in req.options:
-            is_confirmed = True
-            selected = "user_confirmed"
-        else:
-            # Non-interactive Codex surface cannot fake user confirmation; default to deny / unconfirmed
-            is_confirmed = False
-            selected = "deny"
-
-        return ConfirmationResult(
-            request_id=req.request_id,
-            selected_option=selected,
-            is_confirmed=is_confirmed,
-            is_real_host=self._is_real_host
+        raise AgentNotSupportedError(
+            "Codex CLI exec is non-interactive; confirmation must be collected "
+            "and verified by a trusted outer host."
         )
 
     def get_session_thread_id(self, session_id: str) -> Optional[str]:
@@ -604,10 +594,17 @@ class CodexCliAdapter(BaseHostAdapter):
                         detected_invocation_id = m_inv.group(1)
                     messages.append(line)
 
-        # DEF-T0050-10: Ground host invocation ID in canonical <thread_id>:<item_id>
-        if detected_thread_id:
-            item_part = detected_item_id or (detected_invocation_id if detected_invocation_id and detected_invocation_id != detected_thread_id else "item_0")
-            detected_invocation_id = f"{detected_thread_id}:{item_part}"
+        # DEF-T0050-10/14: both sides must come from the host event stream.
+        # A thread alone is a session identity, not an invocation identity.
+        identity_part = detected_item_id or detected_invocation_id
+        if detected_thread_id and identity_part:
+            prefix = f"{detected_thread_id}:"
+            if identity_part == detected_thread_id:
+                detected_invocation_id = None
+            elif identity_part.startswith(prefix):
+                detected_invocation_id = identity_part
+            else:
+                detected_invocation_id = f"{prefix}{identity_part}"
         else:
             detected_invocation_id = None
 
@@ -658,7 +655,7 @@ def create_codex_cli_manifest(
             "worktree": "supported",
             "permission_approval": "supported",
             "mcp": "supported",
-            "interactive_confirmation": "supported",
+            "interactive_confirmation": "unsupported",
             "usage_telemetry": "supported"
         },
         workspace_modes=("isolated", "worktree", "shared"),

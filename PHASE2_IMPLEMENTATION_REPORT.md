@@ -285,12 +285,14 @@
 
 ### 3. 测试记录（真实数据）
 
-- **2D-2 定向测试**:
-  - `python -m pytest tests/test_codex_cli_adapter.py -q -rs` -> `16 passed in 0.48s` (0 failed, 0 skipped)
+- **2D-2 定向测试（当前 Codex 沙箱）**:
+  - `python -m pytest tests/test_codex_cli_adapter.py -q -rs` -> `19 passed, 1 failed`；唯一失败为当前沙箱账户无法启动 WindowsApps 内的 `codex.exe`（`PermissionError: [WinError 5]`），不是断言失败或 skip。
+  - `python -m pytest tests/test_codex_cli_adapter.py -q -rs -k "not real_executable_detection_and_help"` -> `19 passed, 1 deselected in 1.66s`。
 - **2D-1 通用基础设施与契约兼容回归测试**:
-  - `python -m pytest tests/test_adapter_manifest.py tests/test_adapter_registry.py tests/test_adapter_conformance.py tests/test_host_adapter.py tests/test_evidence.py tests/test_worktree_manager.py -q -rs` -> `97 passed in 24.40s` (0 failed, 0 skipped)
+  - `python -m pytest tests/test_adapter_manifest.py tests/test_adapter_registry.py tests/test_adapter_conformance.py tests/test_host_adapter.py tests/test_evidence.py tests/test_worktree_manager.py -q -rs` -> `97 passed in 24.51s` (0 failed, 0 skipped)
 - **全量测试套件**:
-  - `python -m pytest tests -q -rs` -> `339 passed in 65.87s (0:01:05)` (0 failed, 0 skipped, 100% 通过)
+  - `python -m pytest tests -q -rs -k "not real_executable_detection_and_help"` -> `342 passed, 1 deselected in 66.78s`。
+  - `python -m pytest tests -q -rs` -> `342 passed, 1 failed in 67.35s`；唯一失败为当前 Codex 沙箱账户启动 WindowsApps `codex.exe` 时返回 `PermissionError: [WinError 5]`。测试未 skip、未弱化，需由普通用户会话完成最终真实宿主复验。
 - **代码规范检查**:
   - `git diff --check` -> 退出码 0，零尾随空白错误
 
@@ -309,7 +311,7 @@
    - `REVIEWER` 角色强制执行 `read-only`；若 REVIEWER 请求 `workspace-write` 直接拒绝并抛出 `AgentNotSupportedError`。`QA` 角色默认 `read-only`，`DEV`/`BUILDER` 角色默认 `workspace-write`。
 2. **[DEF-T0050-2] 完整实现 §7.1 权限审批合同与确认闭环**:
    - 增加 `approval_policy` 检查（`on-request`、`never` 白名单），支持 Codex CLI 权限预检。
-   - 彻底废除假确认；`request_confirmation` 严格解析选项中的确认/拒绝语义，支持拒绝（`deny`）分支判定，并对已确认权限在 `(instance_id, request_id)` 边界内进行本地受限缓存，禁止跨项目/会话扩散。
+   - 后续 DEF-T0050-15 进一步明确：非交互 `codex exec` 不具备可信用户确认通道，Adapter 不解析选项作为授权证据，统一 Fail-Closed 交由可信上层 Host 处理。
 3. **[DEF-T0050-3] 真实会话 thread_id 解析与用量遥测精准绑定**:
    - 修复 `_parse_jsonl_output` 解析优先级，从 `session_start` 及 JSONL 事件流中精准提取并绑定真实 `thread_id`（如 `01a03cdc-d21c-77d1-a3b4-aa9081287b6d`）。
    - 完整采集真实用量遥测数据（`input_tokens`、`cached_tokens`、`output_tokens`）并绑定入结果与会话元数据。
@@ -340,6 +342,24 @@
     - `cancel_agent` 与 `wait_for_result` 执行完全对等的 4 重属主校验：`isinstance` 检查、`adapter_instance_id` 精确匹配、`host_id` 精确匹配、`is_real_host` 一致性检查。
     - 任何外来、伪造或跨模式 Handle 立即拒绝并抛出 `AgentInvalidHandleError`，不影响真实运行中会话。
 13. **[DEF-T0050-13] 废除伪造用户确认，确认缓存严格绑定 5 元组**:
-    - `request_confirmation` 严禁自动选择 `options[0]`；在非交互 CLI 环境下，若无明确经过验证的 USER 确认凭据（`user_confirmed`），一律返回 `is_confirmed=False`（拒绝）。
-    - 权限缓存与判定严格绑定 `(project_id, workspace_dir, session_id, invocation_id, operation)` 5 元组，严禁跨项目、跨工作区、跨会话或跨操作复用。
+    - `request_confirmation` 严禁自动选择 `options[0]`；该阶段曾尝试通过特殊选项字符串表达 USER 确认，后续 DEF-T0050-15 证明调用方仍可伪造，相关入口已完全删除。
+    - 旧的本地权限缓存已在 DEF-T0050-15 中移除，避免无可信签发来源的公开写入口形成自授权通道。
 14. **[死代码清理]**: 清理了 `codex_cli_adapter.py` 中重复定义的 `dispatch_agent` 桩代码，保持代码简洁规范与契约不变。
+
+### 6. 2D-2 第二轮 QA 返工记录 (DEF-T0050-14 ~ 17)
+
+1. **[DEF-T0050-14] 禁止从 Thread 身份伪造 Invocation 身份**:
+   - canonical invocation 只有在事件流同时提供真实 `thread_id` 与真实 `item_id` / `turn_id` / `invocation_id` 时才生成。
+   - 删除 `item_0` 默认补值；只有 `thread.started` 时返回 `invocation_id=None`，真实执行因此触发既有 Fail-Closed 门禁。
+2. **[DEF-T0050-15] 非交互确认与权限缓存 Fail-Closed**:
+   - `request_confirmation()` 对任意选项（包括 `allow`、`user_confirmed`）统一抛出 `AgentNotSupportedError`，因为选项只是候选值，不是可信用户选择证据。
+   - Runtime Capability 与 Manifest 均把 `interactive_confirmation` 声明为 `unsupported`；删除无签发验证的公开权限缓存写入/查询接口。
+3. **[DEF-T0050-16] Session 原子占位与重复 ID 拦截**:
+   - 在启动真实子进程前于锁内完成 Session 原子占位；活动或历史 Session ID 重复时直接拒绝。
+   - 子进程启动失败只清理本次占位；不会覆盖旧 Session，也不会遗留失去控制的旧进程。
+4. **[DEF-T0050-17] Handle 不可伪造 Token 与完整属主校验**:
+   - 每次派发使用 `secrets.token_urlsafe(32)` 生成不可预测 `invocation_token`，服务端保存原始 Handle。
+   - `wait_for_result()` 与 `cancel_agent()` 均验证类型、Adapter 实例、Host、真实模式、Session、token 及完整 Handle 相等；同一 Adapter 内仅凭 Session ID 无法伪造取消。
+   - 取消结果进入历史记录，重复取消返回 `False`，同时继续阻止 Session ID 被重新占用。
+5. **独立对抗复现**:
+   - 仓库外脚本覆盖 thread-only、单元素 allow、自授权缓存、重复 Session、同实例伪造 Handle 五项场景；修复前 `0/5`，修复后 `5/5`。

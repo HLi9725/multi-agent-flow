@@ -3,6 +3,7 @@ import os
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from types import MappingProxyType
 import pytest
 
@@ -87,7 +88,7 @@ def test_codex_cli_adapter_capabilities_detection_zero_side_effects():
     assert caps.supports_worktree == CapabilitySupport.SUPPORTED
     assert caps.supports_isolated_context == CapabilitySupport.SUPPORTED
     assert caps.supports_parallelism == CapabilitySupport.SUPPORTED
-    assert caps.supports_interactive_confirmation == CapabilitySupport.SUPPORTED
+    assert caps.supports_interactive_confirmation == CapabilitySupport.UNSUPPORTED
 
 
 def test_codex_cli_adapter_sandbox_role_enforcement():
@@ -183,44 +184,20 @@ def test_codex_cli_adapter_command_building_and_no_invalid_a_flag():
 
 
 def test_codex_cli_adapter_approval_and_confirmation_contract():
-    # DEF-T0050-2 & DEF-T0050-13: Test §7.1 permission approval without faked confirmation
+    # DEF-T0050-2/13/15: options never constitute proof of user consent.
     adapter = CodexCliAdapter(is_real_host=False)
 
-    # 1. Multi-option request without user confirmation token must NOT pick options[0] (DEF-T0050-13)
-    conf_prompt = ConfirmationRequest(
-        request_id="req_conf_01",
-        prompt="Execute git clean?",
-        options=("approve", "deny")
-    )
-    res_prompt = adapter.request_confirmation(conf_prompt)
-    assert res_prompt.is_confirmed is False
-    assert res_prompt.selected_option == "deny"
+    for options in (("approve", "deny"), ("allow",), ("user_confirmed",)):
+        with pytest.raises(AgentNotSupportedError, match="non-interactive"):
+            adapter.request_confirmation(ConfirmationRequest(
+                request_id="req_conf_01",
+                prompt="Execute sensitive operation?",
+                options=options,
+            ))
 
-    # 2. Verified user approval token
-    conf_user = ConfirmationRequest(
-        request_id="req_conf_02",
-        prompt="Delete production database?",
-        options=("user_confirmed",)
-    )
-    res_user = adapter.request_confirmation(conf_user)
-    assert res_user.is_confirmed is True
-    assert res_user.selected_option == "user_confirmed"
+    assert adapter.detect_capabilities().supports_interactive_confirmation == CapabilitySupport.UNSUPPORTED
 
-    # 3. 5-tuple permission approval caching strictly forbids cross-boundary reuse (DEF-T0050-13)
-    adapter.record_permission_approval("proj1", "/ws1", "sess1", "inv1", "op_write")
-    assert adapter.has_permission_approval("proj1", "/ws1", "sess1", "inv1", "op_write") is True
-    # Cross-project boundary
-    assert adapter.has_permission_approval("proj2", "/ws1", "sess1", "inv1", "op_write") is False
-    # Cross-workspace boundary
-    assert adapter.has_permission_approval("proj1", "/ws2", "sess1", "inv1", "op_write") is False
-    # Cross-session boundary
-    assert adapter.has_permission_approval("proj1", "/ws1", "sess2", "inv1", "op_write") is False
-    # Cross-invocation boundary
-    assert adapter.has_permission_approval("proj1", "/ws1", "sess1", "inv2", "op_write") is False
-    # Cross-operation boundary
-    assert adapter.has_permission_approval("proj1", "/ws1", "sess1", "inv1", "op_delete") is False
-
-    # 4. Whitespace request_id validation
+    # Request validation remains fail-closed before capability rejection.
     with pytest.raises(ValueError, match="cannot be empty"):
         adapter.request_confirmation(ConfirmationRequest(request_id="", prompt="p", options=()))
 
@@ -263,6 +240,16 @@ def test_codex_cli_adapter_distinct_thread_invocations_no_collision():
     assert inv_a == "01a03d0f-ed4f-7191-a8b5-4c8810ad207d:item_0"
     assert inv_b == "02b14e1a-fa5e-8202-b9c6-5d9921be318e:item_0"
     assert inv_a != inv_b
+
+
+def test_codex_cli_adapter_thread_without_item_has_no_invocation_identity():
+    # DEF-T0050-14: never fabricate item_0 from a thread-only event stream.
+    adapter = CodexCliAdapter(is_real_host=False)
+    _, _, _, thread_id, invocation_id, _ = adapter._parse_jsonl_output(
+        '{"type":"thread.started","thread_id":"thread-only"}\n', ""
+    )
+    assert thread_id == "thread-only"
+    assert invocation_id is None
 
 
 def test_codex_cli_adapter_exit_zero_missing_canonical_identity_fails_closed(monkeypatch):
@@ -335,6 +322,86 @@ def test_codex_cli_adapter_cancel_handle_ownership_validation():
     )
     with pytest.raises(AgentInvalidHandleError, match="does not match adapter"):
         adapter.cancel_agent(h_mismatch_real)
+
+
+def test_codex_cli_adapter_duplicate_session_and_handle_token_enforcement():
+    # DEF-T0050-16/17: no session overwrite and no same-instance handle forgery.
+    adapter = CodexCliAdapter(is_real_host=False)
+    request = AgentRequest(
+        session_id="owned_session",
+        prompt="Task",
+        role="DEV",
+        workspace_dir=os.path.abspath("."),
+    )
+    owned = adapter.dispatch_agent(request)
+    assert owned.invocation_token
+
+    with pytest.raises(AgentInvalidHandleError, match="already exists"):
+        adapter.dispatch_agent(request)
+
+    forged = AgentHandle(
+        session_id=owned.session_id,
+        host_id=owned.host_id,
+        status=owned.status,
+        is_real_host=owned.is_real_host,
+        adapter_instance_id=owned.adapter_instance_id,
+        invocation_token="attacker-token",
+    )
+    with pytest.raises(AgentInvalidHandleError, match="invocation_token"):
+        adapter.cancel_agent(forged)
+
+    assert adapter.cancel_agent(owned) is True
+
+    # Completed/cancelled history also reserves the identity permanently.
+    with pytest.raises(AgentInvalidHandleError, match="already exists"):
+        adapter.dispatch_agent(request)
+
+
+def test_codex_cli_adapter_concurrent_duplicate_session_has_one_winner():
+    # DEF-T0050-16: session reservation is atomic, not a check-then-write race.
+    adapter = CodexCliAdapter(is_real_host=False)
+
+    def dispatch_once(index):
+        try:
+            return adapter.dispatch_agent(AgentRequest(
+                session_id="contended_session",
+                prompt=f"Task {index}",
+                role="DEV",
+                workspace_dir=os.path.abspath("."),
+            ))
+        except AgentInvalidHandleError:
+            return None
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(dispatch_once, range(16)))
+
+    assert sum(result is not None for result in results) == 1
+
+
+def test_codex_cli_adapter_launch_failure_releases_only_own_reservation(monkeypatch):
+    # DEF-T0050-16: failed Popen does not leave a poisoned session registry.
+    adapter = CodexCliAdapter(executable_path=sys.executable, is_real_host=True)
+    request = AgentRequest(
+        session_id="retry_after_launch_failure",
+        prompt="Task",
+        role="DEV",
+        workspace_dir=os.path.abspath("."),
+    )
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("launch failed")))
+    with pytest.raises(RuntimeError, match="Failed to launch"):
+        adapter.dispatch_agent(request)
+    assert request.session_id not in adapter._running_sessions
+
+    class MockProcess:
+        pid = 12345
+        returncode = 0
+        def poll(self):
+            return 0
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: MockProcess())
+    handle = adapter.dispatch_agent(request)
+    assert handle.session_id == request.session_id
 
 
 def test_codex_cli_adapter_error_events_and_git_repo_check(tmp_path):
