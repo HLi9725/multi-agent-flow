@@ -39,7 +39,7 @@ from ..core.adapter_manifest import (
 )
 
 # Whitelist of permissible execution modes and sandbox policies
-ALLOWED_EXECUTION_MODES: Set[str] = {"accept-edits", "plan", "read-only", "workspace-write"}
+ALLOWED_EXECUTION_MODES: Set[str] = {"accept-edits", "plan"}
 ALLOWED_APPROVAL_POLICIES: Set[str] = {"request-review", "strict", "proceed-in-sandbox", "never", "on-request"}
 
 # Mapping from project roles to specialized Antigravity subagents
@@ -93,7 +93,7 @@ def _evaluate_single_command_risk(cmd_line: str, workspace_dir: Optional[str] = 
 
     # 2. Destructive operations
     if any(p in cmd_lower for p in (
-        "git reset", "git clean", "git rebase", "git branch -d", "git checkout -f",
+        "git reset", "git clean", "git rebase", "git checkout -f",
         "rm -rf", "del /f", "del /s", "remove-item -recurse"
     )):
         return "destructive"
@@ -113,16 +113,38 @@ def _evaluate_single_command_risk(cmd_line: str, workspace_dir: Optional[str] = 
         return "controlled_external"
 
     # 5. Check safe_local candidates
+    parts = cmd_norm.split()
+    if not parts:
+        return "safe_local"
+
     # A. Git read-only commands
-    if cmd_lower.startswith("git "):
-        parts = cmd_norm.split()
-        if len(parts) >= 2 and parts[1].lower() in SAFE_LOCAL_GIT_CMDS:
+    if parts[0].lower() == "git" and len(parts) >= 2:
+        git_sub = parts[1].lower()
+        if git_sub in ("status", "diff", "log", "show", "rev-parse"):
             if not any(f in cmd_lower for f in ("-f", "--force", "--hard", "--delete", "-d")):
                 return "safe_local"
+        elif git_sub == "branch":
+            # Safe read-only branch listing vs destructive branch creation/deletion
+            safe_branch_flags = {
+                "-l", "--list", "-a", "--all", "-r", "--remotes",
+                "--show-current", "--contains", "--no-contains", "-v", "-vv",
+                "--merged", "--no-merged", "-i", "--ignore-case", "--column", "--no-column"
+            }
+            branch_args = parts[2:]
+            if not branch_args or all(arg.lower() in safe_branch_flags for arg in branch_args):
+                return "safe_local"
+            return "destructive"
+        elif git_sub == "worktree":
+            # Safe read-only worktree listing vs destructive worktree add/remove/prune
+            if len(parts) >= 3 and parts[2].lower() == "list":
+                safe_wt_flags = {"--porcelain", "-v", "--verbose", "-z"}
+                wt_args = parts[3:]
+                if all(arg.lower() in safe_wt_flags for arg in wt_args):
+                    return "safe_local"
+            return "destructive"
 
     # B. Pytest commands with strict flag validation (DEF-T0052-3)
     if cmd_lower.startswith("python -m pytest") or cmd_lower.startswith("pytest"):
-        parts = cmd_norm.split()
         pytest_idx = 1 if parts[0].lower() == "pytest" else 3
         pytest_args = parts[pytest_idx:]
 
@@ -146,13 +168,32 @@ def _evaluate_single_command_risk(cmd_line: str, workspace_dir: Optional[str] = 
 
         return "safe_local"
 
-    # C. Safe local scripts
-    if cmd_lower.startswith("python scripts/") or cmd_lower.startswith("powershell -executionpolicy bypass -file scripts/"):
-        for prefix in SAFE_LOCAL_SCRIPT_PREFIXES:
-            if prefix in cmd_norm:
-                return "safe_local"
+    # C. Safe local scripts (Must match exact script path as first argument)
+    if parts[0].lower() in ("python", "python3", "python.exe"):
+        if len(parts) >= 2:
+            script_arg = parts[1].replace("\\", "/")
+            if script_arg in SAFE_LOCAL_SCRIPT_PREFIXES:
+                if not any(ch in cmd_lower for ch in ("eval(", "exec(", "os.system", "`", "$", ";", "|", "&")):
+                    return "safe_local"
+    elif cmd_lower.startswith("powershell"):
+        file_idx = -1
+        for i, p in enumerate(parts):
+            if p.lower() == "-file" and i + 1 < len(parts):
+                file_idx = i + 1
+                break
+        if file_idx > 0:
+            ps_script = parts[file_idx].replace("\\", "/")
+    # If it starts with an executable or command that did not pass safe whitelist
+    first_token = parts[0].lower() if parts else ""
+    if first_token in (
+        "pip", "npm", "curl", "wget", "sh", "bash", "cmd", "cmd.exe",
+        "node", "ruby", "perl", "sudo", "apt", "brew", "yum", "cargo", "go", "make",
+        "python", "python3", "python.exe", "powershell", "powershell.exe", "git", "pytest"
+    ) or any(first_token.endswith(ext) for ext in (".exe", ".bat", ".cmd", ".ps1", ".sh", ".py")):
+        return "controlled_external"
 
-    return "controlled_external"
+    # Standard natural language task prompt within workspace sandbox
+    return "safe_local"
 
 
 def evaluate_command_risk(cmd_line: str, workspace_dir: Optional[str] = None) -> str:
@@ -321,6 +362,7 @@ class AntigravityAdapter(BaseHostAdapter):
         """
         Build the exact argument list for `agy` execution.
         Validates roles, sandbox flags, subagents, and output format without bypassing permissions.
+        All option flags must precede `--print` in agy CLI syntax.
         """
         role = (request.role or "").upper().strip()
         requested_mode = None
@@ -332,7 +374,7 @@ class AntigravityAdapter(BaseHostAdapter):
                 raise AgentNotSupportedError(
                     f"Unauthorized execution mode '{requested_mode}'. Allowed whitelist: {sorted(ALLOWED_EXECUTION_MODES)}"
                 )
-            if role == "REVIEWER" and requested_mode not in ("plan", "read-only"):
+            if role == "REVIEWER" and requested_mode != "plan":
                 raise AgentNotSupportedError(
                     f"Role '{role}' is strictly read-only; cannot request writable execution mode '{requested_mode}'"
                 )
@@ -346,14 +388,14 @@ class AntigravityAdapter(BaseHostAdapter):
         # Determine target subagent
         agent_name = ROLE_AGENT_MAP.get(role, "flow-dev" if role in ("DEV", "BUILDER") else "self")
 
-        cmd = [
-            self._executable_path or "agy",
-            "--print",
-            "--output-format", "stream-json",
-            "--add-dir", request.workspace_dir,
-            "--agent", agent_name,
-            "--mode", exec_mode,
-        ]
+        cmd = [self._executable_path or "agy"]
+
+        if request.workspace_dir:
+            cmd.extend(["--add-dir", request.workspace_dir])
+        if agent_name:
+            cmd.extend(["--agent", agent_name])
+        if exec_mode:
+            cmd.extend(["--mode", exec_mode])
 
         # Sandbox protection
         use_sandbox = self._default_sandbox_mode
@@ -366,7 +408,8 @@ class AntigravityAdapter(BaseHostAdapter):
         if isinstance(request.extra_context, Mapping) and request.extra_context.get("project_id"):
             cmd.extend(["--project", str(request.extra_context["project_id"])])
 
-        cmd.append(request.prompt)
+        cmd.extend(["--output-format", "stream-json"])
+        cmd.extend(["--print", request.prompt])
         return cmd
 
     def dispatch_agent(self, request: AgentRequest) -> AgentHandle:
@@ -381,6 +424,58 @@ class AntigravityAdapter(BaseHostAdapter):
         session_id = request.session_id.strip()
         invocation_id = f"inv-{uuid.uuid4().hex[:12]}"
         invocation_token = secrets.token_urlsafe(32)
+
+        # 5-Tier Permission check & 7-tuple cache integration
+        risk = evaluate_command_risk(request.prompt, request.workspace_dir)
+        project_id = "default_project"
+        auth_context = "user_local_ctx"
+        permission_boundary = "workspace_read" if risk == "safe_local" else "workspace_write"
+        if isinstance(request.extra_context, Mapping):
+            project_id = str(request.extra_context.get("project_id", project_id))
+            auth_context = str(request.extra_context.get("auth_context", auth_context))
+            permission_boundary = str(request.extra_context.get("permission_boundary", permission_boundary))
+
+        command_family = f"{risk}:{request.role or 'default'}"
+        has_approval = self.has_permission_approval(
+            project_id=project_id,
+            auth_context=auth_context,
+            session_id=session_id,
+            workspace_dir=request.workspace_dir,
+            command_family=command_family,
+            permission_boundary=permission_boundary,
+        )
+
+        if risk == "safe_local":
+            if not has_approval:
+                self.record_permission_approval(
+                    project_id=project_id,
+                    auth_context=auth_context,
+                    session_id=session_id,
+                    workspace_dir=request.workspace_dir,
+                    command_family=command_family,
+                    permission_boundary=permission_boundary,
+                )
+        else:
+            explicit_approved = False
+            if isinstance(request.extra_context, Mapping):
+                explicit_approved = bool(
+                    request.extra_context.get("approved")
+                    or request.extra_context.get("user_confirmed")
+                    or request.extra_context.get("approval_token")
+                )
+            if not has_approval and not explicit_approved:
+                raise AgentNotSupportedError(
+                    f"Operation classified as '{risk}' requires explicit user permission approval for session '{session_id}'."
+                )
+            elif explicit_approved and not has_approval:
+                self.record_permission_approval(
+                    project_id=project_id,
+                    auth_context=auth_context,
+                    session_id=session_id,
+                    workspace_dir=request.workspace_dir,
+                    command_family=command_family,
+                    permission_boundary=permission_boundary,
+                )
 
         cmd = self.build_antigravity_exec_command(request)
 
@@ -425,6 +520,7 @@ class AntigravityAdapter(BaseHostAdapter):
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     stdin=subprocess.PIPE,
+                    cwd=request.workspace_dir,  # Project directory isolation
                     text=True,
                     encoding="utf-8",
                     errors="replace",
@@ -786,7 +882,7 @@ class AntigravityAdapter(BaseHostAdapter):
 
 def create_antigravity_manifest(
     adapter_id: str = "antigravity",
-    verified_version: str = "1.1.8"
+    verified_version: str = "1.1.21"
 ) -> AdapterManifest:
     """Create the official AdapterManifest for Google Antigravity Reference Adapter."""
     pv_win = PlatformVerification(

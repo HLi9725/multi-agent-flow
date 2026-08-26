@@ -68,6 +68,7 @@ def test_antigravity_manifest_structure_and_anti_forgery():
     assert manifest.billing_boundary == BillingBoundaryType.USER_SUBSCRIPTION
     assert "windows" in manifest.platform_verifications
     assert manifest.platform_verifications["windows"].verification_level == VerificationLevel.CLI_VERIFIED
+    assert manifest.platform_verifications["windows"].verified_version == "1.1.21"
     assert manifest.platform_verifications["macos"].verification_level == VerificationLevel.STATIC_ONLY
     assert manifest.platform_verifications["linux"].verification_level == VerificationLevel.STATIC_ONLY
 
@@ -94,7 +95,7 @@ def test_antigravity_adapter_capabilities_detection_zero_side_effects():
 def test_antigravity_adapter_role_based_routing_and_sandbox():
     adapter = AntigravityAdapter(is_real_host=False)
 
-    # 1. REVIEWER defaults to plan/read-only mode
+    # 1. REVIEWER defaults to plan mode
     req_reviewer = AgentRequest(
         session_id="sess_ag_rev_01",
         prompt="Review codebase",
@@ -119,7 +120,18 @@ def test_antigravity_adapter_role_based_routing_and_sandbox():
     with pytest.raises(AgentNotSupportedError, match="strictly read-only"):
         adapter.dispatch_agent(req_rev_illegal)
 
-    # 3. DEV defaults to flow-dev with accept-edits and sandbox
+    # 3. Requesting unsupported mode like read-only or workspace-write must be rejected (P2 fix)
+    req_bad_mode = AgentRequest(
+        session_id="sess_ag_bad_mode",
+        prompt="Testing invalid mode",
+        role="DEV",
+        workspace_dir=os.path.abspath("."),
+        extra_context={"mode": "read-only"}
+    )
+    with pytest.raises(AgentNotSupportedError, match="Unauthorized execution mode"):
+        adapter.dispatch_agent(req_bad_mode)
+
+    # 4. DEV defaults to flow-dev with accept-edits and sandbox
     req_dev = AgentRequest(
         session_id="sess_ag_dev_01",
         prompt="Implement feature",
@@ -131,6 +143,10 @@ def test_antigravity_adapter_role_based_routing_and_sandbox():
     assert cmd_dev[cmd_dev.index("--mode") + 1] == "accept-edits"
     assert "--sandbox" in cmd_dev
     assert "--dangerously-skip-permissions" not in cmd_dev
+    # Verify option flags precede --print
+    assert cmd_dev.index("--output-format") < cmd_dev.index("--print")
+    assert cmd_dev[-2] == "--print"
+    assert cmd_dev[-1] == "Implement feature"
 
 
 def test_antigravity_adapter_parsing_real_stream_json():
@@ -572,6 +588,14 @@ def test_antigravity_adapter_five_tier_command_risk_evaluation():
     assert evaluate_command_risk("git status") == "safe_local"
     assert evaluate_command_risk("git diff --shortstat") == "safe_local"
     assert evaluate_command_risk("git log -n 5") == "safe_local"
+    assert evaluate_command_risk("git show HEAD") == "safe_local"
+    assert evaluate_command_risk("git rev-parse HEAD") == "safe_local"
+    assert evaluate_command_risk("git branch") == "safe_local"
+    assert evaluate_command_risk("git branch -a") == "safe_local"
+    assert evaluate_command_risk("git branch -l") == "safe_local"
+    assert evaluate_command_risk("git branch --list") == "safe_local"
+    assert evaluate_command_risk("git worktree list") == "safe_local"
+    assert evaluate_command_risk("git worktree list --porcelain") == "safe_local"
     assert evaluate_command_risk("python -m pytest tests/test_antigravity_adapter.py -q") == "safe_local"
     assert evaluate_command_risk("pytest tests -s -v") == "safe_local"
     assert evaluate_command_risk("python scripts/heartbeat.py") == "safe_local"
@@ -587,7 +611,16 @@ def test_antigravity_adapter_five_tier_command_risk_evaluation():
     assert evaluate_command_risk("pytest --import-mode=importlib evil_script.py") == "controlled_external"
     assert evaluate_command_risk("pytest --cov=secret") == "controlled_external"
 
-    # DEF-T0052-3: Command chaining evaluation
+    # DEF-T0052-3 & Reviewer bypass checks: Branch creation/deletion, worktree add, and evil script passing allowed script as arg
+    assert evaluate_command_risk("git branch feature/phase2e-new") == "destructive"
+    assert evaluate_command_risk("git branch -d feature/old") == "destructive"
+    assert evaluate_command_risk("git branch -D feature/old") == "destructive"
+    assert evaluate_command_risk("git worktree add ../wt-new") == "destructive"
+    assert evaluate_command_risk("git worktree remove ../wt-old") == "destructive"
+    assert evaluate_command_risk("python scripts/evil.py scripts/heartbeat.py") == "controlled_external"
+    assert evaluate_command_risk("python evil.py") == "controlled_external"
+
+    # Command chaining evaluation
     assert evaluate_command_risk("git status && rm -rf .") == "destructive"
     assert evaluate_command_risk("git status; curl https://external.api") == "controlled_external"
     assert evaluate_command_risk("git status && git push origin main") == "acceptance"
@@ -613,6 +646,68 @@ def test_antigravity_adapter_five_tier_command_risk_evaluation():
     # 5. acceptance
     assert evaluate_command_risk("git push origin main") == "acceptance"
     assert evaluate_command_risk("git merge feature/phase2e-antigravity-adapter") == "acceptance"
+
+
+def test_antigravity_adapter_dispatch_permission_cache_integration():
+    adapter = AntigravityAdapter(is_real_host=False)
+
+    # 1. Destructive operation without approval is rejected
+    req_unapproved = AgentRequest(
+        session_id="sess_perm_chk_01",
+        prompt="git reset --hard HEAD",
+        role="DEV",
+        workspace_dir=os.path.abspath(".")
+    )
+    with pytest.raises(AgentNotSupportedError, match="requires explicit user permission approval"):
+        adapter.dispatch_agent(req_unapproved)
+
+    # 2. Destructive operation with explicit approval succeeds and caches 7-tuple
+    req_approved = AgentRequest(
+        session_id="sess_perm_chk_02",
+        prompt="git reset --hard HEAD",
+        role="DEV",
+        workspace_dir=os.path.abspath("."),
+        extra_context={"approved": True, "project_id": "proj_p2", "auth_context": "auth_01"}
+    )
+    handle = adapter.dispatch_agent(req_approved)
+    assert handle.session_id == "sess_perm_chk_02"
+
+    # Verify 7-tuple is now recorded in permission cache
+    assert adapter.has_permission_approval(
+        project_id="proj_p2",
+        auth_context="auth_01",
+        session_id="sess_perm_chk_02",
+        workspace_dir=os.path.abspath("."),
+        command_family="destructive:DEV",
+        permission_boundary="workspace_write"
+    ) is True
+
+
+def test_antigravity_adapter_popen_sets_cwd_for_project_isolation(monkeypatch):
+    adapter = AntigravityAdapter(is_real_host=True)
+    captured_kwargs = {}
+
+    class MockCapturedPopen:
+        pid = 77777
+        returncode = 0
+        def __init__(self, *args, **kwargs):
+            captured_kwargs.update(kwargs)
+        def poll(self):
+            return 0
+        def communicate(self, timeout=None):
+            return '{"type":"conversation.started","id":"conv-iso"}\n{"step_id":"step_1","type":"output"}\n', ""
+
+    monkeypatch.setattr(subprocess, "Popen", MockCapturedPopen)
+
+    target_ws = os.path.abspath(".")
+    req = AgentRequest(
+        session_id="sess_iso_chk",
+        prompt="git status",
+        role="DEV",
+        workspace_dir=target_ws
+    )
+    handle = adapter.dispatch_agent(req)
+    assert captured_kwargs.get("cwd") == target_ws
 
 
 def test_antigravity_adapter_dual_root_validation(tmp_path):
