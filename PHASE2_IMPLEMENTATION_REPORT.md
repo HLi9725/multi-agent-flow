@@ -158,8 +158,8 @@
 - **实施范围**: 仅执行第二阶段 2D-1（AdapterManifest、AdapterRegistry、验证等级、能力解析与通用合规测试套件）。
 - **基线提交**: 21828a88ae0aa65b7cf84ea9b1e4244737100892
 - **开发分支**: feature/phase2d-1-generic-adapters
-- **本轮核心修复提交**: 93f7fa67e780812412d8464082e5154868c88fe3
-- **结论**: 2D-1 五项通用基础能力及 DEF-T0049-12～14 返工已完成开发验证，等待独立 Reviewer 与 QA 准出。核心代码中零客户端名称硬编码，严格遵循 Fail-Closed 与逐平台验证隔离。未实施任何真实 Codex/Antigravity Adapter，未进入 2D-2、2E、2F、第三阶段或第四阶段。
+- **本轮核心修复提交**: 8f9c36d2d90edbfd575a16af4f0243d95ff7d656
+- **结论**: 2D-1 五项通用基础能力及 DEF-T0049-15～16 返工已完成开发验证，等待角色隔离 Reviewer 与 QA 准出。核心代码中零客户端名称硬编码，严格遵循 Fail-Closed 与逐平台验证隔离。未实施任何真实 Codex/Antigravity Adapter，未进入 2D-2、2E、2F、第三阶段或第四阶段。
 
 ### 核心实现方案
 1. **不可变 AdapterManifest**:
@@ -180,12 +180,12 @@
 
 ### 测试记录（最新真实数据）
 - **2D-1 定向测试**:
-  - `python -m pytest tests/test_adapter_manifest.py tests/test_adapter_registry.py tests/test_adapter_conformance.py -q -rs` -> `32 passed in 1.66s`
-  - **总计**: `32 passed in 1.66s` (0 failed, 0 skipped)
+  - `python -m pytest tests/test_adapter_manifest.py tests/test_adapter_registry.py tests/test_adapter_conformance.py -q -rs` -> `36 passed in 1.68s`
+  - **总计**: `36 passed in 1.68s` (0 failed, 0 skipped)
 - **2A/2B/2C 关联兼容测试**:
-  - `python -m pytest tests/test_host_adapter.py tests/test_evidence.py tests/test_worktree_manager.py -q -rs` -> `60 passed in 25.65s` (0 failed, 0 skipped)
+  - `python -m pytest tests/test_host_adapter.py tests/test_evidence.py tests/test_worktree_manager.py -q -rs` -> `60 passed in 20.20s` (0 failed, 0 skipped)
 - **全量测试**:
-  - `python -m pytest tests -q -rs` -> `318 passed in 62.27s` (0 failed, 0 skipped, 100% 通过)
+  - `python -m pytest tests -q -rs` -> `322 passed in 62.50s` (0 failed, 0 skipped, 100% 通过)
 - **代码规范**:
   - `git diff --check` -> 退出码 0，零尾随空白错误
 
@@ -224,7 +224,7 @@
 3. **[DEF-T0049-10] 完整实现多候选策略解析器 (deterministic / priority / first_match)**:
    - `first_match` 策略：按 `adapter_id` 字母序确定性选取首个匹配候选。
    - `priority` 策略：按 Manifest `extra.priority` 权重优先决策；若最高分存在并列平局，则返回 `AMBIGUOUS`。
-   - `deterministic` 策略：多阶段严格排序（验证等级权重 -> 优先级），若顶层仍平局则 Fail-Closed 返回 `AMBIGUOUS`。
+   - `deterministic` 策略的初版曾使用验证等级权重；该设计已在 DEF-T0049-13 中删除并由多候选直接 `AMBIGUOUS` 取代。
 4. **[DEF-T0049-11] 增加 Auth 与 Billing 边界声明与过滤**:
    - `AdapterResolutionRequest` 引入 `allowed_auth_boundaries` 与 `allowed_billing_boundaries` 强类型白名单校验。
    - `resolve()` 严格对比 Manifest 的 `auth_boundary` 与 `billing_boundary`，不符合请求边界声明的候选一律被排除。
@@ -232,8 +232,7 @@
 #### DEF-T0049-12 ~ 14 修复（Codex 最终 QA 返工）
 1. **[DEF-T0049-12] 零副作用检查改为线程作用域审计隔离**:
    - 删除对 `builtins`、`io`、`os`、`pathlib`、`subprocess`、`socket` 等进程级函数的动态重绑。
-   - 使用一次安装、默认休眠的 Python Audit Hook，并用 `threading.local()` 仅激活当前能力探测线程；文件写入、进程创建和网络操作仍然 Fail-Closed，无关线程的合法临时目录操作不受影响。
-   - 新增并发对抗测试：能力探测阻塞期间，另一线程可正常执行 `Path.write_text()`；被测 Adapter 的 `open`、`io.open`、`Path.write_text` 与 `subprocess.run` 仍全部被拦截。
+   - 本轮曾使用 `threading.local()` 激活当前能力探测线程；随后 DEF-T0049-15 证明派生子线程可绕过，该实现已由专用子进程隔离替代。
 2. **[DEF-T0049-13] 移除验证路径数值权重**:
    - 删除 `VERIFICATION_LEVEL_WEIGHTS`，不再把 `native_verified`、`cli_verified`、`mcp_verified`、`static_only` 解释为可比较的高低等级。
    - 默认 `deterministic` 在多个候选满足条件时返回 `AMBIGUOUS`；显式 `priority` 只比较 Manifest 的调用方优先级，显式 `first_match` 只按 Adapter ID 确定性选择。
@@ -243,7 +242,16 @@
    - 非匿名认证边界必须声明 `auth_context_id`；计量或宿主绑定计费边界必须声明 `billing_context_id`；匿名/不计费边界禁止携带伪上下文 ID。
    - Resolver 对两类上下文 ID 执行 1:1 精确匹配；相同边界枚举但不同账号、订阅或计费上下文，以及请求省略 ID，均 Fail-Closed 返回 `UNSUPPORTED`。
 
+#### DEF-T0049-15 ~ 16 修复（Codex 角色隔离复审返工）
+1. **[DEF-T0049-15] Adapter 派生线程纳入专用进程隔离**:
+   - `assert_zero_side_effects()` 不再在宿主进程安装审计钩子；Adapter 通过 `spawn` 在一次性专用进程中重建，Audit Hook 在该进程内全局启用，因此 Adapter 派生的所有线程共享同一阻断边界。
+   - 专用进程完成后使用硬退出，防止延迟或后台线程在门禁关闭后继续运行；残留线程、超时、不可序列化或非模块级 Adapter 均 Fail-Closed。
+   - 无关宿主线程完全不进入隔离进程的审计上下文，可在探测期间正常执行合法临时目录写入。
+2. **[DEF-T0049-16] 文件系统变更审计事件补齐**:
+   - 拦截集合覆盖写模式 `open`、`mkdir/remove/rmdir/rename/chmod/truncate`，并补齐 `link/symlink/utime/chown`、环境变更、进程创建、注册表写入和网络事件。
+   - 新增 Adapter 子线程写入、hardlink、symlink、utime、不可 spawn 类五组对抗测试；所有操作均在 OS 实际执行前被阻断，临时目录文件树和 mtime 保持不变。
+
 ### 本轮测试看板哈希说明
-- 代码工作树测试数据 `user_data/board.json`：全量测试前 `6C67C1FB0DD82A985232C344093CAF141CB255547EC5EFD8CBED870167472FC1`，测试后 `9CFC14BE2A04C4D64F015932ECFBFF4B017821DBFEFD87B69875F21B8B8A4B19`。
+- 代码工作树测试数据 `user_data/board.json`：本轮全量测试前 `9CFC14BE2A04C4D64F015932ECFBFF4B017821DBFEFD87B69875F21B8B8A4B19`，测试后 `3FD47FA4038F1B0B1B381148CB075CE49D0ADCAE00F1C214F1725D886B843295`。
 - 该文件属于代码工作树的非权威测试数据且未进入 Git 修改集；未直接编辑、覆盖或物理删除。
 - 权威看板位于阶段集成工作树，T0049 在本轮开发期间保持 `进行中 / 李开发`。
