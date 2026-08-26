@@ -14,6 +14,7 @@ from scripts._lib.core.worktree_schema import (
     WorktreeError, WorktreeSecurityError, WorktreeGitError
 )
 from scripts._lib.core.worktree_manager import WorktreeManager
+import scripts._lib.core.worktree_manager as worktree_manager_module
 
 @pytest.fixture
 def test_repo(tmp_path):
@@ -144,6 +145,29 @@ def test_request_field_fail_closed_validation(manager, test_repo):
     # Non-string type
     with pytest.raises(WorktreeSecurityError, match="must be a string"):
         manager.create_worktree(WorktreeRequest(123, "t", "DEV", "s", commit_hash))
+
+def test_worktree_id_fixed_length_and_opaque_host_session(manager, test_repo):
+    _, commit_hash = test_repo
+    request = WorktreeRequest(
+        project_id="p" * 128,
+        task_id="t" * 128,
+        actor_role="R" * 128,
+        host_session_id="fake-session:123e4567-e89b-12d3-a456-426614174000",
+        baseline_commit=commit_hash,
+    )
+
+    worktree_id = manager._compute_worktree_id(
+        request.project_id,
+        request.task_id,
+        request.actor_role,
+        request.host_session_id,
+    )
+
+    assert len(worktree_id) <= 128
+    assert manager._safe_path(worktree_id).endswith(os.path.normcase(worktree_id))
+    descriptor = manager.create_worktree(request)
+    assert descriptor.request.host_session_id == request.host_session_id
+    assert manager.inspect(descriptor.worktree_id).request == request
 
 def test_inspect_illegal_id_zero_filesystem_access(manager, monkeypatch):
     # DEF-T0023-28: inspect must validate ID before touching filesystem
@@ -284,6 +308,50 @@ def test_junction_escape(tmp_path, test_repo):
 
     with pytest.raises(WorktreeSecurityError, match="traversal|already exists"):
         manager.create_worktree(req)
+
+def test_registry_junction_within_controlled_root_is_rejected(tmp_path, test_repo):
+    repo_path, _ = test_repo
+    root_dir = tmp_path / "controlled-registry"
+    root_dir.mkdir()
+    manager = WorktreeManager(str(root_dir), repo_path)
+    foreign_registry = root_dir / "foreign-registry"
+    foreign_registry.mkdir()
+
+    os.rmdir(manager.registry_dir)
+    if os.name == 'nt':
+        subprocess.run(
+            ["cmd", "/c", "mklink", "/J", manager.registry_dir, str(foreign_registry)],
+            check=True,
+        )
+    else:
+        os.symlink(foreign_registry, manager.registry_dir, target_is_directory=True)
+
+    with pytest.raises(WorktreeSecurityError, match="symbolic link or Junction"):
+        manager.list_worktrees("proj")
+
+def test_posix_temp_unlink_failure_is_reported_with_real_retention(manager, tmp_path, monkeypatch):
+    tmp_file = tmp_path / "owned-temp.json"
+    meta_file = tmp_path / "published.json"
+    tmp_file.write_text("evidence", encoding="utf-8")
+    real_unlink = os.unlink
+
+    def fail_owned_temp_unlink(path):
+        if os.path.normcase(os.path.abspath(path)) == os.path.normcase(os.path.abspath(tmp_file)):
+            raise OSError("simulated unlink denial")
+        return real_unlink(path)
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(worktree_manager_module.os, "name", "posix")
+        patcher.setattr(worktree_manager_module.os, "unlink", fail_owned_temp_unlink)
+        with pytest.raises(WorktreeError, match="temporary link cleanup failed") as exc_info:
+            manager._publish_registry_create_if_absent(str(tmp_file), str(meta_file))
+
+    assert exc_info.value.recovery_required is True
+    assert exc_info.value.branch_retained is True
+    assert exc_info.value.registry_retained is True
+    assert exc_info.value.tmp_retained is True
+    assert tmp_file.exists()
+    assert meta_file.exists()
 
 def test_meta_json_integrity(manager, test_repo):
     _, commit_hash = test_repo

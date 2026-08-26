@@ -68,10 +68,12 @@
    - 测试涵盖全场景: 绝对路径逃逸防御、并发覆盖防护、非法命令注入拦截、清理不落盘、linked worktree 场景验证、Registry 碰撞保全、短写防护、严格 Schema 校验、原子发布并发隔离、双仓库身份绑定校验、无歧义隔离标识边界测试、非法 ID 零文件系统访问验证和仓库子目录初始化规范化核对。
 
 ### 测试记录（最新真实数据）
-- **定向工作树测试**: `python -m pytest tests/test_worktree_manager.py -q -rs` -> `30 passed in 20.53s` (0 failed, 0 skipped)
-- **定向环境测试**: `python -m pytest tests/test_host_adapter.py tests/test_evidence.py -q -rs` -> `25 passed in 1.18s` (0 failed, 0 skipped)
-- **全量测试**: `python -m pytest tests -q -rs` -> `281 passed in 62.10s` (0 failed, 0 skipped, exit code 0)
+- **定向工作树测试**: `python -m pytest tests/test_worktree_manager.py -q -rs` -> `33 passed in 20.71s` (0 failed, 0 skipped, exit code 0)
+- **定向环境测试**: `python -m pytest tests/test_host_adapter.py tests/test_evidence.py -q -rs` -> `25 passed in 1.49s` (0 failed, 0 skipped, exit code 0)
+- **全量测试**: `python -m pytest tests -q -rs` -> `284 passed in 62.70s` (0 failed, 0 skipped, exit code 0)
 - **代码规范**: `git diff --check` -> 退出码 0，零尾随空白错误
+- **独立对抗复现**: 仓库外脚本验证合法长字段、2A `fake-session:<uuid>` 和 `.registry` Junction 三条攻击/兼容路径；修复前 `3 failed`，修复后 `0 failed`。
+- **看板哈希链**: 测试前 `FDEA4E67D8D4ECFF194AE23A33E74C28E7E9BC9C649101C070E42E905C6444FB`；全量测试后 `38B7325955F6E7FACC5ABEE4149FBA9185BB33EE5084F72FA2FBC75A540794E7`；测试污染卡 T0045 经合法 CLI 软取消后 `B46B68AE6BD479BCEB25F41D0368B29FD41C3AB5AB6974E263DC81973F74A398`，未复制或直接编辑 `board.json`。
 
 ### 2C 历次返工修复记录
 
@@ -86,14 +88,14 @@
 
 #### DEF-T0023-10 ~ 11 修复（含历史缺陷标注）
 1. **[DEF-T0023-10] 完善 Registry 根类型校验**: 在 `inspect()` 中增加 `isinstance(data, dict)` 断言，封堵由于非对象 JSON 触发 `AttributeError` 的漏洞。
-2. **[DEF-T0023-11] [历史阶段性尝试/已在 DEF-T0023-14 彻底废弃]**: 该阶段曾尝试在失败路径执行 `os.unlink` 清理元数据；后因引入路径竞态 (TOCTOU)，已在 DEF-T0023-14 及后续版本中彻底废除一切自动 `unlink`，全面转为保留现场的 Fail-Closed 恢复架构。
+2. **[DEF-T0023-11] [历史阶段性尝试/已在 DEF-T0023-14 彻底废弃]**: 该阶段曾尝试在失败路径执行 `os.unlink` 清理已发布元数据；后因引入路径竞态 (TOCTOU)，已在 DEF-T0023-14 及后续版本中废除对最终 Registry、分支和 Worktree 的自动删除。POSIX 原子发布仍仅对本进程创建的临时硬链接名称执行 `unlink`，不删除已发布 Registry。
 
 #### DEF-T0023-12 ~ 13 修复（含历史缺陷标注）
 1. **[DEF-T0023-12] [历史阶段性尝试/已在 DEF-T0023-14 彻底废弃]**: 该阶段曾尝试通过 `lstat/fstat` 校验文件身份后执行回滚；后经独立复现证实路径仍存在读取后删除前的 TOCTOU 窗口，已在 DEF-T0023-14 中彻底弃用回滚删除逻辑。
 2. **[DEF-T0023-13] 高强度的 Schema 与提交真实性防御**: 在 `inspect()` 加入字典边界与类型校验。拒绝包含不合理 Float 的假造时间，对 `baseline_commit` 进行底层 `git rev-parse` 严格双重校验。
 
 #### DEF-T0023-14 ~ 17 修复
-1. **[DEF-T0023-14] 彻底消除回滚 TOCTOU 竞态**: 摒弃一切基于路径解析的删除逻辑，确立零 unlink 架构：1) 校验通过并生成唯一 Git branch（跨进程原子锁）；2) 以 `O_EXCL` 创建 Registry；3) 若写入或 worktree add 失败，原样保留已创建的 branch 和 Registry 现场以供审计与人工干预，在 `WorktreeError` 中附带结构化字段 `recovery_required=True, branch_retained=True, registry_retained=True`。
+1. **[DEF-T0023-14] 彻底消除已发布资源回滚的 TOCTOU 竞态**: 摒弃对最终 Registry、分支和 Worktree 的自动删除：1) 校验通过并生成唯一 Git branch（跨进程原子锁）；2) 以 `O_EXCL` 创建 Registry；3) 若写入或 worktree add 失败，原样保留已创建的 branch 和 Registry 现场以供审计与人工干预，在 `WorktreeError` 中附带结构化字段 `recovery_required=True, branch_retained=True, registry_retained=True`。POSIX 发布完成后只移除本进程拥有的临时硬链接名称。
 2. **[DEF-T0023-15] Registry os.write 短写保护与持久化**: 使用 `memoryview` 与循环 `write-all` 模式对 `os.write` 进行字节确认，写完后强制 `os.fsync`，最后才启动 `git worktree add`。
 3. **[DEF-T0023-16] 严苛的小写 Canonical SHA-1 同态断言**: 入参强制使用 `^[0-9a-f]{40}$` 正则严格校验，禁止隐式 `lower()` 宽容转换，`git rev-parse` 解析结果必须与输入 SHA 完全相同。
 4. **[DEF-T0023-17] 卫生清理与测试隔离**: 清理临时脚本与未跟踪残留，测试数据全面使用 `copy.deepcopy` 防污染。
@@ -134,3 +136,13 @@
    - 恢复路径注入拒绝断言、添加 Windows 与 POSIX 绝对路径载荷测试、添加非法 ID 零文件访问 mock 断言、子目录规范化及多 clone 身份核对测试。
 5. **[DEF-T0023-31] 流程真实性与测试退出码核验**:
    - 全量测试通过并确认退出码为 0，看板状态与处理人经磁盘直接验真。
+
+#### DEF-T0023-32 ~ 35 修复（Codex 独立复审返工）
+1. **[DEF-T0023-32] 固定长度、完整摘要的 Worktree ID**:
+   - 输入字段仍以 Canonical JSON 绑定，但 ID 改为有限长度可读前缀加完整 SHA-256 摘要；所有通过字段校验的请求都能生成符合 `_safe_path` 上限的 ID，不再出现“字段合法、组合 ID 非法”。
+2. **[DEF-T0023-33] Host 会话标识保持不透明**:
+   - `host_session_id` 使用独立校验器，允许 2A Host 契约定义的 `fake-session:<uuid>` 命名空间，同时继续拒绝空白、控制字符、路径分隔符、相对路径段、前导选项和命令注入载荷。
+3. **[DEF-T0023-34] Registry 目录本体强绑定**:
+   - 构造、创建、检查和列举入口均重新验证 `.registry` 的绝对路径与 `realpath` 完全一致；即使 Junction 目标仍位于 `controlled_root` 内，也会 Fail-Closed 拒绝。
+4. **[DEF-T0023-35] POSIX 临时硬链接清理证据准确化**:
+   - 原子发布成功后若本进程临时硬链接名称清理失败，不再吞掉异常；改为报告 `registry_retained=True`、`tmp_retained=True` 并停止后续 Worktree 创建，保留真实现场供审计。

@@ -33,6 +33,26 @@ def _validate_request_field(val: Any, field_name: str) -> str:
         raise WorktreeSecurityError(f"Invalid {field_name} format: {val}")
     return val
 
+
+def _validate_host_session_id(val: Any) -> str:
+    """Validate an opaque Host session identifier without treating it as a path."""
+    field_name = "host_session_id"
+    if not isinstance(val, str):
+        raise WorktreeSecurityError(f"Invalid {field_name}: must be a string, got {type(val).__name__}")
+    if not val:
+        raise WorktreeSecurityError(f"Invalid {field_name}: cannot be empty")
+    if not val.strip():
+        raise WorktreeSecurityError(f"Invalid {field_name}: cannot be whitespace-only")
+    if re.search(r'[\x00-\x1f\x7f]', val):
+        raise WorktreeSecurityError(f"Invalid {field_name}: contains control characters")
+    if '/' in val or '\\' in val or '..' in val:
+        raise WorktreeSecurityError(f"Invalid {field_name}: path segments are forbidden: {val}")
+    if val.startswith('-'):
+        raise WorktreeSecurityError(f"Invalid {field_name}: leading options are forbidden: {val}")
+    if not re.fullmatch(r'[a-zA-Z0-9_][a-zA-Z0-9_\-\.:@]{0,511}', val):
+        raise WorktreeSecurityError(f"Invalid {field_name} format: {val}")
+    return val
+
 class WorktreeManager:
     def __init__(self, controlled_root: str, target_repo_path: str):
         self.controlled_root = os.path.normcase(os.path.realpath(os.path.abspath(controlled_root)))
@@ -49,6 +69,7 @@ class WorktreeManager:
         os.makedirs(self.controlled_root, exist_ok=True)
         self.registry_dir = os.path.join(self.controlled_root, ".registry")
         os.makedirs(self.registry_dir, exist_ok=True)
+        self._validate_registry_boundary()
 
         self._repo_git_dir = self._get_absolute_git_dir(self.target_repo_root)
         self.git_common_dir = self._get_common_dir(self.target_repo_root)
@@ -63,7 +84,7 @@ class WorktreeManager:
         _validate_request_field(project_id, "project_id")
         _validate_request_field(task_id, "task_id")
         _validate_request_field(actor_role, "actor_role")
-        _validate_request_field(host_session_id, "host_session_id")
+        _validate_host_session_id(host_session_id)
 
         payload = json.dumps({
             "actor_role": actor_role,
@@ -71,9 +92,20 @@ class WorktreeManager:
             "project_id": project_id,
             "task_id": task_id
         }, sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode('utf-8')
-        digest = hashlib.sha256(payload).hexdigest()[:16]
+        digest = hashlib.sha256(payload).hexdigest()
 
-        return f"{project_id}_{task_id}_{actor_role}_{digest}"
+        # Prefixes remain readable, while the complete digest keeps the ID fixed
+        # length and binds every untruncated input field without delimiter ambiguity.
+        return f"{project_id[:12]}_{task_id[:12]}_{actor_role[:8]}_{digest}"
+
+    def _validate_registry_boundary(self) -> str:
+        expected = os.path.normcase(os.path.abspath(self.registry_dir))
+        actual = os.path.normcase(os.path.realpath(self.registry_dir))
+        if actual != expected:
+            raise WorktreeSecurityError("Registry directory is a symbolic link or Junction.")
+        if os.path.commonpath([self.controlled_root, actual]) != self.controlled_root:
+            raise WorktreeSecurityError("Registry path traversal detected.")
+        return actual
 
     def _publish_registry_create_if_absent(self, tmp_path: str, meta_path: str):
         if os.name == 'nt':
@@ -82,8 +114,16 @@ class WorktreeManager:
             os.link(tmp_path, meta_path)
             try:
                 os.unlink(tmp_path)
-            except OSError:
-                pass
+            except OSError as e:
+                raise WorktreeError(
+                    "Registry published but owned temporary link cleanup failed: "
+                    f"{str(e)}. recovery_required=True, branch_retained=True, "
+                    "registry_retained=True, tmp_retained=True",
+                    recovery_required=True,
+                    branch_retained=True,
+                    registry_retained=True,
+                    tmp_retained=True,
+                )
 
     def _run_git(self, cwd: str, args: List[str]) -> str:
         cmd = ["git"] + args
@@ -166,6 +206,7 @@ class WorktreeManager:
             raise WorktreeSecurityError(f"Worktree path already exists: {path}")
 
         meta_path = os.path.join(self.registry_dir, f"{worktree_id}.json")
+        self._validate_registry_boundary()
         desc = WorktreeDescriptor(
             worktree_id=worktree_id,
             absolute_path=path,
@@ -251,9 +292,10 @@ class WorktreeManager:
         if worktree_id.startswith('-') or (len(worktree_id) >= 2 and worktree_id[1] == ':'):
             raise WorktreeSecurityError(f"Invalid worktree_id prefix or drive format: {worktree_id}")
 
+        registry_root = self._validate_registry_boundary()
         meta_path = os.path.join(self.registry_dir, f"{worktree_id}.json")
         real_meta_path = os.path.normcase(os.path.realpath(meta_path))
-        if os.path.commonpath([self.controlled_root, real_meta_path]) != self.controlled_root:
+        if os.path.commonpath([registry_root, real_meta_path]) != registry_root:
             raise WorktreeSecurityError("Registry path traversal detected.")
 
         if not os.path.exists(meta_path):
@@ -400,6 +442,7 @@ class WorktreeManager:
 
     def list_worktrees(self, project_id: str) -> List[WorktreeDescriptor]:
         results = []
+        self._validate_registry_boundary()
         if not os.path.exists(self.registry_dir):
             return results
 
