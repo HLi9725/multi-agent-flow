@@ -53,8 +53,11 @@
 1. **Worktree Schema 抽象**: 引入 `WorktreeRequest`、`WorktreeDescriptor` 和 `WorktreeStatus` 三层结构，使用严格的 dataclass 和 `freeze_value` 提供深度不可变性。
 2. **WorktreeManager**:
    - 依赖注入: `controlled_root` 和 `target_repo_path`，强制绝对路径约束。
+   - 规范化 Git 仓库根: 通过 `git rev-parse --show-toplevel` 与 `--git-common-dir` 解析并规范化根路径与通用目录，杜绝从子目录传入导致的身份分裂。
    - 仓库身份绑定: 显式记录并双向核验 `target_repo_root`、`git_common_dir` 和由其唯一计算的 `repository_identity`，杜绝多仓库跨登记冒充。
+   - 输入严格 Fail-Closed: 在计算 ID 前对 `WorktreeRequest` 全字段执行类型、空值、空白、控制字符、路径分隔符、`..` 段及前导选项的全面校验，严禁“清洗后继续”。
    - 隔离 ID 无歧义: 采用 Canonical JSON 字典规范化与 SHA-256 摘要哈希计算隔离标识，根除字段连字符拼接时的边界碰撞。
+   - 零文件系统接触预检: `inspect()` 在接触文件系统前先完成 ID 格式 fullmatch 与边界校验，非法 ID 零文件访问。
    - 并发创建与原子发布保护: 先创建唯一 Git branch 作为跨进程原子锁，写入独立临时文件完成 write-all 和 fsync 后，通过 create-if-absent 原子发布到最终 Registry 路径，确保写入期间并发 inspect/list 绝观察不到半成品文件。
    - 真实校验: 严格验证 `git rev-parse --absolute-git-dir` 和 `--git-common-dir`。
    - 目录与分支名安全: 正则验证和 `git check-ref-format` 防御注入，隔离逃逸目录限制（阻止 `../` 和 Symlink/Junction 等攻击）。
@@ -62,12 +65,12 @@
    - 完全抽离注册表: `.registry` 存储在 Agent worktree 外部，确保 `git status` 原生干净，实施严格交叉核验。
 3. **测试覆盖**:
    - `test_worktree_manager.py` 通过真实 `pytest tmp_path` 生成 Git 临时空仓库并挂载文件流。
-   - 测试涵盖全场景: 绝对路径逃逸防御、并发覆盖防护、非法命令注入拦截、清理不落盘、linked worktree 场景验证、Registry 碰撞保全、短写防护、严格 Schema 校验、原子发布并发隔离、双仓库身份绑定校验和无歧义隔离标识边界测试。
+   - 测试涵盖全场景: 绝对路径逃逸防御、并发覆盖防护、非法命令注入拦截、清理不落盘、linked worktree 场景验证、Registry 碰撞保全、短写防护、严格 Schema 校验、原子发布并发隔离、双仓库身份绑定校验、无歧义隔离标识边界测试、非法 ID 零文件系统访问验证和仓库子目录初始化规范化核对。
 
 ### 测试记录（最新真实数据）
-- **定向工作树测试**: `python -m pytest tests/test_worktree_manager.py -q -rs` -> `25 passed in 16.80s` (0 failed, 0 skipped)
-- **定向环境测试**: `python -m pytest tests/test_host_adapter.py tests/test_evidence.py -q -rs` -> `25 passed in 1.46s` (0 failed, 0 skipped)
-- **全量测试**: `python -m pytest tests -q -rs` -> `276 passed in 59.67s` (0 failed, 0 skipped)
+- **定向工作树测试**: `python -m pytest tests/test_worktree_manager.py -q -rs` -> `30 passed in 20.53s` (0 failed, 0 skipped)
+- **定向环境测试**: `python -m pytest tests/test_host_adapter.py tests/test_evidence.py -q -rs` -> `25 passed in 1.18s` (0 failed, 0 skipped)
+- **全量测试**: `python -m pytest tests -q -rs` -> `281 passed in 62.10s` (0 failed, 0 skipped, exit code 0)
 - **代码规范**: `git diff --check` -> 退出码 0，零尾随空白错误
 
 ### 2C 历次返工修复记录
@@ -108,17 +111,26 @@
 5. **[DEF-T0023-22] 实施报告格式与历史结论全面修正**:
    - 彻底清除报告中的所有控制字符和转义反斜杠，将历史回滚尝试明确标注为历史废弃机制。
 
-#### DEF-T0023-23 ~ 26 修复（当前最新交付）
+#### DEF-T0023-23 ~ 26 修复
 1. **[DEF-T0023-23] Registry 原子发布与并发隔离**:
-   - 禁止在最终 Registry 路径中逐步写入文件。先在独立临时文件完成 UTF-8 完整写入、write-all 循环保障与 `os.fsync`。
-   - 采用 `create-if-absent` 原语（Windows 下基于 `os.rename` 目标存在失败，POSIX 下基于 `os.link` + `unlink`）将临时文件原子发布到最终 Registry 路径，不覆盖已有 Registry。
-   - 写入与发布期间并发调用的 `inspect()` 和 `list_worktrees()` 绝不会观察到残缺、半成品或损坏 JSON。
+   - 先在独立临时文件完成 UTF-8 完整写入、write-all 循环保障与 `os.fsync`。
+   - 采用 `create-if-absent` 原语原子发布到最终 Registry 路径，写入期间并发 `inspect()`/`list_worktrees()` 绝不观察到半成品文件。
 2. **[DEF-T0023-24] 仓库身份 1:1 强绑定与跨仓库隔离**:
-   - `WorktreeDescriptor` 和 Registry 显式记录规范化的 `target_repo_root`、`git_common_dir` 和由两者计算出的唯一摘要 `repository_identity`。
-   - 即使两个仓库拥有完全相同的提交历史和 commit SHA，因其 `git_common_dir` 物理路径不同，其 `repository_identity` 也完全不同。
-   - `inspect()`、`verify()` 与 `list_worktrees()` 必须进行 1:1 仓库身份核对，不匹配时强制 Fail-Closed。
+   - `WorktreeDescriptor` 和 Registry 显式记录规范化的 `target_repo_root`、`git_common_dir` 和 `repository_identity`。
 3. **[DEF-T0023-25] 隔离 ID 无歧义与边界碰撞防御**:
-   - 废除普通的连字符拼接公式，采用 Canonical JSON（严格排序键与无空白紧凑编码）+ SHA-256 摘要哈希计算 `worktree_id`。
-   - 彻底消除了因不同字段组合（如 `project_id="a-b", task_id="c"` 与 `project_id="a", task_id="b-c"`）在原连字符拼接下产生的歧义碰撞漏洞。
+   - 采用 Canonical JSON + SHA-256 计算 `worktree_id`，杜绝字段连字符拼接时的歧义碰撞。
 4. **[DEF-T0023-26] 流程真实性与看板闭环核验**:
-   - 状态流转后显式重新读取权威 `board.json` 校验 status 与 assignee，禁止仅依赖 CLI 成功输出。
+   - 状态流转后显式重新读取权威 `board.json` 校验 status 与 assignee。
+
+#### DEF-T0023-27 ~ 31 修复（当前最新交付）
+1. **[DEF-T0023-27] 请求字段前置 Fail-Closed 严密防御**:
+   - 在计算任何哈希 ID 前，对 `WorktreeRequest` 全部字段执行全面安全校验（拒绝非字符串、空值、纯空白、控制字符、路径分隔符、绝对路径、`..` 相对段及前导 Git 选项 `-`），彻底废除“清洗危险字符后继续执行”的宽容隐患。
+2. **[DEF-T0023-28] inspect 零文件系统访问防御**:
+   - `inspect()` 在调用 `os.path.exists` 或 `open` 之前，首先执行 `worktree_id` 严格正则 fullmatch 与 `commonpath` 越界检查。针对任何非法、路径遍历或绝对路径输入，直接抛出 `WorktreeSecurityError`，实现文件系统零接触。
+3. **[DEF-T0023-29] 规范化 Git 仓库根解析**:
+   - 通过 `git rev-parse --show-toplevel` 与 `--git-common-dir` 获取真实规范化的 `target_repo_root` 与 `git_common_dir`。
+   - 无论从主仓库根目录或其任意深层子目录初始化，均能解析出完全同态的 `target_repo_root` 与 `repository_identity`；不同 clone 仓库即使拥有相同 commit 历史，亦严格拥有不同仓库身份。
+4. **[DEF-T0023-30] 测试矩阵全面恢复与增强**:
+   - 恢复路径注入拒绝断言、添加 Windows 与 POSIX 绝对路径载荷测试、添加非法 ID 零文件访问 mock 断言、子目录规范化及多 clone 身份核对测试。
+5. **[DEF-T0023-31] 流程真实性与测试退出码核验**:
+   - 全量测试通过并确认退出码为 0，看板状态与处理人经磁盘直接验真。

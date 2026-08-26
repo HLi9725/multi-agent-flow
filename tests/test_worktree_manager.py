@@ -100,21 +100,116 @@ def test_isolation(manager, test_repo):
 
 def test_invalid_ref_and_injection(manager, test_repo):
     _, commit_hash = test_repo
-    req = WorktreeRequest("p", "t", "DEV", "s1 -o option", commit_hash)
-    # The special char in host_session_id is sanitized in safe components and hashed in SHA-256
-    # If project_id has invalid characters that can't form a valid branch ref
-    bad_req = WorktreeRequest("p..bad", "t", "DEV", "s1", commit_hash)
-    # branch name agent-branch-... will check ref format
-    desc = manager.create_worktree(req)
-    assert os.path.exists(desc.absolute_path)
+    # Option injection payload in host_session_id
+    req_injection = WorktreeRequest("p", "t", "DEV", "s1 -o option", commit_hash)
+    with pytest.raises(WorktreeSecurityError, match="Invalid host_session_id"):
+        manager.create_worktree(req_injection)
 
-def test_path_traversal_and_escapes(manager, test_repo, tmp_path):
+    # Path traversal payload in project_id
+    req_traversal = WorktreeRequest("../p", "t", "DEV", "s1", commit_hash)
+    with pytest.raises(WorktreeSecurityError, match="Invalid project_id"):
+        manager.create_worktree(req_traversal)
+
+def test_path_traversal_and_escapes(manager, test_repo):
     _, commit_hash = test_repo
-    # Even if project_id contains traversal, compute_worktree_id sanitizes and hashes it
-    # But safe_path double-checks path traversal
-    req = WorktreeRequest("../../../evil", "t", "DEV", "s1", commit_hash)
-    desc = manager.create_worktree(req)
-    assert os.path.commonpath([manager.controlled_root, desc.absolute_path]) == manager.controlled_root
+    # 1. Relative traversal
+    bad_req1 = WorktreeRequest("../../../evil", "t", "DEV", "s1", commit_hash)
+    with pytest.raises(WorktreeSecurityError, match="Invalid project_id"):
+        manager.create_worktree(bad_req1)
+
+    # 2. Windows absolute path
+    bad_req2 = WorktreeRequest("C:\\evil", "t", "DEV", "s1", commit_hash)
+    with pytest.raises(WorktreeSecurityError, match="Invalid project_id"):
+        manager.create_worktree(bad_req2)
+
+    # 3. POSIX absolute path
+    bad_req3 = WorktreeRequest("/evil", "t", "DEV", "s1", commit_hash)
+    with pytest.raises(WorktreeSecurityError, match="Invalid project_id"):
+        manager.create_worktree(bad_req3)
+
+def test_request_field_fail_closed_validation(manager, test_repo):
+    _, commit_hash = test_repo
+    # Whitespace only
+    with pytest.raises(WorktreeSecurityError, match="cannot be whitespace-only"):
+        manager.create_worktree(WorktreeRequest("   ", "t", "DEV", "s", commit_hash))
+
+    # Control characters
+    with pytest.raises(WorktreeSecurityError, match="contains control characters"):
+        manager.create_worktree(WorktreeRequest("p\nevil", "t", "DEV", "s", commit_hash))
+
+    # Leading option
+    with pytest.raises(WorktreeSecurityError, match="leading options are forbidden"):
+        manager.create_worktree(WorktreeRequest("-o", "t", "DEV", "s", commit_hash))
+
+    # Non-string type
+    with pytest.raises(WorktreeSecurityError, match="must be a string"):
+        manager.create_worktree(WorktreeRequest(123, "t", "DEV", "s", commit_hash))
+
+def test_inspect_illegal_id_zero_filesystem_access(manager, monkeypatch):
+    # DEF-T0023-28: inspect must validate ID before touching filesystem
+    def forbidden_fs_call(*args, **kwargs):
+        pytest.fail(f"Filesystem was accessed with args: {args}")
+
+    monkeypatch.setattr(os.path, "exists", forbidden_fs_call)
+
+    illegal_ids = [
+        "../../../evil",
+        "/etc/passwd",
+        "C:\\Windows\\win.ini",
+        "invalid id with spaces",
+        "-o option",
+        "",
+        "p/t/DEV",
+        "p\\t\\DEV"
+    ]
+
+    for bad_id in illegal_ids:
+        with pytest.raises(WorktreeSecurityError):
+            manager.inspect(bad_id)
+
+def test_repo_root_normalization_from_subdirectories(test_repo, tmp_path):
+    # DEF-T0023-29: Normalized target_repo_root from root and subdirectories
+    repo_dir, _ = test_repo
+    sub_dir = os.path.join(repo_dir, "sub", "dir", "nested")
+    os.makedirs(sub_dir, exist_ok=True)
+
+    cr1 = str(tmp_path / "cr1")
+    cr2 = str(tmp_path / "cr2")
+    manager_root = WorktreeManager(cr1, repo_dir)
+    manager_sub = WorktreeManager(cr2, sub_dir)
+
+    assert manager_root.target_repo_root == manager_sub.target_repo_root
+    assert manager_root.git_common_dir == manager_sub.git_common_dir
+    assert manager_root.repository_identity == manager_sub.repository_identity
+
+def test_distinct_clones_distinct_identity(tmp_path):
+    # DEF-T0023-29: Distinct clones have distinct identities
+    repo_a = tmp_path / "clone_a"
+    repo_b = tmp_path / "clone_b"
+    for r in [repo_a, repo_b]:
+        r.mkdir()
+        subprocess.run(["git", "init"], cwd=str(r), check=True)
+        (r / "init.txt").write_text("common_content")
+        subprocess.run(["git", "add", "init.txt"], cwd=str(r), check=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=str(r), check=True)
+
+    manager_a = WorktreeManager(str(tmp_path / "cr_a"), str(repo_a))
+    manager_b = WorktreeManager(str(tmp_path / "cr_b"), str(repo_b))
+
+    assert manager_a.target_repo_root != manager_b.target_repo_root
+    assert manager_a.git_common_dir != manager_b.git_common_dir
+    assert manager_a.repository_identity != manager_b.repository_identity
+
+def test_linked_worktree_common_dir(test_repo, tmp_path):
+    # Linked worktree correctly identifies common dir
+    repo_dir, commit_hash = test_repo
+    linked_wt_path = str(tmp_path / "linked_worktree")
+    subprocess.run(["git", "worktree", "add", linked_wt_path, "HEAD"], cwd=repo_dir, check=True)
+
+    manager_main = WorktreeManager(str(tmp_path / "cr_main"), repo_dir)
+    manager_linked = WorktreeManager(str(tmp_path / "cr_linked"), linked_wt_path)
+
+    assert manager_linked.git_common_dir == manager_main.git_common_dir
 
 def test_concurrency_collision(manager, test_repo):
     _, commit_hash = test_repo

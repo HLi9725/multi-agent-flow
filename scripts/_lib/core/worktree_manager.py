@@ -12,17 +12,46 @@ from .worktree_schema import (
     WorktreeError, WorktreeSecurityError, WorktreeGitError
 )
 
+def _validate_request_field(val: Any, field_name: str) -> str:
+    if not isinstance(val, str):
+        raise WorktreeSecurityError(f"Invalid {field_name}: must be a string, got {type(val).__name__}")
+    if not val:
+        raise WorktreeSecurityError(f"Invalid {field_name}: cannot be empty")
+    if not val.strip():
+        raise WorktreeSecurityError(f"Invalid {field_name}: cannot be whitespace-only")
+    if re.search(r'[\x00-\x1f\x7f]', val):
+        raise WorktreeSecurityError(f"Invalid {field_name}: contains control characters")
+    if '/' in val or '\\' in val:
+        raise WorktreeSecurityError(f"Invalid {field_name}: path separators are forbidden: {val}")
+    if val.startswith('-'):
+        raise WorktreeSecurityError(f"Invalid {field_name}: leading options are forbidden: {val}")
+    if val == '.' or val == '..' or '..' in val:
+        raise WorktreeSecurityError(f"Invalid {field_name}: relative path segments are forbidden: {val}")
+    if os.path.isabs(val) or (len(val) >= 2 and val[1] == ':'):
+        raise WorktreeSecurityError(f"Invalid {field_name}: absolute paths are forbidden: {val}")
+    if not re.match(r'^[a-zA-Z0-9_][a-zA-Z0-9_\-\.]{0,127}$', val):
+        raise WorktreeSecurityError(f"Invalid {field_name} format: {val}")
+    return val
+
 class WorktreeManager:
     def __init__(self, controlled_root: str, target_repo_path: str):
-        self.controlled_root = os.path.realpath(os.path.abspath(controlled_root))
-        self.target_repo_path = os.path.realpath(os.path.abspath(target_repo_path))
-        self.target_repo_root = self.target_repo_path
+        self.controlled_root = os.path.normcase(os.path.realpath(os.path.abspath(controlled_root)))
+        if not os.path.isdir(target_repo_path):
+            raise WorktreeError(f"Target repo path does not exist or is not a directory: {target_repo_path}")
+        self._verify_repo_identity(target_repo_path)
+
+        raw_toplevel = self._run_git(target_repo_path, ["rev-parse", "--show-toplevel"])
+        if not os.path.isabs(raw_toplevel):
+            raw_toplevel = os.path.join(target_repo_path, raw_toplevel)
+        self.target_repo_root = os.path.normcase(os.path.realpath(raw_toplevel))
+        self.target_repo_path = self.target_repo_root
+
         os.makedirs(self.controlled_root, exist_ok=True)
         self.registry_dir = os.path.join(self.controlled_root, ".registry")
         os.makedirs(self.registry_dir, exist_ok=True)
-        self._verify_repo_identity(self.target_repo_path)
-        self._repo_git_dir = self._get_absolute_git_dir(self.target_repo_path)
-        self.git_common_dir = self._get_common_dir(self.target_repo_path)
+
+        self._repo_git_dir = self._get_absolute_git_dir(self.target_repo_root)
+        self.git_common_dir = self._get_common_dir(self.target_repo_root)
         self.repository_identity = self._compute_repo_identity(self.target_repo_root, self.git_common_dir)
 
     def _compute_repo_identity(self, repo_root: str, common_dir: str) -> str:
@@ -31,6 +60,11 @@ class WorktreeManager:
         return f"repo-identity-{digest[:32]}"
 
     def _compute_worktree_id(self, project_id: str, task_id: str, actor_role: str, host_session_id: str) -> str:
+        _validate_request_field(project_id, "project_id")
+        _validate_request_field(task_id, "task_id")
+        _validate_request_field(actor_role, "actor_role")
+        _validate_request_field(host_session_id, "host_session_id")
+
         payload = json.dumps({
             "actor_role": actor_role,
             "host_session_id": host_session_id,
@@ -39,10 +73,7 @@ class WorktreeManager:
         }, sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode('utf-8')
         digest = hashlib.sha256(payload).hexdigest()[:16]
 
-        safe_proj = re.sub(r'[^\w]', '_', project_id)[:16]
-        safe_task = re.sub(r'[^\w]', '_', task_id)[:16]
-        safe_role = re.sub(r'[^\w]', '_', actor_role)[:16]
-        return f"{safe_proj}_{safe_task}_{safe_role}_{digest}"
+        return f"{project_id}_{task_id}_{actor_role}_{digest}"
 
     def _publish_registry_create_if_absent(self, tmp_path: str, meta_path: str):
         if os.name == 'nt':
@@ -64,7 +95,7 @@ class WorktreeManager:
 
     def _get_absolute_git_dir(self, repo_path: str) -> str:
         try:
-            return self._run_git(repo_path, ["rev-parse", "--absolute-git-dir"])
+            return os.path.normcase(os.path.realpath(self._run_git(repo_path, ["rev-parse", "--absolute-git-dir"])))
         except WorktreeGitError as e:
             raise WorktreeError(f"Failed to get git dir for {repo_path}: {str(e)}")
 
@@ -83,15 +114,15 @@ class WorktreeManager:
             raise WorktreeError(f"Path is not a valid git repository: {repo_path}")
 
     def _safe_path(self, worktree_id: str) -> str:
-        if not worktree_id or not re.match(r'^[\w\-]{1,128}$', worktree_id):
+        if not worktree_id or not re.fullmatch(r'^[a-zA-Z0-9_][a-zA-Z0-9_\-\.]{1,127}$', worktree_id):
             raise WorktreeSecurityError(f"Invalid worktree_id format: {worktree_id}")
 
         path = os.path.join(self.controlled_root, worktree_id)
-        real_path = os.path.realpath(path)
+        real_path = os.path.normcase(os.path.realpath(path))
 
         if os.path.commonpath([self.controlled_root, real_path]) != self.controlled_root:
             raise WorktreeSecurityError("Path traversal detected.")
-        if real_path == self.controlled_root or real_path == self.registry_dir:
+        if real_path == self.controlled_root or real_path == os.path.normcase(self.registry_dir):
             raise WorktreeSecurityError("Path collision.")
 
         return real_path
@@ -116,6 +147,10 @@ class WorktreeManager:
             raise WorktreeError(f"Commit {commit} does not exist in target repository.")
 
     def create_worktree(self, request: WorktreeRequest) -> WorktreeDescriptor:
+        canonical_commit = self._verify_commit(request.baseline_commit)
+        if request.baseline_commit != canonical_commit:
+             raise WorktreeSecurityError("Baseline commit not provided as lowercase canonical SHA")
+
         worktree_id = self._compute_worktree_id(
             request.project_id,
             request.task_id,
@@ -126,10 +161,6 @@ class WorktreeManager:
         branch_name = f"agent-branch-{worktree_id}"
 
         self._check_branch_name(branch_name)
-        canonical_commit = self._verify_commit(request.baseline_commit)
-
-        if request.baseline_commit != canonical_commit:
-             raise WorktreeSecurityError("Baseline commit not provided as lowercase canonical SHA")
 
         if os.path.exists(path):
             raise WorktreeSecurityError(f"Worktree path already exists: {path}")
@@ -211,7 +242,20 @@ class WorktreeManager:
         return desc
 
     def inspect(self, worktree_id: str) -> WorktreeDescriptor:
+        if not isinstance(worktree_id, str) or not worktree_id:
+            raise WorktreeSecurityError(f"Invalid worktree_id: must be a non-empty string, got {type(worktree_id).__name__}")
+        if not re.fullmatch(r'^[a-zA-Z0-9_][a-zA-Z0-9_\-\.]{1,127}$', worktree_id):
+            raise WorktreeSecurityError(f"Invalid worktree_id format: {worktree_id}")
+        if '/' in worktree_id or '\\' in worktree_id or '..' in worktree_id:
+            raise WorktreeSecurityError(f"Path traversal or separator in worktree_id forbidden: {worktree_id}")
+        if worktree_id.startswith('-') or (len(worktree_id) >= 2 and worktree_id[1] == ':'):
+            raise WorktreeSecurityError(f"Invalid worktree_id prefix or drive format: {worktree_id}")
+
         meta_path = os.path.join(self.registry_dir, f"{worktree_id}.json")
+        real_meta_path = os.path.normcase(os.path.realpath(meta_path))
+        if os.path.commonpath([self.controlled_root, real_meta_path]) != self.controlled_root:
+            raise WorktreeSecurityError("Registry path traversal detected.")
+
         if not os.path.exists(meta_path):
             raise WorktreeError(f"Registry not found: {worktree_id}")
 
