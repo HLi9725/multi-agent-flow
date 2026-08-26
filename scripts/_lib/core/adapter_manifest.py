@@ -132,6 +132,14 @@ class PlatformVerification:
         object.__setattr__(self, "e2e_evidence_refs", frozen_refs)
 
         # Verification anti-forgery rules
+        if self.verification_level == VerificationLevel.NATIVE_VERIFIED and self.host_surface != HostSurface.NATIVE:
+            raise ValueError("native_verified requires NATIVE surface")
+        if self.verification_level == VerificationLevel.CLI_VERIFIED and self.host_surface != HostSurface.CLI:
+            raise ValueError("cli_verified requires CLI surface")
+        if self.verification_level == VerificationLevel.MCP_VERIFIED and self.host_surface != HostSurface.MCP:
+            raise ValueError("mcp_verified requires MCP surface")
+        if self.host_surface == HostSurface.SIMULATED and self.verification_level in (VerificationLevel.NATIVE_VERIFIED, VerificationLevel.CLI_VERIFIED, VerificationLevel.MCP_VERIFIED):
+            raise ValueError("simulated surface cannot be verified")
         if self.verification_level in (VerificationLevel.NATIVE_VERIFIED, VerificationLevel.CLI_VERIFIED, VerificationLevel.MCP_VERIFIED):
             if not self.e2e_evidence_refs:
                 raise ValueError(f"VerificationLevel '{self.verification_level.value}' requires non-empty e2e_evidence_refs.")
@@ -228,6 +236,8 @@ class AdapterManifest:
                 raise ValueError(f"platform_verifications contains os '{pv_os}' not in supported_operating_systems")
             if not isinstance(pv_val, PlatformVerification):
                 raise ValueError(f"platform_verifications['{pv_os}'] must be PlatformVerification instance")
+            if pv_val.host_surface != self.host_surface:
+                raise ValueError(f"Mismatch between PlatformVerification.host_surface '{pv_val.host_surface.value}' and Manifest.host_surface '{self.host_surface.value}'")
             if pv_val.operating_system != pv_os:
                 raise ValueError(f"Mismatch between key '{pv_os}' and PlatformVerification.operating_system '{pv_val.operating_system}'")
         object.__setattr__(self, "platform_verifications", frozen_pv)
@@ -276,6 +286,14 @@ class AdapterManifest:
         _scan_for_sensitive_data(self.config_path_templates_by_os, "config_path_templates_by_os")
 
         # Top-level verification anti-forgery check
+        if self.verification_level == VerificationLevel.NATIVE_VERIFIED and self.host_surface != HostSurface.NATIVE:
+            raise ValueError("native_verified requires NATIVE surface")
+        if self.verification_level == VerificationLevel.CLI_VERIFIED and self.host_surface != HostSurface.CLI:
+            raise ValueError("cli_verified requires CLI surface")
+        if self.verification_level == VerificationLevel.MCP_VERIFIED and self.host_surface != HostSurface.MCP:
+            raise ValueError("mcp_verified requires MCP surface")
+        if self.host_surface == HostSurface.SIMULATED and self.verification_level in (VerificationLevel.NATIVE_VERIFIED, VerificationLevel.CLI_VERIFIED, VerificationLevel.MCP_VERIFIED):
+            raise ValueError("simulated surface cannot be verified")
         if self.verification_level in (VerificationLevel.NATIVE_VERIFIED, VerificationLevel.CLI_VERIFIED, VerificationLevel.MCP_VERIFIED):
             if not self.e2e_evidence_refs:
                 raise ValueError(f"Top-level verification_level '{self.verification_level.value}' requires e2e_evidence_refs.")

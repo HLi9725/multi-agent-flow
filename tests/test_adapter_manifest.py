@@ -257,13 +257,13 @@ def test_cross_platform_verification_isolation():
     )
     pv_mac = PlatformVerification(
         operating_system="macos",
-        host_surface=HostSurface.STATIC,
+        host_surface=HostSurface.NATIVE,
         verification_level=VerificationLevel.STATIC_ONLY,
         verified_version="1.0.0"
     )
     pv_linux = PlatformVerification(
         operating_system="linux",
-        host_surface=HostSurface.STATIC,
+        host_surface=HostSurface.NATIVE,
         verification_level=VerificationLevel.UNSUPPORTED,
         verified_version="1.0.0"
     )
