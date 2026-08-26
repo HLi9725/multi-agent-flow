@@ -36,9 +36,14 @@ from scripts._lib.core.adapter_conformance import (
     FaultyCapabilitiesMismatchAdapter,
     FaultyForgedRealHostHandleAdapter,
     FaultySideEffectIoOpenAdapter,
+    FaultySideEffectChildThreadAdapter,
+    FaultySideEffectHardlinkAdapter,
     FaultySideEffectPathlibWriteTextAdapter,
     FaultySideEffectSubprocessAdapter,
+    FaultySideEffectSymlinkAdapter,
+    FaultySideEffectUtimeAdapter,
     FaultySideEffectWriteFileAdapter,
+    SlowCapabilityAdapter,
     StandardTestFakeAdapter,
     assert_capabilities_conformance,
     assert_handle_conformance,
@@ -132,36 +137,71 @@ def test_zero_side_effects_active_interception_subprocess():
 
 
 def test_zero_side_effect_guard_does_not_pollute_unrelated_threads(tmp_path):
-    entered_probe = threading.Event()
-    release_probe = threading.Event()
     probe_errors = []
-
-    class BlockingAdapter(StandardTestFakeAdapter):
-        def detect_capabilities(self):
-            entered_probe.set()
-            if not release_probe.wait(timeout=5):
-                raise RuntimeError("test probe release timed out")
-            return self._capabilities
+    probe_started = threading.Event()
 
     def run_probe():
         try:
-            assert_zero_side_effects(BlockingAdapter("blocking_adapter"))
+            probe_started.set()
+            assert_zero_side_effects(SlowCapabilityAdapter("slow_adapter"))
         except Exception as exc:  # captured for the parent test thread
             probe_errors.append(exc)
 
     probe_thread = threading.Thread(target=run_probe)
     probe_thread.start()
-    assert entered_probe.wait(timeout=5)
+    assert probe_started.wait(timeout=5)
     unrelated_file = tmp_path / "unrelated-thread-write.txt"
-    try:
-        unrelated_file.write_text("allowed", encoding="utf-8")
-    finally:
-        release_probe.set()
-        probe_thread.join(timeout=5)
+    unrelated_file.write_text("allowed", encoding="utf-8")
+    probe_thread.join(timeout=10)
 
     assert not probe_thread.is_alive()
     assert probe_errors == []
     assert unrelated_file.read_text(encoding="utf-8") == "allowed"
+
+
+def test_zero_side_effects_blocks_adapter_child_thread_write(tmp_path):
+    target = tmp_path / "child-thread-write.txt"
+    adapter = FaultySideEffectChildThreadAdapter(str(target))
+
+    with pytest.raises(ConformanceError, match="file write attempt"):
+        assert_zero_side_effects(adapter)
+
+    assert not target.exists()
+
+
+def test_zero_side_effects_blocks_hardlink_and_utime(tmp_path):
+    source = tmp_path / "source.txt"
+    source.write_text("source", encoding="utf-8")
+    hardlink = tmp_path / "hardlink.txt"
+
+    with pytest.raises(ConformanceError, match="os.link"):
+        assert_zero_side_effects(FaultySideEffectHardlinkAdapter(str(source), str(hardlink)))
+    assert not hardlink.exists()
+
+    before_mtime = source.stat().st_mtime_ns
+    with pytest.raises(ConformanceError, match="os.utime"):
+        assert_zero_side_effects(FaultySideEffectUtimeAdapter(str(source)))
+    assert source.stat().st_mtime_ns == before_mtime
+
+
+def test_zero_side_effects_blocks_symlink_before_os_permission_check(tmp_path):
+    source = tmp_path / "source.txt"
+    source.write_text("source", encoding="utf-8")
+    symlink = tmp_path / "symlink.txt"
+
+    with pytest.raises(ConformanceError, match="os.symlink"):
+        assert_zero_side_effects(FaultySideEffectSymlinkAdapter(str(source), str(symlink)))
+
+    assert not symlink.exists()
+    assert not symlink.is_symlink()
+
+
+def test_zero_side_effects_rejects_local_unspawnable_adapter():
+    class LocalAdapter(StandardTestFakeAdapter):
+        pass
+
+    with pytest.raises(ConformanceError, match="module-level"):
+        assert_zero_side_effects(LocalAdapter("local_adapter"))
 
 
 def test_adapter_timeout_and_cancel_lifecycle():

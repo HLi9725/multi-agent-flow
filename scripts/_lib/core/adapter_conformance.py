@@ -1,10 +1,12 @@
 from collections.abc import Mapping
 import io
+import multiprocessing
 import os
 import pathlib
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -38,15 +40,50 @@ class ConformanceError(Exception):
     pass
 
 
-_AUDIT_CONTEXT = threading.local()
-_AUDIT_INSTALL_LOCK = threading.Lock()
-_AUDIT_HOOK_INSTALLED = False
+_ISOLATED_PROBE_ACTIVE = False
+_ISOLATED_INTERCEPTED_CALLS: List[str] = []
+
+_MUTATING_AUDIT_EVENTS = frozenset({
+    "os.chdir",
+    "os.chmod",
+    "os.chown",
+    "os.exec",
+    "os.fork",
+    "os.forkpty",
+    "os.kill",
+    "os.killpg",
+    "os.link",
+    "os.mkdir",
+    "os.posix_spawn",
+    "os.putenv",
+    "os.remove",
+    "os.rename",
+    "os.rmdir",
+    "os.spawn",
+    "os.startfile",
+    "os.symlink",
+    "os.system",
+    "os.truncate",
+    "os.unsetenv",
+    "os.utime",
+    "shutil.chown",
+    "shutil.copyfile",
+    "shutil.copymode",
+    "shutil.copystat",
+    "shutil.move",
+    "winreg.CreateKey",
+    "winreg.CreateKeyEx",
+    "winreg.DeleteKey",
+    "winreg.DeleteValue",
+    "winreg.SaveKey",
+    "winreg.SetValue",
+    "winreg.SetValueEx",
+})
 
 
-def _zero_side_effect_audit_hook(event: str, args: Tuple[Any, ...]) -> None:
-    """Fail closed only for the thread currently running a capability probe."""
-    intercepted_calls = getattr(_AUDIT_CONTEXT, "intercepted_calls", None)
-    if intercepted_calls is None:
+def _isolated_probe_audit_hook(event: str, args: Tuple[Any, ...]) -> None:
+    """Block observable side effects across every thread in the probe process."""
+    if not _ISOLATED_PROBE_ACTIVE:
         return
 
     description: Optional[str] = None
@@ -59,26 +96,67 @@ def _zero_side_effect_audit_hook(event: str, args: Tuple[Any, ...]) -> None:
             isinstance(flags, int) and bool(flags & write_flags)
         ):
             description = f"file write attempt on {path}"
-    elif event in {"os.mkdir", "os.remove", "os.rmdir", "os.rename", "os.chmod", "os.truncate"}:
-        description = f"filesystem mutation via {event}"
-    elif event == "subprocess.Popen":
+    elif event.startswith("subprocess."):
         description = "subprocess execution attempt"
-    elif event in {"socket.connect", "socket.bind", "socket.getaddrinfo"}:
+    elif event in _MUTATING_AUDIT_EVENTS:
+        description = f"filesystem mutation via {event}"
+    elif event.startswith("socket.") or event.startswith("http.client.") or event.startswith("urllib.Request"):
         description = f"network operation via {event}"
 
     if description is not None:
-        intercepted_calls.append(f"{event}: {description}")
+        _ISOLATED_INTERCEPTED_CALLS.append(f"{event}: {description}")
         raise ConformanceError(f"Side-effect intercepted: {description}")
 
 
-def _install_zero_side_effect_audit_hook() -> None:
-    global _AUDIT_HOOK_INSTALLED
-    if _AUDIT_HOOK_INSTALLED:
-        return
-    with _AUDIT_INSTALL_LOCK:
-        if not _AUDIT_HOOK_INSTALLED:
-            sys.addaudithook(_zero_side_effect_audit_hook)
-            _AUDIT_HOOK_INSTALLED = True
+def _isolated_capability_probe_worker(
+    adapter_class: type,
+    constructor_args: Tuple[Any, ...],
+    constructor_kwargs: Dict[str, Any],
+    connection: Any,
+) -> None:
+    """Construct and probe an adapter inside a dedicated, process-wide guard."""
+    global _ISOLATED_PROBE_ACTIVE, _ISOLATED_INTERCEPTED_CALLS
+    sys.dont_write_bytecode = True
+    _ISOLATED_INTERCEPTED_CALLS = []
+    sys.addaudithook(_isolated_probe_audit_hook)
+    baseline_threads = {thread.ident for thread in threading.enumerate()}
+    _ISOLATED_PROBE_ACTIVE = True
+
+    try:
+        isolated_adapter = adapter_class(*constructor_args, **constructor_kwargs)
+        caps = isolated_adapter.detect_capabilities()
+        if not isinstance(caps, HostCapabilities):
+            raise ConformanceError("detect_capabilities did not return HostCapabilities instance")
+
+        lingering_threads = [
+            thread.name
+            for thread in threading.enumerate()
+            if thread.ident not in baseline_threads and thread.is_alive()
+        ]
+        if lingering_threads:
+            _ISOLATED_INTERCEPTED_CALLS.append(
+                f"lingering adapter threads: {sorted(lingering_threads)}"
+            )
+        if _ISOLATED_INTERCEPTED_CALLS:
+            raise ConformanceError(
+                f"Zero side-effect violation: intercepted {_ISOLATED_INTERCEPTED_CALLS}"
+            )
+        message = {"status": "ok"}
+    except BaseException as exc:
+        message = {
+            "status": "error",
+            "error_type": type(exc).__name__,
+            "message": str(exc),
+            "intercepted_calls": tuple(_ISOLATED_INTERCEPTED_CALLS),
+        }
+
+    try:
+        connection.send(message)
+        connection.close()
+    finally:
+        # The process is disposable. Hard exit prevents delayed/background adapter
+        # work from escaping after the guard is disabled.
+        os._exit(0)
 
 
 def assert_manifest_conformance(manifest: AdapterManifest) -> None:
@@ -131,33 +209,73 @@ def assert_capabilities_conformance(adapter: BaseHostAdapter, manifest: AdapterM
                 raise ConformanceError(f"Manifest claims '{cap_k}' is unsupported, but detect_capabilities reports SUPPORTED")
 
 
-def assert_zero_side_effects(adapter: BaseHostAdapter) -> None:
+def assert_zero_side_effects(adapter: BaseHostAdapter, timeout_seconds: float = 10.0) -> None:
     """
     Intercept writes, process creation, and network activity during detect_capabilities().
 
-    The audit hook is process-global but inert by default. Its enforcement context is
-    thread-local, so unrelated threads retain their normal filesystem/network behavior.
-    This avoids rebinding builtins/os/pathlib functions across the whole process.
+    The adapter is reconstructed in a disposable spawn process. The audit hook is
+    process-wide only inside that worker, so adapter-created threads are covered while
+    unrelated parent-process threads remain untouched.
     """
-    _install_zero_side_effect_audit_hook()
-    intercepted_calls: List[str] = []
-    previous_context = getattr(_AUDIT_CONTEXT, "intercepted_calls", None)
-    try:
-        _AUDIT_CONTEXT.intercepted_calls = intercepted_calls
-        caps = adapter.detect_capabilities()
-        if not isinstance(caps, HostCapabilities):
-            raise ConformanceError("detect_capabilities did not return HostCapabilities instance")
-    finally:
-        if previous_context is None:
-            try:
-                del _AUDIT_CONTEXT.intercepted_calls
-            except AttributeError:
-                pass
-        else:
-            _AUDIT_CONTEXT.intercepted_calls = previous_context
+    if not isinstance(timeout_seconds, (int, float)) or isinstance(timeout_seconds, bool) or timeout_seconds <= 0:
+        raise ConformanceError("timeout_seconds must be a positive number")
 
-    if intercepted_calls:
-        raise ConformanceError(f"Zero side-effect violation: intercepted {intercepted_calls}")
+    spec_factory = getattr(adapter, "get_conformance_probe_spec", None)
+    if not callable(spec_factory):
+        raise ConformanceError(
+            "Adapter must implement get_conformance_probe_spec() for isolated capability probing"
+        )
+    try:
+        constructor_args, constructor_kwargs = spec_factory()
+    except Exception as exc:
+        raise ConformanceError(f"Failed to build isolated conformance probe spec: {exc}") from exc
+
+    if not isinstance(constructor_args, tuple) or not isinstance(constructor_kwargs, dict):
+        raise ConformanceError("Conformance probe spec must be a (tuple args, dict kwargs) pair")
+    adapter_class = adapter.__class__
+    if "<locals>" in adapter_class.__qualname__:
+        raise ConformanceError("Adapter class must be module-level for spawn-process conformance probing")
+
+    context = multiprocessing.get_context("spawn")
+    receive_connection, send_connection = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_isolated_capability_probe_worker,
+        args=(adapter_class, constructor_args, constructor_kwargs, send_connection),
+        name=f"adapter-conformance-{getattr(adapter, 'adapter_id', 'unknown')}",
+    )
+    process.daemon = True
+    process_started = False
+    try:
+        process.start()
+        process_started = True
+        send_connection.close()
+        if not receive_connection.poll(float(timeout_seconds)):
+            raise ConformanceError(
+                f"Isolated capability probe timed out after {timeout_seconds} seconds"
+            )
+        try:
+            message = receive_connection.recv()
+        except EOFError as exc:
+            raise ConformanceError(
+                f"Isolated capability probe exited without a result (exit code {process.exitcode})"
+            ) from exc
+    except ConformanceError:
+        raise
+    except Exception as exc:
+        raise ConformanceError(f"Failed to start or communicate with isolated capability probe: {exc}") from exc
+    finally:
+        receive_connection.close()
+        send_connection.close()
+        if process_started:
+            process.join(timeout=1.0)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5.0)
+
+    if message.get("status") != "ok":
+        error_type = message.get("error_type", "ConformanceError")
+        detail = message.get("message", "isolated probe failed")
+        raise ConformanceError(f"{error_type}: {detail}")
 
 
 def assert_handle_conformance(adapter: BaseHostAdapter, req: AgentRequest) -> AgentHandle:
@@ -256,6 +374,10 @@ class StandardTestFakeAdapter(BaseHostAdapter):
 
     def detect_capabilities(self) -> HostCapabilities:
         return self._capabilities
+
+    def get_conformance_probe_spec(self) -> Tuple[Tuple[Any, ...], Dict[str, Any]]:
+        """Return spawn-safe constructor inputs for the isolated capability probe."""
+        return (self.adapter_id,), {}
 
     def dispatch_agent(self, request: AgentRequest) -> AgentHandle:
         handle = AgentHandle(
@@ -410,4 +532,81 @@ class FaultySideEffectSubprocessAdapter(StandardTestFakeAdapter):
     def detect_capabilities(self) -> HostCapabilities:
         # VIOLATION: attempts subprocess during capability detection
         subprocess.run(["echo", "malicious"])
+        return self._capabilities
+
+
+class SlowCapabilityAdapter(StandardTestFakeAdapter):
+    """Keeps the isolated probe active long enough for parent concurrency tests."""
+    def detect_capabilities(self) -> HostCapabilities:
+        time.sleep(0.5)
+        return self._capabilities
+
+
+class FaultySideEffectChildThreadAdapter(StandardTestFakeAdapter):
+    """Attempts a filesystem write from an adapter-created child thread."""
+    def __init__(self, target_path: str, adapter_id: str = "child_thread_writer"):
+        super().__init__(adapter_id)
+        self.target_path = target_path
+
+    def get_conformance_probe_spec(self) -> Tuple[Tuple[Any, ...], Dict[str, Any]]:
+        return (self.target_path, self.adapter_id), {}
+
+    def detect_capabilities(self) -> HostCapabilities:
+        errors: List[BaseException] = []
+
+        def write_file() -> None:
+            try:
+                pathlib.Path(self.target_path).write_text("escaped", encoding="utf-8")
+            except BaseException as exc:
+                errors.append(exc)
+
+        worker = threading.Thread(target=write_file, name="adapter-child-writer")
+        worker.start()
+        worker.join()
+        if errors:
+            raise errors[0]
+        return self._capabilities
+
+
+class FaultySideEffectHardlinkAdapter(StandardTestFakeAdapter):
+    """Attempts to create a hard link during capability detection."""
+    def __init__(self, source_path: str, target_path: str, adapter_id: str = "hardlink_writer"):
+        super().__init__(adapter_id)
+        self.source_path = source_path
+        self.target_path = target_path
+
+    def get_conformance_probe_spec(self) -> Tuple[Tuple[Any, ...], Dict[str, Any]]:
+        return (self.source_path, self.target_path, self.adapter_id), {}
+
+    def detect_capabilities(self) -> HostCapabilities:
+        os.link(self.source_path, self.target_path)
+        return self._capabilities
+
+
+class FaultySideEffectSymlinkAdapter(StandardTestFakeAdapter):
+    """Attempts to create a symbolic link during capability detection."""
+    def __init__(self, source_path: str, target_path: str, adapter_id: str = "symlink_writer"):
+        super().__init__(adapter_id)
+        self.source_path = source_path
+        self.target_path = target_path
+
+    def get_conformance_probe_spec(self) -> Tuple[Tuple[Any, ...], Dict[str, Any]]:
+        return (self.source_path, self.target_path, self.adapter_id), {}
+
+    def detect_capabilities(self) -> HostCapabilities:
+        os.symlink(self.source_path, self.target_path)
+        return self._capabilities
+
+
+class FaultySideEffectUtimeAdapter(StandardTestFakeAdapter):
+    """Attempts to mutate file timestamps during capability detection."""
+    def __init__(self, target_path: str, adapter_id: str = "utime_writer"):
+        super().__init__(adapter_id)
+        self.target_path = target_path
+
+    def get_conformance_probe_spec(self) -> Tuple[Tuple[Any, ...], Dict[str, Any]]:
+        return (self.target_path, self.adapter_id), {}
+
+    def detect_capabilities(self) -> HostCapabilities:
+        os.utime(self.target_path, (1, 1))
         return self._capabilities
