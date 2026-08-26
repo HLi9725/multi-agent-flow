@@ -12,7 +12,7 @@
 - **基线提交**: 004b37dbcd9a2b1a9c2bb02d4c464751c516baf3
 
 ### 2B 历次返工核心修复项
-1. **Schema 极致深度冻结**: 修复了可变集合注入问题。`freeze_value` 现已递归支持 `Mapping`, `list`, `tuple`。因 `set/frozenset` 在 Canonical JSON 序列化时的无序性，已底层直接引发 `TypeError` 予以禁用。`ArtifactRecord` 在 `__post_init__` 被严格转为只读 `tuple` 并做了强类型校验。
+1. **Schema 极致深度冻结**: 修复了可变集合注入问题。`freeze_value` 现已递归支持 `Mapping`, `list`, `tuple`. 因 `set/frozenset` 在 Canonical JSON 序列化时的无序性，已底层直接引发 `TypeError` 予以禁用。`ArtifactRecord` 在 `__post_init__` 被严格转为只读 `tuple` 并做了强类型校验。
 2. **零竞态的 Create-if-absent 文件落盘**: 去除 `os.replace`。依靠 `os.open(tmp_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)` 原子生成临时文件，且确保证据不可覆盖、多线程下同写有且只有一方成功并安全清理残留文件。
 3. **真实对抗逃逸拦截**: 通过 `os.path.realpath` 与 `commonpath` 检查，彻底粉碎包括真实 Windows `mklink /J` Junction 等任何突破 `project_root` 的企图。
 4. **显式用户确认过滤**: `USER_CONFIRMATION` 严格要求下发 `ConfirmationResult`，真实请求源必须为 `explicit_user`，并拦截任何试图由 `model`, `system`, `fake` 混入的确认数据。
@@ -124,7 +124,7 @@
 4. **[DEF-T0023-26] 流程真实性与看板闭环核验**:
    - 状态流转后显式重新读取权威 `board.json` 校验 status 与 assignee。
 
-#### DEF-T0023-27 ~ 31 修复（当前最新交付）
+#### DEF-T0023-27 ~ 31 修复
 1. **[DEF-T0023-27] 请求字段前置 Fail-Closed 严密防御**:
    - 在计算任何哈希 ID 前，对 `WorktreeRequest` 全部字段执行全面安全校验（拒绝非字符串、空值、纯空白、控制字符、路径分隔符、绝对路径、`..` 相对段及前导 Git 选项 `-`），彻底废除“清洗危险字符后继续执行”的宽容隐患。
 2. **[DEF-T0023-28] inspect 零文件系统访问防御**:
@@ -179,13 +179,38 @@
 
 ### 测试记录（最新真实数据）
 - **2D-1 定向测试**:
-  - `python -m pytest tests/test_adapter_manifest.py -q -rs` -> `5 passed in 0.05s`
-  - `python -m pytest tests/test_adapter_registry.py -q -rs` -> `8 passed in 0.07s`
-  - `python -m pytest tests/test_adapter_conformance.py -q -rs` -> `6 passed in 0.05s`
-  - **总计**: `19 passed in 0.08s` (0 failed, 0 skipped)
+  - `python -m pytest tests/test_adapter_manifest.py -q -rs` -> `7 passed in 0.05s`
+  - `python -m pytest tests/test_adapter_registry.py -q -rs` -> `12 passed in 0.06s`
+  - `python -m pytest tests/test_adapter_conformance.py -q -rs` -> `8 passed in 0.06s`
+  - **总计**: `27 passed in 0.17s` (0 failed, 0 skipped)
 - **2A/2B/2C 关联兼容测试**:
-  - `python -m pytest tests/test_host_adapter.py tests/test_evidence.py tests/test_worktree_manager.py -q -rs` -> `60 passed in 25.17s` (0 failed, 0 skipped)
+  - `python -m pytest tests/test_host_adapter.py tests/test_evidence.py tests/test_worktree_manager.py -q -rs` -> `60 passed in 23.68s` (0 failed, 0 skipped)
 - **全量测试**:
-  - `python -m pytest tests -q -rs` -> `305 passed in 64.83s` (0 failed, 0 skipped, 100% 通过)
+  - `python -m pytest tests -q -rs` -> `313 passed in 66.02s` (0 failed, 0 skipped, 100% 通过)
 - **代码规范**:
   - `git diff --check` -> 退出码 0，零尾随空白错误
+
+### 2D-1 历次返工修复记录
+
+#### DEF-T0049-1 ~ 7 修复（第一次独立复审返工）
+1. **[DEF-T0049-1] 验证等级严格 Fail-Closed 与空集合/UNSUPPORTED 防御**:
+   - `allowed_verification_levels` 强制要求非空元组，空集合直接抛出 `ValueError`。
+   - `VerificationLevel.UNSUPPORTED` 在任何情况下均被 Resolver 绝对拦截，永不进入 `selected`。
+   - `STATIC_ONLY` 验证等级严禁被选入 `verified_automatic` 执行模式，防止跨模式假冒。
+2. **[DEF-T0049-2] 运行时真实能力核验与 Ghost Capability 拦截**:
+   - 彻底废除仅凭 Manifest 自述放行能力的漏洞。Resolver 在核验能力时必须同时校验 `adapter.detect_capabilities()` 的运行时字段与 `extra` 属性。
+   - 未在运行时 `HostCapabilities` 声明或状态为 `UNKNOWN`/`UNSUPPORTED` 的能力一律判定为缺失（`UNKNOWN != SUPPORTED`）。
+3. **[DEF-T0049-3] 合规套件零副作用主动拦截机制**:
+   - `assert_zero_side_effects()` 内部封装对 `builtins.open`（写模式）、`os.open`（写标志）、`os.mkdir`/`makedirs`、`subprocess.run`/`Popen` 以及网络 socket/HTTP 连接的主动拦截哨兵。
+   - 增加 `FaultySideEffectWriteFileAdapter` 与 `FaultySideEffectSubprocessAdapter` 夹具，实测证明套件能主动拦截具有真实副作用的恶意 Adapter。
+4. **[DEF-T0049-4] Adapter 身份一致性强校验**:
+   - `AdapterRegistry.register()` 严格核对 `adapter.adapter_id == manifest.adapter_id`，大小写不一致、未定义或跨 Adapter 冒充均直接抛出 `AdapterRegistryError` 并保证零局部污染。
+5. **[DEF-T0049-5] 项目上下文 ID 强绑定**:
+   - `AdapterRegistry.resolve()` 校验 `request.project_id == self.context_id`，跨项目解析请求一律 Fail-Closed 返回 `UNSUPPORTED`。
+6. **[DEF-T0049-6] Manifest 键类型严格校验与全小写 ID 规范**:
+   - 废除 `_freeze_manifest_value` 中的隐式 `str(k)` 转换，Mapping 出现非字符串键直接抛出 `TypeError`。
+   - `adapter_id` 统一强制全小写格式 `^[a-z0-9_][a-z0-9_\-\.]{1,63}$`。
+   - 对 `workspace_modes`、`identity_fields`、`capabilities` 键值及各类路径模板执行完整的空白与控制字符强类型校验。
+7. **[DEF-T0049-7] 精确 ID 拒绝静默回退与合规生命周期套件补齐**:
+   - 当请求指定了精确 `adapter_id` 时，未注册或不匹配一律返回 `UNSUPPORTED`，严禁静默回退或降级为 `manual_fallback`。
+   - `selection_strategy` 纳入严格白名单校验；合规套件补齐超时、取消、部分结果、异常映射、Handle 属主及与 `EvidenceValidationContext` / `WorktreeDescriptor` 的端到端兼容校验。

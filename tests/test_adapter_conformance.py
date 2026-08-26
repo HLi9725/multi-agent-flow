@@ -4,17 +4,26 @@ import subprocess
 import pytest
 
 from scripts._lib.core.agent_schema import (
+    AgentCancelledError,
     AgentHandle,
+    AgentInvalidHandleError,
+    AgentNotSupportedError,
     AgentRequest,
     AgentResult,
     AgentStatus,
+    AgentTimeoutError,
     CapabilitySupport,
+    ConfirmationRequest,
+    ConfirmationResult,
     HostCapabilities,
 )
+from scripts._lib.core.evidence_schema import EvidenceType
+from scripts._lib.core.evidence_gate import EvidenceValidationContext
 from scripts._lib.core.adapter_manifest import (
     AdapterManifest,
     AuthBoundaryType,
     BillingBoundaryType,
+    ExecutionMode,
     HostSurface,
     PlatformVerification,
     VerificationLevel,
@@ -24,6 +33,8 @@ from scripts._lib.core.adapter_conformance import (
     FaultyAcceptForeignHandleAdapter,
     FaultyCapabilitiesMismatchAdapter,
     FaultyForgedRealHostHandleAdapter,
+    FaultySideEffectSubprocessAdapter,
+    FaultySideEffectWriteFileAdapter,
     StandardTestFakeAdapter,
     assert_capabilities_conformance,
     assert_handle_conformance,
@@ -77,26 +88,45 @@ def test_faulty_foreign_handle_acceptance_intercepted():
         assert_lifecycle_conformance(adp, req)
 
 
-def test_zero_side_effects_guarantee(monkeypatch):
-    adp = StandardTestFakeAdapter("side_effect_checker")
+def test_zero_side_effects_active_interception_write_file():
+    # DEF-T0049-3: Malicious adapter writing file during detect_capabilities must be intercepted
+    adp = FaultySideEffectWriteFileAdapter("faulty_writer")
 
-    def forbidden_call(*args, **kwargs):
-        pytest.fail(f"Side-effect call attempted with args: {args} kwargs: {kwargs}")
+    with pytest.raises(ConformanceError, match="Side-effect intercepted: builtins.open write attempt"):
+        assert_zero_side_effects(adp)
 
-    # Guard file writes, subprocesses, and directory creations during detect_capabilities
-    monkeypatch.setattr(os, "mkdir", forbidden_call)
-    monkeypatch.setattr(os, "makedirs", forbidden_call)
-    monkeypatch.setattr(subprocess, "run", forbidden_call)
-    monkeypatch.setattr(subprocess, "Popen", forbidden_call)
+    # Ensure no side effect file actually persisted
+    assert not os.path.exists("unauthorized_side_effect.tmp")
 
-    # Calling detect_capabilities must succeed with zero side-effects
-    assert_zero_side_effects(adp)
-    caps = adp.detect_capabilities()
-    assert isinstance(caps, HostCapabilities)
+
+def test_zero_side_effects_active_interception_subprocess():
+    # DEF-T0049-3: Malicious adapter running subprocess during detect_capabilities must be intercepted
+    adp = FaultySideEffectSubprocessAdapter("faulty_runner")
+
+    with pytest.raises(ConformanceError, match="Side-effect intercepted: subprocess.run attempt"):
+        assert_zero_side_effects(adp)
+
+
+def test_adapter_timeout_and_cancel_lifecycle():
+    # DEF-T0049-7: Adapter timeout and cancellation handling
+    class TimeoutAndCancelAdapter(StandardTestFakeAdapter):
+        def wait_for_result(self, handle: AgentHandle, timeout_seconds=None):
+            raise AgentTimeoutError(f"Session {handle.session_id} timed out")
+
+    adp = TimeoutAndCancelAdapter("timeout_adp")
+    req = AgentRequest(session_id="sess_timeout", prompt="timeout prompt", role="DEV", workspace_dir=".")
+    handle = adp.dispatch_agent(req)
+
+    with pytest.raises(AgentTimeoutError, match="timed out"):
+        adp.wait_for_result(handle, timeout_seconds=0.01)
+
+    assert adp.cancel_agent(handle) is True
+    # Second cancel on removed session returns False
+    assert adp.cancel_agent(handle) is False
 
 
 def test_evidence_context_and_worktree_compatibility_seam():
-    # Verify that AdapterManifest identity fields and capabilities match 2B/2C structures
+    # DEF-T0049-7: Verify that AdapterManifest identity fields and capabilities match 2B/2C structures
     man = create_standard_fake_manifest("compat_adapter")
     adp = StandardTestFakeAdapter("compat_adapter")
 
@@ -105,3 +135,25 @@ def test_evidence_context_and_worktree_compatibility_seam():
     assert caps.supports_worktree == CapabilitySupport.SUPPORTED
     assert "isolated" in man.workspace_modes
     assert "worktree" in man.workspace_modes
+
+    # Verify compatibility with EvidenceValidationContext
+    req = AgentRequest(session_id="sess_evidence", prompt="prompt", role="BUILDER", workspace_dir=".")
+    handle = adp.dispatch_agent(req)
+
+    ctx = EvidenceValidationContext(
+        project_id="test_project",
+        task_id="T0049",
+        actor_role="DEV",
+        transition_from="进行中",
+        transition_to="审查中",
+        baseline_commit="21828a88ae0aa65b7cf84ea9b1e4244737100892",
+        result_commit="956853803bf43d82de1a2e62c4f66a5efb619533",
+        expected_invocation_id="inv_001",
+        expected_adapter=man.adapter_id,
+        expected_workspace_mode="worktree",
+        expected_evidence_type=EvidenceType.TASK_TRANSITION,
+        host_handle=handle,
+        expected_capabilities=caps
+    )
+    assert ctx.expected_adapter == "compat_adapter"
+    assert ctx.host_handle.host_id == "compat_adapter"

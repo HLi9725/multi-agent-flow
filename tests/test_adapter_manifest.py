@@ -32,6 +32,66 @@ def test_valid_manifest_creation_and_immutability():
         manifest.workspace_modes.append("extra")  # type: ignore
 
 
+def test_manifest_rejects_uppercase_adapter_id():
+    # DEF-T0049-6: adapter_id must be strictly lowercase format
+    pv = PlatformVerification(
+        operating_system="windows",
+        host_surface=HostSurface.SIMULATED,
+        verification_level=VerificationLevel.STATIC_ONLY,
+        verified_version="1.0.0"
+    )
+    with pytest.raises(ValueError, match="strictly lowercase"):
+        AdapterManifest(
+            schema_version="2.0",
+            adapter_id="My_Adapter_Uppercase",
+            display_name="Test",
+            implementation_version="1.0",
+            host_surface=HostSurface.SIMULATED,
+            verification_level=VerificationLevel.STATIC_ONLY,
+            capabilities={},
+            workspace_modes=("isolated",),
+            identity_fields=("id",),
+            auth_boundary=AuthBoundaryType.NONE,
+            billing_boundary=BillingBoundaryType.UNMETERED,
+            platform_version_constraint=">=1.0",
+            supported_operating_systems=("windows",),
+            platform_verifications={"windows": pv},
+            executable_candidates_by_os={},
+            config_path_templates_by_os={},
+            conformance_suite_version="2.0"
+        )
+
+
+def test_manifest_rejects_non_string_mapping_keys():
+    # DEF-T0049-6: No implicit str(k) conversion; non-string keys must raise TypeError
+    pv = PlatformVerification(
+        operating_system="windows",
+        host_surface=HostSurface.SIMULATED,
+        verification_level=VerificationLevel.STATIC_ONLY,
+        verified_version="1.0.0"
+    )
+    with pytest.raises(TypeError, match="Mapping key must be string"):
+        AdapterManifest(
+            schema_version="2.0",
+            adapter_id="valid_id",
+            display_name="Test",
+            implementation_version="1.0",
+            host_surface=HostSurface.SIMULATED,
+            verification_level=VerificationLevel.STATIC_ONLY,
+            capabilities={123: "supported"},  # Non-string key!
+            workspace_modes=("isolated",),
+            identity_fields=("id",),
+            auth_boundary=AuthBoundaryType.NONE,
+            billing_boundary=BillingBoundaryType.UNMETERED,
+            platform_version_constraint=">=1.0",
+            supported_operating_systems=("windows",),
+            platform_verifications={"windows": pv},
+            executable_candidates_by_os={},
+            config_path_templates_by_os={},
+            conformance_suite_version="2.0"
+        )
+
+
 def test_manifest_rejects_empty_and_control_chars():
     pv = PlatformVerification(
         operating_system="windows",

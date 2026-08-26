@@ -1,6 +1,11 @@
+import builtins
 from collections.abc import Mapping
+import http.client
 import os
+import socket
+import subprocess
 import sys
+import urllib.request
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -67,20 +72,98 @@ def assert_capabilities_conformance(adapter: BaseHostAdapter, manifest: AdapterM
     # Cross check individual capabilities
     for cap_k, cap_v in manifest.capabilities.items():
         field_name = f"supports_{cap_k}" if not cap_k.startswith("supports_") else cap_k
+        val = None
         if hasattr(caps, field_name):
             val = getattr(caps, field_name)
-            if cap_v == "supported" and val != CapabilitySupport.SUPPORTED:
+        elif isinstance(caps.extra, Mapping):
+            val = caps.extra.get(cap_k, caps.extra.get(field_name))
+
+        if cap_v == "supported":
+            if val != CapabilitySupport.SUPPORTED and val != "supported":
                 raise ConformanceError(f"Manifest claims '{cap_k}' is supported, but detect_capabilities reports '{val}'")
-            if cap_v == "unsupported" and val == CapabilitySupport.SUPPORTED:
+        elif cap_v == "unsupported":
+            if val == CapabilitySupport.SUPPORTED or val == "supported":
                 raise ConformanceError(f"Manifest claims '{cap_k}' is unsupported, but detect_capabilities reports SUPPORTED")
 
 
 def assert_zero_side_effects(adapter: BaseHostAdapter) -> None:
-    """Verifies that calling detect_capabilities has zero filesystem, network, or process side-effects."""
-    # We execute detect_capabilities and ensure it returns without triggering unauthorized state
-    caps = adapter.detect_capabilities()
-    if not isinstance(caps, HostCapabilities):
-        raise ConformanceError("detect_capabilities failed zero side-effect contract.")
+    """
+    DEF-T0049-3: Actively intercepts and guarantees that calling detect_capabilities()
+    has zero filesystem write, network, process, or logging/billing side-effects.
+    """
+    intercepted_calls: List[str] = []
+
+    orig_open = builtins.open
+    orig_os_open = os.open
+    orig_mkdir = os.mkdir
+    orig_makedirs = os.makedirs
+    orig_subprocess_run = subprocess.run
+    orig_subprocess_popen = subprocess.Popen
+    orig_socket_connect = socket.socket.connect
+    orig_http_connect = http.client.HTTPConnection.connect
+
+    def guarded_open(file, mode="r", *args, **kwargs):
+        if any(w in mode for w in ("w", "a", "x", "+")):
+            intercepted_calls.append(f"builtins.open(mode='{mode}', file='{file}')")
+            raise ConformanceError(f"Side-effect intercepted: builtins.open write attempt on {file}")
+        return orig_open(file, mode, *args, **kwargs)
+
+    def guarded_os_open(path, flags, *args, **kwargs):
+        write_flags = os.O_WRONLY | os.O_RDWR | os.O_CREAT | getattr(os, "O_APPEND", 0) | getattr(os, "O_TRUNC", 0)
+        if flags & write_flags:
+            intercepted_calls.append(f"os.open(flags={flags}, path='{path}')")
+            raise ConformanceError(f"Side-effect intercepted: os.open write attempt on {path}")
+        return orig_os_open(path, flags, *args, **kwargs)
+
+    def guarded_mkdir(path, *args, **kwargs):
+        intercepted_calls.append(f"os.mkdir(path='{path}')")
+        raise ConformanceError(f"Side-effect intercepted: os.mkdir attempt on {path}")
+
+    def guarded_makedirs(name, *args, **kwargs):
+        intercepted_calls.append(f"os.makedirs(name='{name}')")
+        raise ConformanceError(f"Side-effect intercepted: os.makedirs attempt on {name}")
+
+    def guarded_subprocess_run(*args, **kwargs):
+        intercepted_calls.append(f"subprocess.run({args})")
+        raise ConformanceError("Side-effect intercepted: subprocess.run attempt")
+
+    def guarded_subprocess_popen(*args, **kwargs):
+        intercepted_calls.append(f"subprocess.Popen({args})")
+        raise ConformanceError("Side-effect intercepted: subprocess.Popen attempt")
+
+    def guarded_socket_connect(self, *args, **kwargs):
+        intercepted_calls.append("socket.socket.connect()")
+        raise ConformanceError("Side-effect intercepted: network socket connect attempt")
+
+    def guarded_http_connect(self, *args, **kwargs):
+        intercepted_calls.append("HTTPConnection.connect()")
+        raise ConformanceError("Side-effect intercepted: HTTP network connect attempt")
+
+    try:
+        builtins.open = guarded_open
+        os.open = guarded_os_open
+        os.mkdir = guarded_mkdir
+        os.makedirs = guarded_makedirs
+        subprocess.run = guarded_subprocess_run
+        subprocess.Popen = guarded_subprocess_popen
+        socket.socket.connect = guarded_socket_connect
+        http.client.HTTPConnection.connect = guarded_http_connect
+
+        caps = adapter.detect_capabilities()
+        if not isinstance(caps, HostCapabilities):
+            raise ConformanceError("detect_capabilities did not return HostCapabilities instance")
+    finally:
+        builtins.open = orig_open
+        os.open = orig_os_open
+        os.mkdir = orig_mkdir
+        os.makedirs = orig_makedirs
+        subprocess.run = orig_subprocess_run
+        subprocess.Popen = orig_subprocess_popen
+        socket.socket.connect = orig_socket_connect
+        http.client.HTTPConnection.connect = orig_http_connect
+
+    if intercepted_calls:
+        raise ConformanceError(f"Zero side-effect violation: intercepted {intercepted_calls}")
 
 
 def assert_handle_conformance(adapter: BaseHostAdapter, req: AgentRequest) -> AgentHandle:
@@ -300,3 +383,20 @@ class FaultyAcceptForeignHandleAdapter(StandardTestFakeAdapter):
     def wait_for_result(self, handle: AgentHandle, timeout_seconds: Optional[float] = None) -> AgentResult:
         # VIOLATION: accepts any handle
         return AgentResult(session_id=handle.session_id, status=AgentStatus.SUCCESS, output="unauthorized accepted output")
+
+
+class FaultySideEffectWriteFileAdapter(StandardTestFakeAdapter):
+    """DEF-T0049-3: A malicious adapter that attempts file writing during detect_capabilities."""
+    def detect_capabilities(self) -> HostCapabilities:
+        # VIOLATION: attempts file write during capability detection
+        with open("unauthorized_side_effect.tmp", "w") as f:
+            f.write("malicious payload")
+        return self._capabilities
+
+
+class FaultySideEffectSubprocessAdapter(StandardTestFakeAdapter):
+    """DEF-T0049-3: A malicious adapter that attempts subprocess execution during detect_capabilities."""
+    def detect_capabilities(self) -> HostCapabilities:
+        # VIOLATION: attempts subprocess during capability detection
+        subprocess.run(["echo", "malicious"])
+        return self._capabilities

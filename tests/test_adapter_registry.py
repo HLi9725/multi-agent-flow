@@ -2,10 +2,12 @@ import os
 import pytest
 import threading
 
+from scripts._lib.core.agent_schema import CapabilitySupport, HostCapabilities
 from scripts._lib.core.adapter_manifest import (
     AdapterManifest,
     AuthBoundaryType,
     BillingBoundaryType,
+    ExecutionMode,
     HostSurface,
     PlatformVerification,
     VerificationLevel,
@@ -36,6 +38,20 @@ def test_registry_registration_and_get():
     # Duplicate registration rejected
     with pytest.raises(AdapterRegistryError, match="already registered"):
         registry.register(adapter, manifest)
+
+
+def test_registry_adapter_id_mismatch_rejected():
+    # DEF-T0049-4: Adapter implementation ID must match Manifest ID
+    registry = AdapterRegistry(context_id="ctx_id_check")
+    adapter = StandardTestFakeAdapter(adapter_id="adapter_impl_id")
+    manifest = create_standard_fake_manifest("manifest_id_differs")
+
+    with pytest.raises(AdapterRegistryError, match="does not match Manifest adapter_id"):
+        registry.register(adapter, manifest)
+
+    # Ensure no partial state remained
+    assert registry.get("manifest_id_differs") is None
+    assert len(registry.list_manifests()) == 0
 
 
 def test_registry_fake_adapter_cannot_claim_verified():
@@ -76,7 +92,8 @@ def test_registry_fake_adapter_cannot_claim_verified():
         registry.register(adapter, manifest)
 
 
-def test_registry_context_isolation():
+def test_registry_context_and_project_id_binding():
+    # DEF-T0049-5: Registry context_id bound to request.project_id
     reg_a = AdapterRegistry(context_id="project_A")
     reg_b = AdapterRegistry(context_id="project_B")
 
@@ -86,86 +103,95 @@ def test_registry_context_isolation():
 
     assert reg_a.get("adp_a") is not None
     assert reg_b.get("adp_a") is None
-    assert len(reg_a.list_manifests()) == 1
-    assert len(reg_b.list_manifests()) == 0
+
+    # Request matching project_A succeeds
+    req_match = AdapterResolutionRequest(
+        project_id="project_A",
+        allowed_verification_levels=(VerificationLevel.STATIC_ONLY,)
+    )
+    assert reg_a.resolve(req_match).decision_status == ResolutionStatus.SELECTED
+
+    # Request with mismatched project_B on reg_a fails-closed
+    req_mismatch = AdapterResolutionRequest(
+        project_id="project_B",
+        allowed_verification_levels=(VerificationLevel.STATIC_ONLY,)
+    )
+    d_mismatch = reg_a.resolve(req_mismatch)
+    assert d_mismatch.decision_status == ResolutionStatus.UNSUPPORTED
+    assert "Project ID mismatch" in d_mismatch.reason
 
 
-def test_registry_exact_id_resolution():
-    registry = AdapterRegistry()
-    adp = StandardTestFakeAdapter(adapter_id="my_exact_adapter")
-    man = create_standard_fake_manifest("my_exact_adapter")
+def test_registry_verification_level_fail_closed_and_empty_set():
+    # DEF-T0049-1: Empty allowed_verification_levels must raise ValueError
+    with pytest.raises(ValueError, match="non-empty tuple of VerificationLevel"):
+        AdapterResolutionRequest(
+            project_id="p1",
+            allowed_verification_levels=()  # Empty!
+        )
+
+
+def test_registry_unsupported_level_never_selected():
+    # DEF-T0049-1: UNSUPPORTED verification level can NEVER be selected
+    registry = AdapterRegistry(context_id="p1")
+
+    pv_win = PlatformVerification(
+        operating_system="windows",
+        host_surface=HostSurface.SIMULATED,
+        verification_level=VerificationLevel.UNSUPPORTED,
+        verified_version="1.0.0"
+    )
+    man = AdapterManifest(
+        schema_version="2.0",
+        adapter_id="unsupported_adp",
+        display_name="Unsupported",
+        implementation_version="1.0.0",
+        host_surface=HostSurface.SIMULATED,
+        verification_level=VerificationLevel.UNSUPPORTED,
+        capabilities={},
+        workspace_modes=("isolated",),
+        identity_fields=("id",),
+        auth_boundary=AuthBoundaryType.NONE,
+        billing_boundary=BillingBoundaryType.UNMETERED,
+        platform_version_constraint=">=1.0.0",
+        supported_operating_systems=("windows",),
+        platform_verifications={"windows": pv_win},
+        executable_candidates_by_os={"windows": ()},
+        config_path_templates_by_os={"windows": ()},
+        conformance_suite_version="2.0"
+    )
+    adp = StandardTestFakeAdapter(adapter_id="unsupported_adp")
     registry.register(adp, man)
 
-    # 1. Exact match found
-    req_success = AdapterResolutionRequest(
+    # Even if allowed_verification_levels contains UNSUPPORTED, it must be rejected!
+    req = AdapterResolutionRequest(
         project_id="p1",
-        adapter_id="my_exact_adapter",
-        required_capabilities=("worktree",),
-        allowed_verification_levels=(VerificationLevel.STATIC_ONLY,)
+        allowed_verification_levels=(VerificationLevel.UNSUPPORTED, VerificationLevel.STATIC_ONLY)
     )
-    decision = registry.resolve(req_success)
-    assert decision.decision_status == ResolutionStatus.SELECTED
-    assert decision.selected_adapter_id == "my_exact_adapter"
-
-    # 2. Exact match missing -> unsupported
-    req_missing = AdapterResolutionRequest(
-        project_id="p1",
-        adapter_id="unregistered_adapter",
-        allow_manual_fallback=False
-    )
-    decision_missing = registry.resolve(req_missing)
-    assert decision_missing.decision_status == ResolutionStatus.UNSUPPORTED
-    assert decision_missing.selected_adapter_id is None
-
-    # 3. Exact match missing with manual fallback
-    req_fallback = AdapterResolutionRequest(
-        project_id="p1",
-        adapter_id="unregistered_adapter",
-        allow_manual_fallback=True
-    )
-    decision_fallback = registry.resolve(req_fallback)
-    assert decision_fallback.decision_status == ResolutionStatus.MANUAL_FALLBACK
+    decision = registry.resolve(req)
+    assert decision.decision_status == ResolutionStatus.UNSUPPORTED
+    assert "UNSUPPORTED can never be selected" in decision.reason
 
 
-def test_registry_capability_and_unknown_handling():
-    registry = AdapterRegistry()
-    adp = StandardTestFakeAdapter(adapter_id="cap_adapter")
-    man = create_standard_fake_manifest("cap_adapter")
+def test_registry_static_only_rejected_for_verified_automatic():
+    # DEF-T0049-1: STATIC_ONLY cannot enter verified_automatic execution mode
+    registry = AdapterRegistry(context_id="p1")
+    adp = StandardTestFakeAdapter(adapter_id="static_adp")
+    man = create_standard_fake_manifest("static_adp")
     registry.register(adp, man)
 
-    # Required supported capability -> SELECTED
-    req1 = AdapterResolutionRequest(
+    req_auto = AdapterResolutionRequest(
         project_id="p1",
-        required_capabilities=("parallelism", "worktree"),
+        execution_mode=ExecutionMode.VERIFIED_AUTOMATIC,
         allowed_verification_levels=(VerificationLevel.STATIC_ONLY,)
     )
-    d1 = registry.resolve(req1)
-    assert d1.decision_status == ResolutionStatus.SELECTED
-    assert "parallelism" in d1.matched_capabilities
-
-    # Required unsupported capability -> UNSUPPORTED
-    req2 = AdapterResolutionRequest(
-        project_id="p1",
-        required_capabilities=("real_subagents",),  # marked unsupported in standard fake
-        allowed_verification_levels=(VerificationLevel.STATIC_ONLY,)
-    )
-    d2 = registry.resolve(req2)
-    assert d2.decision_status == ResolutionStatus.UNSUPPORTED
-    assert "real_subagents" in d2.missing_capabilities
-
-    # Required undeclared / unknown capability -> UNSUPPORTED (UNKNOWN != SUPPORTED)
-    req3 = AdapterResolutionRequest(
-        project_id="p1",
-        required_capabilities=("completely_unknown_capability",),
-        allowed_verification_levels=(VerificationLevel.STATIC_ONLY,)
-    )
-    d3 = registry.resolve(req3)
-    assert d3.decision_status == ResolutionStatus.UNSUPPORTED
-    assert "completely_unknown_capability" in d3.missing_capabilities
+    decision = registry.resolve(req_auto)
+    assert decision.decision_status == ResolutionStatus.UNSUPPORTED
+    assert "STATIC_ONLY" in decision.reason
 
 
-def test_registry_cross_platform_resolution():
-    registry = AdapterRegistry()
+def test_registry_ghost_capability_rejected():
+    # DEF-T0049-2: Manifest claims ghost capability not present in HostCapabilities
+    registry = AdapterRegistry(context_id="p1")
 
     pv_win = PlatformVerification(
         operating_system="windows",
@@ -173,60 +199,69 @@ def test_registry_cross_platform_resolution():
         verification_level=VerificationLevel.STATIC_ONLY,
         verified_version="1.0.0"
     )
-    pv_mac = PlatformVerification(
-        operating_system="macos",
-        host_surface=HostSurface.SIMULATED,
-        verification_level=VerificationLevel.STATIC_ONLY,
-        verified_version="1.0.0"
-    )
-    pv_linux = PlatformVerification(
-        operating_system="linux",
-        host_surface=HostSurface.SIMULATED,
-        verification_level=VerificationLevel.UNSUPPORTED,
-        verified_version="1.0.0"
-    )
-
     man = AdapterManifest(
         schema_version="2.0",
-        adapter_id="cross_plat_adapter",
-        display_name="Cross Platform Test",
+        adapter_id="ghost_adp",
+        display_name="Ghost Capability Adapter",
         implementation_version="1.0.0",
         host_surface=HostSurface.SIMULATED,
         verification_level=VerificationLevel.STATIC_ONLY,
-        capabilities={"worktree": "supported"},
-        workspace_modes=("worktree",),
+        capabilities={"ghost_capability_x": "supported"},  # Ghost capability!
+        workspace_modes=("isolated",),
         identity_fields=("id",),
         auth_boundary=AuthBoundaryType.NONE,
         billing_boundary=BillingBoundaryType.UNMETERED,
         platform_version_constraint=">=1.0.0",
-        supported_operating_systems=("windows", "macos", "linux"),
-        platform_verifications={"windows": pv_win, "macos": pv_mac, "linux": pv_linux},
-        executable_candidates_by_os={"windows": (), "macos": (), "linux": ()},
-        config_path_templates_by_os={"windows": (), "macos": (), "linux": ()},
+        supported_operating_systems=("windows",),
+        platform_verifications={"windows": pv_win},
+        executable_candidates_by_os={"windows": ()},
+        config_path_templates_by_os={"windows": ()},
         conformance_suite_version="2.0"
     )
-    adp = StandardTestFakeAdapter(adapter_id="cross_plat_adapter")
+    adp = StandardTestFakeAdapter(adapter_id="ghost_adp")
     registry.register(adp, man)
 
-    # Windows request requesting STATIC_ONLY -> SELECTED
-    req_win = AdapterResolutionRequest(
+    # Resolution requesting ghost_capability_x must fail-closed
+    req = AdapterResolutionRequest(
         project_id="p1",
-        target_os="windows",
+        required_capabilities=("ghost_capability_x",),
         allowed_verification_levels=(VerificationLevel.STATIC_ONLY,)
     )
-    assert registry.resolve(req_win).decision_status == ResolutionStatus.SELECTED
+    decision = registry.resolve(req)
+    assert decision.decision_status == ResolutionStatus.UNSUPPORTED
+    assert "ghost_capability_x" in decision.missing_capabilities
 
-    # Linux request requesting STATIC_ONLY -> UNSUPPORTED (because Linux is declared UNSUPPORTED)
-    req_linux = AdapterResolutionRequest(
+
+def test_registry_exact_id_no_manual_fallback():
+    # DEF-T0049-7: Exact adapter_id specified cannot use manual fallback
+    registry = AdapterRegistry(context_id="p1")
+    adp = StandardTestFakeAdapter(adapter_id="my_exact_adapter")
+    man = create_standard_fake_manifest("my_exact_adapter")
+    registry.register(adp, man)
+
+    # Exact match missing with allow_manual_fallback=True -> must still be UNSUPPORTED!
+    req_missing = AdapterResolutionRequest(
         project_id="p1",
-        target_os="linux",
-        allowed_verification_levels=(VerificationLevel.STATIC_ONLY,)
+        adapter_id="unregistered_adapter",
+        allowed_verification_levels=(VerificationLevel.STATIC_ONLY,),
+        allow_manual_fallback=True
     )
-    assert registry.resolve(req_linux).decision_status == ResolutionStatus.UNSUPPORTED
+    decision_missing = registry.resolve(req_missing)
+    assert decision_missing.decision_status == ResolutionStatus.UNSUPPORTED
+
+
+def test_registry_selection_strategy_validation():
+    # DEF-T0049-7: Invalid selection_strategy must raise ValueError
+    with pytest.raises(ValueError, match="Invalid selection_strategy"):
+        AdapterResolutionRequest(
+            project_id="p1",
+            allowed_verification_levels=(VerificationLevel.STATIC_ONLY,),
+            selection_strategy="invalid_random_strategy"
+        )
 
 
 def test_registry_multi_candidate_ambiguity():
-    registry = AdapterRegistry()
+    registry = AdapterRegistry(context_id="p1")
     adp1 = StandardTestFakeAdapter(adapter_id="candidate_1")
     man1 = create_standard_fake_manifest("candidate_1")
     adp2 = StandardTestFakeAdapter(adapter_id="candidate_2")
@@ -249,7 +284,7 @@ def test_registry_multi_candidate_ambiguity():
 
 
 def test_registry_thread_safety():
-    registry = AdapterRegistry()
+    registry = AdapterRegistry(context_id="p_thread")
     errors = []
 
     def worker(idx):

@@ -13,7 +13,13 @@ def _freeze_manifest_value(value: Any) -> Any:
     if isinstance(value, PlatformVerification):
         return value
     if isinstance(value, Mapping):
-        return MappingProxyType({str(k): _freeze_manifest_value(v) for k, v in value.items()})
+        res = {}
+        for k, v in value.items():
+            if not isinstance(k, str):
+                raise TypeError(f"Mapping key must be string, got {type(k).__name__}")
+            _assert_valid_string(k, "mapping_key")
+            res[k] = _freeze_manifest_value(v)
+        return MappingProxyType(res)
     if isinstance(value, (list, tuple)):
         return tuple(_freeze_manifest_value(item) for item in value)
     if isinstance(value, (set, frozenset)):
@@ -121,6 +127,8 @@ class PlatformVerification:
         frozen_refs = _freeze_manifest_value(self.e2e_evidence_refs)
         if not isinstance(frozen_refs, tuple) or not all(isinstance(r, str) for r in frozen_refs):
             raise ValueError("e2e_evidence_refs must be a tuple of strings")
+        for r in frozen_refs:
+            _assert_valid_string(r, "e2e_evidence_ref")
         object.__setattr__(self, "e2e_evidence_refs", frozen_refs)
 
         # Verification anti-forgery rules
@@ -157,8 +165,9 @@ class AdapterManifest:
     def __post_init__(self) -> None:
         _assert_valid_string(self.schema_version, "schema_version")
         _assert_valid_string(self.adapter_id, "adapter_id")
-        if not re.fullmatch(r'^[a-zA-Z0-9_][a-zA-Z0-9_\-\.]{1,63}$', self.adapter_id):
-            raise ValueError(f"Invalid adapter_id format '{self.adapter_id}'. Must match ^[a-zA-Z0-9_][a-zA-Z0-9_\\-\\.]{{1,63}}$")
+        # DEF-T0049-6: strictly lowercase normalized format
+        if not re.fullmatch(r'^[a-z0-9_][a-z0-9_\-\.]{1,63}$', self.adapter_id):
+            raise ValueError(f"Invalid adapter_id format '{self.adapter_id}'. Must match ^[a-z0-9_][a-z0-9_\\-\\.]{{1,63}}$ (strictly lowercase).")
 
         _assert_valid_string(self.display_name, "display_name")
         _assert_valid_string(self.implementation_version, "implementation_version")
@@ -178,6 +187,7 @@ class AdapterManifest:
         if not isinstance(frozen_os, tuple) or not all(isinstance(os_name, str) for os_name in frozen_os):
             raise ValueError("supported_operating_systems must be a tuple of strings")
         for os_name in frozen_os:
+            _assert_valid_string(os_name, "supported_operating_system")
             if os_name not in ALLOWED_OPERATING_SYSTEMS:
                 raise ValueError(f"Invalid operating system '{os_name}'. Allowed: {sorted(ALLOWED_OPERATING_SYSTEMS)}")
         object.__setattr__(self, "supported_operating_systems", frozen_os)
@@ -188,6 +198,7 @@ class AdapterManifest:
             raise ValueError("capabilities must be a mapping of capability name to support level")
         for cap_k, cap_v in frozen_caps.items():
             _assert_valid_string(cap_k, "capability_key")
+            _assert_valid_string(cap_v, "capability_value")
             if cap_v not in ("supported", "unsupported", "unknown"):
                 raise ValueError(f"Capability '{cap_k}' has invalid support status '{cap_v}'. Must be supported, unsupported, or unknown.")
         object.__setattr__(self, "capabilities", frozen_caps)
@@ -196,11 +207,15 @@ class AdapterManifest:
         frozen_wm = _freeze_manifest_value(self.workspace_modes)
         if not isinstance(frozen_wm, tuple) or not all(isinstance(m, str) for m in frozen_wm):
             raise ValueError("workspace_modes must be a tuple of strings")
+        for wm in frozen_wm:
+            _assert_valid_string(wm, "workspace_mode")
         object.__setattr__(self, "workspace_modes", frozen_wm)
 
         frozen_id_fields = _freeze_manifest_value(self.identity_fields)
         if not isinstance(frozen_id_fields, tuple) or not all(isinstance(f, str) for f in frozen_id_fields):
             raise ValueError("identity_fields must be a tuple of strings")
+        for idf in frozen_id_fields:
+            _assert_valid_string(idf, "identity_field")
         object.__setattr__(self, "identity_fields", frozen_id_fields)
 
         # Freeze platform verifications
@@ -208,6 +223,7 @@ class AdapterManifest:
         if not isinstance(frozen_pv, Mapping):
             raise ValueError("platform_verifications must be a mapping of os_name to PlatformVerification")
         for pv_os, pv_val in frozen_pv.items():
+            _assert_valid_string(pv_os, "platform_verification_key")
             if pv_os not in self.supported_operating_systems:
                 raise ValueError(f"platform_verifications contains os '{pv_os}' not in supported_operating_systems")
             if not isinstance(pv_val, PlatformVerification):
@@ -220,17 +236,31 @@ class AdapterManifest:
         frozen_exec = _freeze_manifest_value(self.executable_candidates_by_os)
         if not isinstance(frozen_exec, Mapping):
             raise ValueError("executable_candidates_by_os must be a mapping")
+        for os_k, cands in frozen_exec.items():
+            _assert_valid_string(os_k, "os_name in executable_candidates_by_os")
+            if not isinstance(cands, (list, tuple)):
+                raise ValueError(f"executable candidates for {os_k} must be tuple/list")
+            for cand in cands:
+                _assert_valid_string(cand, f"executable_candidate for {os_k}")
         object.__setattr__(self, "executable_candidates_by_os", frozen_exec)
 
         frozen_tmpl = _freeze_manifest_value(self.config_path_templates_by_os)
         if not isinstance(frozen_tmpl, Mapping):
             raise ValueError("config_path_templates_by_os must be a mapping")
+        for os_k, tmpls in frozen_tmpl.items():
+            _assert_valid_string(os_k, "os_name in config_path_templates_by_os")
+            if not isinstance(tmpls, (list, tuple)):
+                raise ValueError(f"config templates for {os_k} must be tuple/list")
+            for tmpl in tmpls:
+                _assert_valid_string(tmpl, f"config_path_template for {os_k}")
         object.__setattr__(self, "config_path_templates_by_os", frozen_tmpl)
 
         # Freeze e2e_evidence_refs and extra
         frozen_refs = _freeze_manifest_value(self.e2e_evidence_refs)
         if not isinstance(frozen_refs, tuple) or not all(isinstance(r, str) for r in frozen_refs):
             raise ValueError("e2e_evidence_refs must be a tuple of strings")
+        for r in frozen_refs:
+            _assert_valid_string(r, "e2e_evidence_ref")
         object.__setattr__(self, "e2e_evidence_refs", frozen_refs)
 
         frozen_extra = _freeze_manifest_value(self.extra)

@@ -13,6 +13,7 @@ from .adapter_manifest import (
     AdapterManifest,
     AuthBoundaryType,
     BillingBoundaryType,
+    ExecutionMode,
     PlatformVerification,
     VerificationLevel,
     _assert_valid_string,
@@ -26,6 +27,9 @@ class ResolutionStatus(str, Enum):
     UNSUPPORTED = "unsupported"
     AMBIGUOUS = "ambiguous"
     MANUAL_FALLBACK = "manual_fallback"
+
+
+ALLOWED_SELECTION_STRATEGIES: FrozenSet[str] = frozenset({"deterministic", "priority", "first_match"})
 
 
 def _normalize_current_os() -> str:
@@ -42,11 +46,12 @@ def _normalize_current_os() -> str:
 @dataclass(frozen=True)
 class AdapterResolutionRequest:
     project_id: str
+    allowed_verification_levels: Tuple[VerificationLevel, ...]
     required_capabilities: Tuple[str, ...] = field(default_factory=tuple)
-    allowed_verification_levels: Tuple[VerificationLevel, ...] = field(default_factory=tuple)
     required_workspace_modes: Tuple[str, ...] = field(default_factory=tuple)
     adapter_id: Optional[str] = None
     target_os: Optional[str] = None
+    execution_mode: ExecutionMode = ExecutionMode.MANUAL
     allow_manual_fallback: bool = False
     selection_strategy: str = "deterministic"
     audit_context: TMapping[str, Any] = field(default_factory=dict)
@@ -58,19 +63,31 @@ class AdapterResolutionRequest:
         if self.target_os is not None:
             _assert_valid_string(self.target_os, "target_os")
 
+        if not isinstance(self.execution_mode, ExecutionMode):
+            raise ValueError(f"execution_mode must be an ExecutionMode enum, got {type(self.execution_mode).__name__}")
+
+        _assert_valid_string(self.selection_strategy, "selection_strategy")
+        if self.selection_strategy not in ALLOWED_SELECTION_STRATEGIES:
+            raise ValueError(f"Invalid selection_strategy '{self.selection_strategy}'. Allowed: {sorted(ALLOWED_SELECTION_STRATEGIES)}")
+
+        # DEF-T0049-1: allowed_verification_levels must be non-empty
+        frozen_vl = _freeze_manifest_value(self.allowed_verification_levels)
+        if not isinstance(frozen_vl, tuple) or not frozen_vl or not all(isinstance(v, VerificationLevel) for v in frozen_vl):
+            raise ValueError("allowed_verification_levels must be a non-empty tuple of VerificationLevel enums")
+        object.__setattr__(self, "allowed_verification_levels", frozen_vl)
+
         frozen_rc = _freeze_manifest_value(self.required_capabilities)
         if not isinstance(frozen_rc, tuple) or not all(isinstance(c, str) for c in frozen_rc):
             raise ValueError("required_capabilities must be a tuple of strings")
+        for c in frozen_rc:
+            _assert_valid_string(c, "required_capability")
         object.__setattr__(self, "required_capabilities", frozen_rc)
-
-        frozen_vl = _freeze_manifest_value(self.allowed_verification_levels)
-        if not isinstance(frozen_vl, tuple) or not all(isinstance(v, VerificationLevel) for v in frozen_vl):
-            raise ValueError("allowed_verification_levels must be a tuple of VerificationLevel enums")
-        object.__setattr__(self, "allowed_verification_levels", frozen_vl)
 
         frozen_wm = _freeze_manifest_value(self.required_workspace_modes)
         if not isinstance(frozen_wm, tuple) or not all(isinstance(m, str) for m in frozen_wm):
             raise ValueError("required_workspace_modes must be a tuple of strings")
+        for m in frozen_wm:
+            _assert_valid_string(m, "required_workspace_mode")
         object.__setattr__(self, "required_workspace_modes", frozen_wm)
 
         frozen_audit = _freeze_manifest_value(self.audit_context)
@@ -91,6 +108,7 @@ class AdapterResolutionDecision:
     auth_boundary_summary: str = ""
     billing_boundary_summary: str = ""
     workspace_modes: Tuple[str, ...] = field(default_factory=tuple)
+    execution_mode: ExecutionMode = ExecutionMode.MANUAL
     is_real_host: bool = False
     audit_context: TMapping[str, Any] = field(default_factory=dict)
     manifest: Optional[AdapterManifest] = None
@@ -100,6 +118,8 @@ class AdapterResolutionDecision:
             raise ValueError(f"decision_status must be a ResolutionStatus enum, got {type(self.decision_status).__name__}")
         if self.verification_level is not None and not isinstance(self.verification_level, VerificationLevel):
             raise ValueError(f"verification_level must be a VerificationLevel enum, got {type(self.verification_level).__name__}")
+        if not isinstance(self.execution_mode, ExecutionMode):
+            raise ValueError(f"execution_mode must be an ExecutionMode enum, got {type(self.execution_mode).__name__}")
 
         object.__setattr__(self, "matched_capabilities", tuple(_freeze_manifest_value(self.matched_capabilities)))
         object.__setattr__(self, "missing_capabilities", tuple(_freeze_manifest_value(self.missing_capabilities)))
@@ -125,6 +145,13 @@ class AdapterRegistry:
             raise AdapterRegistryError(f"Adapter must be an instance of BaseHostAdapter, got {type(adapter).__name__}")
         if not isinstance(manifest, AdapterManifest):
             raise AdapterRegistryError(f"Manifest must be an instance of AdapterManifest, got {type(manifest).__name__}")
+
+        # DEF-T0049-4: Adapter implementation ID must match Manifest ID exactly
+        adapter_impl_id = getattr(adapter, "adapter_id", None)
+        if not isinstance(adapter_impl_id, str) or not adapter_impl_id:
+            raise AdapterRegistryError(f"Adapter must declare non-empty string attribute 'adapter_id', got {repr(adapter_impl_id)}")
+        if adapter_impl_id != manifest.adapter_id:
+            raise AdapterRegistryError(f"Adapter implementation ID '{adapter_impl_id}' does not match Manifest adapter_id '{manifest.adapter_id}'.")
 
         with self._lock:
             if manifest.adapter_id in self._manifests:
@@ -162,66 +189,62 @@ class AdapterRegistry:
 
     def resolve(self, request: AdapterResolutionRequest) -> AdapterResolutionDecision:
         with self._lock:
+            # DEF-T0049-5: context_id binding with request.project_id
+            if request.project_id != self.context_id:
+                return AdapterResolutionDecision(
+                    decision_status=ResolutionStatus.UNSUPPORTED,
+                    selected_adapter_id=None,
+                    matched_capabilities=(),
+                    missing_capabilities=request.required_capabilities,
+                    reason=f"Project ID mismatch: request project_id '{request.project_id}' does not match registry context '{self.context_id}'.",
+                    execution_mode=request.execution_mode,
+                    audit_context=request.audit_context
+                )
+
             effective_os = request.target_os or _normalize_current_os()
 
-            # 1. Exact adapter_id specified
+            # 1. Exact adapter_id specified (DEF-T0049-7: manual fallback is forbidden for exact ID!)
             if request.adapter_id is not None:
                 manifest = self._manifests.get(request.adapter_id)
                 adapter = self._adapters.get(request.adapter_id)
                 if not manifest or not adapter:
-                    if request.allow_manual_fallback:
-                        return AdapterResolutionDecision(
-                            decision_status=ResolutionStatus.MANUAL_FALLBACK,
-                            selected_adapter_id=None,
-                            matched_capabilities=(),
-                            missing_capabilities=request.required_capabilities,
-                            reason=f"Requested adapter_id '{request.adapter_id}' is not registered; manual fallback enabled.",
-                            audit_context=request.audit_context
-                        )
                     return AdapterResolutionDecision(
                         decision_status=ResolutionStatus.UNSUPPORTED,
                         selected_adapter_id=None,
                         matched_capabilities=(),
                         missing_capabilities=request.required_capabilities,
-                        reason=f"Requested adapter_id '{request.adapter_id}' is not registered.",
+                        reason=f"Requested exact adapter_id '{request.adapter_id}' is not registered in context '{self.context_id}'.",
+                        execution_mode=request.execution_mode,
                         audit_context=request.audit_context
                     )
 
-                # Evaluate single candidate
                 can_match, missing_caps, matched_caps, plat_ver, reject_reason = self._evaluate_candidate(
                     manifest, adapter, request, effective_os
                 )
-                if can_match:
+                if can_match and plat_ver is not None:
                     return AdapterResolutionDecision(
                         decision_status=ResolutionStatus.SELECTED,
                         selected_adapter_id=manifest.adapter_id,
                         matched_capabilities=matched_caps,
                         missing_capabilities=(),
-                        verification_level=plat_ver.verification_level if plat_ver else manifest.verification_level,
+                        verification_level=plat_ver.verification_level,
                         reason=f"Exact adapter '{manifest.adapter_id}' matches all requirements.",
                         auth_boundary_summary=manifest.auth_boundary.value,
                         billing_boundary_summary=manifest.billing_boundary.value,
                         workspace_modes=manifest.workspace_modes,
+                        execution_mode=request.execution_mode,
                         is_real_host=adapter.detect_capabilities().is_real_host,
                         audit_context=request.audit_context,
                         manifest=manifest
                     )
                 else:
-                    if request.allow_manual_fallback:
-                        return AdapterResolutionDecision(
-                            decision_status=ResolutionStatus.MANUAL_FALLBACK,
-                            selected_adapter_id=None,
-                            matched_capabilities=matched_caps,
-                            missing_capabilities=missing_caps,
-                            reason=f"Requested adapter '{manifest.adapter_id}' does not satisfy requirements: {reject_reason}; manual fallback.",
-                            audit_context=request.audit_context
-                        )
                     return AdapterResolutionDecision(
                         decision_status=ResolutionStatus.UNSUPPORTED,
                         selected_adapter_id=None,
                         matched_capabilities=matched_caps,
                         missing_capabilities=missing_caps,
-                        reason=f"Requested adapter '{manifest.adapter_id}' does not satisfy requirements: {reject_reason}",
+                        reason=f"Requested exact adapter '{manifest.adapter_id}' does not satisfy requirements: {reject_reason}",
+                        execution_mode=request.execution_mode,
                         audit_context=request.audit_context
                     )
 
@@ -254,6 +277,7 @@ class AdapterRegistry:
                     auth_boundary_summary=sel_man.auth_boundary.value,
                     billing_boundary_summary=sel_man.billing_boundary.value,
                     workspace_modes=sel_man.workspace_modes,
+                    execution_mode=request.execution_mode,
                     is_real_host=sel_adp.detect_capabilities().is_real_host,
                     audit_context=request.audit_context,
                     manifest=sel_man
@@ -266,6 +290,7 @@ class AdapterRegistry:
                         matched_capabilities=(),
                         missing_capabilities=request.required_capabilities,
                         reason=f"No matching adapter found ({'; '.join(rejection_reasons)}); manual fallback enabled.",
+                        execution_mode=ExecutionMode.MANUAL,
                         audit_context=request.audit_context
                     )
                 return AdapterResolutionDecision(
@@ -274,6 +299,7 @@ class AdapterRegistry:
                     matched_capabilities=(),
                     missing_capabilities=request.required_capabilities,
                     reason=f"No adapter satisfies requirements. Candidates rejected: {'; '.join(rejection_reasons)}",
+                    execution_mode=request.execution_mode,
                     audit_context=request.audit_context
                 )
             else:
@@ -285,6 +311,7 @@ class AdapterRegistry:
                     matched_capabilities=(),
                     missing_capabilities=(),
                     reason=f"Multiple adapters satisfy criteria without a tie-breaker: {candidate_ids}. Resolution is ambiguous.",
+                    execution_mode=request.execution_mode,
                     audit_context=request.audit_context
                 )
 
@@ -304,16 +331,23 @@ class AdapterRegistry:
         if not pv:
             return False, request.required_capabilities, (), None, f"No platform verification record for '{effective_os}'."
 
-        if request.allowed_verification_levels:
-            if pv.verification_level not in request.allowed_verification_levels:
-                return False, request.required_capabilities, (), pv, f"Platform verification level '{pv.verification_level.value}' not in allowed levels."
+        # DEF-T0049-1: UNSUPPORTED verification level must NEVER be selected!
+        if pv.verification_level == VerificationLevel.UNSUPPORTED:
+            return False, request.required_capabilities, (), pv, "VerificationLevel.UNSUPPORTED can never be selected."
+
+        if pv.verification_level not in request.allowed_verification_levels:
+            return False, request.required_capabilities, (), pv, f"Platform verification level '{pv.verification_level.value}' not in allowed levels."
+
+        # DEF-T0049-1: STATIC_ONLY cannot be selected for VERIFIED_AUTOMATIC execution mode
+        if request.execution_mode == ExecutionMode.VERIFIED_AUTOMATIC and pv.verification_level == VerificationLevel.STATIC_ONLY:
+            return False, request.required_capabilities, (), pv, "STATIC_ONLY verification cannot be used for verified_automatic execution mode."
 
         # c. Workspace modes check
         for req_wm in request.required_workspace_modes:
             if req_wm not in manifest.workspace_modes:
                 return False, request.required_capabilities, (), pv, f"Required workspace mode '{req_wm}' not supported."
 
-        # d. Capabilities check
+        # d. Capabilities check (DEF-T0049-2: UNKNOWN != SUPPORTED, runtime check required)
         detected_caps = adapter.detect_capabilities()
         matched: List[str] = []
         missing: List[str] = []
@@ -325,14 +359,23 @@ class AdapterRegistry:
                 missing.append(req_cap)
                 continue
 
-            # Check runtime detected capability if field exists on HostCapabilities
+            # DEF-T0049-2: Must check runtime HostCapabilities
             field_name = f"supports_{req_cap}" if not req_cap.startswith("supports_") else req_cap
+            has_cap = False
             if hasattr(detected_caps, field_name):
                 cap_val = getattr(detected_caps, field_name)
-                if cap_val != CapabilitySupport.SUPPORTED and cap_val != "supported":
-                    missing.append(req_cap)
-                    continue
-            matched.append(req_cap)
+                if cap_val == CapabilitySupport.SUPPORTED or cap_val == "supported":
+                    has_cap = True
+            elif isinstance(detected_caps.extra, Mapping):
+                extra_val = detected_caps.extra.get(req_cap, detected_caps.extra.get(field_name))
+                if extra_val == CapabilitySupport.SUPPORTED or extra_val == "supported":
+                    has_cap = True
+
+            if not has_cap:
+                # Ghost/unknown capability -> rejected!
+                missing.append(req_cap)
+            else:
+                matched.append(req_cap)
 
         if missing:
             return False, tuple(missing), tuple(matched), pv, f"Missing required capabilities: {missing}."
