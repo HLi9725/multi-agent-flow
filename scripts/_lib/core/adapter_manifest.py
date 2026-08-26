@@ -166,6 +166,8 @@ class AdapterManifest:
     executable_candidates_by_os: TMapping[str, Tuple[str, ...]]
     config_path_templates_by_os: TMapping[str, Tuple[str, ...]]
     conformance_suite_version: str
+    auth_context_id: Optional[str] = None
+    billing_context_id: Optional[str] = None
     verified_at: Optional[str] = None
     e2e_evidence_refs: Tuple[str, ...] = field(default_factory=tuple)
     extra: TMapping[str, Any] = field(default_factory=dict)
@@ -187,6 +189,22 @@ class AdapterManifest:
             raise ValueError(f"auth_boundary must be an AuthBoundaryType enum, got {type(self.auth_boundary).__name__}")
         if not isinstance(self.billing_boundary, BillingBoundaryType):
             raise ValueError(f"billing_boundary must be a BillingBoundaryType enum, got {type(self.billing_boundary).__name__}")
+
+        if self.auth_context_id is not None:
+            _assert_valid_string(self.auth_context_id, "auth_context_id")
+            _scan_for_sensitive_data(self.auth_context_id, "auth_context_id")
+        if self.billing_context_id is not None:
+            _assert_valid_string(self.billing_context_id, "billing_context_id")
+            _scan_for_sensitive_data(self.billing_context_id, "billing_context_id")
+        if self.auth_boundary == AuthBoundaryType.NONE and self.auth_context_id is not None:
+            raise ValueError("auth_context_id must be None when auth_boundary is NONE")
+        if self.auth_boundary != AuthBoundaryType.NONE and self.auth_context_id is None:
+            raise ValueError("Non-NONE auth_boundary requires a non-secret auth_context_id")
+        if self.billing_boundary in (BillingBoundaryType.NONE, BillingBoundaryType.UNMETERED):
+            if self.billing_context_id is not None:
+                raise ValueError("billing_context_id must be None for NONE or UNMETERED billing boundaries")
+        elif self.billing_context_id is None:
+            raise ValueError("Metered or host-bound billing_boundary requires a non-secret billing_context_id")
         _assert_valid_string(self.platform_version_constraint, "platform_version_constraint")
         _assert_valid_string(self.conformance_suite_version, "conformance_suite_version")
 

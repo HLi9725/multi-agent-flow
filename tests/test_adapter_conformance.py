@@ -3,6 +3,7 @@ import io
 import os
 import pathlib
 import pytest
+import threading
 
 from scripts._lib.core.agent_schema import (
     AgentCancelledError,
@@ -95,7 +96,7 @@ def test_zero_side_effects_active_interception_write_file():
     # DEF-T0049-3: Malicious adapter writing file via builtins.open during detect_capabilities must be intercepted
     adp = FaultySideEffectWriteFileAdapter("faulty_writer")
 
-    with pytest.raises(ConformanceError, match="Side-effect intercepted: file open write attempt"):
+    with pytest.raises(ConformanceError, match="Side-effect intercepted: file write attempt"):
         assert_zero_side_effects(adp)
 
     # Ensure no side effect file actually persisted
@@ -106,7 +107,7 @@ def test_zero_side_effects_active_interception_io_open():
     # DEF-T0049-9: Malicious adapter writing file via io.open during detect_capabilities must be intercepted
     adp = FaultySideEffectIoOpenAdapter("faulty_io_writer")
 
-    with pytest.raises(ConformanceError, match="Side-effect intercepted: file open write attempt"):
+    with pytest.raises(ConformanceError, match="Side-effect intercepted: file write attempt"):
         assert_zero_side_effects(adp)
 
     assert not os.path.exists("unauthorized_io_effect.tmp")
@@ -116,7 +117,7 @@ def test_zero_side_effects_active_interception_pathlib_write_text():
     # DEF-T0049-9: Malicious adapter writing file via pathlib.Path.write_text during detect_capabilities must be intercepted
     adp = FaultySideEffectPathlibWriteTextAdapter("faulty_pathlib_writer")
 
-    with pytest.raises(ConformanceError, match="Side-effect intercepted: Path.write_text attempt"):
+    with pytest.raises(ConformanceError, match="Side-effect intercepted: file write attempt"):
         assert_zero_side_effects(adp)
 
     assert not os.path.exists("unauthorized_pathlib_effect.tmp")
@@ -126,8 +127,41 @@ def test_zero_side_effects_active_interception_subprocess():
     # DEF-T0049-3: Malicious adapter running subprocess during detect_capabilities must be intercepted
     adp = FaultySideEffectSubprocessAdapter("faulty_runner")
 
-    with pytest.raises(ConformanceError, match="Side-effect intercepted: subprocess.run attempt"):
+    with pytest.raises(ConformanceError, match="Side-effect intercepted: subprocess execution attempt"):
         assert_zero_side_effects(adp)
+
+
+def test_zero_side_effect_guard_does_not_pollute_unrelated_threads(tmp_path):
+    entered_probe = threading.Event()
+    release_probe = threading.Event()
+    probe_errors = []
+
+    class BlockingAdapter(StandardTestFakeAdapter):
+        def detect_capabilities(self):
+            entered_probe.set()
+            if not release_probe.wait(timeout=5):
+                raise RuntimeError("test probe release timed out")
+            return self._capabilities
+
+    def run_probe():
+        try:
+            assert_zero_side_effects(BlockingAdapter("blocking_adapter"))
+        except Exception as exc:  # captured for the parent test thread
+            probe_errors.append(exc)
+
+    probe_thread = threading.Thread(target=run_probe)
+    probe_thread.start()
+    assert entered_probe.wait(timeout=5)
+    unrelated_file = tmp_path / "unrelated-thread-write.txt"
+    try:
+        unrelated_file.write_text("allowed", encoding="utf-8")
+    finally:
+        release_probe.set()
+        probe_thread.join(timeout=5)
+
+    assert not probe_thread.is_alive()
+    assert probe_errors == []
+    assert unrelated_file.read_text(encoding="utf-8") == "allowed"
 
 
 def test_adapter_timeout_and_cancel_lifecycle():

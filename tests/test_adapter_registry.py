@@ -1,6 +1,7 @@
 import os
 import pytest
 import threading
+from dataclasses import replace
 
 from scripts._lib.core.agent_schema import CapabilitySupport, HostCapabilities
 from scripts._lib.core.adapter_manifest import (
@@ -344,7 +345,7 @@ def test_registry_selection_strategies():
     assert d_prio.decision_status == ResolutionStatus.SELECTED
     assert d_prio.selected_adapter_id == "adapter_b"
 
-    # 3. Strategy: deterministic -> since verification levels are equal, checks priority (50 > 10) -> picks adapter_b
+    # 3. Strategy: deterministic has no implicit ranking policy -> fail closed as ambiguous
     req_det = AdapterResolutionRequest(
         project_id="p_strat",
         required_capabilities=("worktree",),
@@ -352,8 +353,70 @@ def test_registry_selection_strategies():
         selection_strategy="deterministic"
     )
     d_det = registry.resolve(req_det)
-    assert d_det.decision_status == ResolutionStatus.SELECTED
-    assert d_det.selected_adapter_id == "adapter_b"
+    assert d_det.decision_status == ResolutionStatus.AMBIGUOUS
+    assert d_det.selected_adapter_id is None
+
+
+def test_registry_never_ranks_verification_levels_numerically():
+    class RealHostAdapter(StandardTestFakeAdapter):
+        def detect_capabilities(self):
+            return HostCapabilities(is_real_host=True)
+
+    registry = AdapterRegistry(context_id="p_no_level_rank")
+    static_adapter = StandardTestFakeAdapter(adapter_id="static_high_priority")
+    static_manifest = replace(
+        create_standard_fake_manifest("static_high_priority"),
+        extra={"priority": 100}
+    )
+
+    native_pv = PlatformVerification(
+        operating_system="windows",
+        host_surface=HostSurface.NATIVE,
+        verification_level=VerificationLevel.NATIVE_VERIFIED,
+        verified_version="1.0.0",
+        verified_at="2026-08-26T10:00:00Z",
+        e2e_evidence_refs=("e2e:native-low-priority",)
+    )
+    native_manifest = AdapterManifest(
+        schema_version="2.0",
+        adapter_id="native_low_priority",
+        display_name="Native Low Priority",
+        implementation_version="1.0.0",
+        host_surface=HostSurface.NATIVE,
+        verification_level=VerificationLevel.STATIC_ONLY,
+        capabilities={},
+        workspace_modes=("isolated",),
+        identity_fields=("id",),
+        auth_boundary=AuthBoundaryType.NONE,
+        billing_boundary=BillingBoundaryType.UNMETERED,
+        platform_version_constraint=">=1.0.0",
+        supported_operating_systems=("windows",),
+        platform_verifications={"windows": native_pv},
+        executable_candidates_by_os={"windows": ()},
+        config_path_templates_by_os={"windows": ()},
+        conformance_suite_version="2.0",
+        extra={"priority": 0}
+    )
+    registry.register(static_adapter, static_manifest)
+    registry.register(RealHostAdapter("native_low_priority"), native_manifest)
+
+    allowed_levels = (VerificationLevel.STATIC_ONLY, VerificationLevel.NATIVE_VERIFIED)
+    priority_decision = registry.resolve(AdapterResolutionRequest(
+        project_id="p_no_level_rank",
+        target_os="windows",
+        allowed_verification_levels=allowed_levels,
+        selection_strategy="priority"
+    ))
+    assert priority_decision.decision_status == ResolutionStatus.SELECTED
+    assert priority_decision.selected_adapter_id == "static_high_priority"
+
+    deterministic_decision = registry.resolve(AdapterResolutionRequest(
+        project_id="p_no_level_rank",
+        target_os="windows",
+        allowed_verification_levels=allowed_levels,
+        selection_strategy="deterministic"
+    ))
+    assert deterministic_decision.decision_status == ResolutionStatus.AMBIGUOUS
 
 
 def test_registry_auth_and_billing_boundaries():
@@ -378,7 +441,9 @@ def test_registry_auth_and_billing_boundaries():
         workspace_modes=("isolated",),
         identity_fields=("id",),
         auth_boundary=AuthBoundaryType.USER_LOCAL,
-        billing_boundary=BillingBoundaryType.UNMETERED,
+        billing_boundary=BillingBoundaryType.USER_SUBSCRIPTION,
+        auth_context_id="account:local-a",
+        billing_context_id="subscription:team-a",
         platform_version_constraint=">=1.0.0",
         supported_operating_systems=("windows",),
         platform_verifications={"windows": pv_local},
@@ -393,7 +458,9 @@ def test_registry_auth_and_billing_boundaries():
         project_id="p_bound",
         allowed_verification_levels=(VerificationLevel.STATIC_ONLY,),
         allowed_auth_boundaries=(AuthBoundaryType.USER_LOCAL,),
-        allowed_billing_boundaries=(BillingBoundaryType.UNMETERED,)
+        allowed_billing_boundaries=(BillingBoundaryType.USER_SUBSCRIPTION,),
+        auth_context_id="account:local-a",
+        billing_context_id="subscription:team-a"
     )
     assert registry.resolve(req_ok).decision_status == ResolutionStatus.SELECTED
 
@@ -401,7 +468,9 @@ def test_registry_auth_and_billing_boundaries():
     req_bad_auth = AdapterResolutionRequest(
         project_id="p_bound",
         allowed_verification_levels=(VerificationLevel.STATIC_ONLY,),
-        allowed_auth_boundaries=(AuthBoundaryType.HOST_MANAGED,)
+        allowed_auth_boundaries=(AuthBoundaryType.HOST_MANAGED,),
+        auth_context_id="account:local-a",
+        billing_context_id="subscription:team-a"
     )
     d_bad_auth = registry.resolve(req_bad_auth)
     assert d_bad_auth.decision_status == ResolutionStatus.UNSUPPORTED
@@ -411,11 +480,35 @@ def test_registry_auth_and_billing_boundaries():
     req_bad_bill = AdapterResolutionRequest(
         project_id="p_bound",
         allowed_verification_levels=(VerificationLevel.STATIC_ONLY,),
-        allowed_billing_boundaries=(BillingBoundaryType.API_KEY,)
+        allowed_billing_boundaries=(BillingBoundaryType.API_KEY,),
+        auth_context_id="account:local-a",
+        billing_context_id="subscription:team-a"
     )
     d_bad_bill = registry.resolve(req_bad_bill)
     assert d_bad_bill.decision_status == ResolutionStatus.UNSUPPORTED
     assert "Billing boundary" in d_bad_bill.reason
+
+    # 4. Same boundary type but a different account/subscription must be rejected
+    req_bad_context = AdapterResolutionRequest(
+        project_id="p_bound",
+        allowed_verification_levels=(VerificationLevel.STATIC_ONLY,),
+        allowed_auth_boundaries=(AuthBoundaryType.USER_LOCAL,),
+        allowed_billing_boundaries=(BillingBoundaryType.USER_SUBSCRIPTION,),
+        auth_context_id="account:local-b",
+        billing_context_id="subscription:team-b"
+    )
+    d_bad_context = registry.resolve(req_bad_context)
+    assert d_bad_context.decision_status == ResolutionStatus.UNSUPPORTED
+    assert "Auth context ID" in d_bad_context.reason
+
+    # 5. Omitting context IDs also fails closed for a context-bound adapter
+    req_missing_context = AdapterResolutionRequest(
+        project_id="p_bound",
+        allowed_verification_levels=(VerificationLevel.STATIC_ONLY,),
+        allowed_auth_boundaries=(AuthBoundaryType.USER_LOCAL,),
+        allowed_billing_boundaries=(BillingBoundaryType.USER_SUBSCRIPTION,)
+    )
+    assert registry.resolve(req_missing_context).decision_status == ResolutionStatus.UNSUPPORTED
 
 
 def test_registry_thread_safety():

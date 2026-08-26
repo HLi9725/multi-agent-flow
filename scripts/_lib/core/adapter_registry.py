@@ -32,15 +32,6 @@ class ResolutionStatus(str, Enum):
 
 ALLOWED_SELECTION_STRATEGIES: FrozenSet[str] = frozenset({"deterministic", "priority", "first_match"})
 
-VERIFICATION_LEVEL_WEIGHTS: TMapping[VerificationLevel, int] = {
-    VerificationLevel.NATIVE_VERIFIED: 4,
-    VerificationLevel.CLI_VERIFIED: 3,
-    VerificationLevel.MCP_VERIFIED: 2,
-    VerificationLevel.STATIC_ONLY: 1,
-    VerificationLevel.UNSUPPORTED: 0,
-}
-
-
 def _normalize_current_os() -> str:
     sys_plat = sys.platform.lower()
     if sys_plat.startswith("win"):
@@ -65,6 +56,8 @@ class AdapterResolutionRequest:
     selection_strategy: str = "deterministic"
     allowed_auth_boundaries: Optional[Tuple[AuthBoundaryType, ...]] = None
     allowed_billing_boundaries: Optional[Tuple[BillingBoundaryType, ...]] = None
+    auth_context_id: Optional[str] = None
+    billing_context_id: Optional[str] = None
     audit_context: TMapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -73,6 +66,12 @@ class AdapterResolutionRequest:
             _assert_valid_string(self.adapter_id, "adapter_id")
         if self.target_os is not None:
             _assert_valid_string(self.target_os, "target_os")
+        if self.auth_context_id is not None:
+            _assert_valid_string(self.auth_context_id, "auth_context_id")
+            _scan_for_sensitive_data(self.auth_context_id, "auth_context_id")
+        if self.billing_context_id is not None:
+            _assert_valid_string(self.billing_context_id, "billing_context_id")
+            _scan_for_sensitive_data(self.billing_context_id, "billing_context_id")
 
         if not isinstance(self.execution_mode, ExecutionMode):
             raise ValueError(f"execution_mode must be an ExecutionMode enum, got {type(self.execution_mode).__name__}")
@@ -365,14 +364,13 @@ class AdapterRegistry:
                     )
                 elif request.selection_strategy == "priority":
                     def priority_key(cand):
-                        man, adp, matched, pv = cand
+                        man, _adp, _matched, _pv = cand
                         prio = 0
                         if isinstance(man.extra, Mapping):
                             raw_p = man.extra.get("priority", 0)
-                            if isinstance(raw_p, (int, float)):
+                            if isinstance(raw_p, (int, float)) and not isinstance(raw_p, bool):
                                 prio = raw_p
-                        vl_weight = VERIFICATION_LEVEL_WEIGHTS.get(pv.verification_level, 0)
-                        return (prio, vl_weight)
+                        return prio
 
                     sorted_by_prio = sorted(matching_candidates, key=priority_key, reverse=True)
                     top_cand = sorted_by_prio[0]
@@ -386,7 +384,7 @@ class AdapterRegistry:
                             matched_capabilities=sel_matched,
                             missing_capabilities=(),
                             verification_level=sel_pv.verification_level,
-                            reason=f"Selected '{sel_man.adapter_id}' via priority strategy with score {priority_key(top_cand)}.",
+                            reason=f"Selected '{sel_man.adapter_id}' via explicit priority strategy with priority {priority_key(top_cand)}.",
                             auth_boundary_summary=sel_man.auth_boundary.value,
                             billing_boundary_summary=sel_man.billing_boundary.value,
                             workspace_modes=sel_man.workspace_modes,
@@ -406,49 +404,17 @@ class AdapterRegistry:
                             execution_mode=request.execution_mode,
                             audit_context=request.audit_context
                         )
-                else:  # deterministic
-                    def deterministic_key(cand):
-                        man, adp, matched, pv = cand
-                        prio = 0
-                        if isinstance(man.extra, Mapping):
-                            raw_p = man.extra.get("priority", 0)
-                            if isinstance(raw_p, (int, float)):
-                                prio = raw_p
-                        vl_weight = VERIFICATION_LEVEL_WEIGHTS.get(pv.verification_level, 0)
-                        return (vl_weight, prio)
-
-                    sorted_by_det = sorted(matching_candidates, key=deterministic_key, reverse=True)
-                    top_cand = sorted_by_det[0]
-                    second_cand = sorted_by_det[1]
-
-                    if deterministic_key(top_cand) > deterministic_key(second_cand):
-                        sel_man, sel_adp, sel_matched, sel_pv = top_cand
-                        return AdapterResolutionDecision(
-                            decision_status=ResolutionStatus.SELECTED,
-                            selected_adapter_id=sel_man.adapter_id,
-                            matched_capabilities=sel_matched,
-                            missing_capabilities=(),
-                            verification_level=sel_pv.verification_level,
-                            reason=f"Adapter '{sel_man.adapter_id}' uniquely ranked highest via deterministic resolution.",
-                            auth_boundary_summary=sel_man.auth_boundary.value,
-                            billing_boundary_summary=sel_man.billing_boundary.value,
-                            workspace_modes=sel_man.workspace_modes,
-                            execution_mode=request.execution_mode,
-                            is_real_host=sel_adp.detect_capabilities().is_real_host,
-                            audit_context=request.audit_context,
-                            manifest=sel_man
-                        )
-                    else:
-                        candidate_ids = [c[0].adapter_id for c in matching_candidates]
-                        return AdapterResolutionDecision(
-                            decision_status=ResolutionStatus.AMBIGUOUS,
-                            selected_adapter_id=None,
-                            matched_capabilities=(),
-                            missing_capabilities=(),
-                            reason=f"Multiple adapters satisfy criteria with equal deterministic rank: {candidate_ids}. Resolution is ambiguous.",
-                            execution_mode=request.execution_mode,
-                            audit_context=request.audit_context
-                        )
+                else:  # deterministic: no implicit ranking policy
+                    candidate_ids = [c[0].adapter_id for c in matching_candidates]
+                    return AdapterResolutionDecision(
+                        decision_status=ResolutionStatus.AMBIGUOUS,
+                        selected_adapter_id=None,
+                        matched_capabilities=(),
+                        missing_capabilities=(),
+                        reason=f"Multiple adapters satisfy criteria: {candidate_ids}. No explicit selection policy was requested.",
+                        execution_mode=request.execution_mode,
+                        audit_context=request.audit_context
+                    )
 
     def _evaluate_candidate(
         self,
@@ -494,6 +460,12 @@ class AdapterRegistry:
         if request.allowed_billing_boundaries is not None:
             if manifest.billing_boundary not in request.allowed_billing_boundaries:
                 return False, request.required_capabilities, (), pv, f"Billing boundary '{manifest.billing_boundary.value}' not in allowed billing boundaries."
+
+        # DEF-T0049-14: account and billing identities are exact-match boundaries.
+        if manifest.auth_context_id != request.auth_context_id:
+            return False, request.required_capabilities, (), pv, "Auth context ID does not match the registered adapter context."
+        if manifest.billing_context_id != request.billing_context_id:
+            return False, request.required_capabilities, (), pv, "Billing context ID does not match the registered adapter context."
 
         # c. Workspace modes check
         for req_wm in request.required_workspace_modes:

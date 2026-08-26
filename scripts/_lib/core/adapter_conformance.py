@@ -1,20 +1,12 @@
-import builtins
 from collections.abc import Mapping
-import http.client
 import io
 import os
 import pathlib
-import socket
 import subprocess
 import sys
-import urllib.request
+import threading
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
-
-try:
-    import _io
-except ImportError:
-    _io = None
 
 from .agent_schema import (
     AgentCancelledError,
@@ -44,6 +36,49 @@ from .adapter_manifest import (
 class ConformanceError(Exception):
     """Raised when an adapter or manifest fails the generic conformance suite."""
     pass
+
+
+_AUDIT_CONTEXT = threading.local()
+_AUDIT_INSTALL_LOCK = threading.Lock()
+_AUDIT_HOOK_INSTALLED = False
+
+
+def _zero_side_effect_audit_hook(event: str, args: Tuple[Any, ...]) -> None:
+    """Fail closed only for the thread currently running a capability probe."""
+    intercepted_calls = getattr(_AUDIT_CONTEXT, "intercepted_calls", None)
+    if intercepted_calls is None:
+        return
+
+    description: Optional[str] = None
+    if event == "open":
+        path = args[0] if args else "<unknown>"
+        mode = args[1] if len(args) > 1 else None
+        flags = args[2] if len(args) > 2 else 0
+        write_flags = os.O_WRONLY | os.O_RDWR | os.O_CREAT | getattr(os, "O_APPEND", 0) | getattr(os, "O_TRUNC", 0)
+        if (isinstance(mode, str) and any(marker in mode for marker in ("w", "a", "x", "+"))) or (
+            isinstance(flags, int) and bool(flags & write_flags)
+        ):
+            description = f"file write attempt on {path}"
+    elif event in {"os.mkdir", "os.remove", "os.rmdir", "os.rename", "os.chmod", "os.truncate"}:
+        description = f"filesystem mutation via {event}"
+    elif event == "subprocess.Popen":
+        description = "subprocess execution attempt"
+    elif event in {"socket.connect", "socket.bind", "socket.getaddrinfo"}:
+        description = f"network operation via {event}"
+
+    if description is not None:
+        intercepted_calls.append(f"{event}: {description}")
+        raise ConformanceError(f"Side-effect intercepted: {description}")
+
+
+def _install_zero_side_effect_audit_hook() -> None:
+    global _AUDIT_HOOK_INSTALLED
+    if _AUDIT_HOOK_INSTALLED:
+        return
+    with _AUDIT_INSTALL_LOCK:
+        if not _AUDIT_HOOK_INSTALLED:
+            sys.addaudithook(_zero_side_effect_audit_hook)
+            _AUDIT_HOOK_INSTALLED = True
 
 
 def assert_manifest_conformance(manifest: AdapterManifest) -> None:
@@ -98,198 +133,28 @@ def assert_capabilities_conformance(adapter: BaseHostAdapter, manifest: AdapterM
 
 def assert_zero_side_effects(adapter: BaseHostAdapter) -> None:
     """
-    DEF-T0049-3, DEF-T0049-9: Actively intercepts and guarantees that calling detect_capabilities()
-    has zero filesystem write, network, process, or logging/billing side-effects across
-    builtins, io, _io, os, and pathlib.Path APIs.
+    Intercept writes, process creation, and network activity during detect_capabilities().
+
+    The audit hook is process-global but inert by default. Its enforcement context is
+    thread-local, so unrelated threads retain their normal filesystem/network behavior.
+    This avoids rebinding builtins/os/pathlib functions across the whole process.
     """
+    _install_zero_side_effect_audit_hook()
     intercepted_calls: List[str] = []
-
-    orig_builtin_open = builtins.open
-    orig_io_open = io.open
-    orig_raw_io_open = getattr(_io, "open", None) if _io else None
-    orig_os_open = os.open
-    orig_mkdir = os.mkdir
-    orig_makedirs = os.makedirs
-    orig_remove = os.remove
-    orig_unlink = os.unlink
-    orig_rename = os.rename
-    orig_replace = os.replace
-
-    orig_path_open = pathlib.Path.open
-    orig_path_write_text = pathlib.Path.write_text
-    orig_path_write_bytes = pathlib.Path.write_bytes
-    orig_path_touch = pathlib.Path.touch
-    orig_path_mkdir = pathlib.Path.mkdir
-    orig_path_unlink = pathlib.Path.unlink
-    orig_path_rmdir = pathlib.Path.rmdir
-    orig_path_rename = pathlib.Path.rename
-    orig_path_replace = pathlib.Path.replace
-    orig_path_chmod = pathlib.Path.chmod
-
-    orig_subprocess_run = subprocess.run
-    orig_subprocess_popen = subprocess.Popen
-    orig_socket_connect = socket.socket.connect
-    orig_http_connect = http.client.HTTPConnection.connect
-
-    def guarded_open(file, mode="r", *args, **kwargs):
-        if any(w in mode for w in ("w", "a", "x", "+")):
-            intercepted_calls.append(f"open(mode='{mode}', file='{file}')")
-            raise ConformanceError(f"Side-effect intercepted: file open write attempt on {file}")
-        return orig_builtin_open(file, mode, *args, **kwargs)
-
-    def guarded_os_open(path, flags, *args, **kwargs):
-        write_flags = os.O_WRONLY | os.O_RDWR | os.O_CREAT | getattr(os, "O_APPEND", 0) | getattr(os, "O_TRUNC", 0)
-        if flags & write_flags:
-            intercepted_calls.append(f"os.open(flags={flags}, path='{path}')")
-            raise ConformanceError(f"Side-effect intercepted: os.open write attempt on {path}")
-        return orig_os_open(path, flags, *args, **kwargs)
-
-    def guarded_mkdir(path, *args, **kwargs):
-        intercepted_calls.append(f"os.mkdir(path='{path}')")
-        raise ConformanceError(f"Side-effect intercepted: os.mkdir attempt on {path}")
-
-    def guarded_makedirs(name, *args, **kwargs):
-        intercepted_calls.append(f"os.makedirs(name='{name}')")
-        raise ConformanceError(f"Side-effect intercepted: os.makedirs attempt on {name}")
-
-    def guarded_remove(path, *args, **kwargs):
-        intercepted_calls.append(f"os.remove(path='{path}')")
-        raise ConformanceError(f"Side-effect intercepted: os.remove attempt on {path}")
-
-    def guarded_unlink(path, *args, **kwargs):
-        intercepted_calls.append(f"os.unlink(path='{path}')")
-        raise ConformanceError(f"Side-effect intercepted: os.unlink attempt on {path}")
-
-    def guarded_rename(src, dst, *args, **kwargs):
-        intercepted_calls.append(f"os.rename({src} -> {dst})")
-        raise ConformanceError(f"Side-effect intercepted: os.rename attempt on {src}")
-
-    def guarded_replace(src, dst, *args, **kwargs):
-        intercepted_calls.append(f"os.replace({src} -> {dst})")
-        raise ConformanceError(f"Side-effect intercepted: os.replace attempt on {src}")
-
-    # Pathlib guards (DEF-T0049-9)
-    def guarded_path_open(self, mode="r", *args, **kwargs):
-        if any(w in mode for w in ("w", "a", "x", "+")):
-            intercepted_calls.append(f"Path.open(mode='{mode}', path='{self}')")
-            raise ConformanceError(f"Side-effect intercepted: Path.open write attempt on {self}")
-        return orig_path_open(self, mode, *args, **kwargs)
-
-    def guarded_path_write_text(self, data, *args, **kwargs):
-        intercepted_calls.append(f"Path.write_text(path='{self}')")
-        raise ConformanceError(f"Side-effect intercepted: Path.write_text attempt on {self}")
-
-    def guarded_path_write_bytes(self, data, *args, **kwargs):
-        intercepted_calls.append(f"Path.write_bytes(path='{self}')")
-        raise ConformanceError(f"Side-effect intercepted: Path.write_bytes attempt on {self}")
-
-    def guarded_path_touch(self, *args, **kwargs):
-        intercepted_calls.append(f"Path.touch(path='{self}')")
-        raise ConformanceError(f"Side-effect intercepted: Path.touch attempt on {self}")
-
-    def guarded_path_mkdir(self, *args, **kwargs):
-        intercepted_calls.append(f"Path.mkdir(path='{self}')")
-        raise ConformanceError(f"Side-effect intercepted: Path.mkdir attempt on {self}")
-
-    def guarded_path_unlink(self, *args, **kwargs):
-        intercepted_calls.append(f"Path.unlink(path='{self}')")
-        raise ConformanceError(f"Side-effect intercepted: Path.unlink attempt on {self}")
-
-    def guarded_path_rmdir(self, *args, **kwargs):
-        intercepted_calls.append(f"Path.rmdir(path='{self}')")
-        raise ConformanceError(f"Side-effect intercepted: Path.rmdir attempt on {self}")
-
-    def guarded_path_rename(self, target, *args, **kwargs):
-        intercepted_calls.append(f"Path.rename({self} -> {target})")
-        raise ConformanceError(f"Side-effect intercepted: Path.rename attempt on {self}")
-
-    def guarded_path_replace(self, target, *args, **kwargs):
-        intercepted_calls.append(f"Path.replace({self} -> {target})")
-        raise ConformanceError(f"Side-effect intercepted: Path.replace attempt on {self}")
-
-    def guarded_path_chmod(self, mode, *args, **kwargs):
-        intercepted_calls.append(f"Path.chmod(path='{self}')")
-        raise ConformanceError(f"Side-effect intercepted: Path.chmod attempt on {self}")
-
-    # Process and network guards
-    def guarded_subprocess_run(*args, **kwargs):
-        intercepted_calls.append(f"subprocess.run({args})")
-        raise ConformanceError("Side-effect intercepted: subprocess.run attempt")
-
-    def guarded_subprocess_popen(*args, **kwargs):
-        intercepted_calls.append(f"subprocess.Popen({args})")
-        raise ConformanceError("Side-effect intercepted: subprocess.Popen attempt")
-
-    def guarded_socket_connect(self, *args, **kwargs):
-        intercepted_calls.append("socket.socket.connect()")
-        raise ConformanceError("Side-effect intercepted: network socket connect attempt")
-
-    def guarded_http_connect(self, *args, **kwargs):
-        intercepted_calls.append("HTTPConnection.connect()")
-        raise ConformanceError("Side-effect intercepted: HTTP network connect attempt")
-
+    previous_context = getattr(_AUDIT_CONTEXT, "intercepted_calls", None)
     try:
-        builtins.open = guarded_open
-        io.open = guarded_open
-        if _io is not None and hasattr(_io, "open"):
-            _io.open = guarded_open
-
-        os.open = guarded_os_open
-        os.mkdir = guarded_mkdir
-        os.makedirs = guarded_makedirs
-        os.remove = guarded_remove
-        os.unlink = guarded_unlink
-        os.rename = guarded_rename
-        os.replace = guarded_replace
-
-        pathlib.Path.open = guarded_path_open
-        pathlib.Path.write_text = guarded_path_write_text
-        pathlib.Path.write_bytes = guarded_path_write_bytes
-        pathlib.Path.touch = guarded_path_touch
-        pathlib.Path.mkdir = guarded_path_mkdir
-        pathlib.Path.unlink = guarded_path_unlink
-        pathlib.Path.rmdir = guarded_path_rmdir
-        pathlib.Path.rename = guarded_path_rename
-        pathlib.Path.replace = guarded_path_replace
-        pathlib.Path.chmod = guarded_path_chmod
-
-        subprocess.run = guarded_subprocess_run
-        subprocess.Popen = guarded_subprocess_popen
-        socket.socket.connect = guarded_socket_connect
-        http.client.HTTPConnection.connect = guarded_http_connect
-
+        _AUDIT_CONTEXT.intercepted_calls = intercepted_calls
         caps = adapter.detect_capabilities()
         if not isinstance(caps, HostCapabilities):
             raise ConformanceError("detect_capabilities did not return HostCapabilities instance")
     finally:
-        builtins.open = orig_builtin_open
-        io.open = orig_io_open
-        if _io is not None and hasattr(_io, "open"):
-            _io.open = orig_raw_io_open
-
-        os.open = orig_os_open
-        os.mkdir = orig_mkdir
-        os.makedirs = orig_makedirs
-        os.remove = orig_remove
-        os.unlink = orig_unlink
-        os.rename = orig_rename
-        os.replace = orig_replace
-
-        pathlib.Path.open = orig_path_open
-        pathlib.Path.write_text = orig_path_write_text
-        pathlib.Path.write_bytes = orig_path_write_bytes
-        pathlib.Path.touch = orig_path_touch
-        pathlib.Path.mkdir = orig_path_mkdir
-        pathlib.Path.unlink = orig_path_unlink
-        pathlib.Path.rmdir = orig_path_rmdir
-        pathlib.Path.rename = orig_path_rename
-        pathlib.Path.replace = orig_path_replace
-        pathlib.Path.chmod = orig_path_chmod
-
-        subprocess.run = orig_subprocess_run
-        subprocess.Popen = orig_subprocess_popen
-        socket.socket.connect = orig_socket_connect
-        http.client.HTTPConnection.connect = orig_http_connect
+        if previous_context is None:
+            try:
+                del _AUDIT_CONTEXT.intercepted_calls
+            except AttributeError:
+                pass
+        else:
+            _AUDIT_CONTEXT.intercepted_calls = previous_context
 
     if intercepted_calls:
         raise ConformanceError(f"Zero side-effect violation: intercepted {intercepted_calls}")

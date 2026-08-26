@@ -179,14 +179,12 @@
 
 ### 测试记录（最新真实数据）
 - **2D-1 定向测试**:
-  - `python -m pytest tests/test_adapter_manifest.py -q -rs` -> `7 passed in 0.05s`
-  - `python -m pytest tests/test_adapter_registry.py -q -rs` -> `12 passed in 0.09s`
-  - `python -m pytest tests/test_adapter_conformance.py -q -rs` -> `10 passed in 0.07s`
-  - **总计**: `29 passed in 0.21s` (0 failed, 0 skipped)
+  - `python -m pytest tests/test_adapter_manifest.py tests/test_adapter_registry.py tests/test_adapter_conformance.py -q -rs` -> `32 passed in 1.66s`
+  - **总计**: `32 passed in 1.66s` (0 failed, 0 skipped)
 - **2A/2B/2C 关联兼容测试**:
-  - `python -m pytest tests/test_host_adapter.py tests/test_evidence.py tests/test_worktree_manager.py -q -rs` -> `60 passed in 23.18s` (0 failed, 0 skipped)
+  - `python -m pytest tests/test_host_adapter.py tests/test_evidence.py tests/test_worktree_manager.py -q -rs` -> `60 passed in 25.65s` (0 failed, 0 skipped)
 - **全量测试**:
-  - `python -m pytest tests -q -rs` -> `315 passed in 62.49s` (0 failed, 0 skipped, 100% 通过)
+  - `python -m pytest tests -q -rs` -> `318 passed in 62.27s` (0 failed, 0 skipped, 100% 通过)
 - **代码规范**:
   - `git diff --check` -> 退出码 0，零尾随空白错误
 
@@ -229,3 +227,22 @@
 4. **[DEF-T0049-11] 增加 Auth 与 Billing 边界声明与过滤**:
    - `AdapterResolutionRequest` 引入 `allowed_auth_boundaries` 与 `allowed_billing_boundaries` 强类型白名单校验。
    - `resolve()` 严格对比 Manifest 的 `auth_boundary` 与 `billing_boundary`，不符合请求边界声明的候选一律被排除。
+
+#### DEF-T0049-12 ~ 14 修复（Codex 最终 QA 返工）
+1. **[DEF-T0049-12] 零副作用检查改为线程作用域审计隔离**:
+   - 删除对 `builtins`、`io`、`os`、`pathlib`、`subprocess`、`socket` 等进程级函数的动态重绑。
+   - 使用一次安装、默认休眠的 Python Audit Hook，并用 `threading.local()` 仅激活当前能力探测线程；文件写入、进程创建和网络操作仍然 Fail-Closed，无关线程的合法临时目录操作不受影响。
+   - 新增并发对抗测试：能力探测阻塞期间，另一线程可正常执行 `Path.write_text()`；被测 Adapter 的 `open`、`io.open`、`Path.write_text` 与 `subprocess.run` 仍全部被拦截。
+2. **[DEF-T0049-13] 移除验证路径数值权重**:
+   - 删除 `VERIFICATION_LEVEL_WEIGHTS`，不再把 `native_verified`、`cli_verified`、`mcp_verified`、`static_only` 解释为可比较的高低等级。
+   - 默认 `deterministic` 在多个候选满足条件时返回 `AMBIGUOUS`；显式 `priority` 只比较 Manifest 的调用方优先级，显式 `first_match` 只按 Adapter ID 确定性选择。
+   - 新增跨验证路径对抗测试，证明高优先级 `static_only` 不会被低优先级 `native_verified` 的隐式等级权重覆盖。
+3. **[DEF-T0049-14] 账号与计费身份链精确绑定**:
+   - `AdapterManifest` 与 `AdapterResolutionRequest` 增加非秘密 `auth_context_id`、`billing_context_id`。
+   - 非匿名认证边界必须声明 `auth_context_id`；计量或宿主绑定计费边界必须声明 `billing_context_id`；匿名/不计费边界禁止携带伪上下文 ID。
+   - Resolver 对两类上下文 ID 执行 1:1 精确匹配；相同边界枚举但不同账号、订阅或计费上下文，以及请求省略 ID，均 Fail-Closed 返回 `UNSUPPORTED`。
+
+### 本轮测试看板哈希说明
+- 代码工作树测试数据 `user_data/board.json`：全量测试前 `6C67C1FB0DD82A985232C344093CAF141CB255547EC5EFD8CBED870167472FC1`，测试后 `9CFC14BE2A04C4D64F015932ECFBFF4B017821DBFEFD87B69875F21B8B8A4B19`。
+- 该文件属于代码工作树的非权威测试数据且未进入 Git 修改集；未直接编辑、覆盖或物理删除。
+- 权威看板位于阶段集成工作树，T0049 在本轮开发期间保持 `进行中 / 李开发`。

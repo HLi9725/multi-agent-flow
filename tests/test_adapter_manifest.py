@@ -280,6 +280,8 @@ def test_cross_platform_verification_isolation():
         identity_fields=("id",),
         auth_boundary=AuthBoundaryType.HOST_MANAGED,
         billing_boundary=BillingBoundaryType.HOST_INCLUDED,
+        auth_context_id="host-account:windows-e2e",
+        billing_context_id="host-plan:windows-e2e",
         platform_version_constraint=">=1.0.0",
         supported_operating_systems=("windows", "macos", "linux"),
         platform_verifications={"windows": pv_win, "macos": pv_mac, "linux": pv_linux},
@@ -293,3 +295,44 @@ def test_cross_platform_verification_isolation():
     assert man.platform_verifications["windows"].verification_level == VerificationLevel.NATIVE_VERIFIED
     assert man.platform_verifications["macos"].verification_level == VerificationLevel.STATIC_ONLY
     assert man.platform_verifications["linux"].verification_level == VerificationLevel.UNSUPPORTED
+
+
+def test_non_anonymous_boundaries_require_non_secret_context_ids():
+    pv = PlatformVerification(
+        operating_system="windows",
+        host_surface=HostSurface.STATIC,
+        verification_level=VerificationLevel.STATIC_ONLY,
+        verified_version="1.0.0"
+    )
+    common = dict(
+        schema_version="2.0",
+        adapter_id="context_bound_adapter",
+        display_name="Context Bound Adapter",
+        implementation_version="1.0.0",
+        host_surface=HostSurface.STATIC,
+        verification_level=VerificationLevel.STATIC_ONLY,
+        capabilities={},
+        workspace_modes=("isolated",),
+        identity_fields=("id",),
+        auth_boundary=AuthBoundaryType.USER_LOCAL,
+        billing_boundary=BillingBoundaryType.USER_SUBSCRIPTION,
+        platform_version_constraint=">=1.0.0",
+        supported_operating_systems=("windows",),
+        platform_verifications={"windows": pv},
+        executable_candidates_by_os={"windows": ()},
+        config_path_templates_by_os={"windows": ()},
+        conformance_suite_version="2.0"
+    )
+
+    with pytest.raises(ValueError, match="auth_context_id"):
+        AdapterManifest(**common)
+    with pytest.raises(ValueError, match="billing_context_id"):
+        AdapterManifest(**common, auth_context_id="account:local-a")
+
+    manifest = AdapterManifest(
+        **common,
+        auth_context_id="account:local-a",
+        billing_context_id="subscription:team-a"
+    )
+    assert manifest.auth_context_id == "account:local-a"
+    assert manifest.billing_context_id == "subscription:team-a"
