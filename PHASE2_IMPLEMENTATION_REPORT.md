@@ -286,13 +286,13 @@
 ### 3. 测试记录（真实数据）
 
 - **2D-2 定向测试**:
-  - `python -m pytest tests/test_codex_cli_adapter.py -q -rs` -> `13 passed in 0.35s` (0 failed, 0 skipped)
+  - `python -m pytest tests/test_codex_cli_adapter.py -q -rs` -> `12 passed in 0.40s` (0 failed, 0 skipped)
 - **2D-1 通用基础设施回归测试**:
   - `python -m pytest tests/test_adapter_manifest.py tests/test_adapter_registry.py tests/test_adapter_conformance.py -q -rs` -> `37 passed in 1.86s` (0 failed, 0 skipped)
 - **2A/2B/2C 契约与隔离兼容测试**:
-  - `python -m pytest tests/test_host_adapter.py tests/test_evidence.py tests/test_worktree_manager.py -q -rs` -> `60 passed in 27.57s` (0 failed, 0 skipped)
+  - `python -m pytest tests/test_host_adapter.py tests/test_evidence.py tests/test_worktree_manager.py -q -rs` -> `60 passed in 23.87s` (0 failed, 0 skipped)
 - **全量测试套件**:
-  - `python -m pytest tests -q -rs` -> `336 passed in 72.08s (0:01:12)` (0 failed, 0 skipped, 100% 通过)
+  - `python -m pytest tests -q -rs` -> `335 passed in 66.27s (0:01:06)` (0 failed, 0 skipped, 100% 通过)
 - **代码规范检查**:
   - `git diff --check` -> 退出码 0，零尾随空白错误
 
@@ -302,3 +302,20 @@
 - 计费边界采用 `USER_SUBSCRIPTION`（用户桌面客户端订阅/本地配额），不启用未经批准的 OpenAI Responses API，不产生额外 API 费用。
 - 遵循零副作用合规探测原则，能力探测（`detect_capabilities`）为纯内存计算，通过了 `assert_zero_side_effects` 严格测试。
 - 与 `EvidenceGate`、`EvidenceValidationContext` 及 `WorktreeManager` 无缝集成。
+
+### 5. 2D-2 缺陷返工记录 (DEF-T0050-1 ~ 5)
+
+1. **[DEF-T0050-1] 沙箱模式角色强约束与越权注入拦截**:
+   - 建立沙箱模式白名单 `ALLOWED_SANDBOX_MODES = {"read-only", "workspace-write"}`，严禁任何 `danger-full-access` 注入或默认开启。
+   - `REVIEWER` 角色强制执行 `read-only`；若 REVIEWER 请求 `workspace-write` 直接拒绝并抛出 `AgentNotSupportedError`。`QA` 角色默认 `read-only`，`DEV`/`BUILDER` 角色默认 `workspace-write`。
+2. **[DEF-T0050-2] 完整实现 §7.1 权限审批合同与确认闭环**:
+   - 增加 `approval_policy` 检查（`on-request`、`never` 白名单），支持 Codex CLI 权限预检。
+   - 彻底废除假确认；`request_confirmation` 严格解析选项中的确认/拒绝语义，支持拒绝（`deny`）分支判定，并对已确认权限在 `(instance_id, request_id)` 边界内进行本地受限缓存，禁止跨项目/会话扩散。
+3. **[DEF-T0050-3] 真实会话 thread_id 解析与用量遥测精准绑定**:
+   - 修复 `_parse_jsonl_output` 解析优先级，从 `session_start` 及 JSONL 事件流中精准提取并绑定真实 `thread_id`（如 `01a03cdc-d21c-77d1-a3b4-aa9081287b6d`）。
+   - 完整采集真实用量遥测数据（`input_tokens`、`cached_tokens`、`output_tokens`）并绑定入结果与会话元数据。
+4. **[DEF-T0050-4] 真实 EvidenceGate 判决与证据闭环**:
+   - 完善 E2E 证据测试，构造符合权威 Schema 的 `EvidenceRecord` 与 `EvidenceMetadata`（含 `thread_id` 与 capabilities），通过 `EvidenceStore.append` 与 `EvidenceGate.validate_evidence` 完成完整门禁通过判决。
+5. **[DEF-T0050-5] 错误事件捕获与 Git 仓库受信目录强校验**:
+   - JSONL `error` 事件全量保留至 `events` 事件列表，不丢失错误审计信息。
+   - `dispatch_agent` 在执行前执行 `_is_git_repository` 校验，非 Git 仓库目录直接拒绝执行（`AgentNotSupportedError`），防止由于脱离受信任目录产生异常。

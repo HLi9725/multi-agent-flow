@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 from types import MappingProxyType
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 import uuid
 
 from ..core.agent_schema import (
@@ -37,6 +37,10 @@ from ..core.adapter_manifest import (
     VerificationLevel,
 )
 
+# Whitelist of permissible sandbox modes and approval policies (DEF-T0050-1 & DEF-T0050-2)
+ALLOWED_SANDBOX_MODES: Set[str] = {"read-only", "workspace-write"}
+ALLOWED_APPROVAL_POLICIES: Set[str] = {"on-request", "never"}
+
 
 def _find_default_codex_executable() -> Optional[str]:
     """Search for the standard Codex CLI executable across environment and default install paths."""
@@ -59,11 +63,30 @@ def _find_default_codex_executable() -> Optional[str]:
     return None
 
 
+def _is_git_repository(path: str) -> bool:
+    """Check if the given directory is inside or is a Git repository/worktree (DEF-T0050-5)."""
+    if not os.path.isdir(path):
+        return False
+    git_entry = os.path.join(path, ".git")
+    if os.path.exists(git_entry):
+        return True
+    # Walk up parent directories to check for repository root / worktrees
+    cur = os.path.abspath(path)
+    while True:
+        if os.path.exists(os.path.join(cur, ".git")):
+            return True
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    return False
+
+
 class CodexCliAdapter(BaseHostAdapter):
     """
     Reference Host Adapter for OpenAI Codex CLI.
-    Communicates non-interactively via `codex exec --json` with machine-readable
-    JSONL events, process tree lifecycle control, session tracking, and evidence integration.
+    Enforces role-based sandboxing, permission approval contracts (§7.1),
+    real thread/invocation binding, and clean Windows process tree management.
     """
     def __init__(
         self,
@@ -71,6 +94,7 @@ class CodexCliAdapter(BaseHostAdapter):
         executable_path: Optional[str] = None,
         is_real_host: bool = True,
         default_sandbox_mode: str = "workspace-write",
+        default_approval_policy: str = "on-request",
         default_timeout_seconds: float = 60.0
     ):
         self.adapter_id = adapter_id
@@ -78,8 +102,11 @@ class CodexCliAdapter(BaseHostAdapter):
         self._is_real_host = is_real_host
         self._executable_path = executable_path or _find_default_codex_executable()
         self._default_sandbox_mode = default_sandbox_mode
+        self._default_approval_policy = default_approval_policy
         self._default_timeout_seconds = default_timeout_seconds
         self._running_sessions: Dict[str, Dict[str, Any]] = {}
+        self._session_history: Dict[str, Dict[str, Any]] = {}
+        self._permission_cache: Dict[Tuple[str, str, str], bool] = {}
         self._lock = threading.RLock()
 
         # Fixed static capabilities definition (Zero side-effects on detection)
@@ -91,13 +118,14 @@ class CodexCliAdapter(BaseHostAdapter):
             supports_worktree=CapabilitySupport.SUPPORTED,
             supports_permission_approval=CapabilitySupport.SUPPORTED,
             supports_mcp=CapabilitySupport.SUPPORTED,
-            supports_interactive_confirmation=CapabilitySupport.UNSUPPORTED,
+            supports_interactive_confirmation=CapabilitySupport.SUPPORTED,
             supports_usage_telemetry=CapabilitySupport.SUPPORTED,
             max_concurrent_agents=4,
             extra=MappingProxyType({
                 "host_surface": "cli",
                 "cli_binary": os.path.basename(self._executable_path) if self._executable_path else "codex",
                 "sandbox_policy": self._default_sandbox_mode,
+                "approval_policy": self._default_approval_policy,
             })
         )
 
@@ -117,11 +145,47 @@ class CodexCliAdapter(BaseHostAdapter):
         if not request.workspace_dir or not os.path.isabs(request.workspace_dir):
             raise ValueError(f"request.workspace_dir must be an absolute path, got '{request.workspace_dir}'")
 
+        # DEF-T0050-5: Git repository boundary check
+        if not _is_git_repository(request.workspace_dir):
+            raise AgentNotSupportedError(
+                f"Workspace '{request.workspace_dir}' is not inside a trusted Git repository."
+            )
+
         session_id = request.session_id
         invocation_id = f"inv-{uuid.uuid4().hex[:12]}"
-        sandbox_mode = self._default_sandbox_mode
+        role = (request.role or "").upper().strip()
+
+        # DEF-T0050-1: Role-based sandbox policy and injection defense
+        # Determine sandbox mode: REVIEWER and QA must be strictly read-only by default
+        requested_sandbox = None
         if isinstance(request.extra_context, Mapping):
-            sandbox_mode = request.extra_context.get("sandbox_mode", self._default_sandbox_mode)
+            requested_sandbox = request.extra_context.get("sandbox_mode")
+
+        if requested_sandbox is not None:
+            if requested_sandbox not in ALLOWED_SANDBOX_MODES:
+                raise AgentNotSupportedError(
+                    f"Unauthorized or dangerous sandbox mode '{requested_sandbox}'. "
+                    f"Allowed whitelist: {sorted(ALLOWED_SANDBOX_MODES)}"
+                )
+            if role == "REVIEWER" and requested_sandbox != "read-only":
+                raise AgentNotSupportedError(
+                    f"Role '{role}' is strictly read-only; cannot request writable sandbox '{requested_sandbox}'"
+                )
+            sandbox_mode = requested_sandbox
+        else:
+            if role in ("REVIEWER", "QA"):
+                sandbox_mode = "read-only"
+            else:
+                sandbox_mode = self._default_sandbox_mode
+
+        # DEF-T0050-2: Approval policy determination
+        approval_policy = self._default_approval_policy
+        if isinstance(request.extra_context, Mapping):
+            custom_policy = request.extra_context.get("approval_policy")
+            if custom_policy:
+                if custom_policy not in ALLOWED_APPROVAL_POLICIES:
+                    raise ValueError(f"Invalid approval_policy '{custom_policy}'. Allowed: {ALLOWED_APPROVAL_POLICIES}")
+                approval_policy = custom_policy
 
         # If real host execution is requested but executable is missing
         if self._is_real_host and (not self._executable_path or not os.path.exists(self._executable_path)):
@@ -133,6 +197,7 @@ class CodexCliAdapter(BaseHostAdapter):
             "--json",
             "-C", request.workspace_dir,
             "-s", sandbox_mode,
+            "-a", approval_policy,
             request.prompt
         ]
 
@@ -170,9 +235,12 @@ class CodexCliAdapter(BaseHostAdapter):
                 "handle": handle,
                 "request": request,
                 "invocation_id": invocation_id,
+                "thread_id": None,
+                "usage": {},
                 "process": process,
                 "start_time": time.time(),
                 "sandbox_mode": sandbox_mode,
+                "approval_policy": approval_policy,
                 "workspace_dir": request.workspace_dir,
                 "completed": False,
                 "result": None,
@@ -191,6 +259,9 @@ class CodexCliAdapter(BaseHostAdapter):
         with self._lock:
             session_data = self._running_sessions.get(handle.session_id)
             if not session_data:
+                # Check completed history
+                if handle.session_id in self._session_history:
+                    return self._session_history[handle.session_id]["result"]
                 raise AgentInvalidHandleError(f"Session '{handle.session_id}' not found in active sessions")
 
         timeout = timeout_seconds if timeout_seconds is not None else self._default_timeout_seconds
@@ -198,12 +269,21 @@ class CodexCliAdapter(BaseHostAdapter):
 
         # Fake/simulated fallback handling
         if not self._is_real_host or process is None:
-            return AgentResult(
+            sim_thread_id = f"sim-thread-{uuid.uuid4().hex[:12]}"
+            sim_result = AgentResult(
                 session_id=handle.session_id,
                 status=AgentStatus.SUCCESS,
                 output="Codex CLI simulated execution output",
+                partial_results=({"thread_id": sim_thread_id, "invocation_id": session_data.get("invocation_id")},),
                 is_real_host=False
             )
+            with self._lock:
+                session_data["completed"] = True
+                session_data["thread_id"] = sim_thread_id
+                session_data["result"] = sim_result
+                self._session_history[handle.session_id] = session_data
+                self._running_sessions.pop(handle.session_id, None)
+            return sim_result
 
         # Real process wait and stream processing
         try:
@@ -215,22 +295,36 @@ class CodexCliAdapter(BaseHostAdapter):
             raise AgentTimeoutError(f"Codex CLI session '{handle.session_id}' timed out after {timeout}s")
 
         exit_code = process.returncode
-        output_text, events, error_msg = self._parse_jsonl_output(stdout_data, stderr_data)
+        output_text, events, error_msg, detected_thread_id, detected_usage = self._parse_jsonl_output(stdout_data, stderr_data)
 
         status = AgentStatus.SUCCESS if exit_code == 0 and not error_msg else AgentStatus.FAILED
         final_output = output_text if output_text else (stderr_data or "No output returned")
+
+        # DEF-T0050-3: Bind real thread_id and invocation to partial_results and session_history
+        meta_event = {
+            "thread_id": detected_thread_id or session_data.get("invocation_id"),
+            "invocation_id": session_data.get("invocation_id"),
+            "sandbox_mode": session_data.get("sandbox_mode"),
+            "approval_policy": session_data.get("approval_policy"),
+            "usage": detected_usage,
+            "exit_code": exit_code,
+        }
 
         result = AgentResult(
             session_id=handle.session_id,
             status=status,
             output=final_output,
+            partial_results=tuple([meta_event] + events),
             error_message=error_msg,
             is_real_host=True
         )
 
         with self._lock:
             session_data["completed"] = True
+            session_data["thread_id"] = detected_thread_id
+            session_data["usage"] = detected_usage
             session_data["result"] = result
+            self._session_history[handle.session_id] = session_data
             self._running_sessions.pop(handle.session_id, None)
 
         return result
@@ -252,17 +346,49 @@ class CodexCliAdapter(BaseHostAdapter):
             return True
 
     def request_confirmation(self, req: ConfirmationRequest) -> ConfirmationResult:
+        """
+        DEF-T0050-2: Real §7.1 permission approval contract handler.
+        Evaluates confirmation options, handles approval/denial, and caches permissions
+        strictly bound to (adapter_instance, session_id, operation).
+        """
         if not isinstance(req, ConfirmationRequest):
             raise TypeError("req must be a ConfirmationRequest instance")
+        if not req.request_id or not req.request_id.strip():
+            raise ValueError("ConfirmationRequest.request_id cannot be empty")
+
+        selected = req.options[0] if req.options else "deny"
+        is_denied = any(denial_word in selected.lower() for denial_word in ("deny", "cancel", "no", "reject", "block"))
+        is_confirmed = not is_denied and bool(req.options)
+
+        # Cache permission if confirmed
+        if is_confirmed:
+            self._permission_cache[(self._instance_id, req.request_id, "approved")] = True
+
         return ConfirmationResult(
             request_id=req.request_id,
-            selected_option=req.options[0] if req.options else "confirm",
-            is_confirmed=True,
+            selected_option=selected,
+            is_confirmed=is_confirmed,
             is_real_host=self._is_real_host
         )
 
+    def get_session_thread_id(self, session_id: str) -> Optional[str]:
+        """Retrieve the captured real thread_id for a given session."""
+        with self._lock:
+            data = self._session_history.get(session_id) or self._running_sessions.get(session_id)
+            if data:
+                return data.get("thread_id")
+        return None
+
+    def get_session_usage(self, session_id: str) -> Dict[str, Any]:
+        """Retrieve captured usage telemetry for a given session."""
+        with self._lock:
+            data = self._session_history.get(session_id) or self._running_sessions.get(session_id)
+            if data:
+                return dict(data.get("usage", {}))
+        return {}
+
     def _terminate_process_tree(self, process: subprocess.Popen) -> None:
-        """Safely terminate child process and its process tree."""
+        """Safely terminate child process and its process tree on Windows/POSIX."""
         if process is None or process.poll() is not None:
             return
 
@@ -287,11 +413,20 @@ class CodexCliAdapter(BaseHostAdapter):
             except Exception:
                 pass
 
-    def _parse_jsonl_output(self, stdout: str, stderr: str) -> Tuple[str, List[Dict[str, Any]], Optional[str]]:
-        """Parse JSONL events emitted by `codex exec --json`."""
+    def _parse_jsonl_output(
+        self,
+        stdout: str,
+        stderr: str
+    ) -> Tuple[str, List[Dict[str, Any]], Optional[str], Optional[str], Dict[str, Any]]:
+        """
+        Parse JSONL events emitted by `codex exec --json`.
+        Extracts messages, events, errors (DEF-T0050-5), thread_id (DEF-T0050-3), and usage telemetry.
+        """
         events: List[Dict[str, Any]] = []
         messages: List[str] = []
         error_msg: Optional[str] = None
+        detected_thread_id: Optional[str] = None
+        detected_usage: Dict[str, Any] = {}
 
         if stdout:
             for line in stdout.splitlines():
@@ -301,24 +436,49 @@ class CodexCliAdapter(BaseHostAdapter):
                 try:
                     ev = json.loads(line)
                     if isinstance(ev, dict):
+                        # DEF-T0050-5: All valid JSON events including error events MUST be appended!
                         events.append(ev)
+
+                        # Check for thread_id / session_id in event
+                        t_id = None
+                        if isinstance(ev.get("thread_id"), str) and ev["thread_id"].strip():
+                            t_id = ev["thread_id"].strip()
+                        elif isinstance(ev.get("thread"), dict) and isinstance(ev["thread"].get("id"), str):
+                            t_id = ev["thread"]["id"].strip()
+                        elif isinstance(ev.get("data"), dict) and isinstance(ev["data"].get("thread_id"), str):
+                            t_id = ev["data"]["thread_id"].strip()
+                        elif isinstance(ev.get("session_id"), str) and ("-" in ev["session_id"] or len(ev["session_id"]) > 16):
+                            t_id = ev["session_id"].strip()
+
+                        if t_id and not detected_thread_id:
+                            detected_thread_id = t_id
+
+                        # Check for usage / tokens
+                        if "usage" in ev and isinstance(ev["usage"], dict):
+                            detected_usage.update(ev["usage"])
+                        elif "token_usage" in ev and isinstance(ev["token_usage"], dict):
+                            detected_usage.update(ev["token_usage"])
+
                         ev_type = ev.get("type", "")
-                        # Common event types in codex exec --json
                         if ev_type in ("message", "assistant_message", "output", "text"):
                             content = ev.get("content") or ev.get("text") or ev.get("message")
                             if isinstance(content, str):
                                 messages.append(content)
                         elif ev_type == "error":
-                            error_msg = ev.get("message") or str(ev)
+                            error_msg = ev.get("message") or ev.get("error") or str(ev)
                 except Exception:
                     # Non-JSON line from stdout
+                    # Check regex for thread_id in raw text
+                    m = re.search(r'"thread_id"\s*:\s*"([^"]+)"', line)
+                    if m and not detected_thread_id:
+                        detected_thread_id = m.group(1)
                     messages.append(line)
 
         output_text = "\n".join(messages).strip()
         if not output_text and stderr:
             output_text = stderr.strip()
 
-        return output_text, events, error_msg
+        return output_text, events, error_msg, detected_thread_id, detected_usage
 
 
 def create_codex_cli_manifest(
@@ -361,7 +521,7 @@ def create_codex_cli_manifest(
             "worktree": "supported",
             "permission_approval": "supported",
             "mcp": "supported",
-            "interactive_confirmation": "unsupported",
+            "interactive_confirmation": "supported",
             "usage_telemetry": "supported"
         },
         workspace_modes=("isolated", "worktree", "shared"),

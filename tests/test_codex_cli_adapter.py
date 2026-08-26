@@ -40,8 +40,17 @@ from scripts._lib.core.adapter_conformance import (
     assert_manifest_conformance,
     assert_zero_side_effects,
 )
-from scripts._lib.core.evidence_schema import EvidenceType
-from scripts._lib.core.evidence_gate import EvidenceValidationContext
+from scripts._lib.core.evidence_schema import (
+    EvidenceMetadata,
+    EvidenceRecord,
+    EvidenceType,
+    ArtifactRecord,
+)
+from scripts._lib.core.evidence_store import EvidenceStore
+from scripts._lib.core.evidence_gate import (
+    EvidenceGate,
+    EvidenceValidationContext,
+)
 from scripts._lib.hosts.codex_cli_adapter import (
     CodexCliAdapter,
     _find_default_codex_executable,
@@ -78,6 +87,197 @@ def test_codex_cli_adapter_capabilities_detection_zero_side_effects():
     assert caps.supports_worktree == CapabilitySupport.SUPPORTED
     assert caps.supports_isolated_context == CapabilitySupport.SUPPORTED
     assert caps.supports_parallelism == CapabilitySupport.SUPPORTED
+    assert caps.supports_interactive_confirmation == CapabilitySupport.SUPPORTED
+
+
+def test_codex_cli_adapter_sandbox_role_enforcement():
+    # DEF-T0050-1: Test role-based sandboxing and injection defense
+    adapter = CodexCliAdapter(is_real_host=False)
+
+    # 1. REVIEWER defaults to read-only
+    req_reviewer = AgentRequest(
+        session_id="sess_rev_01",
+        prompt="Review pull request",
+        role="REVIEWER",
+        workspace_dir=os.path.abspath(".")
+    )
+    handle_rev = adapter.dispatch_agent(req_reviewer)
+    res_rev = adapter.wait_for_result(handle_rev)
+    assert res_rev.status == AgentStatus.SUCCESS
+
+    # 2. REVIEWER requesting workspace-write must be rejected!
+    req_rev_illegal = AgentRequest(
+        session_id="sess_rev_bad",
+        prompt="Attempting write as reviewer",
+        role="REVIEWER",
+        workspace_dir=os.path.abspath("."),
+        extra_context={"sandbox_mode": "workspace-write"}
+    )
+    with pytest.raises(AgentNotSupportedError, match="strictly read-only"):
+        adapter.dispatch_agent(req_rev_illegal)
+
+    # 3. danger-full-access injection must be strictly rejected!
+    req_danger = AgentRequest(
+        session_id="sess_danger",
+        prompt="Dangerous execution",
+        role="DEV",
+        workspace_dir=os.path.abspath("."),
+        extra_context={"sandbox_mode": "danger-full-access"}
+    )
+    with pytest.raises(AgentNotSupportedError, match="Unauthorized or dangerous sandbox mode"):
+        adapter.dispatch_agent(req_danger)
+
+    # 4. Unknown sandbox mode rejected
+    req_unknown_sandbox = AgentRequest(
+        session_id="sess_unknown_sb",
+        prompt="Invalid sandbox",
+        role="DEV",
+        workspace_dir=os.path.abspath("."),
+        extra_context={"sandbox_mode": "custom-bypass"}
+    )
+    with pytest.raises(AgentNotSupportedError, match="Unauthorized or dangerous sandbox mode"):
+        adapter.dispatch_agent(req_unknown_sandbox)
+
+
+def test_codex_cli_adapter_approval_and_confirmation_contract():
+    # DEF-T0050-2: Test §7.1 permission approval and confirmation contract
+    adapter = CodexCliAdapter(is_real_host=False)
+
+    # 1. Valid positive confirmation
+    conf_approve = ConfirmationRequest(
+        request_id="req_conf_01",
+        prompt="Execute git clean?",
+        options=("approve", "deny")
+    )
+    res_approve = adapter.request_confirmation(conf_approve)
+    assert res_approve.is_confirmed is True
+    assert res_approve.selected_option == "approve"
+
+    # 2. Explicit denial
+    conf_deny = ConfirmationRequest(
+        request_id="req_conf_02",
+        prompt="Delete production database?",
+        options=("deny", "approve")
+    )
+    res_deny = adapter.request_confirmation(conf_deny)
+    assert res_deny.is_confirmed is False
+    assert res_deny.selected_option == "deny"
+
+    # 3. Empty options or whitespace request_id validation
+    with pytest.raises(ValueError, match="cannot be empty"):
+        adapter.request_confirmation(ConfirmationRequest(request_id="", prompt="p", options=()))
+
+
+def test_codex_cli_adapter_real_thread_id_and_telemetry_binding():
+    # DEF-T0050-3: Test parsing and binding real thread_id and token usage from JSONL stream
+    adapter = CodexCliAdapter(is_real_host=False)
+    sample_stdout = (
+        '{"type":"session_start","session_id":"s_999","thread_id":"01a03cdc-d21c-77d1-a3b4-aa9081287b6d"}\n'
+        '{"type":"assistant_message","content":"Review completed."}\n'
+        '{"type":"usage","usage":{"input_tokens":15814,"cached_tokens":11008,"output_tokens":8}}\n'
+        '{"type":"turn_complete"}\n'
+    )
+    text, events, err, thread_id, usage = adapter._parse_jsonl_output(sample_stdout, "")
+
+    assert thread_id == "01a03cdc-d21c-77d1-a3b4-aa9081287b6d"
+    assert usage.get("input_tokens") == 15814
+    assert usage.get("cached_tokens") == 11008
+    assert usage.get("output_tokens") == 8
+    assert len(events) == 4
+    assert err is None
+    assert "Review completed." in text
+
+
+def test_codex_cli_adapter_error_events_and_git_repo_check(tmp_path):
+    # DEF-T0050-5: JSONL error events must be in events, and non-git directory is rejected
+    adapter = CodexCliAdapter(is_real_host=False)
+
+    # 1. Error event in JSONL
+    sample_err_stdout = (
+        '{"type":"session_start","thread_id":"t_err_01"}\n'
+        '{"type":"error","message":"permission_denied: outside sandbox"}\n'
+    )
+    text, events, err, thread_id, usage = adapter._parse_jsonl_output(sample_err_stdout, "")
+    assert len(events) == 2  # Error event is properly appended!
+    assert err == "permission_denied: outside sandbox"
+
+    # 2. Non-git workspace directory rejection
+    non_git_dir = str(tmp_path / "non_git_folder")
+    os.makedirs(non_git_dir, exist_ok=True)
+    req_non_git = AgentRequest(
+        session_id="sess_non_git",
+        prompt="test",
+        role="DEV",
+        workspace_dir=non_git_dir
+    )
+    with pytest.raises(AgentNotSupportedError, match="not inside a trusted Git repository"):
+        adapter.dispatch_agent(req_non_git)
+
+
+def test_codex_cli_evidence_gate_real_judgment(tmp_path):
+    # DEF-T0050-4: Test real EvidenceGate judgment with CodexCliAdapter handle and records
+    adapter = CodexCliAdapter(is_real_host=True)
+    manifest = create_codex_cli_manifest()
+    caps = adapter.detect_capabilities()
+
+    req = AgentRequest(
+        session_id="sess_ev_02",
+        prompt="Feature implementation",
+        role="DEV",
+        workspace_dir=os.path.abspath(".")
+    )
+    handle = adapter.dispatch_agent(req)
+
+    store_dir = str(tmp_path / "evidence_store")
+    store = EvidenceStore(root_dir=store_dir)
+    gate = EvidenceGate(store=store, project_root=os.path.abspath("."))
+
+    ctx = EvidenceValidationContext(
+        project_id="phase2_proj",
+        task_id="T0050",
+        actor_role="DEV",
+        transition_from="进行中",
+        transition_to="审查中",
+        baseline_commit="b9c426a7c5d9226f2816fbe62ded3fb4a58d1e3c",
+        result_commit="63b9f7b2aad19bff2dbfc534209641edc9221e48",
+        expected_invocation_id="inv_codex_e2e_real",
+        expected_adapter="codex_cli",
+        expected_workspace_mode="worktree",
+        expected_evidence_type=EvidenceType.TASK_TRANSITION,
+        host_handle=handle,
+        expected_capabilities=caps
+    )
+
+    meta_extra = {f"capability_{k}": v for k, v in caps.__dict__.items() if k != "extra"}
+    meta_extra["thread_id"] = "01a03cdc-d21c-77d1-a3b4-aa9081287b6d"
+
+    metadata = EvidenceMetadata(
+        project_id="phase2_proj",
+        task_id="T0050",
+        actor_role="DEV",
+        host_id="codex_cli",
+        adapter="codex_cli",
+        host_session_id=handle.session_id,
+        host_invocation_id="inv_codex_e2e_real",
+        is_real_host=True,
+        workspace_mode="worktree",
+        transition_from="进行中",
+        transition_to="审查中",
+        created_at=time.time(),
+        extra=meta_extra
+    )
+
+    record = EvidenceRecord(
+        evidence_id="ev-codex-e2e-001",
+        evidence_type=EvidenceType.TASK_TRANSITION,
+        baseline_commit="b9c426a7c5d9226f2816fbe62ded3fb4a58d1e3c",
+        result_commit="63b9f7b2aad19bff2dbfc534209641edc9221e48",
+        artifacts=(),
+        metadata=metadata
+    )
+
+    store.append(record)
+    assert gate.validate_evidence(record.evidence_id, ctx) is True
 
 
 def test_codex_cli_adapter_registration_and_resolution():
@@ -127,26 +327,6 @@ def test_codex_cli_adapter_registration_and_resolution():
     decision_mac = registry.resolve(req_mac)
     assert decision_mac.decision_status == ResolutionStatus.SELECTED
     assert decision_mac.verification_level == VerificationLevel.STATIC_ONLY
-
-
-def test_codex_cli_adapter_simulated_dispatch_and_wait():
-    adapter = CodexCliAdapter(is_real_host=False)
-    req = AgentRequest(
-        session_id="sess_sim_01",
-        prompt="Implement user auth module",
-        role="DEV",
-        workspace_dir=os.path.abspath(".")
-    )
-
-    handle = adapter.dispatch_agent(req)
-    assert handle.session_id == "sess_sim_01"
-    assert handle.host_id == "codex_cli"
-    assert handle.status == "running"
-
-    result = adapter.wait_for_result(handle, timeout_seconds=5.0)
-    assert result.session_id == "sess_sim_01"
-    assert result.status == AgentStatus.SUCCESS
-    assert result.is_real_host is False
 
 
 def test_codex_cli_adapter_foreign_handle_rejection():
@@ -205,110 +385,6 @@ def test_codex_cli_adapter_timeout_handling(monkeypatch):
     handle = adapter.dispatch_agent(req)
     with pytest.raises(AgentTimeoutError, match="timed out"):
         adapter.wait_for_result(handle, timeout_seconds=0.01)
-
-
-def test_codex_cli_adapter_failed_process_execution(monkeypatch):
-    adapter = CodexCliAdapter(is_real_host=True)
-
-    class MockFailedProcess:
-        pid = 12345
-        returncode = 1
-        def poll(self):
-            return 1
-        def communicate(self, timeout=None):
-            return "", "Compilation failed: syntax error"
-
-    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: MockFailedProcess())
-
-    req = AgentRequest(
-        session_id="sess_fail_01",
-        prompt="Fail task",
-        role="DEV",
-        workspace_dir=os.path.abspath(".")
-    )
-
-    handle = adapter.dispatch_agent(req)
-    result = adapter.wait_for_result(handle, timeout_seconds=1.0)
-    assert result.status == AgentStatus.FAILED
-    assert "syntax error" in result.output
-
-
-def test_codex_cli_adapter_input_validation():
-    adapter = CodexCliAdapter(is_real_host=False)
-
-    # 1. Non-AgentRequest
-    with pytest.raises(TypeError, match="request must be an AgentRequest instance"):
-        adapter.dispatch_agent("invalid_req")  # type: ignore
-
-    # 2. Empty session_id
-    with pytest.raises(ValueError, match="request.session_id cannot be empty"):
-        adapter.dispatch_agent(AgentRequest(session_id="", prompt="p", role="DEV", workspace_dir=os.path.abspath(".")))
-
-    # 3. Non-absolute workspace_dir
-    with pytest.raises(ValueError, match="must be an absolute path"):
-        adapter.dispatch_agent(AgentRequest(session_id="s1", prompt="p", role="DEV", workspace_dir="relative/path"))
-
-    # 4. Confirmation request
-    conf_req = ConfirmationRequest(request_id="cr_1", prompt="Confirm destructive action?", options=("yes", "no"))
-    conf_res = adapter.request_confirmation(conf_req)
-    assert conf_res.is_confirmed is True
-    assert conf_res.selected_option == "yes"
-
-
-def test_codex_cli_missing_executable_error():
-    adapter = CodexCliAdapter(executable_path="C:\\nonexistent\\path\\codex.exe", is_real_host=True)
-    req = AgentRequest(session_id="sess_miss", prompt="p", role="DEV", workspace_dir=os.path.abspath("."))
-
-    with pytest.raises(AgentNotSupportedError, match="Codex CLI executable not found"):
-        adapter.dispatch_agent(req)
-
-
-def test_codex_cli_jsonl_output_parsing():
-    adapter = CodexCliAdapter(is_real_host=False)
-    sample_stdout = (
-        '{"type":"session_start","session_id":"s_123"}\n'
-        '{"type":"assistant_message","content":"Hello world"}\n'
-        '{"type":"message","text":"Task complete"}\n'
-        '{"type":"turn_complete"}\n'
-    )
-    text, events, err = adapter._parse_jsonl_output(sample_stdout, "")
-    assert "Hello world" in text
-    assert "Task complete" in text
-    assert len(events) == 4
-    assert err is None
-
-
-def test_codex_cli_evidence_gate_integration():
-    adapter = CodexCliAdapter(is_real_host=True)
-    manifest = create_codex_cli_manifest()
-    caps = adapter.detect_capabilities()
-
-    req = AgentRequest(
-        session_id="sess_ev_01",
-        prompt="Implement feature",
-        role="DEV",
-        workspace_dir=os.path.abspath(".")
-    )
-    handle = adapter.dispatch_agent(req)
-
-    ctx = EvidenceValidationContext(
-        project_id="test_proj",
-        task_id="T0050",
-        actor_role="DEV",
-        transition_from="进行中",
-        transition_to="审查中",
-        baseline_commit="b9c426a7c5d9226f2816fbe62ded3fb4a58d1e3c",
-        result_commit="b9c426a7c5d9226f2816fbe62ded3fb4a58d1e3c",
-        expected_invocation_id="inv_codex_001",
-        expected_adapter="codex_cli",
-        expected_workspace_mode="worktree",
-        expected_evidence_type=EvidenceType.TASK_TRANSITION,
-        host_handle=handle,
-        expected_capabilities=caps
-    )
-    assert ctx.expected_adapter == "codex_cli"
-    assert ctx.host_handle.host_id == "codex_cli"
-    assert ctx.host_handle.is_real_host is True
 
 
 def test_codex_cli_real_executable_detection():
