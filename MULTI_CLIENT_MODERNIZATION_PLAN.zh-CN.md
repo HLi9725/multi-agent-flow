@@ -1061,6 +1061,10 @@ Codex 必须区分三条执行路线：
 
 ### 8.3 实现 Antigravity Adapter
 
+2E 的独立实施合同、权限自动化边界、测试矩阵与停止条件见：
+
+`docs/D04-研发过程/D01-任务/Phase2-2E-Antigravity真实Adapter实施任务书.md`
+
 执行流程：
 
 1. 探测 `invoke_subagent` 与自定义 Agent 能力；
@@ -1068,13 +1072,23 @@ Codex 必须区分三条执行路线：
 3. 映射工作区模式：只读探索可 `inherit`，写入实现优先 `branch`，明确共享才使用 `share`；
 4. 映射 Antigravity 工具权限、命令策略、MCP Server 和模型层级；
 5. 保存 invocation ID、workspace 模式和结果；
-6. 对无子 Agent 权限或额度不足提供明确降级提示。
+6. 对无子 Agent 权限或额度不足提供明确降级提示；
+7. 探测并记录当前 Antigravity Terminal Execution Policy、Sandbox 与项目权限来源，但不得静默修改宿主设置；
+8. 使用稳定的仓库 CLI 作为看板查询、状态流转和测试入口，禁止为常规操作反复生成不同的 `python -c`、临时补丁脚本或动态 Shell；
+9. 支持项目级最小权限 Allow/Deny 建议与显式安装流程：安全、稳定、工作区内命令可预授权，网络、工作区外写入、依赖安装、全局配置、费用、破坏性 Git、Push/Merge/发布和最终验收必须保持询问或拒绝；
+10. 权限拒绝、等待批准和策略不匹配必须映射为结构化结果，不得把“未获批准”伪报为执行成功；
+11. 只有 verified Adapter 与持续运行的 2F 编排器同时存在时，才可宣传为自动开发—审核—QA；2E 单独完成仍不得自动用户验收。
 
 注意事项：
 
 - `share` 会让多个写 Agent 操作同一目录，默认禁止并行写；
 - `inherit` 不等于独立代码工作区；上下文独立与文件隔离是两个维度；
 - IDE、Desktop、CLI 的发现路径和能力应分别做契约测试。
+- `Always Proceed` 和 `--dangerously-skip-permissions` 不得作为默认部署或 E2E 前提；优先使用 Sandbox 与项目级、命令级最小权限规则；
+- 不得宽泛放行 `command(*)`、`command(python)` 或 `command(python -c.*)`；内联 Python 能执行任意代码，不属于稳定安全入口；
+- 权限规则安装属于宿主外部状态变更，必须先向用户展示精确规则、作用域和风险，并取得单独确认；
+- 若权威看板目录与代码 worktree 不在同一 Antigravity Project Folders 范围，应请求用户添加精确目录，不能通过开启任意非工作区访问绕过；
+- 同一安全命令在已批准项目规则下重复执行应不再弹窗；任何危险命令即使字符串相似也必须继续 Ask/Deny，此行为必须进入 Windows 真实 E2E。
 
 ### 8.4 增加 worktree 隔离
 
