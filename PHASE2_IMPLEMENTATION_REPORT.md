@@ -699,7 +699,7 @@ dual_host_l2_status:
 ### 5. 测试记录（真实数据）
 
 - **2F-LIVE 端到端与契约测试**:
-  - `python -m pytest tests/test_phase2_live_e2e.py -q -rs` -> `4 passed in 1.55s` (0 failed, 0 skipped, exit 0)
+  - `python -m pytest tests/test_phase2_live_e2e.py -q -rs` -> `5 passed in 1.22s` (0 failed, 0 skipped, exit 0)
 - **2F 编排器定向测试**:
   - `python -m pytest tests/test_orchestrator.py -q -rs` -> `12 passed in 1.80s` (0 failed, 0 skipped, exit 0)
 - **2D-1 通用基础设施回归测试**:
@@ -711,7 +711,7 @@ dual_host_l2_status:
 - **Host / Evidence / Worktree 回归测试**:
   - `python -m pytest tests/test_host_adapter.py tests/test_evidence.py tests/test_worktree_manager.py -q -rs` -> `60 passed in 21.83s` (0 failed, 0 skipped, exit 0)
 - **全量测试套件**:
-  - `python -m pytest tests -q -rs` -> `383 passed in 68.45s (0:01:08)` (0 failed, 0 skipped, 100% 通过, exit 0)
+  - `python -m pytest tests -q -rs` -> `384 passed in 88.23s (0:01:28)` (0 failed, 0 skipped, 100% 通过, exit 0)
 - **代码规范检查**:
   - `git diff --check` -> 退出码 0，零尾随空白错误
 - **进程安全守卫**:
@@ -745,3 +745,19 @@ dual_host_l2_status:
    - **严格真实原则 (Fail-Closed)**：严格遵守任务书“如果网络或认证仍阻断，应明确报告 BLOCKED，不得再次用 NOT_READY 结果申请 PASS”之要求，明确报告当前 Antigravity 真实 E2E 处于 **BLOCKED**（阻塞）状态；
    - **零浏览器/零敏感信息纪律**：未自动反复拉起浏览器，未拉起 Edge/Chrome，零 Token/OAuth/Cookie 泄露；
    - **等级与状态冻结**：Windows 严格保持 `STATIC_ONLY`，双宿主 L2 保持 `NOT_READY / BLOCKED`，等待网络环境就绪或用户显式指导。
+
+### 9. Codex 最终 QA 返工记录（DEF-T0054-3～4）
+
+1. **[DEF-T0054-3] 阻塞态不得返回成功或进入用户验收门禁 (P1)**:
+   - `is_blocked=True` 时强制返回 `success=False`；
+   - 编排状态停留在 `BLOCKED`，不再生成 `confirmation_request_id`，不得进入 `PENDING_USER_ACCEPTANCE`；
+   - `real_host_sessions`、`real_host_invocations` 与 `evidence_ids` 均保持为空，避免上层把 assisted 诊断误判为真实宿主成功。
+2. **[DEF-T0054-4] 只读认证探测不得升级验证等级 (P1)**:
+   - `agy --print ping` 返回 conversation ID 只证明认证端点可达，不构成 dispatch-backed E2E 证据；
+   - 未完成 `dispatch_agent()`、`wait_for_result()` 与 `EvidenceGate` 的真实身份链前，Windows 强制保持 `STATIC_ONLY`；
+   - 增加 authenticated-probe 对抗测试，证明仅凭探测结果仍会 fail-closed 为 `BLOCKED`，且不会生成会话、调用或验收凭据。
+3. **Codex 修复后验证记录**:
+   - `python -m pytest tests/test_phase2_live_e2e.py -q -rs` → exit 0，`5 passed`；
+   - 2A～2F 相关定向回归 → exit 0，`152 passed`；
+   - `python -m pytest tests -q -rs` → exit 0，`384 passed in 88.23s`，0 failed，0 skipped；
+   - `git diff --check` → exit 0。

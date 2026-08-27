@@ -32,7 +32,6 @@ try:
         BillingBoundaryType,
         ExecutionMode,
         HostSurface,
-        PlatformVerification,
         VerificationLevel,
     )
     from scripts._lib.core.adapter_registry import AdapterRegistry
@@ -57,7 +56,6 @@ try:
         OrchestrationState,
         ReviewerToQAHandover,
         UserAcceptanceDecision,
-        UserAcceptanceRequest,
     )
     from scripts._lib.hosts.antigravity_adapter import AntigravityAdapter, create_antigravity_manifest
     from scripts._lib.hosts.codex_cli_adapter import CodexCliAdapter, create_codex_cli_manifest
@@ -77,7 +75,6 @@ except ImportError:
         BillingBoundaryType,
         ExecutionMode,
         HostSurface,
-        PlatformVerification,
         VerificationLevel,
     )
     from _lib.core.adapter_registry import AdapterRegistry
@@ -102,7 +99,6 @@ except ImportError:
         OrchestrationState,
         ReviewerToQAHandover,
         UserAcceptanceDecision,
-        UserAcceptanceRequest,
     )
     from _lib.hosts.antigravity_adapter import AntigravityAdapter, create_antigravity_manifest
     from _lib.hosts.codex_cli_adapter import CodexCliAdapter, create_codex_cli_manifest
@@ -222,22 +218,19 @@ def run_phase2_live_e2e_pipeline(target_worktree: str) -> LiveE2EResult:
     codex_adapter = CodexCliAdapter(is_real_host=True)
     registry.register(codex_adapter, codex_manifest)
 
-    # Antigravity verification level evaluation (strictly STATIC_ONLY when unverified)
-    is_ag_verified = ("status=authenticated" in ag_diag)
-    ag_ver_level = VerificationLevel.CLI_VERIFIED if is_ag_verified else VerificationLevel.STATIC_ONLY
+    # A successful read-only ping proves authentication reachability only.  It is
+    # not dispatch-backed E2E evidence and must never upgrade the adapter by
+    # itself.  CLI_VERIFIED is granted only after dispatch_agent(),
+    # wait_for_result(), and the EvidenceGate have all validated genuine host
+    # identities.  This runner has not obtained that chain yet, so it remains
+    # fail-closed even when the probe reports an authenticated conversation.
+    probe_authenticated = "status=authenticated" in ag_diag
+    ag_ver_level = VerificationLevel.STATIC_ONLY
 
     ag_manifest = create_antigravity_manifest(
         adapter_id="antigravity",
         verified_version=ag_ver if (ag_ver != "unknown" and not ag_ver.startswith("error")) else "1.1.21"
     )
-    if is_ag_verified:
-        ag_manifest.platform_verifications["windows"] = PlatformVerification(
-            platform="windows",
-            verification_level=VerificationLevel.CLI_VERIFIED,
-            verified_version=ag_ver,
-            verified_at=time.time(),
-        )
-
     ag_adapter = AntigravityAdapter(is_real_host=True, verification_level=ag_ver_level)
     registry.register(ag_adapter, ag_manifest)
 
@@ -389,34 +382,24 @@ def run_phase2_live_e2e_pipeline(target_worktree: str) -> LiveE2EResult:
     sess_qa = f"sess_qa_live_{int(time.time())}"
     inv_qa = f"{sess_qa}:test_run"
 
-    qa_req = UserAcceptanceRequest(
-        task_id=task_id,
-        project_id=project_id,
-        branch=branch,
-        candidate_commit=cand_commit,
-        qa_report=qa_summary,
-        reviewer_report={"decision": "PASS", "mode": "assisted"},
-        artifacts=("tests/fixtures/fixture_math_util.py", "tests/fixtures/test_fixture_math_util.py"),
-        user_confirmation_prompt="Dual-host L2 verification complete. Please review candidate commit sha and confirm acceptance.",
-        auth_context="auth_ctx_live_builder",
-    )
-    # Generate server-side confirmation request ID and transition to PENDING_USER_ACCEPTANCE
     session.qa_session_id = sess_qa
     session.qa_invocation_id = inv_qa
-    session.confirmation_request_id = f"conf_req_{hashlib.sha256(str(time.time()).encode()).hexdigest()[:16]}"
-    session.state = OrchestrationState.PENDING_USER_ACCEPTANCE
-    session.current_role = OrchestrationRole.USER
-
-    is_blocked = not is_ag_verified
+    # The assisted reports above are useful diagnostics, but they are not real
+    # host evidence.  Never generate a confirmation request or enter the user
+    # acceptance gate until the genuine dual-host identity chain exists.
+    is_blocked = True
+    session.confirmation_request_id = None
+    session.state = OrchestrationState.BLOCKED
+    session.current_role = OrchestrationRole.QA
     blocked_reason = (
-        "Antigravity CLI live endpoint unreachable: "
-        f"{ag_diag}. "
-        "Cannot obtain genuine host session/thread IDs via dispatch_agent(). "
+        ("Antigravity authentication probe succeeded, but " if probe_authenticated else
+         f"Antigravity CLI live endpoint unreachable: {ag_diag}. ")
+        + "No dispatch-backed host identity chain was obtained from dispatch_agent()/wait_for_result(). "
         "Windows verification level remains STATIC_ONLY; automated dual-host L2 verification is BLOCKED."
-    ) if is_blocked else ""
+    )
 
     return LiveE2EResult(
-        success=True,
+        success=False,
         is_blocked=is_blocked,
         blocked_reason=blocked_reason,
         antigravity_binary=cli_path or "none",
@@ -428,9 +411,7 @@ def run_phase2_live_e2e_pipeline(target_worktree: str) -> LiveE2EResult:
             "linux": "static_only",
         },
         real_host_sessions={},  # Strictly empty when Antigravity is STATIC_ONLY (no fake real_host sessions)
-        real_host_invocations={
-            "confirmation_request_id": session.confirmation_request_id,
-        },
+        real_host_invocations={},
         assisted_handover_card=assisted_card,
         qa_real_test_summary=qa_summary,
         evidence_ids=[],
@@ -439,7 +420,7 @@ def run_phase2_live_e2e_pipeline(target_worktree: str) -> LiveE2EResult:
             "qa_test_report": compute_sha256(qa_content),
         },
         dual_host_l2_result={
-            "status": dual_eval.status.value,
+            "status": "BLOCKED",
             "is_dual_host_verified": dual_eval.is_dual_host_verified,
             "orchestration_mode": ag_mode.value,
             "reason": dual_eval.reason,

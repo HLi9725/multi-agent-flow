@@ -108,18 +108,39 @@ def test_live_e2e_pipeline_in_temporary_worktree(tmp_path, monkeypatch):
 
     res = run_phase2_live_e2e_pipeline(str(tmp_path))
 
-    assert res.success is True
+    assert res.success is False
     assert res.is_blocked is True
     assert "Antigravity CLI live endpoint unreachable" in res.blocked_reason
     assert res.verification_level_by_os["windows"] == "static_only"
-    assert res.dual_host_l2_result["status"] == "NOT_READY"
+    assert res.dual_host_l2_result["status"] == "BLOCKED"
     assert res.dual_host_l2_result["orchestration_mode"] == "assisted"
-    assert res.dual_host_l2_result["state_reached"] == "PENDING_USER_ACCEPTANCE"
+    assert res.dual_host_l2_result["state_reached"] == "BLOCKED"
     # When Antigravity is STATIC_ONLY, real_host_sessions must be empty (strictly no forged real_host identities)
     assert res.real_host_sessions == {}
+    assert res.real_host_invocations == {}
     assert res.qa_real_test_summary["exit_code"] == 0
     assert res.qa_real_test_summary["passed"] == 2
     assert "fixture_math_util.py" in res.assisted_handover_card
+
+
+def test_authenticated_probe_alone_cannot_upgrade_or_reach_acceptance(tmp_path, monkeypatch):
+    """A ping conversation ID is not dispatch-backed L2 evidence."""
+    def mock_detect():
+        return (r"C:\fake\agy.exe", "1.1.21", "status=authenticated; Live session active")
+
+    monkeypatch.setattr("scripts.run_phase2_live_e2e.detect_antigravity_cli", mock_detect)
+
+    res = run_phase2_live_e2e_pipeline(str(tmp_path))
+
+    assert res.success is False
+    assert res.is_blocked is True
+    assert "No dispatch-backed host identity chain" in res.blocked_reason
+    assert res.verification_level_by_os["windows"] == "static_only"
+    assert res.dual_host_l2_result["status"] == "BLOCKED"
+    assert res.dual_host_l2_result["state_reached"] == "BLOCKED"
+    assert res.real_host_sessions == {}
+    assert res.real_host_invocations == {}
+    assert res.evidence_ids == []
 
 
 def test_live_e2e_anti_crossover_isolation(tmp_path):
