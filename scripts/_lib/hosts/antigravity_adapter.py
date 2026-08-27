@@ -384,6 +384,7 @@ class AntigravityAdapter(BaseHostAdapter):
         self._running_sessions: Dict[str, Dict[str, Any]] = {}
         self._session_history: Dict[str, Dict[str, Any]] = {}
         self._permission_cache: Dict[Tuple[str, str, str, str, str, str, str], bool] = {}
+        self._verification_probe_ctx = threading.local()
         self._lock = threading.RLock()
 
         # Fixed static capabilities definition (Zero side-effects on detection)
@@ -585,7 +586,10 @@ class AntigravityAdapter(BaseHostAdapter):
             )
 
         # DEF-T0052-21: Block direct unverified automated real process spawning when STATIC_ONLY (Zero caller bypass)
-        if self._is_real_host and self._verification_level == VerificationLevel.STATIC_ONLY:
+        verification_probe_authorized = (
+            getattr(self._verification_probe_ctx, "session_id", None) == session_id
+        )
+        if self._is_real_host and self._verification_level == VerificationLevel.STATIC_ONLY and not verification_probe_authorized:
             raise AgentNotSupportedError(
                 "Antigravity Adapter is declared STATIC_ONLY; automated real host CLI execution "
                 "is disabled until host surface is CLI_VERIFIED with human OAuth authorization."
@@ -653,6 +657,55 @@ class AntigravityAdapter(BaseHostAdapter):
                 current["process"] = process
 
         return handle
+
+    def dispatch_verification_probe(self, request: AgentRequest) -> AgentHandle:
+        """Run one externally approved, read-only probe without pre-promoting STATIC_ONLY."""
+        if not isinstance(request, AgentRequest):
+            raise TypeError("request must be an AgentRequest instance")
+        if request.role.strip().upper() != "REVIEWER":
+            raise AgentNotSupportedError("Verification probes are restricted to the read-only REVIEWER role")
+        if str(request.extra_context.get("permission_boundary", "")) != "workspace_read":
+            raise AgentNotSupportedError("Verification probes require workspace_read permission boundary")
+        if str(request.extra_context.get("mode", "")) != "plan":
+            raise AgentNotSupportedError("Verification probes require plan mode")
+        session_id = request.session_id.strip()
+        if getattr(self._verification_probe_ctx, "session_id", None) is not None:
+            raise AgentNotSupportedError("Nested verification probes are not allowed")
+        self._verification_probe_ctx.session_id = session_id
+        try:
+            return self.dispatch_agent(request)
+        finally:
+            self._verification_probe_ctx.session_id = None
+
+    def promote_after_verified_evidence(
+        self,
+        evidence_ref: str,
+        *,
+        host_session_id: str,
+        host_invocation_id: str,
+    ) -> None:
+        """Promote only when evidence names one completed canonical real session."""
+        if not isinstance(evidence_ref, str) or not evidence_ref.strip():
+            raise ValueError("evidence_ref must be non-empty")
+        if not isinstance(host_session_id, str) or not host_session_id.strip():
+            raise ValueError("host_session_id must be non-empty")
+        if not isinstance(host_invocation_id, str) or not host_invocation_id.strip():
+            raise ValueError("host_invocation_id must be non-empty")
+        with self._lock:
+            data = self._session_history.get(host_session_id.strip())
+            has_identity_chain = bool(
+                data
+                and data.get("completed")
+                and data.get("conversation_id")
+                and data.get("invocation_id") == host_invocation_id.strip()
+                and isinstance(data.get("result"), AgentResult)
+                and data["result"].is_real_host is True
+            )
+            if not has_identity_chain:
+                raise AgentNotSupportedError(
+                    "Cannot promote without an evidence-bound completed real canonical identity chain"
+                )
+            self._verification_level = VerificationLevel.CLI_VERIFIED
 
     def wait_for_result(self, handle: AgentHandle, timeout_seconds: Optional[float] = None) -> AgentResult:
         if not isinstance(handle, AgentHandle):
@@ -999,8 +1052,6 @@ class AntigravityAdapter(BaseHostAdapter):
                             error_msg = ev.get("message") or ev.get("error") or str(ev)
                         elif isinstance(ev.get("result"), dict):
                             res_obj = ev["result"]
-                            if not detected_step_id:
-                                detected_step_id = "step_1"
                             if res_obj.get("status") == "SUCCESS" and isinstance(res_obj.get("response"), str):
                                 messages.append(res_obj["response"])
                             elif res_obj.get("status") == "ERROR":
@@ -1035,8 +1086,14 @@ def create_antigravity_manifest(
 ) -> AdapterManifest:
     """Create the official AdapterManifest for Google Antigravity Reference Adapter."""
     if verification_level_windows == VerificationLevel.CLI_VERIFIED:
-        v_ts = verified_at_windows or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        v_refs = e2e_evidence_refs_windows or ("evi_live_reviewer_transition",)
+        if not verified_at_windows or not verified_at_windows.strip():
+            raise ValueError("CLI_VERIFIED requires an explicit verified_at_windows from completed E2E evidence")
+        if not e2e_evidence_refs_windows or any(
+            not isinstance(ref, str) or not ref.strip() for ref in e2e_evidence_refs_windows
+        ):
+            raise ValueError("CLI_VERIFIED requires non-empty e2e_evidence_refs_windows")
+        v_ts = verified_at_windows.strip()
+        v_refs = tuple(ref.strip() for ref in e2e_evidence_refs_windows)
         pv_win = PlatformVerification(
             operating_system="windows",
             host_surface=HostSurface.CLI,

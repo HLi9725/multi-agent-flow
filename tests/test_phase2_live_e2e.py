@@ -95,6 +95,7 @@ def process_guard(monkeypatch):
         return orig_run(cmd, *args, **kwargs)
 
     monkeypatch.setattr(subprocess, "Popen", guarded_popen)
+    monkeypatch.setattr(subprocess, "run", guarded_run)
 
 
 def test_live_e2e_blocked_when_unreachable(tmp_path, monkeypatch):
@@ -147,18 +148,75 @@ def test_live_e2e_dispatch_flow_and_upgrade(tmp_path, monkeypatch):
             data = self._running_sessions.pop(handle.session_id, {})
             data["conversation_id"] = "conv_9d8755b1_live"
             data["invocation_id"] = "conv_9d8755b1_live:step_1"
+            data["completed"] = True
+            result = AgentResult(
+                session_id=handle.session_id,
+                status=AgentStatus.SUCCESS,
+                output="Yes, pure_add is a pure function adhering to constraints.",
+                is_real_host=True,
+            )
+            data["result"] = result
             self._session_history[handle.session_id] = data
-        return AgentResult(
-            session_id=handle.session_id,
-            status=AgentStatus.SUCCESS,
-            output="Yes, pure_add is a pure function adhering to constraints.",
-            is_real_host=True,
-        )
+        return result
 
     monkeypatch.setattr(AntigravityAdapter, "dispatch_agent", mock_dispatch)
     monkeypatch.setattr(AntigravityAdapter, "wait_for_result", mock_wait)
 
-    res = run_phase2_live_e2e_pipeline(str(tmp_path))
+    def mock_codex_dispatch(self, req):
+        handle = AgentHandle(
+            session_id=req.session_id,
+            host_id="codex_cli",
+            status="running",
+            is_real_host=True,
+            adapter_instance_id=self._instance_id,
+            invocation_token=f"tok-{req.role.lower()}",
+        )
+        with self._lock:
+            self._running_sessions[req.session_id] = {
+                "handle": handle,
+                "request": req,
+                "thread_id": None,
+                "invocation_id": None,
+                "completed": False,
+            }
+        return handle
+
+    def mock_codex_wait(self, handle, timeout_seconds=None):
+        with self._lock:
+            data = self._running_sessions.pop(handle.session_id)
+            role = data["request"].role.lower()
+            data["thread_id"] = f"thread-{role}-real"
+            data["invocation_id"] = f"item-{role}-real"
+            data["completed"] = True
+            data["result"] = AgentResult(
+                session_id=handle.session_id,
+                status=AgentStatus.SUCCESS,
+                output=f"{role} completed",
+                is_real_host=True,
+            )
+            self._session_history[handle.session_id] = data
+            return data["result"]
+
+    monkeypatch.setattr(CodexCliAdapter, "dispatch_agent", mock_codex_dispatch)
+    monkeypatch.setattr(CodexCliAdapter, "wait_for_result", mock_codex_wait)
+
+    def approve(adapter, request):
+        adapter.record_permission_approval(
+            project_id="test-project",
+            auth_context="auth_ctx_live_builder",
+            session_id=request.session_id,
+            workspace_dir=request.workspace_dir,
+            command_family="safe_local:REVIEWER",
+            permission_boundary="workspace_read",
+        )
+
+    res = run_phase2_live_e2e_pipeline(
+        str(tmp_path),
+        permission_approval_hook=approve,
+        project_id="test-project",
+        baseline_commit="a" * 40,
+        candidate_commit="b" * 40,
+    )
 
     assert res.success is True
     assert res.is_blocked is False

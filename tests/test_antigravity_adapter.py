@@ -630,6 +630,59 @@ def test_antigravity_adapter_registration_and_resolution():
     assert decision_mac.verification_level == VerificationLevel.STATIC_ONLY
 
 
+def test_antigravity_verified_manifest_requires_explicit_evidence():
+    with pytest.raises(ValueError, match="verified_at_windows"):
+        create_antigravity_manifest(
+            verification_level_windows=VerificationLevel.CLI_VERIFIED,
+            e2e_evidence_refs_windows=("evi-real",),
+        )
+
+    with pytest.raises(ValueError, match="e2e_evidence_refs_windows"):
+        create_antigravity_manifest(
+            verification_level_windows=VerificationLevel.CLI_VERIFIED,
+            verified_at_windows="2026-08-27T00:00:00Z",
+            e2e_evidence_refs_windows=(),
+        )
+
+    with pytest.raises(ValueError, match="e2e_evidence_refs_windows"):
+        create_antigravity_manifest(
+            verification_level_windows=VerificationLevel.CLI_VERIFIED,
+            verified_at_windows="2026-08-27T00:00:00Z",
+            e2e_evidence_refs_windows=("",),
+        )
+
+
+def test_antigravity_promotion_requires_matching_canonical_identity():
+    adapter = AntigravityAdapter(is_real_host=True)
+    session_id = "sess-real-reviewer"
+    invocation_id = "conversation-real:item-real"
+    adapter._session_history[session_id] = {
+        "completed": True,
+        "conversation_id": "conversation-real",
+        "invocation_id": invocation_id,
+        "result": AgentResult(
+            session_id=session_id,
+            status=AgentStatus.SUCCESS,
+            output="review complete",
+            is_real_host=True,
+        ),
+    }
+
+    with pytest.raises(AgentNotSupportedError, match="evidence-bound"):
+        adapter.promote_after_verified_evidence(
+            "evi-real",
+            host_session_id=session_id,
+            host_invocation_id="wrong-invocation",
+        )
+
+    adapter.promote_after_verified_evidence(
+        "evi-real",
+        host_session_id=session_id,
+        host_invocation_id=invocation_id,
+    )
+    assert adapter._verification_level == VerificationLevel.CLI_VERIFIED
+
+
 def test_antigravity_real_executable_detection_and_help(monkeypatch):
     exe_path = _find_default_antigravity_executable()
     if exe_path:

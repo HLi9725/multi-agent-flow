@@ -15,11 +15,11 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 try:
     from scripts._lib.core.agent_schema import (
-        AgentHandle,
+        AgentNotSupportedError,
         AgentRequest,
         AgentResult,
         AgentStatus,
@@ -64,7 +64,7 @@ try:
     from scripts._lib.hosts.codex_cli_adapter import CodexCliAdapter, create_codex_cli_manifest
 except ImportError:
     from _lib.core.agent_schema import (
-        AgentHandle,
+        AgentNotSupportedError,
         AgentRequest,
         AgentResult,
         AgentStatus,
@@ -209,7 +209,15 @@ def detect_antigravity_cli() -> Tuple[str, str, str]:
     return (cli_path, ver, f"status={auth_status}; {diag}")
 
 
-def run_phase2_live_e2e_pipeline(target_worktree: str) -> LiveE2EResult:
+def run_phase2_live_e2e_pipeline(
+    target_worktree: str,
+    *,
+    permission_approval_hook: Optional[Callable[[AntigravityAdapter, AgentRequest], None]] = None,
+    task_id: str = "T0054",
+    project_id: Optional[str] = None,
+    baseline_commit: Optional[str] = None,
+    candidate_commit: Optional[str] = None,
+) -> LiveE2EResult:
     """
     Execute Phase 2F-LIVE real dual-host L2 pipeline:
     1. Probe Antigravity CLI status -> detects live authentication.
@@ -256,25 +264,43 @@ def run_phase2_live_e2e_pipeline(target_worktree: str) -> LiveE2EResult:
     store = EvidenceStore(root_dir=e2e_evidence_dir)
     gate = EvidenceGate(store=store, project_root=target_worktree)
 
-    # Registry setup with CLI_VERIFIED
+    def _git_value(*args: str) -> str:
+        proc = subprocess.run(
+            ["git", "-C", target_worktree, *args],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if proc.returncode != 0 or not proc.stdout.strip():
+            raise RuntimeError(f"Unable to resolve authoritative Git context: {' '.join(args)}")
+        return proc.stdout.strip()
+
+    resolved_candidate = candidate_commit or _git_value("rev-parse", "HEAD")
+    resolved_baseline = baseline_commit or _git_value("rev-parse", "HEAD^")
+    if project_id is None:
+        git_common_dir = _git_value("rev-parse", "--path-format=absolute", "--git-common-dir")
+        resolved_project_id = hashlib.sha256(
+            os.path.realpath(git_common_dir).encode("utf-8")
+        ).hexdigest()
+    else:
+        resolved_project_id = project_id
+
+    # Bootstrap with STATIC_ONLY.  A ping is not sufficient to register a
+    # verified manifest; promotion occurs only after dispatch-backed Evidence.
     registry = AdapterRegistry(context_id="phase2_live_e2e")
 
     codex_manifest = create_codex_cli_manifest(adapter_id="codex_cli", verified_version="0.149.0")
     codex_adapter = CodexCliAdapter(is_real_host=True)
     registry.register(codex_adapter, codex_manifest)
 
-    verified_ts_str = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     ag_manifest = create_antigravity_manifest(
         adapter_id="antigravity",
         verified_version=ag_ver if (ag_ver != "unknown" and not ag_ver.startswith("error")) else "1.1.22",
-        verification_level_windows=VerificationLevel.CLI_VERIFIED,
-        e2e_evidence_refs_windows=("evi_live_reviewer_transition",),
-        verified_at_windows=verified_ts_str,
     )
 
     ag_adapter = AntigravityAdapter(
         is_real_host=True,
-        verification_level=VerificationLevel.CLI_VERIFIED,
+        verification_level=VerificationLevel.STATIC_ONLY,
         executable_path=cli_path,
     )
     registry.register(ag_adapter, ag_manifest)
@@ -286,27 +312,31 @@ def run_phase2_live_e2e_pipeline(target_worktree: str) -> LiveE2EResult:
         project_root=target_worktree,
     )
 
-    task_id = "T_E2E_DUAL_HOST_LIVE_001"
-    project_id = "phase2_live_project"
     branch = "feature/phase2f-live-dual-host"
-    base_commit = "988c78833eb76fbc12260b3d24d46227c59e1fb7"
-    cand_commit = "e2e_cand_commit_sha_live_001"
+    base_commit = resolved_baseline
+    cand_commit = resolved_candidate
+    project_id = resolved_project_id
 
     evidence_ids: List[str] = []
     evidence_sha256: Dict[str, str] = {}
 
     # --- STEP 1: Builder (Codex) Starts & Generates Real Test Fixture ---
     sess_builder = f"sess_builder_live_{int(time.time())}"
-    inv_builder = f"{sess_builder}:start"
-
-    builder_handle = AgentHandle(
+    builder_request = AgentRequest(
         session_id=sess_builder,
-        host_id="codex_cli",
-        status=AgentStatus.SUCCESS,
-        is_real_host=True,
-        adapter_instance_id=codex_adapter._instance_id,
-        invocation_token="tok_builder_verified_live",
+        prompt="Create or verify tests/fixtures/fixture_math_util.py and its focused unit test. Keep changes within this worktree.",
+        role="BUILDER",
+        workspace_dir=target_worktree,
+        extra_context={"sandbox": "workspace-write"},
     )
+    builder_handle = codex_adapter.dispatch_agent(builder_request)
+    builder_result = codex_adapter.wait_for_result(builder_handle, timeout_seconds=120)
+    if builder_result.status != AgentStatus.SUCCESS or builder_result.is_real_host is not True:
+        raise RuntimeError("Real Codex Builder dispatch did not complete successfully")
+    builder_thread_id = codex_adapter.get_session_thread_id(sess_builder)
+    inv_builder = codex_adapter.get_session_invocation_id(sess_builder)
+    if not builder_thread_id or not inv_builder:
+        raise RuntimeError("Real Codex Builder result is missing canonical thread/invocation identity")
 
     session = orchestrator.start_builder(
         task_id=task_id,
@@ -410,16 +440,6 @@ def run_phase2_live_e2e_pipeline(target_worktree: str) -> LiveE2EResult:
     # --- STEP 2: Reviewer (Antigravity) Dispatches Real Request & Obtains Canonical Identity ---
     sess_reviewer = f"sess_reviewer_live_{int(time.time())}"
 
-    # Record safe_local permission approval for reviewer in workspace_read boundary
-    ag_adapter.record_permission_approval(
-        project_id=project_id,
-        auth_context="auth_ctx_live_builder",
-        session_id=sess_reviewer,
-        workspace_dir=target_worktree,
-        command_family="safe_local:REVIEWER",
-        permission_boundary="workspace_read",
-    )
-
     req_reviewer = AgentRequest(
         session_id=sess_reviewer,
         prompt="Please perform a read-only code review of tests/fixtures/fixture_math_util.py. Confirm if pure_add is a pure function adhering to boundary constraints.",
@@ -434,16 +454,22 @@ def run_phase2_live_e2e_pipeline(target_worktree: str) -> LiveE2EResult:
         },
     )
 
-    # Real dispatch via Antigravity Adapter
-    reviewer_handle = ag_adapter.dispatch_agent(req_reviewer)
+    if permission_approval_hook is None:
+        raise AgentNotSupportedError("An external human permission approval hook is required for the live Reviewer probe")
+    permission_approval_hook(ag_adapter, req_reviewer)
+
+    # Real, externally approved bootstrap probe while the adapter remains STATIC_ONLY.
+    reviewer_handle = ag_adapter.dispatch_verification_probe(req_reviewer)
     assert reviewer_handle.is_real_host is True
 
     # Real wait for result from agy.exe
     ag_result = ag_adapter.wait_for_result(reviewer_handle, timeout_seconds=60)
     assert ag_result.status == AgentStatus.SUCCESS
 
-    canonical_conv_id = ag_adapter.get_session_thread_id(reviewer_handle.session_id) or f"conv_{int(time.time())}"
-    canonical_inv_id = ag_adapter.get_session_invocation_id(reviewer_handle.session_id) or f"{canonical_conv_id}:step_1"
+    canonical_conv_id = ag_adapter.get_session_thread_id(reviewer_handle.session_id)
+    canonical_inv_id = ag_adapter.get_session_invocation_id(reviewer_handle.session_id)
+    if not canonical_conv_id or not canonical_inv_id:
+        raise RuntimeError("Antigravity result is missing canonical conversation/invocation identity")
 
     # Reviewer writes structured findings
     user_data_dir = os.path.join(target_worktree, "user_data")
@@ -525,18 +551,42 @@ def run_phase2_live_e2e_pipeline(target_worktree: str) -> LiveE2EResult:
     assert session.state == OrchestrationState.TESTING
     assert session.current_role == OrchestrationRole.QA
 
+    # Promotion happens only after the Reviewer Evidence passed EvidenceGate.
+    ag_adapter.promote_after_verified_evidence(
+        evi_reviewer_id,
+        host_session_id=reviewer_handle.session_id,
+        host_invocation_id=canonical_inv_id,
+    )
+    verified_ts_str = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    promoted_manifest = create_antigravity_manifest(
+        adapter_id="antigravity",
+        verified_version=ag_ver,
+        verification_level_windows=VerificationLevel.CLI_VERIFIED,
+        e2e_evidence_refs_windows=(evi_reviewer_id,),
+        verified_at_windows=verified_ts_str,
+    )
+    promoted_registry = AdapterRegistry(context_id="phase2_live_e2e_verified")
+    promoted_registry.register(codex_adapter, codex_manifest)
+    promoted_registry.register(ag_adapter, promoted_manifest)
+    orchestrator.registry = promoted_registry
+
     # --- STEP 3: QA (Codex) Runs Real Pytest on Candidate Fixture ---
     sess_qa = f"sess_qa_live_{int(time.time())}"
-    inv_qa = f"{sess_qa}:exec_1"
-
-    qa_handle = AgentHandle(
+    qa_request = AgentRequest(
         session_id=sess_qa,
-        host_id="codex_cli",
-        status=AgentStatus.SUCCESS,
-        is_real_host=True,
-        adapter_instance_id=codex_adapter._instance_id,
-        invocation_token="tok_qa_verified_live",
+        prompt="Run pytest tests/fixtures/test_fixture_math_util.py -q in read-only QA mode and report the result.",
+        role="QA",
+        workspace_dir=target_worktree,
+        extra_context={"sandbox": "read-only"},
     )
+    qa_handle = codex_adapter.dispatch_agent(qa_request)
+    qa_host_result = codex_adapter.wait_for_result(qa_handle, timeout_seconds=120)
+    if qa_host_result.status != AgentStatus.SUCCESS or qa_host_result.is_real_host is not True:
+        raise RuntimeError("Real Codex QA dispatch did not complete successfully")
+    qa_thread_id = codex_adapter.get_session_thread_id(sess_qa)
+    inv_qa = codex_adapter.get_session_invocation_id(sess_qa)
+    if not qa_thread_id or not inv_qa:
+        raise RuntimeError("Real Codex QA result is missing canonical thread/invocation identity")
 
     qa_start_time = time.time()
     pytest_proc = subprocess.run(
@@ -676,7 +726,20 @@ def run_phase2_live_e2e_pipeline(target_worktree: str) -> LiveE2EResult:
 
 if __name__ == "__main__":
     worktree = os.path.realpath(os.path.abspath(os.getcwd()))
-    res = run_phase2_live_e2e_pipeline(worktree)
+    def _interactive_permission(adapter: AntigravityAdapter, request: AgentRequest) -> None:
+        answer = input("Approve one read-only Antigravity REVIEWER verification probe? [yes/no]: ").strip().lower()
+        if answer not in {"yes", "y"}:
+            raise AgentNotSupportedError("Human permission approval was not granted")
+        adapter.record_permission_approval(
+            project_id=str(request.extra_context.get("project_id")),
+            auth_context=str(request.extra_context.get("auth_context")),
+            session_id=request.session_id,
+            workspace_dir=request.workspace_dir,
+            command_family="safe_local:REVIEWER",
+            permission_boundary="workspace_read",
+        )
+
+    res = run_phase2_live_e2e_pipeline(worktree, permission_approval_hook=_interactive_permission)
     print("=== Phase 2F-LIVE Dual-Host L2 Verification Summary ===")
     print(f"Success: {res.success}")
     print(f"Is Blocked: {res.is_blocked}")

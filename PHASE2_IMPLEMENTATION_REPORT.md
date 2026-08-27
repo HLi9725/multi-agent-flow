@@ -781,3 +781,37 @@ dual_host_l2_status:
    - 全量测试套件：`python -m pytest tests -q -rs` → exit 0，`384 passed in 70.95s (0:01:10)` (100% 通过, 0 failed, 0 skipped)；
    - `git diff --check` → exit 0；
    - 进程安全守卫全程 0 次异常拉起。
+
+### 11. Codex 独立复审返工记录（DEF-T0054-5 ～ DEF-T0054-10）
+
+> 本节覆盖并纠正第 10 节对应候选提交 `307a58f5d8e10c06c7214af0d4aa43116d067c58` 的准出结论。原候选产生的 3 条 Evidence 和 `READY` 结论不得作为第二阶段验收依据；修复后的真实 E2E 必须重新运行并产生新的 Evidence。
+
+1. **[DEF-T0054-5] 禁止无证据预注册 `CLI_VERIFIED`（P1）**：
+   - `create_antigravity_manifest()` 在 Windows 选择 `CLI_VERIFIED` 时，强制要求调用方提供真实 `verified_at_windows` 与至少一条非空 E2E Evidence 引用；
+   - 删除固定占位引用 `evi_live_reviewer_transition` 及自动补时间行为；缺少真实证据时直接 Fail-Closed。
+2. **[DEF-T0054-6] Builder/QA 必须真实经过 Codex Adapter（P1）**：
+   - 删除流水线手工构造 Codex `AgentHandle`、Session、Invocation 与 Token 的逻辑；
+   - Builder 与 QA 均必须调用 `CodexCliAdapter.dispatch_agent()` 和 `wait_for_result()`，并从 Adapter 会话历史读取真实 thread/item 身份；缺少身份或真实成功结果即停止。
+3. **[DEF-T0054-7] 禁止 Antigravity 本地身份回退（P1）**：
+   - 删除 `conv_<time>`、`step_1` 等本地回退；
+   - `agy` 成功响应若未返回规范 conversation/invocation 身份，结果强制标记失败，流水线不得生成 Evidence 或升级验证等级。
+4. **[DEF-T0054-8] EvidenceGate 通过前不得升级（P1）**：
+   - 注册表初始只接受 Antigravity `STATIC_ONLY`；
+   - 仅允许一条外部批准、`REVIEWER + workspace_read + plan` 的线程局部只读验证探针；
+   - Reviewer Evidence 经 EvidenceGate 1:1 校验后，才允许绑定该 Session/Invocation/Evidence 引用升级为 `CLI_VERIFIED`，随后重建已验证 Registry。
+5. **[DEF-T0054-9] 流水线不得自我批准（P1）**：
+   - 核心流水线删除对 `record_permission_approval()` 的直接调用；
+   - 必须由外部人类确认回调登记许可；命令行入口逐次询问用户，拒绝或缺少回调均 Fail-Closed。
+6. **[DEF-T0054-10] Evidence 绑定权威项目上下文（P2）**：
+   - 默认从目标 Worktree 解析真实 `HEAD`、`HEAD^` 与 Git common-dir 派生项目身份；
+   - 默认 Task ID 固定为真实工单 `T0054`，不再使用演示 Task、项目或伪 commit。
+7. **独立验证结果（未启动真实 Host/浏览器）**：
+   - 旧漏洞独立对抗复现：`3/3 PASS`，确认无证据 Manifest 被拒、流水线强制 Codex dispatch、缺失 canonical 身份不再被补造；
+   - 定向测试（Live E2E + Antigravity + Codex）：`50 passed in 4.03s`；
+   - 2A～2F 关键兼容测试：`159 passed in 27.16s`；
+   - 带进程守卫全量测试：`386 passed in 86.17s`，0 failed，0 skipped；
+   - 守卫禁止 `agy.exe`、`taskkill.exe`、Edge、Firefox、Chrome 与 OAuth 进程，测试期间 0 次触发。
+8. **当前真实准出状态**：
+   - 修复代码的自动化回归已通过；
+   - 原候选的 `READY` 与 Evidence 已作废；Windows 必须暂按 `STATIC_ONLY` 处理；
+   - 需要在继承有效代理环境的终端中重新运行真实 2F-LIVE，并经独立 Reviewer、QA 与用户确认后，才能重新声明 `CLI_VERIFIED / READY`。
