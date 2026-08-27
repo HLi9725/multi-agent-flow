@@ -494,7 +494,7 @@ def test_orchestrator_full_deterministic_lifecycle_with_real_gate(mock_dual_regi
         capabilities=codex_caps,
     )
 
-    # 4. QA passes -> advances to User Acceptance with real evidence
+    # 4. QA passes -> advances to User Acceptance with real evidence and binds confirmation_request_id
     qa_req = UserAcceptanceRequest(
         task_id=task_id,
         project_id=project_id,
@@ -516,10 +516,13 @@ def test_orchestrator_full_deterministic_lifecycle_with_real_gate(mock_dual_regi
     assert session.state == OrchestrationState.PENDING_USER_ACCEPTANCE
     assert session.current_role == OrchestrationRole.USER
     assert session.last_evidence_id == evi_q_id
+    assert session.confirmation_request_id is not None
+    assert session.confirmation_request_id.startswith("conf_req_")
 
-    # Prepare real Evidence & ConfirmationResult for User Acceptance
+    # Prepare real Evidence & ConfirmationResult matching server generated confirmation_request_id
+    bound_conf_req_id = session.confirmation_request_id
     confirm_res = ConfirmationResult(
-        request_id="req_conf_001",
+        request_id=bound_conf_req_id,
         selected_option="approve",
         is_confirmed=True,
         is_real_host=True,
@@ -543,11 +546,11 @@ def test_orchestrator_full_deterministic_lifecycle_with_real_gate(mock_dual_regi
         host_id="user_console",
         adapter="user_console",
         host_session_id="sess_user_004",
-        host_invocation_id="user_confirmation",
+        host_invocation_id=bound_conf_req_id,
         workspace_mode="workspace_read",
         capabilities=user_caps,
         extra_meta={
-            "confirmation_id": "req_conf_001",
+            "confirmation_id": bound_conf_req_id,
             "user_source": "explicit_user",
             "confirmed_at": time.time(),
         },
@@ -569,6 +572,7 @@ def test_orchestrator_full_deterministic_lifecycle_with_real_gate(mock_dual_regi
     )
     assert session.state == OrchestrationState.ACCEPTED
     assert session.current_role == OrchestrationRole.USER
+    assert session.last_evidence_id == evi_u_id
 
 
 def test_orchestrator_ghost_evidence_fail_closed(mock_dual_registry, mock_evidence_env):
@@ -641,16 +645,26 @@ def test_orchestrator_ghost_evidence_fail_closed(mock_dual_registry, mock_eviden
         bare_orchestrator.submit_to_reviewer(b_handover, evidence_id="ghost_evidence_123", host_handle=builder_handle)
 
 
-def test_orchestrator_user_acceptance_credential_verification(mock_dual_registry, mock_evidence_env):
-    """DEF-T0053-3: Verify user acceptance strictly requires ConfirmationResult with is_real_host=True."""
+def test_orchestrator_user_acceptance_def_t0053_5_adversarial_suite(mock_dual_registry, mock_evidence_env):
+    """
+    DEF-T0053-5 Comprehensive Adversarial Test Suite for User Acceptance.
+    Verifies all 12 mandatory security and gate requirements.
+    """
     store, gate, proj_root = mock_evidence_env
     orchestrator = Orchestrator(registry=mock_dual_registry, evidence_store=store, evidence_gate=gate, project_root=proj_root)
 
-    orchestrator.start_builder(
-        task_id="T0260",
-        project_id="proj_alpha",
-        branch="feature/f1",
-        baseline_commit="base_sha",
+    task_id = "T0270"
+    project_id = "proj_alpha"
+    branch = "feature/f1"
+    base_commit = "base_sha_777"
+    cand_commit = "cand_sha_888"
+
+    # Start session and advance to PENDING_USER_ACCEPTANCE
+    session = orchestrator.start_builder(
+        task_id=task_id,
+        project_id=project_id,
+        branch=branch,
+        baseline_commit=base_commit,
         assignee="李开发",
         workspace_dir=proj_root,
         worktree_dir=proj_root,
@@ -660,13 +674,12 @@ def test_orchestrator_user_acceptance_credential_verification(mock_dual_registry
         builder_invocation_id="sess_b:1",
         builder_adapter_id="codex_cli"
     )
-
     b_handover = BuilderToReviewerHandover(
-        task_id="T0260",
-        project_id="proj_alpha",
-        branch="feature/f1",
-        baseline_commit="base_sha",
-        candidate_commit="cand_sha",
+        task_id=task_id,
+        project_id=project_id,
+        branch=branch,
+        baseline_commit=base_commit,
+        candidate_commit=cand_commit,
         modified_files=("a.py",),
         diff_stat={},
         test_summary={},
@@ -679,50 +692,222 @@ def test_orchestrator_user_acceptance_credential_verification(mock_dual_registry
     )
     orchestrator.submit_to_reviewer(b_handover)
 
-    # Set up session in PENDING_USER_ACCEPTANCE
-    session = orchestrator.get_session("T0260")
+    # Set up session in PENDING_USER_ACCEPTANCE with a known server generated confirmation_request_id
+    session = orchestrator.get_session(task_id)
+    server_req_id = "conf_req_secure_server_id_123"
     session.state = OrchestrationState.PENDING_USER_ACCEPTANCE
-    session.candidate_commit = "cand_sha"
+    session.candidate_commit = cand_commit
+    session.confirmation_request_id = server_req_id
+    initial_last_evidence = session.last_evidence_id
 
-    # 1. Acceptance without confirmation_result -> Rejected
+    valid_user_handle = AgentHandle(
+        session_id="sess_u_real",
+        host_id="user_console",
+        status=AgentStatus.UNKNOWN,
+        is_real_host=True,
+        adapter_instance_id="inst_u",
+        invocation_token="tok_u",
+    )
+
     user_dec = UserAcceptanceDecision(
-        task_id="T0260",
+        task_id=task_id,
         user_source="explicit_user",
         is_accepted=True,
-        remarks="Self-accepted without credential"
+        remarks="Approved by user"
     )
+
+    # 1. ConfirmationResult is missing -> Rejected
     with pytest.raises(OrchestrationSecurityError, match="strictly requires a ConfirmationResult credential"):
-        orchestrator.confirm_user_acceptance(user_dec, confirmation_result=None)
+        orchestrator.confirm_user_acceptance(user_dec, confirmation_result=None, evidence_id="evi_any", host_handle=valid_user_handle)
+    assert session.state == OrchestrationState.PENDING_USER_ACCEPTANCE
+    assert session.last_evidence_id == initial_last_evidence
 
-    # 2. Acceptance with fake is_real_host=False -> Rejected
-    fake_res = ConfirmationResult(
-        request_id="req_1",
-        selected_option="approve",
-        is_confirmed=True,
-        is_real_host=False,
-    )
-    with pytest.raises(OrchestrationSecurityError, match="ConfirmationResult must have is_real_host=True"):
-        orchestrator.confirm_user_acceptance(user_dec, confirmation_result=fake_res)
-
-    # 3. Acceptance with is_confirmed=False -> Rejected
-    rejected_res = ConfirmationResult(
-        request_id="req_1",
-        selected_option="deny",
-        is_confirmed=False,
-        is_real_host=True,
-    )
-    with pytest.raises(OrchestrationSecurityError, match="ConfirmationResult is_confirmed is False"):
-        orchestrator.confirm_user_acceptance(user_dec, confirmation_result=rejected_res)
-
-    # 4. Valid acceptance with real ConfirmationResult -> Accepted
+    # 2. evidence_id is missing (None or empty) -> Rejected
     valid_res = ConfirmationResult(
-        request_id="req_1",
+        request_id=server_req_id,
         selected_option="approve",
         is_confirmed=True,
         is_real_host=True,
     )
-    session_after = orchestrator.confirm_user_acceptance(user_dec, confirmation_result=valid_res)
-    assert session_after.state == OrchestrationState.ACCEPTED
+    with pytest.raises(OrchestrationGateError, match="evidence_id is mandatory"):
+        orchestrator.confirm_user_acceptance(user_dec, confirmation_result=valid_res, evidence_id=None, host_handle=valid_user_handle)
+    with pytest.raises(OrchestrationGateError, match="evidence_id is mandatory"):
+        orchestrator.confirm_user_acceptance(user_dec, confirmation_result=valid_res, evidence_id="", host_handle=valid_user_handle)
+    assert session.state == OrchestrationState.PENDING_USER_ACCEPTANCE
+    assert session.last_evidence_id == initial_last_evidence
+
+    # 3. host_handle is missing (None) -> Rejected
+    with pytest.raises(OrchestrationGateError, match="host_handle must be provided"):
+        orchestrator.confirm_user_acceptance(user_dec, confirmation_result=valid_res, evidence_id="evi_any", host_handle=None)
+    assert session.state == OrchestrationState.PENDING_USER_ACCEPTANCE
+    assert session.last_evidence_id == initial_last_evidence
+
+    # 4. EvidenceStore/Gate is missing -> Rejected (Fail-Closed)
+    bare_orch = Orchestrator(registry=mock_dual_registry, evidence_store=None, evidence_gate=None, project_root=proj_root)
+    bare_sess = bare_orch.start_builder(
+        task_id="T0270_bare",
+        project_id=project_id,
+        branch=branch,
+        baseline_commit=base_commit,
+        assignee="李开发",
+        workspace_dir=proj_root,
+        worktree_dir=proj_root,
+        auth_context="auth_ctx",
+        billing_context="billing_ctx",
+        builder_session_id="sess_b",
+        builder_invocation_id="sess_b:1",
+        builder_adapter_id="codex_cli"
+    )
+    bare_sess.state = OrchestrationState.PENDING_USER_ACCEPTANCE
+    bare_sess.confirmation_request_id = server_req_id
+    with pytest.raises(OrchestrationGateError, match="Evidence infrastructure .* is not configured"):
+        bare_orch.confirm_user_acceptance(
+            UserAcceptanceDecision(task_id="T0270_bare", user_source="explicit_user", is_accepted=True, remarks="ok"),
+            confirmation_result=valid_res,
+            evidence_id="evi_any",
+            host_handle=valid_user_handle,
+        )
+
+    # 5. Caller constructs is_real_host=True with forged request_id -> Rejected
+    forged_req_res = ConfirmationResult(
+        request_id="caller-forged-request",
+        selected_option="approve",
+        is_confirmed=True,
+        is_real_host=True,
+    )
+    with pytest.raises(OrchestrationSecurityError, match="does not match active confirmation_request_id"):
+        orchestrator.confirm_user_acceptance(user_dec, confirmation_result=forged_req_res, evidence_id="evi_any", host_handle=valid_user_handle)
+    assert session.state == OrchestrationState.PENDING_USER_ACCEPTANCE
+
+    # 6. Caller constructs is_real_host=True with non-existent Evidence -> Rejected
+    with pytest.raises(OrchestrationGateError, match="User confirmation evidence validation failed"):
+        orchestrator.confirm_user_acceptance(user_dec, confirmation_result=valid_res, evidence_id="ghost_user_evi_999", host_handle=valid_user_handle)
+    assert session.state == OrchestrationState.PENDING_USER_ACCEPTANCE
+
+    # 7. Create evidence with task_id mismatch -> Rejected
+    user_caps = HostCapabilities(is_real_host=True, supports_interactive_confirmation=CapabilitySupport.SUPPORTED)
+    _create_helper_evidence(
+        store=store,
+        evidence_id="evi_mismatch_task",
+        evidence_type=EvidenceType.USER_CONFIRMATION,
+        project_id=project_id,
+        task_id="T_WRONG_TASK",  # Mismatch!
+        actor_role="USER",
+        transition_from="PENDING_USER_ACCEPTANCE",
+        transition_to="ACCEPTED",
+        baseline_commit=base_commit,
+        result_commit=cand_commit,
+        host_id="user_console",
+        adapter="user_console",
+        host_session_id="sess_u_real",
+        host_invocation_id=server_req_id,
+        workspace_mode="workspace_read",
+        capabilities=user_caps,
+        extra_meta={"confirmation_id": server_req_id, "user_source": "explicit_user", "confirmed_at": time.time()},
+    )
+    with pytest.raises(OrchestrationGateError, match="Context mismatch for task_id"):
+        orchestrator.confirm_user_acceptance(user_dec, confirmation_result=valid_res, evidence_id="evi_mismatch_task", host_handle=valid_user_handle)
+    assert session.state == OrchestrationState.PENDING_USER_ACCEPTANCE
+
+    # 8. Create evidence with candidate commit mismatch -> Rejected
+    _create_helper_evidence(
+        store=store,
+        evidence_id="evi_mismatch_commit",
+        evidence_type=EvidenceType.USER_CONFIRMATION,
+        project_id=project_id,
+        task_id=task_id,
+        actor_role="USER",
+        transition_from="PENDING_USER_ACCEPTANCE",
+        transition_to="ACCEPTED",
+        baseline_commit=base_commit,
+        result_commit="cand_WRONG_sha",  # Mismatch!
+        host_id="user_console",
+        adapter="user_console",
+        host_session_id="sess_u_real",
+        host_invocation_id=server_req_id,
+        workspace_mode="workspace_read",
+        capabilities=user_caps,
+        extra_meta={"confirmation_id": server_req_id, "user_source": "explicit_user", "confirmed_at": time.time()},
+    )
+    with pytest.raises(OrchestrationGateError, match="Context mismatch for result_commit"):
+        orchestrator.confirm_user_acceptance(user_dec, confirmation_result=valid_res, evidence_id="evi_mismatch_commit", host_handle=valid_user_handle)
+    assert session.state == OrchestrationState.PENDING_USER_ACCEPTANCE
+
+    # 9. Create evidence with fake/mock/simulate host_id -> Rejected by EvidenceGate
+    _create_helper_evidence(
+        store=store,
+        evidence_id="evi_fake_host",
+        evidence_type=EvidenceType.USER_CONFIRMATION,
+        project_id=project_id,
+        task_id=task_id,
+        actor_role="USER",
+        transition_from="PENDING_USER_ACCEPTANCE",
+        transition_to="ACCEPTED",
+        baseline_commit=base_commit,
+        result_commit=cand_commit,
+        host_id="mock_user_console",  # Forbidden token 'mock'!
+        adapter="mock_user_console",
+        host_session_id="sess_u_real",
+        host_invocation_id=server_req_id,
+        workspace_mode="workspace_read",
+        capabilities=user_caps,
+        extra_meta={"confirmation_id": server_req_id, "user_source": "explicit_user", "confirmed_at": time.time()},
+    )
+    fake_handle = AgentHandle(
+        session_id="sess_u_real",
+        host_id="mock_user_console",
+        status=AgentStatus.UNKNOWN,
+        is_real_host=True,
+        adapter_instance_id="inst_fake",
+        invocation_token="tok_fake",
+    )
+    with pytest.raises(OrchestrationGateError, match="Contains fake/test/mock/simulate identifier"):
+        orchestrator.confirm_user_acceptance(user_dec, confirmation_result=valid_res, evidence_id="evi_fake_host", host_handle=fake_handle)
+    assert session.state == OrchestrationState.PENDING_USER_ACCEPTANCE
+
+    # 10. Checkpoint export & restore preserves confirmation_request_id binding
+    ckpt = orchestrator.export_checkpoint(task_id)
+    assert ckpt["confirmation_request_id"] == server_req_id
+    orch_restored = Orchestrator(registry=mock_dual_registry, evidence_store=store, evidence_gate=gate, project_root=proj_root)
+    restored_sess = orch_restored.import_checkpoint(ckpt)
+    assert restored_sess.confirmation_request_id == server_req_id
+    # Attempting to use forged request_id on restored session fails
+    with pytest.raises(OrchestrationSecurityError, match="does not match active confirmation_request_id"):
+        orch_restored.confirm_user_acceptance(user_dec, confirmation_result=forged_req_res, evidence_id="evi_any", host_handle=valid_user_handle)
+
+    # 11. Fully compliant and matched USER_CONFIRMATION Evidence -> ACCEPTED and updates last_evidence_id
+    valid_evi_id = "evi_user_confirmation_valid_100"
+    _create_helper_evidence(
+        store=store,
+        evidence_id=valid_evi_id,
+        evidence_type=EvidenceType.USER_CONFIRMATION,
+        project_id=project_id,
+        task_id=task_id,
+        actor_role="USER",
+        transition_from="PENDING_USER_ACCEPTANCE",
+        transition_to="ACCEPTED",
+        baseline_commit=base_commit,
+        result_commit=cand_commit,
+        host_id="user_console",
+        adapter="user_console",
+        host_session_id="sess_u_real",
+        host_invocation_id=server_req_id,
+        workspace_mode="workspace_read",
+        capabilities=user_caps,
+        extra_meta={
+            "confirmation_id": server_req_id,
+            "user_source": "explicit_user",
+            "confirmed_at": time.time(),
+        },
+    )
+    final_session = orchestrator.confirm_user_acceptance(
+        user_dec,
+        confirmation_result=valid_res,
+        evidence_id=valid_evi_id,
+        host_handle=valid_user_handle,
+    )
+    assert final_session.state == OrchestrationState.ACCEPTED
+    assert final_session.last_evidence_id == valid_evi_id
 
 
 def test_orchestrator_state_jumping_rejection(mock_dual_registry, mock_evidence_env):

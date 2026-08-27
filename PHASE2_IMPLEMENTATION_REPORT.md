@@ -572,17 +572,17 @@ e2e_record:
 ### 3. 测试记录（真实数据）
 
 - **2F 编排器定向测试**:
-  - `python -m pytest tests/test_orchestrator.py -q -rs` -> `12 passed in 0.46s` (0 failed, 0 skipped, exit 0)
+  - `python -m pytest tests/test_orchestrator.py -q -rs` -> `12 passed in 1.36s` (0 failed, 0 skipped, exit 0)
 - **2D-1 通用基础设施回归测试**:
-  - `python -m pytest tests/test_adapter_manifest.py tests/test_adapter_registry.py tests/test_adapter_conformance.py -q -rs` -> `37 passed in 1.87s` (0 failed, 0 skipped, exit 0)
+  - `python -m pytest tests/test_adapter_manifest.py tests/test_adapter_registry.py tests/test_adapter_conformance.py -q -rs` -> `37 passed in 3.38s` (0 failed, 0 skipped, exit 0)
 - **2D-2 Codex CLI Adapter 回归测试**:
-  - `python -m pytest tests/test_codex_cli_adapter.py -q -rs` -> `20 passed in 0.55s` (0 failed, 0 skipped, exit 0)
+  - `python -m pytest tests/test_codex_cli_adapter.py -q -rs` -> `20 passed in 0.57s` (0 failed, 0 skipped, exit 0)
 - **2E Antigravity Adapter 回归测试**:
-  - `python -m pytest tests/test_antigravity_adapter.py -q -rs` -> `23 passed in 0.44s` (0 failed, 0 skipped, exit 0)
+  - `python -m pytest tests/test_antigravity_adapter.py -q -rs` -> `23 passed in 0.46s` (0 failed, 0 skipped, exit 0)
 - **Host / Evidence / Worktree 回归测试**:
-  - `python -m pytest tests/test_host_adapter.py tests/test_evidence.py tests/test_worktree_manager.py -q -rs` -> `60 passed in 21.94s` (0 failed, 0 skipped, exit 0)
+  - `python -m pytest tests/test_host_adapter.py tests/test_evidence.py tests/test_worktree_manager.py -q -rs` -> `60 passed in 22.37s` (0 failed, 0 skipped, exit 0)
 - **全量测试套件**:
-  - `python -m pytest tests -q -rs` -> `378 passed in 67.82s (0:01:07)` (0 failed, 0 skipped, 100% 通过, exit 0)
+  - `python -m pytest tests -q -rs` -> `378 passed in 72.12s (0:01:12)` (0 failed, 0 skipped, 100% 通过, exit 0)
 - **代码规范检查**:
   - `git diff --check` -> 退出码 0，零尾随空白错误
 - **进程安全守卫**:
@@ -625,3 +625,11 @@ dual_host_l2_status:
    - 强化 `confirm_user_acceptance`，严格要求调用方必须提供 `ConfirmationResult` 实例凭据（`is_real_host=True` 且 `is_confirmed=True`），杜绝仅凭自然语言 `user_source="explicit_user"` 字符串自报伪造验收。
 4. **[DEF-T0053-4] 交接包与报告 merge_commit SHA 精确校准 (P3)**:
    - 精确校准 merge commit SHA 为 `7de140979e957c241bedbae10e1fa50aa37ad664`，与 Git 树完整对齐。
+
+### 7. 2F-DEV 第 2 轮 QA 缺陷修复记录 (DEF-T0053-5)
+
+1. **[DEF-T0053-5] 用户验收凭据强制绑定与 request_id / EvidenceGate 闭环门禁 (P1)**:
+   - **服务端生成绑定 ID**：在 `pass_qa_to_user_acceptance` 时由 Orchestrator 服务端生成不可预测的 `confirmation_request_id`，并与 `TaskExecutionSession` 深度绑定（纳入 checkpoint 导出/恢复）；
+   - **验收六元组强制门禁**：在 `confirm_user_acceptance` 时，`is_accepted=True` 必须同时满足：① `confirmation_result` 实例凭据且 `is_real_host=True`、`is_confirmed=True`；② `confirmation_result.request_id` 与 Session 绑定的 `confirmation_request_id` 精确一致（拒绝任意调用方自造 ID）；③ `evidence_id` 强必填；④ `host_handle`（`is_real_host=True`）强必填；⑤ `EvidenceStore` 与 `EvidenceGate` 必须已配置；⑥ 通过 `EvidenceGate` 对 `USER_CONFIRMATION` 证据类型进行上下文严格比对（匹配 task_id、project_id、candidate_commit、session_id、invocation_id、user_source、confirmed_at 等）；
+   - **Fail-Closed 严格保证**：任一条件不满足立即抛出异常拒绝流转，任务保持 `PENDING_USER_ACCEPTANCE`，`last_evidence_id` 保持不变；仅在所有门禁通过后推进至 `ACCEPTED` 并写入 `last_evidence_id`；
+   - **12 项独立对抗测试覆盖**：在 `tests/test_orchestrator.py` 中新增 `test_orchestrator_user_acceptance_def_t0053_5_adversarial_suite`，覆盖凭据缺失、证据缺失、Handle 缺失、基础设施缺失、自造 ID 欺骗、任务/提交不匹配、Mock 标识注入、断点恢复绑定等全部对抗场景。

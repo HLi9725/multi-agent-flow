@@ -9,6 +9,7 @@ import threading
 import time
 from types import MappingProxyType
 from typing import Any, Dict, List, Mapping as TMapping, Optional, Sequence, Set, Tuple
+import uuid
 
 from .agent_schema import (
     AgentHandle,
@@ -77,6 +78,7 @@ class TaskExecutionSession:
     qa_session_id: Optional[str] = None
     qa_invocation_id: Optional[str] = None
     qa_adapter_id: Optional[str] = None
+    confirmation_request_id: Optional[str] = None
     last_evidence_id: Optional[str] = None
     history: List[Dict[str, Any]] = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
@@ -195,6 +197,7 @@ class Orchestrator:
                 existing.builder_session_id = builder_session_id
                 existing.builder_invocation_id = builder_invocation_id
                 existing.builder_adapter_id = builder_adapter_id
+                existing.confirmation_request_id = None
                 existing.updated_at = time.time()
                 existing.history.append({
                     "action": "START_BUILDER_REWORK",
@@ -472,7 +475,7 @@ class Orchestrator:
         evidence_id: str,
         host_handle: Optional[AgentHandle] = None,
     ) -> TaskExecutionSession:
-        """QA passes -> transitions to PENDING_USER_ACCEPTANCE."""
+        """QA passes -> transitions to PENDING_USER_ACCEPTANCE and binds server-generated confirmation_request_id."""
         with self._lock:
             session = self._sessions.get(request.task_id)
             if not session:
@@ -531,8 +534,12 @@ class Orchestrator:
             except (EvidenceError, EvidenceGateError) as e:
                 raise OrchestrationGateError(f"Evidence validation failed: {str(e)}") from e
 
+            # DEF-T0053-5: Generate unpredictable confirmation_request_id bound to session
+            confirmation_request_id = f"conf_req_{uuid.uuid4().hex[:16]}"
+
             session.qa_session_id = qa_session_id
             session.qa_invocation_id = qa_invocation_id
+            session.confirmation_request_id = confirmation_request_id
             session.last_evidence_id = evidence_id
             session.state = OrchestrationState.PENDING_USER_ACCEPTANCE
             session.current_role = OrchestrationRole.USER
@@ -541,6 +548,7 @@ class Orchestrator:
                 "action": "PASS_QA_TO_USER_ACCEPTANCE",
                 "evidence_id": evidence_id,
                 "qa_session_id": qa_session_id,
+                "confirmation_request_id": confirmation_request_id,
                 "timestamp": time.time(),
             })
             return session
@@ -554,7 +562,8 @@ class Orchestrator:
     ) -> TaskExecutionSession:
         """
         User explicit acceptance confirmation.
-        Strictly requires real ConfirmationResult credential for acceptance.
+        DEF-T0053-5: Strictly requires all of ConfirmationResult, evidence_id, host_handle,
+        server-generated confirmation_request_id match, and EvidenceGate verification for acceptance.
         Strictly rejects model self-reported or PM agent automated confirmation.
         Explicitly DOES NOT perform git merge main, push, tag, or worktree cleanup.
         """
@@ -577,7 +586,13 @@ class Orchestrator:
                 )
 
             if decision.is_accepted:
-                # DEF-T0053-3: Acceptance requires valid confirmation_result credential
+                # DEF-T0053-5 requirement 1: server-generated confirmation_request_id must exist
+                if not session.confirmation_request_id:
+                    raise OrchestrationSecurityError(
+                        "Task execution session has no active confirmation_request_id. Must advance to user acceptance first."
+                    )
+
+                # DEF-T0053-5 requirement 2: ConfirmationResult credential must be present and valid
                 if confirmation_result is None:
                     raise OrchestrationSecurityError(
                         "User acceptance confirmation strictly requires a ConfirmationResult credential."
@@ -595,40 +610,63 @@ class Orchestrator:
                         "ConfirmationResult is_confirmed is False; user rejected confirmation."
                     )
 
-                # Validate evidence if provided
-                if evidence_id is not None:
-                    if not self.evidence_gate or not self.evidence_store:
-                        raise OrchestrationGateError(
-                            "Cannot validate user confirmation evidence: Evidence infrastructure is not configured (Fail-Closed)."
-                        )
-                    if host_handle is None:
-                        raise OrchestrationGateError("host_handle must be provided when validating user confirmation evidence.")
-
-                    val_ctx = EvidenceValidationContext(
-                        project_id=session.project_id,
-                        task_id=session.task_id,
-                        actor_role=OrchestrationRole.USER.value,
-                        transition_from="PENDING_USER_ACCEPTANCE",
-                        transition_to="ACCEPTED",
-                        baseline_commit=session.baseline_commit,
-                        result_commit=session.candidate_commit or "",
-                        expected_invocation_id="user_confirmation",
-                        expected_adapter=host_handle.host_id,
-                        expected_workspace_mode="workspace_read",
-                        expected_evidence_type=EvidenceType.USER_CONFIRMATION,
-                        host_handle=host_handle,
-                        expected_capabilities=HostCapabilities(
-                            is_real_host=True,
-                            supports_interactive_confirmation=CapabilitySupport.SUPPORTED,
-                        ),
-                        confirmation_result=confirmation_result,
+                # DEF-T0053-5 requirement 3: confirmation_result.request_id must exact-match server generated ID
+                if confirmation_result.request_id != session.confirmation_request_id:
+                    raise OrchestrationSecurityError(
+                        f"ConfirmationResult request_id '{confirmation_result.request_id}' does not match active "
+                        f"confirmation_request_id '{session.confirmation_request_id}'."
                     )
-                    try:
-                        self.evidence_gate.validate_evidence(evidence_id, val_ctx)
-                    except (EvidenceError, EvidenceGateError) as e:
-                        raise OrchestrationGateError(f"Evidence validation failed: {str(e)}") from e
-                    session.last_evidence_id = evidence_id
 
+                # DEF-T0053-5 requirement 4: evidence_id is strictly mandatory
+                if not evidence_id or not evidence_id.strip():
+                    raise OrchestrationGateError(
+                        "evidence_id is mandatory for user acceptance confirmation (USER_CONFIRMATION Evidence is required)."
+                    )
+
+                # DEF-T0053-5 requirement 5: host_handle is strictly mandatory
+                if host_handle is None:
+                    raise OrchestrationGateError(
+                        "host_handle must be provided for user acceptance confirmation evidence verification."
+                    )
+                if not isinstance(host_handle, AgentHandle):
+                    raise AgentInvalidHandleError("host_handle must be an AgentHandle instance.")
+                if host_handle.is_real_host is not True:
+                    raise OrchestrationSecurityError("host_handle must have is_real_host=True for user acceptance.")
+
+                # DEF-T0053-5 requirement 6: EvidenceGate and EvidenceStore are strictly mandatory
+                if not self.evidence_gate or not self.evidence_store:
+                    raise OrchestrationGateError(
+                        "Cannot confirm user acceptance: Evidence infrastructure (EvidenceGate/EvidenceStore) is not configured (Fail-Closed)."
+                    )
+
+                # DEF-T0053-5 requirement 7: Real EvidenceGate validation against USER_CONFIRMATION Evidence
+                val_ctx = EvidenceValidationContext(
+                    project_id=session.project_id,
+                    task_id=session.task_id,
+                    actor_role=OrchestrationRole.USER.value,
+                    transition_from="PENDING_USER_ACCEPTANCE",
+                    transition_to="ACCEPTED",
+                    baseline_commit=session.baseline_commit,
+                    result_commit=session.candidate_commit or "",
+                    expected_invocation_id=session.confirmation_request_id,
+                    expected_adapter=host_handle.host_id,
+                    expected_workspace_mode="workspace_read",
+                    expected_evidence_type=EvidenceType.USER_CONFIRMATION,
+                    host_handle=host_handle,
+                    expected_capabilities=HostCapabilities(
+                        is_real_host=True,
+                        supports_interactive_confirmation=CapabilitySupport.SUPPORTED,
+                    ),
+                    confirmation_result=confirmation_result,
+                )
+                try:
+                    self.evidence_gate.validate_evidence(evidence_id, val_ctx)
+                except (EvidenceError, EvidenceGateError) as e:
+                    # Fail-Closed: keep state as PENDING_USER_ACCEPTANCE and do not change last_evidence_id
+                    raise OrchestrationGateError(f"User confirmation evidence validation failed: {str(e)}") from e
+
+                # All gates passed -> advance state to ACCEPTED
+                session.last_evidence_id = evidence_id
                 session.state = OrchestrationState.ACCEPTED
                 session.current_role = OrchestrationRole.USER
                 session.updated_at = time.time()
@@ -644,6 +682,7 @@ class Orchestrator:
             else:
                 session.state = OrchestrationState.BUILDING
                 session.current_role = OrchestrationRole.BUILDER
+                session.confirmation_request_id = None
                 session.updated_at = time.time()
                 session.history.append({
                     "action": "USER_ACCEPTANCE_REJECTED",
@@ -838,6 +877,7 @@ class Orchestrator:
                 "qa_session_id": session.qa_session_id,
                 "qa_invocation_id": session.qa_invocation_id,
                 "qa_adapter_id": session.qa_adapter_id,
+                "confirmation_request_id": session.confirmation_request_id,
                 "last_evidence_id": session.last_evidence_id,
                 "history": list(session.history),
                 "created_at": session.created_at,
@@ -870,6 +910,7 @@ class Orchestrator:
                 qa_session_id=data.get("qa_session_id"),
                 qa_invocation_id=data.get("qa_invocation_id"),
                 qa_adapter_id=data.get("qa_adapter_id"),
+                confirmation_request_id=data.get("confirmation_request_id"),
                 last_evidence_id=data.get("last_evidence_id"),
                 history=list(data.get("history", [])),
                 created_at=data.get("created_at", time.time()),
