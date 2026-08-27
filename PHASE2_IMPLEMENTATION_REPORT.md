@@ -505,6 +505,16 @@ e2e_record:
 13. **[DEF-T0052-22] 实施报告历史矛盾结论全量清理 (P3)**:
     - 报告全文清理旧的 `1.1.8`、`CLI_VERIFIED` 和 7 元组残留，全面对齐为 `1.1.21`、`STATIC_ONLY` 与 6 元组架构。
 
+14. **[DEF-T0052-23] 未批准 safe_local 严格拦截与审批门禁闭环 (P1)**:
+    - `dispatch_agent()` 在执行 safe_local 时严格校验 `has_permission_approval()`。未预先获得外部/用户授权的操作直接抛出 `AgentNotSupportedError` 拦截，绝不静默直接执行。
+    - 仅当外部用户/Host 通过 `record_permission_approval()` 登记授权后，dispatch 方可执行，且在相同 6 元组项目/工作区范围内免重复确认。
+
+15. **[DEF-T0052-24] STATIC_ONLY 运行时真实进程零绕过 (P1)**:
+    - 彻底移除 `allow_unverified_execution` 等任何调用方透传绕过参数。在 `STATIC_ONLY` 声明下，`is_real_host=True` 的自动化执行一律强制 Fail-Closed 拦截。
+
+16. **[DEF-T0052-25] 测试套件实现 100% 纯 Mock 零子进程 (P2)**:
+    - 改造 `test_antigravity_real_executable_detection_and_help`，使用 monkeypatch 纯 Mock `subprocess.run` 验证参数协议，全量测试套件实现 100% 零真实子进程拉起，0 进程残留。
+
 ### 7. 未实施范围说明
 
 - 独立 Reviewer/QA 真实自动编排与双宿主自动仲裁（属于 2F）

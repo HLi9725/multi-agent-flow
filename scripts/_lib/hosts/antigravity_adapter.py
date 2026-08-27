@@ -544,6 +544,9 @@ class AntigravityAdapter(BaseHostAdapter):
         # DEF-T0052-4: Dual-root and workspace validation
         self.validate_workspace_roots(request)
 
+        # Build and validate command syntax, role routing and execution mode whitelist
+        cmd = self.build_antigravity_exec_command(request)
+
         session_id = request.session_id.strip()
         invocation_id = f"inv-{uuid.uuid4().hex[:12]}"
         invocation_token = secrets.token_urlsafe(32)
@@ -575,20 +578,18 @@ class AntigravityAdapter(BaseHostAdapter):
             command_family=command_family,
             permission_boundary=permission_boundary,
         )
-        # Note: If has_approval is True, safe_local proceeds as pre-approved.
-        # If not pre-approved, safe_local proceeds under default sandbox, but does NOT fabricate a fake approval record.
-        # Approval records in _permission_cache are exclusively created by explicit record_permission_approval().
+        if not has_approval:
+            raise AgentNotSupportedError(
+                f"Operation classified as '{risk}' requires explicit user permission approval for command family "
+                f"'{command_family}' in project '{project_id}' before execution."
+            )
 
-        cmd = self.build_antigravity_exec_command(request)
-
-        # DEF-T0052-21: Block direct unverified automated real process spawning when STATIC_ONLY
+        # DEF-T0052-21: Block direct unverified automated real process spawning when STATIC_ONLY (Zero caller bypass)
         if self._is_real_host and self._verification_level == VerificationLevel.STATIC_ONLY:
-            if not (isinstance(request.extra_context, Mapping) and request.extra_context.get("allow_unverified_execution")):
-                if getattr(subprocess.Popen, "__module__", "") == "subprocess":
-                    raise AgentNotSupportedError(
-                        "Antigravity Adapter is declared STATIC_ONLY; automated real host CLI execution "
-                        "is disabled until host surface is CLI_VERIFIED with human OAuth authorization."
-                    )
+            raise AgentNotSupportedError(
+                "Antigravity Adapter is declared STATIC_ONLY; automated real host CLI execution "
+                "is disabled until host surface is CLI_VERIFIED with human OAuth authorization."
+            )
 
         if self._is_real_host and (not self._executable_path or not os.path.exists(self._executable_path)):
             raise AgentNotSupportedError(f"Antigravity CLI executable not found at '{self._executable_path}'.")

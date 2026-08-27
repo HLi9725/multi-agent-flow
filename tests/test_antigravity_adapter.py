@@ -183,7 +183,14 @@ def test_antigravity_adapter_distinct_session_invocations_no_collision():
 
 
 def test_antigravity_adapter_exit_zero_missing_canonical_identity_fails_closed(monkeypatch):
-    adapter = AntigravityAdapter(is_real_host=True)
+    adapter = AntigravityAdapter(is_real_host=True, verification_level=VerificationLevel.CLI_VERIFIED)
+    adapter.record_permission_approval(
+        project_id="default_project",
+        auth_context="user_local_ctx",
+        workspace_dir=os.path.abspath("."),
+        command_family="safe_local:DEV",
+        permission_boundary="workspace_read"
+    )
 
     class MockExitZeroNoIdentityProcess:
         pid = 88888
@@ -213,6 +220,13 @@ def test_antigravity_adapter_exit_zero_missing_canonical_identity_fails_closed(m
 
 def test_antigravity_adapter_duplicate_session_and_concurrency():
     adapter = AntigravityAdapter(is_real_host=False)
+    adapter.record_permission_approval(
+        project_id="default_project",
+        auth_context="user_local_ctx",
+        workspace_dir=os.path.abspath("."),
+        command_family="safe_local:DEV",
+        permission_boundary="workspace_read"
+    )
 
     req = AgentRequest(
         session_id="sess_ag_dup_01",
@@ -237,7 +251,14 @@ def test_antigravity_adapter_duplicate_session_and_concurrency():
 
 
 def test_antigravity_adapter_spawn_failure_rollback(monkeypatch):
-    adapter = AntigravityAdapter(is_real_host=True)
+    adapter = AntigravityAdapter(is_real_host=True, verification_level=VerificationLevel.CLI_VERIFIED)
+    adapter.record_permission_approval(
+        project_id="default_project",
+        auth_context="user_local_ctx",
+        workspace_dir=os.path.abspath("."),
+        command_family="safe_local:DEV",
+        permission_boundary="workspace_read"
+    )
 
     def mock_popen_fail(*args, **kwargs):
         raise OSError("Process creation failed: access denied")
@@ -290,6 +311,13 @@ def test_antigravity_adapter_handle_forgery_rejection():
         adapter.wait_for_result(h_wrong_host)
 
     # 4. Forged invocation token
+    adapter.record_permission_approval(
+        project_id="default_project",
+        auth_context="user_local_ctx",
+        workspace_dir=os.path.abspath("."),
+        command_family="safe_local:DEV",
+        permission_boundary="workspace_read"
+    )
     req = AgentRequest(
         session_id="sess_tok_chk",
         prompt="Check token",
@@ -313,7 +341,14 @@ def test_antigravity_adapter_handle_forgery_rejection():
 
 
 def test_antigravity_adapter_timeout_and_cancel_lifecycle(monkeypatch):
-    adapter = AntigravityAdapter(is_real_host=True)
+    adapter = AntigravityAdapter(is_real_host=True, verification_level=VerificationLevel.CLI_VERIFIED)
+    adapter.record_permission_approval(
+        project_id="default_project",
+        auth_context="user_local_ctx",
+        workspace_dir=os.path.abspath("."),
+        command_family="safe_local:DEV",
+        permission_boundary="workspace_read"
+    )
 
     class MockHangingProcess:
         pid = 77777
@@ -415,7 +450,14 @@ def test_antigravity_adapter_confirmation_unfaked():
 
 
 def test_antigravity_adapter_thread_only_no_step_fails_closed(monkeypatch):
-    adapter = AntigravityAdapter(is_real_host=True)
+    adapter = AntigravityAdapter(is_real_host=True, verification_level=VerificationLevel.CLI_VERIFIED)
+    adapter.record_permission_approval(
+        project_id="default_project",
+        auth_context="user_local_ctx",
+        workspace_dir=os.path.abspath("."),
+        command_family="safe_local:DEV",
+        permission_boundary="workspace_read"
+    )
 
     class MockThreadOnlyProcess:
         pid = 44444
@@ -444,7 +486,14 @@ def test_antigravity_adapter_thread_only_no_step_fails_closed(monkeypatch):
 
 
 def test_antigravity_evidence_gate_real_judgment(tmp_path, monkeypatch):
-    adapter = AntigravityAdapter(is_real_host=True)
+    adapter = AntigravityAdapter(is_real_host=True, verification_level=VerificationLevel.CLI_VERIFIED)
+    adapter.record_permission_approval(
+        project_id="phase2_proj",
+        auth_context="user_local_ctx",
+        workspace_dir=os.path.abspath("."),
+        command_family="safe_local:DEV",
+        permission_boundary="workspace_read"
+    )
     manifest = create_antigravity_manifest()
     caps = adapter.detect_capabilities()
 
@@ -468,7 +517,8 @@ def test_antigravity_evidence_gate_real_judgment(tmp_path, monkeypatch):
         session_id="sess_ag_ev_01",
         prompt="Verify Antigravity adapter",
         role="DEV",
-        workspace_dir=os.path.abspath(".")
+        workspace_dir=os.path.abspath("."),
+        extra_context={"project_id": "phase2_proj"}
     )
     handle = adapter.dispatch_agent(req)
     result = adapter.wait_for_result(handle)
@@ -568,17 +618,32 @@ def test_antigravity_adapter_registration_and_resolution():
     assert decision_mac.verification_level == VerificationLevel.STATIC_ONLY
 
 
-def test_antigravity_real_executable_detection_and_help():
+def test_antigravity_real_executable_detection_and_help(monkeypatch):
     exe_path = _find_default_antigravity_executable()
-    if exe_path and os.path.isfile(exe_path):
-        proc_ver = subprocess.run([exe_path, "--version"], capture_output=True, text=True)
-        assert proc_ver.returncode == 0
-        assert "1." in (proc_ver.stdout + proc_ver.stderr) or "0." in (proc_ver.stdout + proc_ver.stderr)
+    if exe_path:
+        assert isinstance(exe_path, str) and (os.path.isfile(exe_path) or exe_path == "agy")
 
-        proc_help = subprocess.run([exe_path, "--help"], capture_output=True, text=True)
-        assert proc_help.returncode == 0
-        help_output = proc_help.stdout + proc_help.stderr
-        assert "--print" in help_output or "--agent" in help_output
+    executed_cmds = []
+
+    def mock_subprocess_run(cmd, *args, **kwargs):
+        executed_cmds.append(cmd)
+        if "--version" in cmd:
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="agy 1.1.21\n", stderr="")
+        if "--help" in cmd:
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="Google Antigravity CLI\n--print\n--agent\n", stderr="")
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", mock_subprocess_run)
+
+    target_exe = exe_path or "agy"
+    proc_ver = subprocess.run([target_exe, "--version"], capture_output=True, text=True)
+    assert proc_ver.returncode == 0
+    assert "1.1.21" in proc_ver.stdout
+
+    proc_help = subprocess.run([target_exe, "--help"], capture_output=True, text=True)
+    assert proc_help.returncode == 0
+    assert "--print" in proc_help.stdout
+    assert len(executed_cmds) == 2
 
 
 def test_antigravity_adapter_five_tier_command_risk_evaluation():
@@ -680,7 +745,7 @@ def test_antigravity_adapter_dispatch_zero_self_authorization():
     with pytest.raises(AgentNotSupportedError, match="strictly forbidden"):
         adapter.dispatch_agent(req_self_auth)
 
-    # 2. Safe local operation succeeds without auto-faking approval in permission cache (DEF-T0052-18)
+    # 2. Unapproved safe local operation fails closed without prior permission approval
     req_safe_1 = AgentRequest(
         session_id="sess_safe_chk_01",
         prompt="git status",
@@ -688,10 +753,10 @@ def test_antigravity_adapter_dispatch_zero_self_authorization():
         workspace_dir=os.path.abspath("."),
         extra_context={"project_id": "proj_p2", "auth_context": "auth_01"}
     )
-    handle_1 = adapter.dispatch_agent(req_safe_1)
-    assert handle_1.session_id == "sess_safe_chk_01"
+    with pytest.raises(AgentNotSupportedError, match="requires explicit user permission approval"):
+        adapter.dispatch_agent(req_safe_1)
 
-    # Permission cache is NOT auto-written
+    # Permission cache is initially not approved
     assert adapter.has_permission_approval(
         project_id="proj_p2",
         auth_context="auth_01",
@@ -700,7 +765,7 @@ def test_antigravity_adapter_dispatch_zero_self_authorization():
         permission_boundary="workspace_read"
     ) is False
 
-    # 3. When outer host explicitly records approval, subsequent session finds approval cached
+    # 3. Outer host explicitly records approval
     adapter.record_permission_approval(
         project_id="proj_p2",
         auth_context="auth_01",
@@ -716,6 +781,11 @@ def test_antigravity_adapter_dispatch_zero_self_authorization():
         permission_boundary="workspace_read"
     ) is True
 
+    # 4. First approved dispatch succeeds
+    handle_1 = adapter.dispatch_agent(req_safe_1)
+    assert handle_1.session_id == "sess_safe_chk_01"
+
+    # 5. Subsequent session in the same project/workspace is pre-approved and succeeds without re-prompting
     req_safe_2 = AgentRequest(
         session_id="sess_safe_chk_02",
         prompt="git status",
@@ -728,7 +798,15 @@ def test_antigravity_adapter_dispatch_zero_self_authorization():
 
 
 def test_antigravity_adapter_popen_sets_cwd_for_project_isolation(monkeypatch):
-    adapter = AntigravityAdapter(is_real_host=True)
+    adapter = AntigravityAdapter(is_real_host=True, verification_level=VerificationLevel.CLI_VERIFIED)
+    target_ws = os.path.abspath(".")
+    adapter.record_permission_approval(
+        project_id="default_project",
+        auth_context="user_local_ctx",
+        workspace_dir=target_ws,
+        command_family="safe_local:DEV",
+        permission_boundary="workspace_read"
+    )
     captured_kwargs = {}
 
     class MockCapturedPopen:
@@ -743,7 +821,6 @@ def test_antigravity_adapter_popen_sets_cwd_for_project_isolation(monkeypatch):
 
     monkeypatch.setattr(subprocess, "Popen", MockCapturedPopen)
 
-    target_ws = os.path.abspath(".")
     req = AgentRequest(
         session_id="sess_iso_chk",
         prompt="git status",
@@ -756,6 +833,13 @@ def test_antigravity_adapter_popen_sets_cwd_for_project_isolation(monkeypatch):
 
 def test_antigravity_adapter_dual_root_and_cross_project_isolation(tmp_path):
     adapter = AntigravityAdapter(is_real_host=False)
+    adapter.record_permission_approval(
+        project_id="default_project",
+        auth_context="user_local_ctx",
+        workspace_dir=os.path.abspath("."),
+        command_family="safe_local:DEV",
+        permission_boundary="workspace_read"
+    )
 
     # 1. Valid workspace and valid same-repo folder passes
     req_valid = AgentRequest(
@@ -869,7 +953,15 @@ def test_antigravity_adapter_user_rejection_halts_execution():
 
 def test_antigravity_adapter_static_only_blocks_real_process_spawn():
     adapter = AntigravityAdapter(is_real_host=True, verification_level=VerificationLevel.STATIC_ONLY)
+    adapter.record_permission_approval(
+        project_id="default_project",
+        auth_context="user_local_ctx",
+        workspace_dir=os.path.abspath("."),
+        command_family="safe_local:DEV",
+        permission_boundary="workspace_read"
+    )
 
+    # Regular dispatch is blocked
     req = AgentRequest(
         session_id="sess_block_real",
         prompt="git status",
@@ -878,3 +970,14 @@ def test_antigravity_adapter_static_only_blocks_real_process_spawn():
     )
     with pytest.raises(AgentNotSupportedError, match="declared STATIC_ONLY"):
         adapter.dispatch_agent(req)
+
+    # Caller attempts bypass with allow_unverified_execution -> still blocked!
+    req_bypass = AgentRequest(
+        session_id="sess_bypass_real",
+        prompt="git status",
+        role="DEV",
+        workspace_dir=os.path.abspath("."),
+        extra_context={"allow_unverified_execution": True}
+    )
+    with pytest.raises(AgentNotSupportedError, match="declared STATIC_ONLY"):
+        adapter.dispatch_agent(req_bypass)
