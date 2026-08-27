@@ -524,7 +524,92 @@ e2e_record:
 
 ### 7. 未实施范围说明
 
-- 独立 Reviewer/QA 真实自动编排与双宿主自动仲裁（属于 2F）
-- main 分支合流与双 Adapter 联调（属于 2F 准出范围）
+- 独立 Reviewer/QA 真实自动编排与双宿主自动仲裁（属于 2F 评审与验收范围）
+- main 分支合流与双 Adapter 联调发布（属于 2F 准出范围）
 - 第三阶段（Skill 拆分与复杂度控制）
 - 第四阶段（多平台打包与发布）
+
+---
+
+## 2F-DEV：受控合流与独立编排开发
+
+### 1. 授权与开发范围
+
+在权威指令授权下，将 2F 开发范围统一整合为“**2F-DEV：受控合流与独立编排开发批次**”。
+本批次已完成：
+1. **受控合流**：
+   - 整合 `phase-2-real-agents`（`37d43ef`）的阶段文档与权限契约；
+   - 整合 `feature/phase2e-antigravity-adapter`（`69699e2`）中串联包含的 2D-1 通用 Adapter 基础设施、2D-2 Codex CLI Adapter 和 2E Antigravity Adapter；
+   - 所有合流均发生在独立 2F 分支（`feature/phase2f-independent-orchestration`）与独立 Worktree（`multi-agent-flow-phase2f-orchestration`），未修改源分支，未合并 main，未执行 Push。
+2. **统一编排核心**：
+   - 实现了客户端解耦的确定性多代理编排器 `Orchestrator`（`scripts/_lib/core/orchestrator.py`、`scripts/_lib/core/orchestrator_schema.py`）；
+   - 支持完整的 `Builder` $\to$ `Reviewer` $\to$ `QA` $\to$ `等待用户验收` 确定性状态机；
+   - 支持 Reviewer 退回后重新调度 Builder（原任务保留，不新建任务）；
+   - 支持 QA 失败后退回原开发负责人（原任务保留，不新建任务）；
+   - 状态流转全程强制绑定 `EvidenceGate` 校验，无证据或证据伪造严格拒绝推进；
+   - 用户验收严格限定 `user_source == "explicit_user"`，绝对拒绝模型或 PM Agent 自动确认；
+   - 严格禁止自动合并 main、自动 Push、自动发布或自动删除分支/Worktree。
+3. **独立角色会话与跨宿主 Handle 隔离**：
+   - `Builder`、`Reviewer`、`QA` 必须使用全局唯一的独立 `session_id`，禁止跨角色复用；
+   - Codex Handle 与 Antigravity Handle 强绑定 `host_id`，跨宿主交叉使用时严格 Fail-Closed（抛出 `OrchestrationSessionIsolationError`）；
+   - 项目、账号、Billing Context、Workspace 与 Worktree 严格 1:1 强校验，防跨租户串线。
+4. **运行模式边界**：
+   - `manual`：仅生成交接包由用户手工操作；
+   - `assisted`：编排器生成标准化 YAML 结构化交接卡并提示用户触发下一客户端，不伪造自动化调用；
+   - `verified_automatic`：基于 Manifest 动态评估，当前 Windows 下 Antigravity 保持 `STATIC_ONLY`，因此禁止进入 `verified_automatic`，双宿主 L2 验证返回明确 `NOT_READY`。
+5. **交接与非破坏性断点恢复**：
+   - 实现了标准化交接包生成（Builder $\to$ Reviewer, Reviewer $\to$ QA, 缺陷退回包, 用户验收请求）；
+   - 实现了无状态破坏的 Checkpoint 导出与恢复，拒绝过期候选 SHA，幂等处理重复事件，绝不执行 git stash/reset/clean。
+
+### 2. 代码变更清单
+
+- `scripts/_lib/core/orchestrator_schema.py`（新增）：编排器角色枚举、状态枚举、运行模式、双宿主验证数据类、4 类标准交接包与异常类。
+- `scripts/_lib/core/orchestrator.py`（新增）：核心状态机、会话隔离门禁、模式评估、双宿主验证评估与断点 Checkpoint 机制。
+- `scripts/_lib/core/__init__.py`（更新）：导出编排器与核心 Schema 符号。
+- `tests/test_orchestrator.py`（新增）：编排器定向测试、进程守卫、跨宿主 Handle 隔离、会话隔离、退回重工循环、证据门禁与恢复测试。
+- `PHASE2_IMPLEMENTATION_REPORT.md`（更新）：追加 2F-DEV 实施与测试报告。
+
+### 3. 测试记录（真实数据）
+
+- **2F 编排器定向测试**:
+  - `python -m pytest tests/test_orchestrator.py -q -rs` -> `11 passed in 0.32s` (0 failed, 0 skipped, exit 0)
+- **2D-1 通用基础设施回归测试**:
+  - `python -m pytest tests/test_adapter_manifest.py tests/test_adapter_registry.py tests/test_adapter_conformance.py -q -rs` -> `37 passed in 1.87s` (0 failed, 0 skipped, exit 0)
+- **2D-2 Codex CLI Adapter 回归测试**:
+  - `python -m pytest tests/test_codex_cli_adapter.py -q -rs` -> `20 passed in 0.55s` (0 failed, 0 skipped, exit 0)
+- **2E Antigravity Adapter 回归测试**:
+  - `python -m pytest tests/test_antigravity_adapter.py -q -rs` -> `23 passed in 0.44s` (0 failed, 0 skipped, exit 0)
+- **Host / Evidence / Worktree 回归测试**:
+  - `python -m pytest tests/test_host_adapter.py tests/test_evidence.py tests/test_worktree_manager.py -q -rs` -> `60 passed in 21.89s` (0 failed, 0 skipped, exit 0)
+- **全量测试套件**:
+  - `python -m pytest tests -q -rs` -> `377 passed in 69.26s (0:01:09)` (0 failed, 0 skipped, 100% 通过, exit 0)
+- **代码规范检查**:
+  - `git diff --check` -> 退出码 0，零尾随空白错误
+- **进程安全守卫**:
+  - 测试套件内置进程守卫，严格禁止 `agy.exe`、`taskkill.exe`、`msedge.exe`、`firefox.exe`、`chrome.exe` 或 OAuth，测试全程 0 次触发进程守卫，0 真实外部子进程拉起。
+
+### 4. 运行模式与双宿主验证状态说明
+
+```yaml
+orchestration_modes:
+  codex_cli:
+    windows: verified_automatic (CLI_VERIFIED)
+    macos: static_only (assisted)
+    linux: static_only (assisted)
+  antigravity:
+    windows: static_only (assisted)
+    macos: static_only (assisted)
+    linux: static_only (assisted)
+dual_host_l2_status:
+  status: NOT_READY
+  is_dual_host_verified: false
+  reason: "Dual-host automated verification is NOT_READY: Builder adapter 'codex_cli' is cli_verified, Reviewer adapter 'antigravity' is static_only on windows. Both require verified status."
+```
+
+### 5. 约束与未实施范围明确声明
+
+1. **Antigravity 验证等级声明**：Antigravity 在 Windows/macOS/Linux 上均保持 `STATIC_ONLY`，真实 OAuth 认证与 E2E 不在本次开发交付范围。
+2. **双宿主自动调度**：由于 Antigravity 保持 `STATIC_ONLY`，当前双宿主自动编排仅提供 `manual` / `assisted` 模式，未宣称双宿主自动调度已完成。
+3. **独立评审与验收**：开发者（李开发）未代行 Reviewer 审核、QA 验证或用户验收，本交接包将完整移交给周审查独立复审。
+4. **Git 纪律**：未执行 Push、未合并 main 分支、未创建 Release/Tag、未清理历史 Worktree。
+5. **后续阶段**：第三阶段（Skill 拆分与复杂度控制）与第四阶段（多平台打包）尚未进入。
