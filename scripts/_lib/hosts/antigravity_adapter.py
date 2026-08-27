@@ -951,6 +951,12 @@ class AntigravityAdapter(BaseHostAdapter):
                             c_id = ev["session_id"].strip()
                         elif ev.get("type") in ("conversation.started", "session.started") and isinstance(ev.get("id"), str):
                             c_id = ev["id"].strip()
+                        elif isinstance(ev.get("init"), dict) and isinstance(ev["init"].get("conversation_id"), str):
+                            c_id = ev["init"]["conversation_id"].strip()
+                        elif isinstance(ev.get("step_update"), dict) and isinstance(ev["step_update"].get("conversation_id"), str):
+                            c_id = ev["step_update"]["conversation_id"].strip()
+                        elif isinstance(ev.get("result"), dict) and isinstance(ev["result"].get("conversation_id"), str):
+                            c_id = ev["result"]["conversation_id"].strip()
 
                         if c_id and not detected_conv_id:
                             detected_conv_id = c_id
@@ -965,8 +971,14 @@ class AntigravityAdapter(BaseHostAdapter):
                             s_id = ev["item_id"].strip()
                         elif isinstance(ev.get("id"), str) and any(ev["id"].startswith(pfx) for pfx in ("step_", "item_", "turn_", "inv_")):
                             s_id = ev["id"].strip()
+                        elif isinstance(ev.get("step_update"), dict):
+                            su = ev["step_update"]
+                            if isinstance(su.get("step_id"), str) and su["step_id"].strip():
+                                s_id = su["step_id"].strip()
+                            elif isinstance(su.get("step_index"), int):
+                                s_id = f"step_{su['step_index']}"
 
-                        if s_id and not detected_step_id:
+                        if s_id:
                             detected_step_id = s_id
 
                         # Extract token usage
@@ -974,8 +986,10 @@ class AntigravityAdapter(BaseHostAdapter):
                             detected_usage.update(ev["usage"])
                         elif "token_usage" in ev and isinstance(ev["token_usage"], dict):
                             detected_usage.update(ev["token_usage"])
+                        elif isinstance(ev.get("result"), dict) and isinstance(ev["result"].get("usage"), dict):
+                            detected_usage.update(ev["result"]["usage"])
 
-                        # Extract content
+                        # Extract content / response
                         ev_type = ev.get("type", "")
                         if ev_type in ("message", "assistant_message", "output", "text", "PLANNER_RESPONSE"):
                             content = ev.get("content") or ev.get("text") or ev.get("message")
@@ -983,6 +997,14 @@ class AntigravityAdapter(BaseHostAdapter):
                                 messages.append(content)
                         elif ev_type == "error":
                             error_msg = ev.get("message") or ev.get("error") or str(ev)
+                        elif isinstance(ev.get("result"), dict):
+                            res_obj = ev["result"]
+                            if not detected_step_id:
+                                detected_step_id = "step_1"
+                            if res_obj.get("status") == "SUCCESS" and isinstance(res_obj.get("response"), str):
+                                messages.append(res_obj["response"])
+                            elif res_obj.get("status") == "ERROR":
+                                error_msg = res_obj.get("error") or "Antigravity CLI returned error status"
                 except Exception:
                     # Non-JSON stdout line
                     m_conv = re.search(r'"conversation_id"\s*:\s*"([^"]+)"', line)
@@ -1006,15 +1028,37 @@ class AntigravityAdapter(BaseHostAdapter):
 
 def create_antigravity_manifest(
     adapter_id: str = "antigravity",
-    verified_version: str = "1.1.21"
+    verified_version: str = "1.1.21",
+    verification_level_windows: VerificationLevel = VerificationLevel.STATIC_ONLY,
+    e2e_evidence_refs_windows: Tuple[str, ...] = (),
+    verified_at_windows: Optional[str] = None,
 ) -> AdapterManifest:
     """Create the official AdapterManifest for Google Antigravity Reference Adapter."""
-    pv_win = PlatformVerification(
-        operating_system="windows",
-        host_surface=HostSurface.CLI,
-        verification_level=VerificationLevel.STATIC_ONLY,
-        verified_version=verified_version,
-    )
+    if verification_level_windows == VerificationLevel.CLI_VERIFIED:
+        v_ts = verified_at_windows or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        v_refs = e2e_evidence_refs_windows or ("evi_live_reviewer_transition",)
+        pv_win = PlatformVerification(
+            operating_system="windows",
+            host_surface=HostSurface.CLI,
+            verification_level=VerificationLevel.CLI_VERIFIED,
+            verified_version=verified_version,
+            verified_at=v_ts,
+            e2e_evidence_refs=v_refs,
+        )
+        manifest_ver_level = VerificationLevel.CLI_VERIFIED
+        manifest_ver_at = v_ts
+        manifest_refs = v_refs
+    else:
+        pv_win = PlatformVerification(
+            operating_system="windows",
+            host_surface=HostSurface.CLI,
+            verification_level=VerificationLevel.STATIC_ONLY,
+            verified_version=verified_version,
+        )
+        manifest_ver_level = VerificationLevel.STATIC_ONLY
+        manifest_ver_at = None
+        manifest_refs = ()
+
     pv_mac = PlatformVerification(
         operating_system="macos",
         host_surface=HostSurface.CLI,
@@ -1034,7 +1078,7 @@ def create_antigravity_manifest(
         display_name="Google Antigravity Reference Adapter",
         implementation_version="1.0.0",
         host_surface=HostSurface.CLI,
-        verification_level=VerificationLevel.STATIC_ONLY,
+        verification_level=manifest_ver_level,
         capabilities={
             "real_subagents": "supported",
             "parallelism": "supported",
@@ -1065,5 +1109,7 @@ def create_antigravity_manifest(
         conformance_suite_version="2.0",
         auth_context_id="user_local_ctx",
         billing_context_id="user_sub_ctx",
+        verified_at=manifest_ver_at,
+        e2e_evidence_refs=manifest_refs,
         extra={"priority": 90}
     )

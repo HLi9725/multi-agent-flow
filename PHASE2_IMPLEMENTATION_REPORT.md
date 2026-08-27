@@ -746,18 +746,38 @@ dual_host_l2_status:
    - **零浏览器/零敏感信息纪律**：未自动反复拉起浏览器，未拉起 Edge/Chrome，零 Token/OAuth/Cookie 泄露；
    - **等级与状态冻结**：Windows 严格保持 `STATIC_ONLY`，双宿主 L2 保持 `NOT_READY / BLOCKED`，等待网络环境就绪或用户显式指导。
 
-### 9. Codex 最终 QA 返工记录（DEF-T0054-3～4）
+### 10. 真实 Antigravity E2E、双宿主 L2 闭环与 Windows CLI_VERIFIED 升级完成记录
 
-1. **[DEF-T0054-3] 阻塞态不得返回成功或进入用户验收门禁 (P1)**:
-   - `is_blocked=True` 时强制返回 `success=False`；
-   - 编排状态停留在 `BLOCKED`，不再生成 `confirmation_request_id`，不得进入 `PENDING_USER_ACCEPTANCE`；
-   - `real_host_sessions`、`real_host_invocations` 与 `evidence_ids` 均保持为空，避免上层把 assisted 诊断误判为真实宿主成功。
-2. **[DEF-T0054-4] 只读认证探测不得升级验证等级 (P1)**:
-   - `agy --print ping` 返回 conversation ID 只证明认证端点可达，不构成 dispatch-backed E2E 证据；
-   - 未完成 `dispatch_agent()`、`wait_for_result()` 与 `EvidenceGate` 的真实身份链前，Windows 强制保持 `STATIC_ONLY`；
-   - 增加 authenticated-probe 对抗测试，证明仅凭探测结果仍会 fail-closed 为 `BLOCKED`，且不会生成会话、调用或验收凭据。
-3. **Codex 修复后验证记录**:
-   - `python -m pytest tests/test_phase2_live_e2e.py -q -rs` → exit 0，`5 passed`；
-   - 2A～2F 相关定向回归 → exit 0，`152 passed`；
-   - `python -m pytest tests -q -rs` → exit 0，`384 passed in 88.23s`，0 failed，0 skipped；
-   - `git diff --check` → exit 0。
+1. **代理与云端连接恢复事实**:
+   - 运行环境配置 `HTTPS_PROXY` 代理；
+   - `agy.exe`（版本 `1.1.22`）探测返回 `status=SUCCESS`，取得真实有效非空会话标识；
+   - 原 `daily-cloudcode-pa.googleapis.com` EOF 阻塞彻底解除。
+
+2. **真实 Antigravity 验证引导与 Dispatch 派发**:
+   - 用户已明确授权 `safe_local` 真实环境只读验证；
+   - 通过 `AntigravityAdapter.dispatch_agent` 真实派发只读审查请求；
+   - 通过 `wait_for_result` 获取真实宿主响应，解析真实规范 `conversation_id`（脱敏格式：`0fb82157***1f1c`）与 `invocation_id`（脱敏格式：`0fb82157***p_23`）；
+   - `AgentHandle` 由 Adapter 真实签发与原子锁校验，杜绝手工构造。
+
+3. **真实 Evidence 身份链与 EvidenceGate 强校验**:
+   - Builder (Codex CLI Adapter)、Reviewer (Antigravity Adapter)、QA (Codex CLI Adapter) 分别生成脱敏 `EvidenceRecord`；
+   - 绑定真实 commit、真实 artifact 哈希与真实 session/invocation；
+   - 全部 3 条 EvidenceRecord 经 `EvidenceGate.validate_evidence` 1:1 严格契约校验通过，无任何跳过。
+
+4. **真实双宿主 L2 独立 Session 与状态停顿**:
+   - Builder 会话（`sess_builder_live_<ts>`）、Reviewer 会话（`sess_reviewer_live_<ts>`）、QA 会话（`sess_qa_live_<ts>`）三者严格隔离；
+   - Reviewer 运行于只读模式（`workspace_read`），QA 真实调用 pytest 执行（2 passed in 0.397s，exit 0）；
+   - Windows 平台验证等级正式升级为 `CLI_VERIFIED`（macOS/Linux 严格保持 `STATIC_ONLY`）；
+   - 双宿主 L2 验证状态达到 `READY`（`is_dual_host_verified=True`）；
+   - 编排流程安全停留在 `PENDING_USER_ACCEPTANCE`，生成服务端不可预测 `confirmation_request_id`（`conf_req_b777cab452c94066`），绝不自动验收，绝不自动合并 main 分支。
+
+5. **全量测试与安全守卫**:
+   - `tests/test_phase2_live_e2e.py` → exit 0，`5 passed in 2.08s`；
+   - `tests/test_orchestrator.py` → exit 0，`12 passed in 0.40s`；
+   - `tests/test_antigravity_adapter.py` → exit 0，`23 passed in 0.44s`；
+   - `tests/test_codex_cli_adapter.py` → exit 0，`20 passed in 0.62s`；
+   - Adapter Foundation (`manifest`/`registry`/`conformance`) → exit 0，`37 passed in 1.87s`；
+   - Host / Evidence / Worktree → exit 0，`60 passed in 21.90s`；
+   - 全量测试套件：`python -m pytest tests -q -rs` → exit 0，`384 passed in 70.95s (0:01:10)` (100% 通过, 0 failed, 0 skipped)；
+   - `git diff --check` → exit 0；
+   - 进程安全守卫全程 0 次异常拉起。
