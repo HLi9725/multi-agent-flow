@@ -32,7 +32,7 @@ from .adapter_manifest import (
 )
 from .adapter_registry import AdapterRegistry, ResolutionStatus
 from .evidence_gate import EvidenceGate, EvidenceValidationContext
-from .evidence_schema import ArtifactRecord, EvidenceMetadata, EvidenceRecord, EvidenceType
+from .evidence_schema import ArtifactRecord, EvidenceError, EvidenceGateError, EvidenceMetadata, EvidenceRecord, EvidenceType
 from .evidence_store import EvidenceStore
 from .orchestrator_schema import (
     BuilderToReviewerHandover,
@@ -116,6 +116,27 @@ class Orchestrator:
         if plat.startswith("linux"):
             return "linux"
         return plat
+
+    def _get_expected_capabilities(self, adapter_id: Optional[str]) -> HostCapabilities:
+        """Resolve valid HostCapabilities with valid schema fields for EvidenceGate matching."""
+        if adapter_id:
+            adapter = self.registry.get(adapter_id)
+            if adapter:
+                return adapter.detect_capabilities()
+
+        # Fallback default HostCapabilities matching agent_schema.py schema
+        return HostCapabilities(
+            is_real_host=True,
+            supports_real_subagents=CapabilitySupport.SUPPORTED,
+            supports_parallelism=CapabilitySupport.SUPPORTED,
+            supports_isolated_context=CapabilitySupport.SUPPORTED,
+            supports_worktree=CapabilitySupport.SUPPORTED,
+            supports_permission_approval=CapabilitySupport.SUPPORTED,
+            supports_mcp=CapabilitySupport.SUPPORTED,
+            supports_interactive_confirmation=CapabilitySupport.UNSUPPORTED,
+            supports_usage_telemetry=CapabilitySupport.SUPPORTED,
+            max_concurrent_agents=4,
+        )
 
     def get_session(self, task_id: str) -> Optional[TaskExecutionSession]:
         with self._lock:
@@ -239,10 +260,16 @@ class Orchestrator:
                     f"Handover builder_session_id '{handover.builder_session_id}' does not match registered session '{session.builder_session_id}'."
                 )
 
-            # Validate evidence if provided
-            if evidence_id and self.evidence_gate and self.evidence_store:
+            # Validate evidence if provided (Fail-Closed if infrastructure or handle is missing)
+            if evidence_id is not None:
+                if not self.evidence_gate or not self.evidence_store:
+                    raise OrchestrationGateError(
+                        f"Evidence validation requested for '{evidence_id}' but EvidenceGate/EvidenceStore is not configured (Fail-Closed)."
+                    )
                 if host_handle is None:
                     raise OrchestrationGateError("host_handle must be provided when evidence validation is requested.")
+
+                self.validate_handle_adapter_binding(host_handle, session.builder_adapter_id or host_handle.host_id)
                 val_ctx = EvidenceValidationContext(
                     project_id=session.project_id,
                     task_id=session.task_id,
@@ -252,17 +279,16 @@ class Orchestrator:
                     baseline_commit=session.baseline_commit,
                     result_commit=handover.candidate_commit,
                     expected_invocation_id=handover.builder_invocation_id,
-                    expected_adapter=session.builder_adapter_id or "",
+                    expected_adapter=session.builder_adapter_id or host_handle.host_id,
                     expected_workspace_mode="workspace_write",
                     expected_evidence_type=EvidenceType.TASK_TRANSITION,
                     host_handle=host_handle,
-                    expected_capabilities=HostCapabilities(
-                        supports_streaming=True,
-                        supports_structured_events=True,
-                        supports_tool_calling=True,
-                    ),
+                    expected_capabilities=self._get_expected_capabilities(session.builder_adapter_id or host_handle.host_id),
                 )
-                self.evidence_gate.validate_evidence(evidence_id, val_ctx)
+                try:
+                    self.evidence_gate.validate_evidence(evidence_id, val_ctx)
+                except (EvidenceError, EvidenceGateError) as e:
+                    raise OrchestrationGateError(f"Evidence validation failed: {str(e)}") from e
                 session.last_evidence_id = evidence_id
 
             session.candidate_commit = handover.candidate_commit
@@ -348,31 +374,38 @@ class Orchestrator:
                     f"Stale candidate commit '{handover.candidate_commit}' does not match session candidate '{session.candidate_commit}'."
                 )
 
-            # Validate evidence
+            # Validate evidence (Mandatory for advancing to QA)
             if not evidence_id or not evidence_id.strip():
                 raise OrchestrationGateError("Evidence is mandatory for advancing to QA state.")
 
-            if self.evidence_gate and self.evidence_store and host_handle:
-                val_ctx = EvidenceValidationContext(
-                    project_id=session.project_id,
-                    task_id=session.task_id,
-                    actor_role=OrchestrationRole.REVIEWER.value,
-                    transition_from="REVIEWING",
-                    transition_to="TESTING",
-                    baseline_commit=session.baseline_commit,
-                    result_commit=handover.candidate_commit,
-                    expected_invocation_id=handover.reviewer_invocation_id,
-                    expected_adapter=session.reviewer_adapter_id or "generic_reviewer",
-                    expected_workspace_mode="workspace_read",  # Reviewer is read-only
-                    expected_evidence_type=EvidenceType.TASK_TRANSITION,
-                    host_handle=host_handle,
-                    expected_capabilities=HostCapabilities(
-                        supports_streaming=True,
-                        supports_structured_events=True,
-                        supports_tool_calling=True,
-                    ),
+            if not self.evidence_gate or not self.evidence_store:
+                raise OrchestrationGateError(
+                    "Cannot pass Reviewer to QA: Evidence infrastructure (EvidenceGate/EvidenceStore) is not configured (Fail-Closed)."
                 )
+
+            if host_handle is None:
+                raise OrchestrationGateError("host_handle must be provided for evidence validation when passing to QA.")
+
+            self.validate_handle_adapter_binding(host_handle, session.reviewer_adapter_id or host_handle.host_id)
+            val_ctx = EvidenceValidationContext(
+                project_id=session.project_id,
+                task_id=session.task_id,
+                actor_role=OrchestrationRole.REVIEWER.value,
+                transition_from="REVIEWING",
+                transition_to="TESTING",
+                baseline_commit=session.baseline_commit,
+                result_commit=handover.candidate_commit,
+                expected_invocation_id=handover.reviewer_invocation_id,
+                expected_adapter=session.reviewer_adapter_id or host_handle.host_id,
+                expected_workspace_mode="workspace_read",  # Reviewer is read-only
+                expected_evidence_type=EvidenceType.TASK_TRANSITION,
+                host_handle=host_handle,
+                expected_capabilities=self._get_expected_capabilities(session.reviewer_adapter_id or host_handle.host_id),
+            )
+            try:
                 self.evidence_gate.validate_evidence(evidence_id, val_ctx)
+            except (EvidenceError, EvidenceGateError) as e:
+                raise OrchestrationGateError(f"Evidence validation failed: {str(e)}") from e
 
             session.reviewer_session_id = handover.reviewer_session_id
             session.reviewer_invocation_id = handover.reviewer_invocation_id
@@ -465,31 +498,38 @@ class Orchestrator:
                     f"Stale candidate commit '{request.candidate_commit}' does not match session candidate '{session.candidate_commit}'."
                 )
 
-            # Validate evidence
+            # Validate evidence (Mandatory for advancing to user acceptance)
             if not evidence_id or not evidence_id.strip():
                 raise OrchestrationGateError("Evidence is mandatory for advancing to user acceptance.")
 
-            if self.evidence_gate and self.evidence_store and host_handle:
-                val_ctx = EvidenceValidationContext(
-                    project_id=session.project_id,
-                    task_id=session.task_id,
-                    actor_role=OrchestrationRole.QA.value,
-                    transition_from="TESTING",
-                    transition_to="PENDING_USER_ACCEPTANCE",
-                    baseline_commit=session.baseline_commit,
-                    result_commit=request.candidate_commit,
-                    expected_invocation_id=qa_invocation_id,
-                    expected_adapter=session.qa_adapter_id or "generic_qa",
-                    expected_workspace_mode="workspace_read",  # QA executes tests, doesn't edit source
-                    expected_evidence_type=EvidenceType.TASK_TRANSITION,
-                    host_handle=host_handle,
-                    expected_capabilities=HostCapabilities(
-                        supports_streaming=True,
-                        supports_structured_events=True,
-                        supports_tool_calling=True,
-                    ),
+            if not self.evidence_gate or not self.evidence_store:
+                raise OrchestrationGateError(
+                    "Cannot pass QA to User Acceptance: Evidence infrastructure (EvidenceGate/EvidenceStore) is not configured (Fail-Closed)."
                 )
+
+            if host_handle is None:
+                raise OrchestrationGateError("host_handle must be provided for evidence validation when advancing to user acceptance.")
+
+            self.validate_handle_adapter_binding(host_handle, session.qa_adapter_id or host_handle.host_id)
+            val_ctx = EvidenceValidationContext(
+                project_id=session.project_id,
+                task_id=session.task_id,
+                actor_role=OrchestrationRole.QA.value,
+                transition_from="TESTING",
+                transition_to="PENDING_USER_ACCEPTANCE",
+                baseline_commit=session.baseline_commit,
+                result_commit=request.candidate_commit,
+                expected_invocation_id=qa_invocation_id,
+                expected_adapter=session.qa_adapter_id or host_handle.host_id,
+                expected_workspace_mode="workspace_read",  # QA executes tests, doesn't edit source
+                expected_evidence_type=EvidenceType.TASK_TRANSITION,
+                host_handle=host_handle,
+                expected_capabilities=self._get_expected_capabilities(session.qa_adapter_id or host_handle.host_id),
+            )
+            try:
                 self.evidence_gate.validate_evidence(evidence_id, val_ctx)
+            except (EvidenceError, EvidenceGateError) as e:
+                raise OrchestrationGateError(f"Evidence validation failed: {str(e)}") from e
 
             session.qa_session_id = qa_session_id
             session.qa_invocation_id = qa_invocation_id
@@ -510,9 +550,11 @@ class Orchestrator:
         decision: UserAcceptanceDecision,
         evidence_id: Optional[str] = None,
         confirmation_result: Optional[ConfirmationResult] = None,
+        host_handle: Optional[AgentHandle] = None,
     ) -> TaskExecutionSession:
         """
         User explicit acceptance confirmation.
+        Strictly requires real ConfirmationResult credential for acceptance.
         Strictly rejects model self-reported or PM agent automated confirmation.
         Explicitly DOES NOT perform git merge main, push, tag, or worktree cleanup.
         """
@@ -535,6 +577,58 @@ class Orchestrator:
                 )
 
             if decision.is_accepted:
+                # DEF-T0053-3: Acceptance requires valid confirmation_result credential
+                if confirmation_result is None:
+                    raise OrchestrationSecurityError(
+                        "User acceptance confirmation strictly requires a ConfirmationResult credential."
+                    )
+                if not isinstance(confirmation_result, ConfirmationResult):
+                    raise OrchestrationSecurityError(
+                        f"confirmation_result must be a ConfirmationResult instance, got {type(confirmation_result).__name__}"
+                    )
+                if confirmation_result.is_real_host is not True:
+                    raise OrchestrationSecurityError(
+                        "ConfirmationResult must have is_real_host=True. Mock/simulated confirmations are strictly rejected."
+                    )
+                if confirmation_result.is_confirmed is not True:
+                    raise OrchestrationSecurityError(
+                        "ConfirmationResult is_confirmed is False; user rejected confirmation."
+                    )
+
+                # Validate evidence if provided
+                if evidence_id is not None:
+                    if not self.evidence_gate or not self.evidence_store:
+                        raise OrchestrationGateError(
+                            "Cannot validate user confirmation evidence: Evidence infrastructure is not configured (Fail-Closed)."
+                        )
+                    if host_handle is None:
+                        raise OrchestrationGateError("host_handle must be provided when validating user confirmation evidence.")
+
+                    val_ctx = EvidenceValidationContext(
+                        project_id=session.project_id,
+                        task_id=session.task_id,
+                        actor_role=OrchestrationRole.USER.value,
+                        transition_from="PENDING_USER_ACCEPTANCE",
+                        transition_to="ACCEPTED",
+                        baseline_commit=session.baseline_commit,
+                        result_commit=session.candidate_commit or "",
+                        expected_invocation_id="user_confirmation",
+                        expected_adapter=host_handle.host_id,
+                        expected_workspace_mode="workspace_read",
+                        expected_evidence_type=EvidenceType.USER_CONFIRMATION,
+                        host_handle=host_handle,
+                        expected_capabilities=HostCapabilities(
+                            is_real_host=True,
+                            supports_interactive_confirmation=CapabilitySupport.SUPPORTED,
+                        ),
+                        confirmation_result=confirmation_result,
+                    )
+                    try:
+                        self.evidence_gate.validate_evidence(evidence_id, val_ctx)
+                    except (EvidenceError, EvidenceGateError) as e:
+                        raise OrchestrationGateError(f"Evidence validation failed: {str(e)}") from e
+                    session.last_evidence_id = evidence_id
+
                 session.state = OrchestrationState.ACCEPTED
                 session.current_role = OrchestrationRole.USER
                 session.updated_at = time.time()
@@ -543,6 +637,8 @@ class Orchestrator:
                     "user_source": decision.user_source,
                     "remarks": decision.remarks,
                     "signature": decision.user_signature,
+                    "confirmation_id": confirmation_result.request_id,
+                    "evidence_id": evidence_id,
                     "timestamp": time.time(),
                 })
             else:

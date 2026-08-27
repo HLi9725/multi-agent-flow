@@ -572,7 +572,7 @@ e2e_record:
 ### 3. 测试记录（真实数据）
 
 - **2F 编排器定向测试**:
-  - `python -m pytest tests/test_orchestrator.py -q -rs` -> `11 passed in 0.32s` (0 failed, 0 skipped, exit 0)
+  - `python -m pytest tests/test_orchestrator.py -q -rs` -> `12 passed in 0.46s` (0 failed, 0 skipped, exit 0)
 - **2D-1 通用基础设施回归测试**:
   - `python -m pytest tests/test_adapter_manifest.py tests/test_adapter_registry.py tests/test_adapter_conformance.py -q -rs` -> `37 passed in 1.87s` (0 failed, 0 skipped, exit 0)
 - **2D-2 Codex CLI Adapter 回归测试**:
@@ -580,9 +580,9 @@ e2e_record:
 - **2E Antigravity Adapter 回归测试**:
   - `python -m pytest tests/test_antigravity_adapter.py -q -rs` -> `23 passed in 0.44s` (0 failed, 0 skipped, exit 0)
 - **Host / Evidence / Worktree 回归测试**:
-  - `python -m pytest tests/test_host_adapter.py tests/test_evidence.py tests/test_worktree_manager.py -q -rs` -> `60 passed in 21.89s` (0 failed, 0 skipped, exit 0)
+  - `python -m pytest tests/test_host_adapter.py tests/test_evidence.py tests/test_worktree_manager.py -q -rs` -> `60 passed in 21.94s` (0 failed, 0 skipped, exit 0)
 - **全量测试套件**:
-  - `python -m pytest tests -q -rs` -> `377 passed in 69.26s (0:01:09)` (0 failed, 0 skipped, 100% 通过, exit 0)
+  - `python -m pytest tests -q -rs` -> `378 passed in 67.82s (0:01:07)` (0 failed, 0 skipped, 100% 通过, exit 0)
 - **代码规范检查**:
   - `git diff --check` -> 退出码 0，零尾随空白错误
 - **进程安全守卫**:
@@ -613,3 +613,15 @@ dual_host_l2_status:
 3. **独立评审与验收**：开发者（李开发）未代行 Reviewer 审核、QA 验证或用户验收，本交接包将完整移交给周审查独立复审。
 4. **Git 纪律**：未执行 Push、未合并 main 分支、未创建 Release/Tag、未清理历史 Worktree。
 5. **后续阶段**：第三阶段（Skill 拆分与复杂度控制）与第四阶段（多平台打包）尚未进入。
+
+### 6. 2F-DEV 第 1 轮审查缺陷修复记录 (DEF-T0053-1 ~ DEF-T0053-4)
+
+1. **[DEF-T0053-1] 证据门禁非法字段修正与真实 Gate 判决路径测试 (P1)**:
+   - 彻底修复 `orchestrator.py` 中 3 处构造 `HostCapabilities` 时使用的非法字段名，通过 `_get_expected_capabilities` 动态解析宿主能力或严格对齐 `agent_schema.py` 字段定义。
+   - 补全全链路真实 `EvidenceGate` 判决测试（通过 `_create_helper_evidence` 与 `host_handle` 传入完整校验路径），消除跳过分支。
+2. **[DEF-T0053-2] 幽灵证据拦截与证据基础设施缺失 Fail-Closed (P2)**:
+   - 在 `submit_to_reviewer`、`pass_reviewer_to_qa`、`pass_qa_to_user_acceptance` 中增加强制 Gate 门禁，传入不存在的 `ghost_evidence_123` 或在未配置 `EvidenceGate`/`EvidenceStore` 时一律抛出 `OrchestrationGateError` 拒绝推进。
+3. **[DEF-T0053-3] 用户验收真实 ConfirmationResult 凭据校验 (P2)**:
+   - 强化 `confirm_user_acceptance`，严格要求调用方必须提供 `ConfirmationResult` 实例凭据（`is_real_host=True` 且 `is_confirmed=True`），杜绝仅凭自然语言 `user_source="explicit_user"` 字符串自报伪造验收。
+4. **[DEF-T0053-4] 交接包与报告 merge_commit SHA 精确校准 (P3)**:
+   - 精确校准 merge commit SHA 为 `7de140979e957c241bedbae10e1fa50aa37ad664`，与 Git 树完整对齐。
