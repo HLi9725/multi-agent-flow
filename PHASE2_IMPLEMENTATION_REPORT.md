@@ -418,13 +418,13 @@
 ### 4. 测试记录（真实数据）
 
 - **2E 定向测试**:
-  - `python -m pytest tests/test_antigravity_adapter.py -q -rs` -> `23 passed in 0.68s` (0 failed, 0 skipped)
+  - `python -m pytest tests/test_antigravity_adapter.py -q -rs` -> `23 passed in 0.48s` (0 failed, 0 skipped)
 - **2D-1 通用基础设施回归测试**:
-  - `python -m pytest tests/test_adapter_manifest.py tests/test_adapter_registry.py tests/test_adapter_conformance.py -q -rs` -> `37 passed in 1.70s` (0 failed, 0 skipped)
+  - `python -m pytest tests/test_adapter_manifest.py tests/test_adapter_registry.py tests/test_adapter_conformance.py -q -rs` -> `37 passed in 2.91s` (0 failed, 0 skipped)
 - **2A～2D-2 兼容性与 Codex 适配器测试**:
-  - `python -m pytest tests/test_host_adapter.py tests/test_evidence.py tests/test_worktree_manager.py tests/test_codex_cli_adapter.py -q -rs` -> `80 passed in 23.45s` (0 failed, 0 skipped)
+  - `python -m pytest tests/test_host_adapter.py tests/test_evidence.py tests/test_worktree_manager.py tests/test_codex_cli_adapter.py -q -rs` -> `80 passed in 25.67s` (0 failed, 0 skipped)
 - **全量测试套件**:
-  - `python -m pytest tests -q -rs` -> `366 passed in 63.28s (0:01:03)` (0 failed, 0 skipped, 100% 通过)
+  - `python -m pytest tests -q -rs` -> `366 passed in 65.63s (0:01:05)` (0 failed, 0 skipped, 100% 通过)
 - **代码规范检查**:
   - `git diff --check` -> 退出码 0，零尾随空白错误
 
@@ -514,6 +514,13 @@ e2e_record:
 
 16. **[DEF-T0052-25] 测试套件实现 100% 纯 Mock 零子进程 (P2)**:
     - 改造 `test_antigravity_real_executable_detection_and_help`，使用 monkeypatch 纯 Mock `subprocess.run` 验证参数协议，全量测试套件实现 100% 零真实子进程拉起，0 进程残留。
+
+17. **[DEF-T0052-26] 彻底隔离 `taskkill` 调用与零真实子进程闭环 (P1)**:
+    - 针对 Windows 环境下超时与取消机制调用的 `taskkill`，在单元测试中通过 monkeypatch 全面拦截 `subprocess.run`。
+    - 彻底消除测试过程中拉起真实 `taskkill.exe` 风险，避免误杀操作系统内匹配 PID 77777 的无关进程，真正实现测试环境 100% 零真实子进程。
+
+18. **[DEF-T0052-27] 实施报告测试数据与交接包实时精确校准 (P3)**:
+    - 全量校准实施报告第 4 节测试耗时、命令与通过率，保持报告与交接包数据 100% 严格一致。
 
 ### 7. 未实施范围说明
 

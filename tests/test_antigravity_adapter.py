@@ -350,6 +350,7 @@ def test_antigravity_adapter_timeout_and_cancel_lifecycle(monkeypatch):
         permission_boundary="workspace_read"
     )
 
+    terminated_pids = []
     class MockHangingProcess:
         pid = 77777
         returncode = None
@@ -358,11 +359,19 @@ def test_antigravity_adapter_timeout_and_cancel_lifecycle(monkeypatch):
         def communicate(self, timeout=None):
             raise subprocess.TimeoutExpired(cmd=["agy"], timeout=timeout)
         def terminate(self):
-            pass
+            terminated_pids.append(self.pid)
         def kill(self):
-            pass
+            terminated_pids.append(self.pid)
 
     monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: MockHangingProcess())
+
+    # Mock subprocess.run so taskkill and external helpers are 100% mocked with 0 real child processes
+    taskkill_calls = []
+    def mock_subprocess_run(cmd, *args, **kwargs):
+        taskkill_calls.append(cmd)
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", mock_subprocess_run)
 
     req = AgentRequest(
         session_id="sess_ag_timeout",
@@ -375,6 +384,9 @@ def test_antigravity_adapter_timeout_and_cancel_lifecycle(monkeypatch):
     # Test timeout
     with pytest.raises(AgentTimeoutError, match="timed out"):
         adapter.wait_for_result(handle, timeout_seconds=0.01)
+
+    # Verify termination was initiated without invoking real taskkill
+    assert len(taskkill_calls) >= 1 or len(terminated_pids) >= 1
 
     # Test cancel lifecycle on a fresh session
     req_cancel = AgentRequest(
