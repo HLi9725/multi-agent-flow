@@ -109,6 +109,8 @@ def test_live_e2e_pipeline_in_temporary_worktree(tmp_path, monkeypatch):
     res = run_phase2_live_e2e_pipeline(str(tmp_path))
 
     assert res.success is True
+    assert res.is_blocked is True
+    assert "Antigravity CLI live endpoint unreachable" in res.blocked_reason
     assert res.verification_level_by_os["windows"] == "static_only"
     assert res.dual_host_l2_result["status"] == "NOT_READY"
     assert res.dual_host_l2_result["orchestration_mode"] == "assisted"

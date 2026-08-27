@@ -111,6 +111,8 @@ except ImportError:
 @dataclass
 class LiveE2EResult:
     success: bool
+    is_blocked: bool
+    blocked_reason: str
     antigravity_binary: str
     antigravity_version: str
     auth_status: str
@@ -405,8 +407,18 @@ def run_phase2_live_e2e_pipeline(target_worktree: str) -> LiveE2EResult:
     session.state = OrchestrationState.PENDING_USER_ACCEPTANCE
     session.current_role = OrchestrationRole.USER
 
+    is_blocked = not is_ag_verified
+    blocked_reason = (
+        "Antigravity CLI live endpoint unreachable: "
+        f"{ag_diag}. "
+        "Cannot obtain genuine host session/thread IDs via dispatch_agent(). "
+        "Windows verification level remains STATIC_ONLY; automated dual-host L2 verification is BLOCKED."
+    ) if is_blocked else ""
+
     return LiveE2EResult(
         success=True,
+        is_blocked=is_blocked,
+        blocked_reason=blocked_reason,
         antigravity_binary=cli_path or "none",
         antigravity_version=ag_ver,
         auth_status=ag_diag,
@@ -442,7 +454,8 @@ def run_phase2_live_e2e_pipeline(target_worktree: str) -> LiveE2EResult:
         diagnostics=(
             f"Dual-host L2 pipeline executed in {ag_mode.value} mode. "
             f"QA pytest passed {qa_summary['passed']} tests in {qa_summary['duration_seconds']}s (exit code {qa_summary['exit_code']}). "
-            f"Orchestration halted at PENDING_USER_ACCEPTANCE without faking real host sessions."
+            f"Orchestration halted at PENDING_USER_ACCEPTANCE without faking real host sessions. "
+            f"Live status: {'BLOCKED (' + blocked_reason + ')' if is_blocked else 'VERIFIED'}."
         ),
     )
 
@@ -452,6 +465,9 @@ if __name__ == "__main__":
     res = run_phase2_live_e2e_pipeline(worktree)
     print("=== Phase 2F-LIVE Dual-Host L2 Verification Summary ===")
     print(f"Success: {res.success}")
+    print(f"Is Blocked: {res.is_blocked}")
+    if res.is_blocked:
+        print(f"Blocked Reason: {res.blocked_reason}")
     print(f"Antigravity Binary: {res.antigravity_binary}")
     print(f"Antigravity Version: {res.antigravity_version}")
     print(f"Auth Status: {res.auth_status}")

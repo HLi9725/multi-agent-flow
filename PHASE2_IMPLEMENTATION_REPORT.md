@@ -699,19 +699,19 @@ dual_host_l2_status:
 ### 5. 测试记录（真实数据）
 
 - **2F-LIVE 端到端与契约测试**:
-  - `python -m pytest tests/test_phase2_live_e2e.py -q -rs` -> `4 passed in 2.05s` (0 failed, 0 skipped, exit 0)
+  - `python -m pytest tests/test_phase2_live_e2e.py -q -rs` -> `4 passed in 1.55s` (0 failed, 0 skipped, exit 0)
 - **2F 编排器定向测试**:
-  - `python -m pytest tests/test_orchestrator.py -q -rs` -> `12 passed in 0.39s` (0 failed, 0 skipped, exit 0)
+  - `python -m pytest tests/test_orchestrator.py -q -rs` -> `12 passed in 1.80s` (0 failed, 0 skipped, exit 0)
 - **2D-1 通用基础设施回归测试**:
-  - `python -m pytest tests/test_adapter_manifest.py tests/test_adapter_registry.py tests/test_adapter_conformance.py -q -rs` -> `37 passed in 1.89s` (0 failed, 0 skipped, exit 0)
+  - `python -m pytest tests/test_adapter_manifest.py tests/test_adapter_registry.py tests/test_adapter_conformance.py -q -rs` -> `37 passed in 1.87s` (0 failed, 0 skipped, exit 0)
 - **2D-2 Codex CLI Adapter 回归测试**:
-  - `python -m pytest tests/test_codex_cli_adapter.py -q -rs` -> `20 passed in 0.59s` (0 failed, 0 skipped, exit 0)
+  - `python -m pytest tests/test_codex_cli_adapter.py -q -rs` -> `20 passed in 0.55s` (0 failed, 0 skipped, exit 0)
 - **2E Antigravity Adapter 回归测试**:
-  - `python -m pytest tests/test_antigravity_adapter.py -q -rs` -> `23 passed in 0.46s` (0 failed, 0 skipped, exit 0)
+  - `python -m pytest tests/test_antigravity_adapter.py -q -rs` -> `23 passed in 0.44s` (0 failed, 0 skipped, exit 0)
 - **Host / Evidence / Worktree 回归测试**:
-  - `python -m pytest tests/test_host_adapter.py tests/test_evidence.py tests/test_worktree_manager.py -q -rs` -> `60 passed in 22.14s` (0 failed, 0 skipped, exit 0)
+  - `python -m pytest tests/test_host_adapter.py tests/test_evidence.py tests/test_worktree_manager.py -q -rs` -> `60 passed in 21.83s` (0 failed, 0 skipped, exit 0)
 - **全量测试套件**:
-  - `python -m pytest tests -q -rs` -> `383 passed in 71.64s (0:01:11)` (0 failed, 0 skipped, 100% 通过, exit 0)
+  - `python -m pytest tests -q -rs` -> `383 passed in 68.45s (0:01:08)` (0 failed, 0 skipped, 100% 通过, exit 0)
 - **代码规范检查**:
   - `git diff --check` -> 退出码 0，零尾随空白错误
 - **进程安全守卫**:
@@ -724,7 +724,7 @@ dual_host_l2_status:
    - macOS: `STATIC_ONLY`
    - Linux: `STATIC_ONLY`
 2. **双宿主 L2 状态**:
-   - 状态: `NOT_READY`（因 Antigravity 为 `STATIC_ONLY`，合流编排提供完整 `assisted` 模式，未虚标自动化完成）
+   - 状态: `NOT_READY / BLOCKED`（因 Antigravity 为 `STATIC_ONLY`，双宿主自动调度因云端网络阻断而阻塞，未宣称自动化已完成）
 3. **严格边界禁止**:
    - 未执行 Push，未合并 main 分支，未创建 Release / Tag，未清理历史 Worktree；
    - 开发者（李开发）未代行 Reviewer 审查、QA 验证或用户终态验收；
@@ -736,3 +736,12 @@ dual_host_l2_status:
    - **消除伪造 real_host 身份**：在 Antigravity 宿主不可达（`STATIC_ONLY`）时，严格禁止写入 `is_real_host=True` 的 EvidenceRecord 或写死 `AgentHandle` / `tok_...`；将双宿主调度降级为 `ASSISTED` 模式，并通过 `generate_assisted_handover_card()` 输出标准辅助交接卡；
    - **QA 真实 Pytest 执行**：QA 测试报告不再使用手写死数据，而是在真实 fixture（`tests/fixtures/test_fixture_math_util.py`）上真实调用 pytest 子进程执行，捕获真实退出码（0）、通过数（2）与耗时（0.42s），写入 `user_data/qa_test_report.json` 并计算真实 SHA-256；
    - **报告与交接包真实性校准**：交接包与报告如实声明 `real_host_sessions: {}`（none），准确反映真实受控状态。
+
+### 8. 2F-LIVE 第 2 轮返工记录 (DEF-T0054-2) 与 BLOCKED 状态明确声明
+
+1. **[DEF-T0054-2] 真实 Antigravity 端点网络阻断事实确认与 BLOCKED 状态声明 (P1)**:
+   - **真实探测诊断输出**：通过 `agy.exe --output-format json --print "ping"` 真实探测，返回：`{"conversation_id":"","status":"ERROR","error":"Eligibility check failed: Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist\": EOF"}`；
+   - **真实宿主标识不可达**：由于云端 API 服务端返回 EOF 网络连接断开，CLI 无法生成真实 `conversation_id`、会话 ID 或 thread ID，无法通过 `dispatch_agent()` 进行真实非交互自动化审查；
+   - **严格真实原则 (Fail-Closed)**：严格遵守任务书“如果网络或认证仍阻断，应明确报告 BLOCKED，不得再次用 NOT_READY 结果申请 PASS”之要求，明确报告当前 Antigravity 真实 E2E 处于 **BLOCKED**（阻塞）状态；
+   - **零浏览器/零敏感信息纪律**：未自动反复拉起浏览器，未拉起 Edge/Chrome，零 Token/OAuth/Cookie 泄露；
+   - **等级与状态冻结**：Windows 严格保持 `STATIC_ONLY`，双宿主 L2 保持 `NOT_READY / BLOCKED`，等待网络环境就绪或用户显式指导。
