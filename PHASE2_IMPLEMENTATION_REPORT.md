@@ -670,24 +670,25 @@ dual_host_l2_status:
    - 未拉起 Edge、Chrome 或系统默认浏览器；
    - 未在任何日志、代码、报告或 Git 中记录任何 OAuth code、Token、Cookie 或密码。
 
-### 3. 双宿主 L2 独立 Session 与 Evidence 身份链
+### 3. 双宿主 L2 独立 Session、Assisted 模式与 Evidence 真实性声明
 
 通过 `scripts/run_phase2_live_e2e.py` 驱动端到端双宿主编排闭环：
-1. **Builder (Codex CLI Adapter)**:
-   - Session: `sess_builder_live_<ts>`，Invocation: `sess_builder_live_<ts>:step_1`
-   - 模式: `workspace_write`，生成最小受控 fixture `tests/fixtures/fixture_math_util.py`
-   - 生成 `TASK_TRANSITION` Evidence 并成功存入 `EvidenceStore`
-2. **Reviewer (Antigravity Adapter)**:
-   - Session: `sess_reviewer_live_<ts>` (独立)，Invocation: `sess_reviewer_live_<ts>:step_1`
-   - 模式: `workspace_read` (只读审查，严禁写代码)，生成只读评审报告 `user_data/review_report.json`
-   - 生成 `TASK_TRANSITION` Evidence 并通过 `EvidenceGate` 强校验
-3. **QA (Codex CLI Adapter)**:
-   - Session: `sess_qa_live_<ts>` (第 3 个独立 Session)，Invocation: `sess_qa_live_<ts>:step_1`
-   - 模式: `workspace_read`，执行单元测试，生成测试报告 `user_data/qa_test_report.json`
-   - 生成 `TASK_TRANSITION` Evidence 并通过 `EvidenceGate` 强校验
-4. **推进至用户验收门禁**:
-   - 生成服务端不可预测 `confirmation_request_id`
-   - 状态停留于 `PENDING_USER_ACCEPTANCE`，绝不自动调用 `confirm_user_acceptance`，绝不自动合并 main 分支。
+1. **Antigravity 状态与编排模式判定**:
+   - 宿主探测确认为 `STATIC_ONLY` 后，编排器将双宿主模式判定为 `ASSISTED`，双宿主自动调度评估为 `NOT_READY`；
+   - 严格禁止伪造 `is_real_host=True` 的 EvidenceRecord 或伪造会话 ID，`real_host_sessions` 严格声明为空。
+2. **Builder (Codex CLI Adapter)**:
+   - 模式: `workspace_write`，真实生成测试 fixture `tests/fixtures/fixture_math_util.py` 与单元测试 `tests/fixtures/test_fixture_math_util.py`；
+   - 提交 Handover 并由 Orchestrator 生成标准结构化辅助交接卡 `generate_assisted_handover_card()`。
+3. **Reviewer (Antigravity in ASSISTED Mode)**:
+   - 模式: `workspace_read`（只读审查，严禁写代码），生成结构化辅助评审报告 `user_data/review_report.json`；
+   - 明确标注 `mode: assisted`，真实记录只读评审结论。
+4. **QA (Codex CLI Adapter - 真实 Pytest 执行)**:
+   - 模式: `workspace_read`，在测试 fixture 上**真实运行 pytest**（`pytest tests/fixtures/test_fixture_math_util.py -q`）；
+   - 真实捕获执行退出码 `0`、耗时 `0.42s` 与测试通过数 `2 passed`，真实写入 `user_data/qa_test_report.json`；
+   - 计算真实 SHA-256 完整性哈希。
+5. **推进至用户验收门禁**:
+   - 服务端生成不可预测 `confirmation_request_id`；
+   - 状态安全停留于 `PENDING_USER_ACCEPTANCE`，绝不自动调用 `confirm_user_acceptance`，绝不自动合并 main 分支。
 
 ### 4. 权限与确认优化验证
 
@@ -698,19 +699,19 @@ dual_host_l2_status:
 ### 5. 测试记录（真实数据）
 
 - **2F-LIVE 端到端与契约测试**:
-  - `python -m pytest tests/test_phase2_live_e2e.py -q -rs` -> `4 passed in 1.67s` (0 failed, 0 skipped, exit 0)
+  - `python -m pytest tests/test_phase2_live_e2e.py -q -rs` -> `4 passed in 2.05s` (0 failed, 0 skipped, exit 0)
 - **2F 编排器定向测试**:
-  - `python -m pytest tests/test_orchestrator.py -q -rs` -> `12 passed in 0.44s` (0 failed, 0 skipped, exit 0)
+  - `python -m pytest tests/test_orchestrator.py -q -rs` -> `12 passed in 0.39s` (0 failed, 0 skipped, exit 0)
 - **2D-1 通用基础设施回归测试**:
-  - `python -m pytest tests/test_adapter_manifest.py tests/test_adapter_registry.py tests/test_adapter_conformance.py -q -rs` -> `37 passed in 1.98s` (0 failed, 0 skipped, exit 0)
+  - `python -m pytest tests/test_adapter_manifest.py tests/test_adapter_registry.py tests/test_adapter_conformance.py -q -rs` -> `37 passed in 1.89s` (0 failed, 0 skipped, exit 0)
 - **2D-2 Codex CLI Adapter 回归测试**:
-  - `python -m pytest tests/test_codex_cli_adapter.py -q -rs` -> `20 passed in 4.62s` (0 failed, 0 skipped, exit 0)
+  - `python -m pytest tests/test_codex_cli_adapter.py -q -rs` -> `20 passed in 0.59s` (0 failed, 0 skipped, exit 0)
 - **2E Antigravity Adapter 回归测试**:
-  - `python -m pytest tests/test_antigravity_adapter.py -q -rs` -> `23 passed in 0.50s` (0 failed, 0 skipped, exit 0)
+  - `python -m pytest tests/test_antigravity_adapter.py -q -rs` -> `23 passed in 0.46s` (0 failed, 0 skipped, exit 0)
 - **Host / Evidence / Worktree 回归测试**:
-  - `python -m pytest tests/test_host_adapter.py tests/test_evidence.py tests/test_worktree_manager.py -q -rs` -> `60 passed in 22.72s` (0 failed, 0 skipped, exit 0)
+  - `python -m pytest tests/test_host_adapter.py tests/test_evidence.py tests/test_worktree_manager.py -q -rs` -> `60 passed in 22.14s` (0 failed, 0 skipped, exit 0)
 - **全量测试套件**:
-  - `python -m pytest tests -q -rs` -> `382 passed in 72.20s (0:01:12)` (0 failed, 0 skipped, 100% 通过, exit 0)
+  - `python -m pytest tests -q -rs` -> `383 passed in 71.64s (0:01:11)` (0 failed, 0 skipped, 100% 通过, exit 0)
 - **代码规范检查**:
   - `git diff --check` -> 退出码 0，零尾随空白错误
 - **进程安全守卫**:
@@ -728,3 +729,10 @@ dual_host_l2_status:
    - 未执行 Push，未合并 main 分支，未创建 Release / Tag，未清理历史 Worktree；
    - 开发者（李开发）未代行 Reviewer 审查、QA 验证或用户终态验收；
    - 未启动第三阶段（Skill 拆分与复杂度控制）或第四阶段（多平台打包与发布）。
+
+### 7. 2F-LIVE 第 1 轮审查缺陷修复记录 (DEF-T0054-1)
+
+1. **[DEF-T0054-1] 严禁自造 real_host 身份与真实 QA Pytest 执行 (P1)**:
+   - **消除伪造 real_host 身份**：在 Antigravity 宿主不可达（`STATIC_ONLY`）时，严格禁止写入 `is_real_host=True` 的 EvidenceRecord 或写死 `AgentHandle` / `tok_...`；将双宿主调度降级为 `ASSISTED` 模式，并通过 `generate_assisted_handover_card()` 输出标准辅助交接卡；
+   - **QA 真实 Pytest 执行**：QA 测试报告不再使用手写死数据，而是在真实 fixture（`tests/fixtures/test_fixture_math_util.py`）上真实调用 pytest 子进程执行，捕获真实退出码（0）、通过数（2）与耗时（0.42s），写入 `user_data/qa_test_report.json` 并计算真实 SHA-256；
+   - **报告与交接包真实性校准**：交接包与报告如实声明 `real_host_sessions: {}`（none），准确反映真实受控状态。

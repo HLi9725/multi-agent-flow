@@ -111,11 +111,13 @@ def test_live_e2e_pipeline_in_temporary_worktree(tmp_path, monkeypatch):
     assert res.success is True
     assert res.verification_level_by_os["windows"] == "static_only"
     assert res.dual_host_l2_result["status"] == "NOT_READY"
+    assert res.dual_host_l2_result["orchestration_mode"] == "assisted"
     assert res.dual_host_l2_result["state_reached"] == "PENDING_USER_ACCEPTANCE"
-    assert len(res.evidence_ids) == 3
-    assert len(res.real_host_sessions) == 3
-    assert res.real_host_sessions["builder"] != res.real_host_sessions["reviewer"]
-    assert res.real_host_sessions["reviewer"] != res.real_host_sessions["qa"]
+    # When Antigravity is STATIC_ONLY, real_host_sessions must be empty (strictly no forged real_host identities)
+    assert res.real_host_sessions == {}
+    assert res.qa_real_test_summary["exit_code"] == 0
+    assert res.qa_real_test_summary["passed"] == 2
+    assert "fixture_math_util.py" in res.assisted_handover_card
 
 
 def test_live_e2e_anti_crossover_isolation(tmp_path):
