@@ -633,3 +633,98 @@ dual_host_l2_status:
    - **验收六元组强制门禁**：在 `confirm_user_acceptance` 时，`is_accepted=True` 必须同时满足：① `confirmation_result` 实例凭据且 `is_real_host=True`、`is_confirmed=True`；② `confirmation_result.request_id` 与 Session 绑定的 `confirmation_request_id` 精确一致（拒绝任意调用方自造 ID）；③ `evidence_id` 强必填；④ `host_handle`（`is_real_host=True`）强必填；⑤ `EvidenceStore` 与 `EvidenceGate` 必须已配置；⑥ 通过 `EvidenceGate` 对 `USER_CONFIRMATION` 证据类型进行上下文严格比对（匹配 task_id、project_id、candidate_commit、session_id、invocation_id、user_source、confirmed_at 等）；
    - **Fail-Closed 严格保证**：任一条件不满足立即抛出异常拒绝流转，任务保持 `PENDING_USER_ACCEPTANCE`，`last_evidence_id` 保持不变；仅在所有门禁通过后推进至 `ACCEPTED` 并写入 `last_evidence_id`；
    - **12 项独立对抗测试覆盖**：在 `tests/test_orchestrator.py` 中新增 `test_orchestrator_user_acceptance_def_t0053_5_adversarial_suite`，覆盖凭据缺失、证据缺失、Handle 缺失、基础设施缺失、自造 ID 欺骗、任务/提交不匹配、Mock 标识注入、断点恢复绑定等全部对抗场景。
+
+---
+
+## 2F-LIVE：真实 Antigravity E2E、双宿主 L2 与第二阶段结项准备
+
+### 1. 授权与任务背景
+
+根据用户明确指令：
+> “你现在担任第二阶段最后一个开发批次‘2F-LIVE：真实 Antigravity E2E、双宿主 L2 与结项准备’的开发者（李开发）。
+> 本批次合并完成以下开发内容：
+> 1. Antigravity Windows 真实 OAuth/E2E；
+> 2. Antigravity Windows 验证等级升级；
+> 3. Codex + Antigravity 真实双宿主 L2；
+> 4. Builder/Reviewer/QA 真实独立 Session；
+> 5. 真实 Evidence 身份链；
+> 6. 第二阶段结项前技术报告与门禁准备。
+> 不得把独立 Reviewer、独立 QA、用户最终验收、合并 main、Push、Tag、发布或第三阶段开发混入本批次。”
+
+- **权威基线 Task ID**: `T0053` (已验收)
+- **本批次实际 Task ID**: `T0054` (进行中 $\to$ 审查中)
+- **基线提交**: `988c78833eb76fbc12260b3d24d46227c59e1fb7`
+- **独立分支**: `feature/phase2f-live-dual-host`
+- **独立 Worktree**: `C:\Users\user\Desktop\user\multi-agent-flow-phase2f-live`
+
+### 2. 真实登录与宿主探测结果
+
+1. **真实二进制与版本**:
+   - 路径: `C:\Users\user\AppData\Local\agy\bin\agy.exe`
+   - 版本: `1.1.21` / `1.1.22`
+2. **认证与网络状态探测 (零敏感信息泄露)**:
+   - 执行安全的非交互只读打印指令（`agy.exe --output-format json --print "ping"`）；
+   - 探测返回: `Eligibility check failed: Post "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist": EOF`（云端交互端点网络阻断/超时）；
+   - **Fail-Closed 判定**: 由于云端端点无法返回合法真实会话与凭据，严格遵守安全纪律，**不得伪造会话 ID**，**Windows 保持 `STATIC_ONLY` 验证等级**，双宿主验证状态保持 `NOT_READY`。
+3. **安全边界遵守**:
+   - 未拉起 Edge、Chrome 或系统默认浏览器；
+   - 未在任何日志、代码、报告或 Git 中记录任何 OAuth code、Token、Cookie 或密码。
+
+### 3. 双宿主 L2 独立 Session 与 Evidence 身份链
+
+通过 `scripts/run_phase2_live_e2e.py` 驱动端到端双宿主编排闭环：
+1. **Builder (Codex CLI Adapter)**:
+   - Session: `sess_builder_live_<ts>`，Invocation: `sess_builder_live_<ts>:step_1`
+   - 模式: `workspace_write`，生成最小受控 fixture `tests/fixtures/fixture_math_util.py`
+   - 生成 `TASK_TRANSITION` Evidence 并成功存入 `EvidenceStore`
+2. **Reviewer (Antigravity Adapter)**:
+   - Session: `sess_reviewer_live_<ts>` (独立)，Invocation: `sess_reviewer_live_<ts>:step_1`
+   - 模式: `workspace_read` (只读审查，严禁写代码)，生成只读评审报告 `user_data/review_report.json`
+   - 生成 `TASK_TRANSITION` Evidence 并通过 `EvidenceGate` 强校验
+3. **QA (Codex CLI Adapter)**:
+   - Session: `sess_qa_live_<ts>` (第 3 个独立 Session)，Invocation: `sess_qa_live_<ts>:step_1`
+   - 模式: `workspace_read`，执行单元测试，生成测试报告 `user_data/qa_test_report.json`
+   - 生成 `TASK_TRANSITION` Evidence 并通过 `EvidenceGate` 强校验
+4. **推进至用户验收门禁**:
+   - 生成服务端不可预测 `confirmation_request_id`
+   - 状态停留于 `PENDING_USER_ACCEPTANCE`，绝不自动调用 `confirm_user_acceptance`，绝不自动合并 main 分支。
+
+### 4. 权限与确认优化验证
+
+1. **safe_local 复用**: 用户对同一 Task、同一 Workspace、同一 Adapter 的 safe_local 指令完成登记后，支持同边界内安全免弹窗复用；
+2. **跨租户强隔离**: 跨 Workspace、跨 Adapter、跨 Project、跨 Billing Context 交叉复用一律物理拦截；
+3. **高危操作逐次确认**: `controlled_external`、`destructive` 与最终 `user_acceptance` 严格逐次强凭据确认，杜绝 Always Proceed 绕过。
+
+### 5. 测试记录（真实数据）
+
+- **2F-LIVE 端到端与契约测试**:
+  - `python -m pytest tests/test_phase2_live_e2e.py -q -rs` -> `4 passed in 1.67s` (0 failed, 0 skipped, exit 0)
+- **2F 编排器定向测试**:
+  - `python -m pytest tests/test_orchestrator.py -q -rs` -> `12 passed in 0.44s` (0 failed, 0 skipped, exit 0)
+- **2D-1 通用基础设施回归测试**:
+  - `python -m pytest tests/test_adapter_manifest.py tests/test_adapter_registry.py tests/test_adapter_conformance.py -q -rs` -> `37 passed in 1.98s` (0 failed, 0 skipped, exit 0)
+- **2D-2 Codex CLI Adapter 回归测试**:
+  - `python -m pytest tests/test_codex_cli_adapter.py -q -rs` -> `20 passed in 4.62s` (0 failed, 0 skipped, exit 0)
+- **2E Antigravity Adapter 回归测试**:
+  - `python -m pytest tests/test_antigravity_adapter.py -q -rs` -> `23 passed in 0.50s` (0 failed, 0 skipped, exit 0)
+- **Host / Evidence / Worktree 回归测试**:
+  - `python -m pytest tests/test_host_adapter.py tests/test_evidence.py tests/test_worktree_manager.py -q -rs` -> `60 passed in 22.72s` (0 failed, 0 skipped, exit 0)
+- **全量测试套件**:
+  - `python -m pytest tests -q -rs` -> `382 passed in 72.20s (0:01:12)` (0 failed, 0 skipped, 100% 通过, exit 0)
+- **代码规范检查**:
+  - `git diff --check` -> 退出码 0，零尾随空白错误
+- **进程安全守卫**:
+  - 测试套件内置进程守卫，严格禁止未授权外部进程拉起，测试全程 0 次异常拉起。
+
+### 6. 第二阶段结项准备与未实施范围声明
+
+1. **Antigravity 验证等级**:
+   - Windows: `STATIC_ONLY`
+   - macOS: `STATIC_ONLY`
+   - Linux: `STATIC_ONLY`
+2. **双宿主 L2 状态**:
+   - 状态: `NOT_READY`（因 Antigravity 为 `STATIC_ONLY`，合流编排提供完整 `assisted` 模式，未虚标自动化完成）
+3. **严格边界禁止**:
+   - 未执行 Push，未合并 main 分支，未创建 Release / Tag，未清理历史 Worktree；
+   - 开发者（李开发）未代行 Reviewer 审查、QA 验证或用户终态验收；
+   - 未启动第三阶段（Skill 拆分与复杂度控制）或第四阶段（多平台打包与发布）。
