@@ -841,3 +841,36 @@ dual_host_l2_status:
    - 3 份 Evidence（Builder、Reviewer、QA）全部经 `EvidenceGate` 1:1 严格通过；
    - Windows 验证等级成功升级为 `cli_verified`，双宿主 L2 状态达到 `READY`；
    - 编排流程安全停留在 `PENDING_USER_ACCEPTANCE`，生成服务端不可预测 `confirmation_request_id`，绝不自动验收。
+
+### 13. 最终候选绑定返工记录（DEF-T0054-15 ～ DEF-T0054-17）
+
+> 本节覆盖第 12 节的准出声明。第 12 节三条磁盘 Evidence 的 `result_commit` 实际为
+> `cc65831208a44e46d93797ea552074c8c14f5392`，并非受审候选
+> `3e9f5190e7bad026d5f4b92508d16c9eba26da68`，因此不得用于该候选或后续候选的准出。
+
+1. **[DEF-T0054-15] Evidence 必须绑定权威且干净的候选提交（P1）**：
+   - 在任何真实 Host 启动前，从目标 Worktree 强制解析 `HEAD`，并要求调用方候选 SHA 与 `HEAD` 完全一致；
+   - 强制检查 tracked 工作区干净、基线为候选祖先；Builder、Reviewer、QA 与本地 pytest 各执行点后再次检查 `HEAD` 与 tracked 工作区未变化；
+   - Evidence 的 `result_commit` 只能来自上述权威 `HEAD`，不再接受与磁盘候选脱节的调用方字符串。
+2. **[DEF-T0054-16] EvidenceGate 必须真实参与验证等级晋升（P1）**：
+   - `promote_after_verified_evidence()` 现在必须同时接收 `EvidenceStore`、`EvidenceGate` 与完整 `EvidenceValidationContext`；
+   - 晋升前强制执行 `gate.validate_evidence()`，逐项核对项目、任务、角色、状态、基线、候选、Adapter、Workspace、Session、Invocation、Capabilities、AgentResult 与 Artifact；
+   - 缺少任一验证对象、Gate 与 Store 不同源或上下文不匹配时，一律 Fail-Closed，Windows 保持 `STATIC_ONLY`。
+3. **[DEF-T0054-17] Reviewer 明确 PASS 与候选不可变（P1）**：
+   - Reviewer 仅在真实成功结果首行明确以 `PASS:` 开头时放行；空白、普通完成文本或模糊结论均按 REJECT 处理；
+   - Builder 改为只读验证仓库中已提交的 fixture 与测试文件，流水线不再自行创建或改写 Builder 产物；
+   - Antigravity 不可达时 `LiveE2EResult.success=False`，不再出现“阻塞但成功”的矛盾结果。
+4. **新增对抗测试**：
+   - 候选 SHA 与 `HEAD` 不一致时，在真实 Host 启动前拒绝；
+   - tracked 工作区存在修改时，在真实 Host 启动前拒绝；
+   - Reviewer 只有显式 `PASS:` 才能推进，普通完成文本 Fail-Closed；
+   - 缺失已提交 Builder 构件时拒绝，不允许流水线代写。
+5. **本地独立回归（全程进程守卫）**：
+   - `python qa_t0054_guarded_pytest.py tests/test_phase2_live_e2e.py tests/test_antigravity_adapter.py tests/test_orchestrator.py -q -rs` → exit 0，`52 passed in 4.97s`；
+   - `python qa_t0054_guarded_pytest.py tests -q -rs` → exit 0，`396 passed in 104.94s`，0 failed，0 skipped；
+   - 守卫禁止 `agy.exe`、`taskkill.exe`、Edge、Firefox、Chrome 与 OAuth，回归测试期间 0 次触发；
+   - `git diff --check` → exit 0。
+6. **准出边界**：
+   - 旧 Evidence 已明确作废；本节仅证明修复代码的静态审查与受控回归通过；
+   - 必须先提交形成新的固定候选 SHA，再重新运行真实双宿主 Live E2E，生成 `result_commit` 与该 SHA 一致的新 Evidence；
+   - 新 Evidence 独立复核 3/3 通过之前，不得重新声明 `CLI_VERIFIED / READY`，不得完成 QA 或用户验收。

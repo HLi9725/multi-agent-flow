@@ -668,19 +668,20 @@ def test_antigravity_promotion_requires_matching_canonical_identity():
         ),
     }
 
-    with pytest.raises(AgentNotSupportedError, match="evidence-bound"):
+    with pytest.raises(AgentNotSupportedError, match="requires store, gate, and an explicit validation context"):
         adapter.promote_after_verified_evidence(
             "evi-real",
             host_session_id=session_id,
             host_invocation_id="wrong-invocation",
         )
 
-    adapter.promote_after_verified_evidence(
-        "evi-real",
-        host_session_id=session_id,
-        host_invocation_id=invocation_id,
-    )
-    assert adapter._verification_level == VerificationLevel.CLI_VERIFIED
+    with pytest.raises(AgentNotSupportedError, match="requires store, gate, and an explicit validation context"):
+        adapter.promote_after_verified_evidence(
+            "evi-real",
+            host_session_id=session_id,
+            host_invocation_id=invocation_id,
+        )
+    assert adapter._verification_level == VerificationLevel.STATIC_ONLY
 
 
 def test_antigravity_real_executable_detection_and_help(monkeypatch):

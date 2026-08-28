@@ -59,7 +59,38 @@ from scripts._lib.core.orchestrator_schema import (
 )
 from scripts._lib.hosts.antigravity_adapter import AntigravityAdapter, create_antigravity_manifest
 from scripts._lib.hosts.codex_cli_adapter import CodexCliAdapter, create_codex_cli_manifest
+import scripts.run_phase2_live_e2e as live_e2e_module
 from scripts.run_phase2_live_e2e import run_phase2_live_e2e_pipeline, detect_antigravity_cli
+
+_REAL_RESOLVE_GIT_CONTEXT = live_e2e_module._resolve_authoritative_git_context
+
+
+@pytest.fixture(autouse=True)
+def authoritative_git_context(monkeypatch, tmp_path):
+    """Unit tests inject deterministic Git context; production uses real Git validation."""
+    def resolve(_root, candidate, baseline, project_id):
+        return (
+            candidate or "b" * 40,
+            baseline or "a" * 40,
+            project_id or "test-project",
+        )
+
+    monkeypatch.setattr(live_e2e_module, "_resolve_authoritative_git_context", resolve)
+    monkeypatch.setattr(live_e2e_module, "_assert_tracked_candidate_unchanged", lambda *_args: None)
+
+    fixture_dir = tmp_path / "tests" / "fixtures"
+    fixture_dir.mkdir(parents=True, exist_ok=True)
+    (fixture_dir / "fixture_math_util.py").write_text(
+        "def pure_add(a: int, b: int) -> int:\n    return a + b\n",
+        encoding="utf-8",
+    )
+    (fixture_dir / "test_fixture_math_util.py").write_text(
+        "from tests.fixtures.fixture_math_util import pure_add\n\n"
+        "def test_pure_add():\n"
+        "    assert pure_add(2, 3) == 5\n"
+        "    assert pure_add(-1, 1) == 0\n",
+        encoding="utf-8",
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -107,7 +138,7 @@ def test_live_e2e_blocked_when_unreachable(tmp_path, monkeypatch):
 
     res = run_phase2_live_e2e_pipeline(str(tmp_path))
 
-    assert res.success is True
+    assert res.success is False
     assert res.is_blocked is True
     assert "Antigravity CLI live authentication failed" in res.blocked_reason
     assert res.verification_level_by_os["windows"] == "static_only"
@@ -152,7 +183,7 @@ def test_live_e2e_dispatch_flow_and_upgrade(tmp_path, monkeypatch):
             result = AgentResult(
                 session_id=handle.session_id,
                 status=AgentStatus.SUCCESS,
-                output="Yes, pure_add is a pure function adhering to constraints.",
+                output="PASS: pure_add is verified as a pure function.",
                 is_real_host=True,
             )
             data["result"] = result
@@ -191,7 +222,7 @@ def test_live_e2e_dispatch_flow_and_upgrade(tmp_path, monkeypatch):
             data["result"] = AgentResult(
                 session_id=handle.session_id,
                 status=AgentStatus.SUCCESS,
-                output=f"{role} completed",
+                output="BUILDER_READY" if role == "builder" else f"{role} completed",
                 is_real_host=True,
             )
             self._session_history[handle.session_id] = data
@@ -472,7 +503,7 @@ def test_reviewer_reject_reverts_to_building_without_qa_or_acceptance(tmp_path, 
             data["result"] = AgentResult(
                 session_id=handle.session_id,
                 status=AgentStatus.SUCCESS,
-                output=f"{role} completed",
+                output="BUILDER_READY" if role == "builder" else f"{role} completed",
                 is_real_host=True,
             )
             self._session_history[handle.session_id] = data
@@ -581,7 +612,7 @@ def test_pytest_failure_rejects_to_building_without_user_acceptance(tmp_path, mo
             data["result"] = AgentResult(
                 session_id=handle.session_id,
                 status=AgentStatus.SUCCESS,
-                output=f"{role} completed",
+                output="BUILDER_READY" if role == "builder" else f"{role} completed",
                 is_real_host=True,
             )
             self._session_history[handle.session_id] = data
@@ -640,7 +671,7 @@ def test_fake_or_unverified_evidence_rejected_on_promotion(tmp_path):
     adapter = AntigravityAdapter(is_real_host=True, verification_level=VerificationLevel.STATIC_ONLY)
 
     # 1. Non-existent evidence ID rejected
-    with pytest.raises(AgentNotSupportedError, match="Evidence store validation failed"):
+    with pytest.raises(AgentNotSupportedError, match="requires store, gate, and an explicit validation context"):
         adapter.promote_after_verified_evidence(
             "evi_non_existent_999",
             host_session_id="sess_fake",
@@ -667,32 +698,61 @@ def test_builder_missing_artifacts_fails_closed(tmp_path, monkeypatch):
 
     monkeypatch.setattr("scripts.run_phase2_live_e2e.detect_antigravity_cli", mock_detect)
 
-    def mock_failing_codex_dispatch(self, req):
-        handle = AgentHandle(
-            session_id=req.session_id,
-            host_id="codex_cli",
-            status="failed",
-            is_real_host=True,
-            adapter_instance_id=self._instance_id,
-            invocation_token="tok_builder_fail",
-        )
-        return handle
+    shutil.rmtree(tmp_path / "tests" / "fixtures")
 
-    def mock_failing_codex_wait(self, handle, timeout_seconds=None):
-        return AgentResult(
-            session_id=handle.session_id,
-            status=AgentStatus.FAILED,
-            output="Builder crashed, no artifacts produced",
-            is_real_host=True,
-        )
-
-    monkeypatch.setattr(CodexCliAdapter, "dispatch_agent", mock_failing_codex_dispatch)
-    monkeypatch.setattr(CodexCliAdapter, "wait_for_result", mock_failing_codex_wait)
-
-    with pytest.raises(RuntimeError, match="Real Codex Builder dispatch did not complete successfully"):
+    with pytest.raises(RuntimeError, match="Committed Builder artifacts are missing"):
         run_phase2_live_e2e_pipeline(
             str(tmp_path),
             project_id="test-project",
             baseline_commit="a" * 40,
             candidate_commit="b" * 40,
         )
+
+
+def test_authoritative_git_context_rejects_candidate_mismatch(monkeypatch, tmp_path):
+    """Evidence generation must never accept a caller-supplied SHA that is not HEAD."""
+    head = "b" * 40
+
+    def fake_git(_root, *args):
+        key = tuple(args)
+        values = {
+            ("rev-parse", "HEAD"): (0, head + "\n"),
+            ("status", "--porcelain", "--untracked-files=no"): (0, ""),
+        }
+        code, stdout = values.get(key, (1, ""))
+        return subprocess.CompletedProcess(args=["git", *args], returncode=code, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(live_e2e_module, "_run_git", fake_git)
+    with pytest.raises(RuntimeError, match="does not match committed HEAD"):
+        _REAL_RESOLVE_GIT_CONTEXT(str(tmp_path), "c" * 40, "a" * 40, "project")
+
+
+def test_authoritative_git_context_rejects_dirty_tracked_worktree(monkeypatch, tmp_path):
+    """Tracked mutations must block Evidence generation before either real host starts."""
+
+    def fake_git(_root, *args):
+        key = tuple(args)
+        values = {
+            ("rev-parse", "HEAD"): (0, "b" * 40 + "\n"),
+            ("status", "--porcelain", "--untracked-files=no"): (0, " M tracked.py\n"),
+        }
+        code, stdout = values.get(key, (1, ""))
+        return subprocess.CompletedProcess(args=["git", *args], returncode=code, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(live_e2e_module, "_run_git", fake_git)
+    with pytest.raises(RuntimeError, match="clean tracked worktree"):
+        _REAL_RESOLVE_GIT_CONTEXT(str(tmp_path), "b" * 40, "a" * 40, "project")
+
+
+@pytest.mark.parametrize(
+    ("output", "expected"),
+    [
+        ("PASS: verified; no defects found", "PASS"),
+        ("No defects found", "REJECT"),
+        ("Review completed", "REJECT"),
+        ("REJECT: defect found", "REJECT"),
+    ],
+)
+def test_reviewer_decision_requires_explicit_pass_marker(output, expected):
+    assert live_e2e_module._classify_reviewer_decision(output, AgentStatus.SUCCESS) == expected
+    assert live_e2e_module._classify_reviewer_decision(output, AgentStatus.FAILED) == "REJECT"

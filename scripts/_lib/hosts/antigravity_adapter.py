@@ -685,6 +685,7 @@ class AntigravityAdapter(BaseHostAdapter):
         host_invocation_id: str,
         store: Optional[Any] = None,
         gate: Optional[Any] = None,
+        validation_context: Optional[Any] = None,
     ) -> None:
         """Promote only when evidence exists in store, is verified, and names one completed canonical real session."""
         if not isinstance(evidence_ref, str) or not evidence_ref.strip():
@@ -694,20 +695,24 @@ class AntigravityAdapter(BaseHostAdapter):
         if not isinstance(host_invocation_id, str) or not host_invocation_id.strip():
             raise ValueError("host_invocation_id must be non-empty")
 
-        # If store is provided, verify evidence record directly
-        if store is not None:
-            try:
-                record = store.read(evidence_ref.strip())
-                if not record or not record.metadata:
-                    raise AgentNotSupportedError(f"Evidence '{evidence_ref}' not found in store")
-                if not record.metadata.is_real_host:
-                    raise AgentNotSupportedError(f"Evidence '{evidence_ref}' is not a real host evidence")
-                if record.metadata.host_session_id != host_session_id.strip():
-                    raise AgentNotSupportedError(f"Evidence '{evidence_ref}' session mismatch")
-                if record.metadata.host_invocation_id != host_invocation_id.strip():
-                    raise AgentNotSupportedError(f"Evidence '{evidence_ref}' invocation mismatch")
-            except Exception as e:
-                raise AgentNotSupportedError(f"Evidence store validation failed for '{evidence_ref}': {e}") from e
+        if store is None or gate is None or validation_context is None:
+            raise AgentNotSupportedError(
+                "Evidence promotion requires store, gate, and an explicit validation context"
+            )
+        try:
+            record = store.read(evidence_ref.strip())
+            if not record or not record.metadata:
+                raise AgentNotSupportedError(f"Evidence '{evidence_ref}' not found in store")
+            if record.metadata.host_session_id != host_session_id.strip():
+                raise AgentNotSupportedError(f"Evidence '{evidence_ref}' session mismatch")
+            if record.metadata.host_invocation_id != host_invocation_id.strip():
+                raise AgentNotSupportedError(f"Evidence '{evidence_ref}' invocation mismatch")
+            if gate.store is not store:
+                raise AgentNotSupportedError("Evidence gate is not bound to the supplied store")
+            if gate.validate_evidence(evidence_ref.strip(), validation_context) is not True:
+                raise AgentNotSupportedError(f"Evidence gate did not validate '{evidence_ref}'")
+        except Exception as e:
+            raise AgentNotSupportedError(f"Evidence store validation failed for '{evidence_ref}': {e}") from e
 
         with self._lock:
             data = self._session_history.get(host_session_id.strip())

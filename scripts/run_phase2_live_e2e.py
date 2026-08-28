@@ -143,6 +143,76 @@ def mask_identifier(ident: Optional[str]) -> str:
     return f"{ident_str[:8]}***{ident_str[-4:]}"
 
 
+def _classify_reviewer_decision(output: str, status: AgentStatus) -> str:
+    """Fail closed unless the real Reviewer returns the requested explicit PASS marker."""
+    if status != AgentStatus.SUCCESS:
+        return "REJECT"
+    return "PASS" if re.match(r"^\s*PASS\s*:", output or "", flags=re.IGNORECASE) else "REJECT"
+
+
+def _run_git(target_worktree: str, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", "-C", target_worktree, *args],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+
+def _resolve_authoritative_git_context(
+    target_worktree: str,
+    requested_candidate: Optional[str],
+    requested_baseline: Optional[str],
+    requested_project_id: Optional[str],
+) -> Tuple[str, str, str]:
+    """Resolve and lock the committed candidate before any real host is started."""
+    head_proc = _run_git(target_worktree, "rev-parse", "HEAD")
+    if head_proc.returncode != 0 or not head_proc.stdout.strip():
+        raise RuntimeError("Live E2E requires a valid Git worktree with a committed HEAD")
+    head = head_proc.stdout.strip()
+
+    status_proc = _run_git(target_worktree, "status", "--porcelain", "--untracked-files=no")
+    if status_proc.returncode != 0:
+        raise RuntimeError("Unable to verify tracked worktree cleanliness")
+    if status_proc.stdout.strip():
+        raise RuntimeError("Live E2E requires a clean tracked worktree; commit changes before generating Evidence")
+
+    if requested_candidate is not None and requested_candidate.strip() != head:
+        raise RuntimeError(
+            f"Requested candidate {requested_candidate.strip()} does not match committed HEAD {head}"
+        )
+
+    if requested_baseline is None:
+        baseline_proc = _run_git(target_worktree, "rev-parse", "HEAD^")
+        if baseline_proc.returncode != 0 or not baseline_proc.stdout.strip():
+            raise RuntimeError("Unable to resolve baseline commit HEAD^")
+        baseline = baseline_proc.stdout.strip()
+    else:
+        baseline = requested_baseline.strip()
+
+    ancestor_proc = _run_git(target_worktree, "merge-base", "--is-ancestor", baseline, head)
+    if ancestor_proc.returncode != 0:
+        raise RuntimeError(f"Baseline {baseline} is not an ancestor of candidate {head}")
+
+    common_proc = _run_git(target_worktree, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    if common_proc.returncode != 0 or not common_proc.stdout.strip():
+        raise RuntimeError("Unable to resolve authoritative Git common directory")
+    project_id = requested_project_id or hashlib.sha256(
+        os.path.realpath(common_proc.stdout.strip()).encode("utf-8")
+    ).hexdigest()
+    return head, baseline, project_id
+
+
+def _assert_tracked_candidate_unchanged(target_worktree: str, expected_candidate: str) -> None:
+    """Fail closed if a host mutates tracked files or changes HEAD during verification."""
+    head_proc = _run_git(target_worktree, "rev-parse", "HEAD")
+    status_proc = _run_git(target_worktree, "status", "--porcelain", "--untracked-files=no")
+    if head_proc.returncode != 0 or head_proc.stdout.strip() != expected_candidate:
+        raise RuntimeError("Candidate HEAD changed during Live E2E")
+    if status_proc.returncode != 0 or status_proc.stdout.strip():
+        raise RuntimeError("Tracked worktree changed during Live E2E; Evidence generation aborted")
+
+
 def detect_antigravity_cli() -> Tuple[str, str, str]:
     """Detect Antigravity CLI path, version, and diagnostic authentication state safely without secrets."""
     win_path = r"C:\Users\user\AppData\Local\agy\bin\agy.exe"
@@ -221,7 +291,7 @@ def run_phase2_live_e2e_pipeline(
     """
     Execute Phase 2F-LIVE real dual-host L2 pipeline:
     1. Probe Antigravity CLI status -> detects live authentication.
-    2. Builder (Codex) writes test fixture on disk & commits EvidenceRecord to EvidenceStore.
+    2. Builder (Codex) verifies committed fixture artifacts without modifying the candidate.
     3. Reviewer (Antigravity) dispatches real read-only request via AntigravityAdapter.dispatch_agent,
        waits for result via wait_for_result, and obtains genuine canonical conversation_id and invocation_id.
     4. Reviewer submits real EvidenceRecord verified by EvidenceGate.
@@ -229,13 +299,20 @@ def run_phase2_live_e2e_pipeline(
     6. Advances cleanly to PENDING_USER_ACCEPTANCE with server-generated confirmation_request_id.
     7. Upgrades Windows verification level to CLI_VERIFIED with real e2e evidence refs.
     """
+    resolved_candidate, resolved_baseline, resolved_project_id = _resolve_authoritative_git_context(
+        target_worktree,
+        candidate_commit,
+        baseline_commit,
+        project_id,
+    )
+
     cli_path, ag_ver, ag_diag = detect_antigravity_cli()
     is_ag_authenticated = ("status=authenticated" in ag_diag)
 
     # Fail closed if live host is not reachable / authenticated
     if not is_ag_authenticated:
         return LiveE2EResult(
-            success=True,
+            success=False,
             is_blocked=True,
             blocked_reason=f"Antigravity CLI live authentication failed: {ag_diag}",
             antigravity_binary=cli_path or "none",
@@ -263,27 +340,6 @@ def run_phase2_live_e2e_pipeline(
     os.makedirs(e2e_evidence_dir, exist_ok=True)
     store = EvidenceStore(root_dir=e2e_evidence_dir)
     gate = EvidenceGate(store=store, project_root=target_worktree)
-
-    def _git_value(*args: str) -> str:
-        proc = subprocess.run(
-            ["git", "-C", target_worktree, *args],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-        if proc.returncode != 0 or not proc.stdout.strip():
-            raise RuntimeError(f"Unable to resolve authoritative Git context: {' '.join(args)}")
-        return proc.stdout.strip()
-
-    resolved_candidate = candidate_commit or _git_value("rev-parse", "HEAD")
-    resolved_baseline = baseline_commit or _git_value("rev-parse", "HEAD^")
-    if project_id is None:
-        git_common_dir = _git_value("rev-parse", "--path-format=absolute", "--git-common-dir")
-        resolved_project_id = hashlib.sha256(
-            os.path.realpath(git_common_dir).encode("utf-8")
-        ).hexdigest()
-    else:
-        resolved_project_id = project_id
 
     # Bootstrap with STATIC_ONLY.  A ping is not sufficient to register a
     # verified manifest; promotion occurs only after dispatch-backed Evidence.
@@ -320,11 +376,25 @@ def run_phase2_live_e2e_pipeline(
     evidence_ids: List[str] = []
     evidence_sha256: Dict[str, str] = {}
 
-    # --- STEP 1: Builder (Codex) Starts & Generates Real Test Fixture ---
+    # --- STEP 1: Builder (Codex) Verifies Existing Committed Fixture ---
+    fixture_dir = os.path.join(target_worktree, "tests", "fixtures")
+    fixture_file = os.path.join(fixture_dir, "fixture_math_util.py")
+    test_fixture_file = os.path.join(fixture_dir, "test_fixture_math_util.py")
+    if not os.path.isfile(fixture_file) or not os.path.isfile(test_fixture_file):
+        raise RuntimeError("Committed Builder artifacts are missing; Live E2E cannot synthesize them")
+    with open(fixture_file, "rb") as f:
+        fixture_content = f.read().decode("utf-8")
+    with open(test_fixture_file, "rb") as f:
+        test_fixture_content = f.read().decode("utf-8")
+
     sess_builder = f"sess_builder_live_{int(time.time())}"
     builder_request = AgentRequest(
         session_id=sess_builder,
-        prompt="echo BUILDER_READY",
+        prompt=(
+            "Read-only verify tests/fixtures/fixture_math_util.py and "
+            "tests/fixtures/test_fixture_math_util.py. Do not modify files. "
+            "Return BUILDER_READY only when both committed artifacts are valid."
+        ),
         role="BUILDER",
         workspace_dir=target_worktree,
         extra_context={"sandbox_mode": "read-only"},
@@ -337,6 +407,9 @@ def run_phase2_live_e2e_pipeline(
     inv_builder = codex_adapter.get_session_invocation_id(sess_builder)
     if not builder_thread_id or not inv_builder:
         raise RuntimeError("Real Codex Builder result is missing canonical thread/invocation identity")
+    if "BUILDER_READY" not in builder_result.output:
+        raise RuntimeError("Real Codex Builder did not confirm committed artifacts")
+    _assert_tracked_candidate_unchanged(target_worktree, resolved_candidate)
 
     session = orchestrator.start_builder(
         task_id=task_id,
@@ -353,29 +426,6 @@ def run_phase2_live_e2e_pipeline(
         builder_adapter_id="codex_cli",
     )
     assert session.state == OrchestrationState.BUILDING
-
-    # Verify builder produced valid fixture files on disk
-    fixture_dir = os.path.join(target_worktree, "tests", "fixtures")
-    os.makedirs(fixture_dir, exist_ok=True)
-    fixture_file = os.path.join(fixture_dir, "fixture_math_util.py")
-    test_fixture_file = os.path.join(fixture_dir, "test_fixture_math_util.py")
-
-    # If fixture files don't exist yet, generate them through builder verification context
-    if not os.path.exists(fixture_file) or not os.path.exists(test_fixture_file):
-        fixture_content = "def pure_add(a: int, b: int) -> int:\n    return a + b\n"
-        with open(fixture_file, "wb") as f:
-            f.write(fixture_content.encode("utf-8"))
-        test_fixture_content = (
-            "from tests.fixtures.fixture_math_util import pure_add\n\n"
-            "def test_pure_add():\n"
-            "    assert pure_add(2, 3) == 5\n"
-            "    assert pure_add(-1, 1) == 0\n"
-        )
-        with open(test_fixture_file, "wb") as f:
-            f.write(test_fixture_content.encode("utf-8"))
-    else:
-        with open(fixture_file, "rb") as f:
-            fixture_content = f.read().decode("utf-8")
 
     # Builder Evidence Record
     evi_builder_id = f"evi_builder_{int(time.time())}"
@@ -409,7 +459,12 @@ def run_phase2_live_e2e_pipeline(
             ArtifactRecord(
                 relative_path="tests/fixtures/fixture_math_util.py",
                 sha256_hash=compute_sha256(fixture_content),
-                description="code_diff",
+                description="verified_candidate_artifact",
+            ),
+            ArtifactRecord(
+                relative_path="tests/fixtures/test_fixture_math_util.py",
+                sha256_hash=compute_sha256(test_fixture_content),
+                description="verified_candidate_test_artifact",
             ),
         ),
         metadata=b_meta,
@@ -483,13 +538,11 @@ def run_phase2_live_e2e_pipeline(
     canonical_inv_id = ag_adapter.get_session_invocation_id(reviewer_handle.session_id)
     if not canonical_conv_id or not canonical_inv_id:
         raise RuntimeError("Antigravity result is missing canonical conversation/invocation identity")
+    _assert_tracked_candidate_unchanged(target_worktree, resolved_candidate)
 
     # Dynamic Reviewer Decision Parsing (DEF-T0054-11)
-    reviewer_decision = "PASS"
     review_comments = ag_result.output.strip()
-    output_upper = review_comments.upper()
-    if "REJECT" in output_upper or "DEFECT" in output_upper or "FAIL" in output_upper or ag_result.status != AgentStatus.SUCCESS:
-        reviewer_decision = "REJECT"
+    reviewer_decision = _classify_reviewer_decision(review_comments, ag_result.status)
 
     # Reviewer writes structured findings
     user_data_dir = os.path.join(target_worktree, "user_data")
@@ -616,6 +669,22 @@ def run_phase2_live_e2e_pipeline(
         host_invocation_id=canonical_inv_id,
         store=store,
         gate=gate,
+        validation_context=EvidenceValidationContext(
+            project_id=project_id,
+            task_id=task_id,
+            actor_role="REVIEWER",
+            transition_from="REVIEWING",
+            transition_to="TESTING",
+            baseline_commit=base_commit,
+            result_commit=cand_commit,
+            expected_invocation_id=canonical_inv_id,
+            expected_adapter="antigravity",
+            expected_workspace_mode="workspace_read",
+            expected_evidence_type=EvidenceType.TASK_TRANSITION,
+            host_handle=reviewer_handle,
+            expected_capabilities=ag_caps,
+            agent_result=ag_result,
+        ),
     )
     verified_ts_str = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     promoted_manifest = create_antigravity_manifest(
@@ -647,6 +716,7 @@ def run_phase2_live_e2e_pipeline(
     inv_qa = codex_adapter.get_session_invocation_id(sess_qa)
     if not qa_thread_id or not inv_qa:
         raise RuntimeError("Real Codex QA result is missing canonical thread/invocation identity")
+    _assert_tracked_candidate_unchanged(target_worktree, resolved_candidate)
 
     qa_start_time = time.time()
     pytest_proc = subprocess.run(
@@ -657,6 +727,7 @@ def run_phase2_live_e2e_pipeline(
         timeout=30,
     )
     qa_duration = time.time() - qa_start_time
+    _assert_tracked_candidate_unchanged(target_worktree, resolved_candidate)
 
     qa_summary = {
         "command": "pytest tests/fixtures/test_fixture_math_util.py -q",
