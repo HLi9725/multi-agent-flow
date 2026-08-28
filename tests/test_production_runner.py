@@ -6,8 +6,8 @@ ProductionRunner 完整编排测试。
 import json
 import os
 import subprocess
+import time
 import pytest
-from unittest.mock import MagicMock
 
 from scripts._lib.core.adapter_registry import AdapterRegistry
 from scripts._lib.core.agent_schema import (
@@ -33,12 +33,12 @@ def mock_git_repo(tmp_path):
     subprocess.run(["git", "init"], cwd=repo_dir, check=True, capture_output=True)
     subprocess.run(["git", "config", "user.name", "TestDev"], cwd=repo_dir, check=True, capture_output=True)
     subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo_dir, check=True, capture_output=True)
-    
+
     readme = repo_dir / "README.md"
     readme.write_text("# Test Repo\n", encoding="utf-8")
     subprocess.run(["git", "add", "README.md"], cwd=repo_dir, check=True, capture_output=True)
     subprocess.run(["git", "commit", "-m", "initial commit"], cwd=repo_dir, check=True, capture_output=True)
-    
+
     head_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo_dir, text=True).strip()
     return repo_dir, head_sha
 
@@ -71,22 +71,23 @@ def test_production_runner_full_pass_pipeline(mock_git_repo, tmp_path, monkeypat
             status="completed",
             is_real_host=True,
             adapter_instance_id="inst_codex",
-            invocation_token="tok_codex",
+            invocation_token="tok_builder_1234567890",
         )
 
     def mock_codex_wait(self, handle, timeout_seconds=None):
         if "builder" in handle.session_id:
             target_dir = str(repo_dir)
-            dummy_file = os.path.join(target_dir, "new_feature.py")
+            dummy_file = os.path.join(target_dir, f"new_feature_{int(time.time()*1000)}.py")
             with open(dummy_file, "w", encoding="utf-8") as f:
                 f.write("def dummy(): return True\n")
-            subprocess.run(["git", "add", "new_feature.py"], cwd=target_dir, check=True, capture_output=True)
+            subprocess.run(["git", "add", "."], cwd=target_dir, check=True, capture_output=True)
             subprocess.run(["git", "commit", "-m", "feat: add dummy function"], cwd=target_dir, check=True, capture_output=True)
 
             return AgentResult(
                 session_id=handle.session_id,
                 status=AgentStatus.SUCCESS,
                 output="Builder successfully implemented dummy function and committed.",
+                partial_results=({"invocation_id": "inv_builder_codex_real"},),
                 is_real_host=True,
             )
         else:
@@ -94,10 +95,11 @@ def test_production_runner_full_pass_pipeline(mock_git_repo, tmp_path, monkeypat
                 session_id=handle.session_id,
                 status=AgentStatus.SUCCESS,
                 output="QA test suite passed: 1 passed in 0.01s",
+                partial_results=({"invocation_id": "inv_qa_codex_real"},),
                 is_real_host=True,
             )
 
-    # Mock reviewer dispatch & wait (structured JSON PASS)
+    # Mock reviewer dispatch & wait (strict structured JSON PASS)
     def mock_reviewer_dispatch(self, req):
         return AgentHandle(
             session_id=req.session_id,
@@ -105,16 +107,17 @@ def test_production_runner_full_pass_pipeline(mock_git_repo, tmp_path, monkeypat
             status="completed",
             is_real_host=True,
             adapter_instance_id="inst_ag",
-            invocation_token="tok_reviewer",
+            invocation_token="tok_reviewer_1234567890",
         )
 
     def mock_reviewer_wait(self, handle, timeout_seconds=None):
+        cand_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=str(repo_dir), text=True).strip()
         out_json = {
             "task_id": "T0088",
             "baseline_commit": baseline_sha,
-            "candidate_commit": "a" * 40,
+            "candidate_commit": cand_sha,
             "session_id": handle.session_id,
-            "host_invocation_id": "inv_reviewer_456",
+            "host_invocation_id": "inv_reviewer_real_456",
             "decision": "PASS",
             "defects": [],
             "summary": "Code review passed. Implementation meets all requirements.",
@@ -123,6 +126,7 @@ def test_production_runner_full_pass_pipeline(mock_git_repo, tmp_path, monkeypat
             session_id=handle.session_id,
             status=AgentStatus.SUCCESS,
             output=json.dumps(out_json),
+            partial_results=({"invocation_id": "inv_reviewer_real_456"},),
             is_real_host=True,
         )
 
@@ -143,7 +147,7 @@ def test_production_runner_full_pass_pipeline(mock_git_repo, tmp_path, monkeypat
     registry.register(ag_adapter, ag_manifest)
 
     evidence_store = EvidenceStore(root_dir=str(data_root / "evidence"))
-    checkpoint_store = RunnerCheckpointStore(data_root=str(data_root))
+    checkpoint_store = RunnerCheckpointStore(data_root=str(data_root), project_root=str(repo_dir), project_id="test_repo")
 
     runner = ProductionRunner(
         registry=registry,

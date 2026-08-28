@@ -181,7 +181,7 @@ def scan_project_stack(target_dir: str = None) -> dict:
 def sync_stack_to_config(info: dict, target_project_dir: str = None) -> bool:
     """委托 save_project_architecture 进行标准 Schema 落盘（保证单一写入源）"""
     from save_project_architecture import save_architecture_config
-    
+
     arch_dict = {
         "meta": {"initialized": True},
         "project": {

@@ -33,7 +33,7 @@ class JiraAdapter:
 
         url = f"{self.domain}/rest/api/3/search?jql={urllib.parse.quote(jql)}&maxResults={limit}&startAt={offset}"
         req = urllib.request.Request(url, headers=self._headers(), method="GET")
-        
+
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
                 data = json.loads(resp.read().decode('utf-8'))

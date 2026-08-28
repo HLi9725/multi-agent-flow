@@ -978,3 +978,49 @@ dual_host_l2_status:
     - `run_task status` 命令必须纯读取、零写入、零锁目录创建、零 Host 调用。
 12. **[全局目录不可变性]**：
     - 严禁自动修改 `C:\Users\user\.codex\skills\yy-flow` 或其他全局安装目录，只修改仓库内 Skill 源码文件。
+### 18. 2F-PROD 独立审查返工与缺陷修复记录（DEF-T0061-1 ~ 9）
+
+针对周审查独立代码审查指出的 DEF-T0061-1 ~ 9 共 9 项缺陷，已完成全方位深度修复与对抗测试覆盖：
+
+1. **[DEF-T0061-1] Reviewer 结构化 JSON Schema 严格校验与身份字段强匹配**：
+   - 在 `ProductionRunner._parse_reviewer_structured_json` 中内置实现零外部依赖的严格 Schema 校验器（`_validate_reviewer_schema_builtin`）。
+   - 严格比对 `task_id`、`baseline_commit`、`candidate_commit`、`session_id`、`host_invocation_id` 是否与上下文精确一致，任何缺失、伪造或提交不匹配立即判定为 `REJECT` 并记录 `DEF-IDENTITY-MISMATCH` 缺陷。
+   - 彻底封堵普通文本 `PASS:` 匹配放行与残缺 JSON 默认值补全漏洞。
+   - `test_reviewer_schema_adversarial_rejections` 对抗测试覆盖普通文本、残缺 JSON、身份不匹配及 PASS 携带缺陷 4 类绕过场景。
+
+2. **[DEF-T0061-2] 真实 Invocation 提取与候选提交校验**：
+   - `_extract_real_invocation_id` 仅从 `AgentResult.host_invocation_id`、`partial_results`（支持 Mapping 类型）及 `handle.invocation_token` 提取真实标识，若无有效标识一律 Fail-Closed 阻断，彻底移除本地生成的 `inv_builder_*` 伪造 fallback。
+   - Builder 阶段完成后，校验 `candidate_commit` 必须为有效 40 位 SHA 且严格不同于 `baseline_commit`；若无新提交立即 Fail-Closed 终止。
+
+3. **[DEF-T0061-3] 权威看板状态机合法流转**：
+   - 废除直接调用 `OfflineBoardAdapter.update_record()` 绕过状态机的做法；Stage 4 必须通过调用 `scripts/transition_task.py` 执行合法的状态、角色（QA）、处理人（严经理）、结束时间与审计记录流转。
+   - 流转执行失败时直接捕获异常并返回 Fail-Closed 结果，严禁静默吞掉异常。
+
+4. **[DEF-T0061-4] 真实业务任务 E2E 完整生命周期闭环**：
+   - `scripts/run_runner_live_e2e.py` 重构为动态读取权威看板任务（`T0063`），通过 `load_task_execution_spec` 动态解析规范。
+   - 启用 `workspace_mode="branch"` 并在独立 Worktree 中执行真实调度，完整覆盖“读取权威任务 -> 隔离 Worktree -> Codex Builder -> Antigravity Reviewer -> Codex QA -> EvidenceGate 逐级核验 -> 经状态机转为已完成”全链条。
+
+5. **[DEF-T0061-5] 真实严格乐观并发版本校验**：
+   - `verify_optimistic_concurrency` 严格比对权威看板当前卡片状态是否等于 `status_at_read`，重新计算当前需求正文与验收标准文本的 SHA256 哈希比对 `acceptance_criteria_hash`，并校验 `task_version`；任何字段被并发篡改或变为终态时一律返回 `False` 阻断。
+   - `test_optimistic_concurrency_verification` 针对需求篡改、状态篡改和终态变更 3 类并发冲突场景进行对抗复现校验。
+
+6. **[DEF-T0061-6] Checkpoint 防路径逃逸与多项目命名空间隔离**：
+   - `_validate_task_id` 严格校验 `task_id` 匹配 `^T\d+$` 正则，彻底拒绝 `../escape` 目录遍历。
+   - `RunnerCheckpointStore` 与并发排他锁按 `project_id` 执行命名空间隔离（`<data_root>/runner_checkpoints/<project_id>/<task_id>.json` 与 `.lock_runner_<project_id>_<task_id>.lock`），防止跨项目同名任务串线或冲突。
+
+7. **[DEF-T0061-7] 权限门禁与 APPROVAL_REQUIRED 暂停/恢复路径**：
+   - 移除默认 `approval_policy="auto"`；当宿主抛出 `AgentNotSupportedError` 时，原子保存 Checkpoint 并将状态置为 `APPROVAL_REQUIRED`，记录具体审批原因。
+   - `scripts/run_task.py resume` 增加 `--approve` 参数，支持用户人工授权后无缝恢复执行。
+   - `test_permission_approval_required_pause_and_resume` 验证了权限拦截暂停与授权恢复的完整生命周期。
+
+8. **[DEF-T0061-8] QA 独立测试执行与结构化结果审计**：
+   - QA 阶段测试命令通过安全分词（`shlex.split`）执行，消除 `shell=True` 命令注入隐患。
+   - 强制比对 QA 执行前后的 Git 跟踪文件状态与 diff，确保 QA 过程对版本控制源码完全只读，任何代码改动立即 Fail-Closed 阻断。
+
+9. **[DEF-T0061-9] 格式与尾随空白修复**：
+   - 全仓库运行空白清理脚本，`git diff --check aa1defb` 退出码为 0，零尾随空白错误。
+
+### 修复后全量测试验证记录
+- **2F-PROD 定向单元与安全对抗测试**：`15 passed in 5.64s`
+- **全仓库全量回归测试**：`412 passed in 91.11s (100% 通过)`
+- **代码格式规范**：`git diff --check aa1defb` 退出码 0（Zero trailing whitespace）

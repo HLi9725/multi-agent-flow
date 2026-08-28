@@ -60,7 +60,7 @@ def record_audit_event(
         "delegated_by": delegated_by or "",
         "delegation_reason": delegation_reason or "",
     }
-    
+
     from _lib.core import file_lock
     lock_file = current_audit_file + ".lock"
     for attempt in range(1, 4):

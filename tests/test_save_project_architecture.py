@@ -45,10 +45,10 @@ def test_save_architecture_config_and_assertions(tmp_path, monkeypatch):
     test_user_data = tmp_path / "user_data"
     test_user_data.mkdir()
     (tmp_path / ".agents").mkdir()
-    
+
     # 模拟 paths
     monkeypatch.setenv("YY_FLOW_PROJECT_ROOT", str(tmp_path))
-    
+
     arch_data = {
         "project": {"name": "sample-project", "version": "0.1.0", "app_type": "fullstack"},
         "tech_stack": {
@@ -64,14 +64,14 @@ def test_save_architecture_config_and_assertions(tmp_path, monkeypatch):
             "core_directories": {"src": "Core modules"}
         }
     }
-    
+
     success = save_architecture_config(arch_data)
     assert success is True
-    
+
     # 验证文件物理生成且 meta.initialized == True
     config_file = test_user_data / "project_architecture.config.yaml"
     assert config_file.exists()
-    
+
     with open(config_file, "r", encoding="utf-8") as f:
         saved = yaml.safe_load(f)
     assert saved["meta"]["initialized"] is True

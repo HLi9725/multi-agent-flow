@@ -45,7 +45,7 @@ def test_same_day_no_rotation(mock_audit_env):
     """同日日志写入后不应触发 daily rotation"""
     today_iso = datetime.now().isoformat()
     log_file = os.path.join(str(mock_audit_env), "audit_trail.log")
-    
+
     event = {
         "timestamp": today_iso,
         "task_id": "T0001",
@@ -74,7 +74,7 @@ def test_cross_day_rotation(mock_audit_env):
     yesterday_iso = yesterday.isoformat()
     yesterday_date = yesterday.strftime("%Y%m%d")
     log_file = os.path.join(str(mock_audit_env), "audit_trail.log")
-    
+
     event = {
         "timestamp": yesterday_iso,
         "task_id": "T0001",
@@ -105,7 +105,7 @@ def test_size_limit_rotation(mock_audit_env):
     """超容文件应触发 size_limit 归档"""
     today_iso = datetime.now().isoformat()
     log_file = os.path.join(str(mock_audit_env), "audit_trail.log")
-    
+
     with open(log_file, "w", encoding="utf-8") as f:
         event = {"timestamp": today_iso, "task_id": "T0002", "payload": "x" * 1024}
         for _ in range(100):

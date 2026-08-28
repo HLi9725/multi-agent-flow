@@ -76,7 +76,12 @@ def cmd_resume(args):
     authority_root = os.path.realpath(args.authority_root) if args.authority_root else None
 
     runner = ProductionRunner()
-    result = runner.resume(project_root=project_root, task_id=args.task_id, authority_root=authority_root)
+    result = runner.resume(
+        project_root=project_root,
+        task_id=args.task_id,
+        authority_root=authority_root,
+        pre_granted_approval=getattr(args, "approve", False),
+    )
     print(json.dumps(result.to_dict(), indent=2, ensure_ascii=False))
     return 0 if result.success else 1
 
@@ -122,6 +127,7 @@ def main():
     p_resume.add_argument("--task-id", required=True, help="Task ID")
     p_resume.add_argument("--project-root", default=".", help="Project root directory")
     p_resume.add_argument("--authority-root", default=None, help="Authoritative board root directory")
+    p_resume.add_argument("--approve", action="store_true", help="Grant permission approval if task was paused at APPROVAL_REQUIRED")
     p_resume.set_defaults(func=cmd_resume)
 
     # cancel

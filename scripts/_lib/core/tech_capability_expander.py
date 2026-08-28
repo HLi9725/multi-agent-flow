@@ -15,12 +15,12 @@ def expand_expert_capabilities(arch_data: Dict[str, Any]) -> Dict[str, List[str]
         return {}
 
     tech = arch_data.get("tech_stack", {}) or {}
-    
+
     # 1. 规范化提取各技术维度
     langs = [l.get("name", "") if isinstance(l, dict) else str(l) for l in tech.get("languages", [])]
     langs_lower = [l.lower() for l in langs]
     primary_lang = langs[0] if langs else "通用语言"
-    
+
     # 后端框架与技术提取 (兼容老版本 frameworks 与新版本 backend_frameworks)
     backend_fws = []
     if "backend_frameworks" in tech and isinstance(tech["backend_frameworks"], list):
@@ -32,7 +32,7 @@ def expand_expert_capabilities(arch_data: Dict[str, Any]) -> Dict[str, List[str]
             if not any(k in fw_name.lower() for k in ["react", "vue", "next", "nuxt", "svelte", "html", "css"]):
                 backend_fws.append(fw_name)
     backend_lower = [f.lower() for f in backend_fws]
-    
+
     # 前端框架与技术提取
     frontend_fws = []
     if "frontend_frameworks" in tech and isinstance(tech["frontend_frameworks"], list):
@@ -53,11 +53,11 @@ def expand_expert_capabilities(arch_data: Dict[str, Any]) -> Dict[str, List[str]
     testing = tech.get("testing", {}) or {}
     test_fw = testing.get("framework", "")
     test_lower = test_fw.lower()
-    
+
     # 存储与向量检索
     storage_list = [s.get("name", "") if isinstance(s, dict) else str(s) for s in tech.get("databases_and_storage", [])]
     storage_lower = [s.lower() for s in storage_list]
-    
+
     # 安全与沙箱
     security_list = [s.get("name", "") if isinstance(s, dict) else str(s) for s in tech.get("security_and_sandbox", [])]
     security_lower = [s.lower() for s in security_list]
@@ -70,7 +70,7 @@ def expand_expert_capabilities(arch_data: Dict[str, Any]) -> Dict[str, List[str]
     # =========================================================================
     # 2. 动态生成各专家专属能力 (3~5 项)
     # =========================================================================
-    
+
     capabilities: Dict[str, List[str]] = {}
 
     # --- 1. 李开发 (flow-dev) ---

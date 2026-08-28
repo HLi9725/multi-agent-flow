@@ -104,7 +104,7 @@ def save_architecture_config(arch_dict: dict) -> bool:
         "flow-pm", "flow-architect", "flow-dev", "flow-frontend",
         "flow-reviewer", "flow-qa", "flow-docs", "flow-devops"
     ]
-    
+
     candidate_patterns = [
         os.path.join(project_root, ".agents", "agents", "{r}", "agent.md"),
         os.path.join(project_root, ".agents", "agents", "{r}.md"),
@@ -161,7 +161,7 @@ def main():
         config_path = _paths.arch_config_path()
         template_path = os.path.join(_paths.skill_root(), "config", "project_architecture.template.yaml")
         base_path = config_path if os.path.exists(config_path) else template_path
-        
+
         with open(base_path, "r", encoding="utf-8") as f:
             arch_data = yaml.safe_load(f) or {}
 

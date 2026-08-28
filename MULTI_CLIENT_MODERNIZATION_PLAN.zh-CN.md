@@ -12,9 +12,9 @@ tags: [多客户端, 多Agent, 可信化, 实施计划]
 # Multi-Agent Flow 多客户端可信化与生态改造实施方案
 
 > 文档状态：第一阶段已验收冻结；第二阶段基础设施（2A～2F-LIVE）已验收，但因缺少通用生产 Runner 重新开启 2F-PROD；第三阶段尚未批准
-> 适用仓库：`YuanYii/multi-agent-flow`  
-> 目标客户端：ChatGPT、OpenAI Codex、Google Antigravity  
-> 制定日期：2026-08-24  
+> 适用仓库：`YuanYii/multi-agent-flow`
+> 目标客户端：ChatGPT、OpenAI Codex、Google Antigravity
+> 制定日期：2026-08-24
 > 实施原则：先可信、再真实多 Agent、再降复杂度、最后扩生态
 
 ## 1. 文档目的

@@ -58,7 +58,7 @@ def build_context(role: str, action: str = "general") -> str:
         context_output.append(f"- **身份名称**: {role_data.get('name')}")
         context_output.append(f"- **并发上限**: {max_parallel}")
         context_output.append(f"- **允许自领取**: {can_claim}")
-        
+
         tech = role_data.get("tech_stack", {})
         if tech:
             context_output.append(f"- **技术栈绑定**: {tech}")

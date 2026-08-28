@@ -232,14 +232,14 @@ class TestAutoChains:
         import os
         def get_tree(p):
             return {os.path.relpath(os.path.join(r, f), p) for r, d, files in os.walk(p) for f in files}
-        
+
         tree_before = get_tree(str(env["tmp"]))
         r = run(env, "auto_task.py", "--task-name", "模拟任务", "--simulate")
         tree_after = get_tree(str(env["tmp"]))
-        
+
         # Should have exactly the same files
         assert tree_before == tree_after
-        
+
         assert cards(env) == []
         assert "DRY-RUN" in r.stderr or "SIMULATE" in r.stdout
 
@@ -254,22 +254,22 @@ class TestAutoResume:
             "--task-name", "独立续跑任务", "--assignee", "李开发", "--no-dup-check")
         tid = "T0100"
         set_status_direct(env, tid, pre)
-        
+
         board_before = env["board"].read_bytes() if env["board"].exists() else b""
         r = run(env, "auto_task.py", "--task-id", tid, "--type", "A")
         board_after = env["board"].read_bytes() if env["board"].exists() else b""
-        
+
         assert board_before == board_after
         assert "DRY-RUN" in r.stderr or "SIMULATE" in r.stdout
 
     def test_idempotent_accepted(self, env):
         run(env, "transition_task.py", "--role", "PM", "--create", "--task-name", "幂等任务", "--assignee", "DEV", "--type", "A")
         set_status_direct(env, "T0001", "已验收")
-        
+
         board_before = env["board"].read_bytes() if env["board"].exists() else b""
         r = run(env, "auto_task.py", "--task-id", "T0001", "--type", "A")
         board_after = env["board"].read_bytes() if env["board"].exists() else b""
-        
+
         assert board_before == board_after
         assert "生命周期已结束" in r.stdout
 
@@ -389,7 +389,7 @@ class TestTaskTiers:
         run(env, "auto_task.py", "--task-name", "文档更新检查", "--role", "DOCS", "--type", "C")
         c = find(env, "T0001")
         assert c is None
-        
+
 
     def test_l2_a_chain_has_review_test(self, env):
         """L2 标准任务走全链：必须经历审查中与测试中。"""

@@ -182,7 +182,7 @@ class TestYyFlowLayout:
         real_skill = tmp_path / ".yy-flow" / "skill"
         real_scripts = real_skill / "scripts"
         real_scripts.mkdir(parents=True)
-        
+
         # 创建符号链接 .agents/skills/yy-flow -> ../../.yy-flow/skill
         symlink_dir = tmp_path / ".agents" / "skills"
         symlink_dir.mkdir(parents=True)
@@ -201,7 +201,7 @@ class TestYyFlowLayout:
         symlinked_script = symlink_path / "scripts" / "paths.py"
         real_script_dir = os.path.dirname(os.path.realpath(str(symlinked_script)))
         assert real_script_dir == str(real_scripts)
-        
+
         # 验证推导出的数据根为 .yy-flow
         real_skill_root = os.path.abspath(os.path.join(real_script_dir, ".."))
         assert os.path.basename(os.path.dirname(real_skill_root)) == ".yy-flow"

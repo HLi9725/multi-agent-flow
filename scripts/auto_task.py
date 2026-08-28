@@ -138,7 +138,7 @@ def main():
     if args.run:
         print("[FAILED] 第二阶段 Host Adapter 完成前，真实执行 --run 功能暂不可用。")
         sys.exit(1)
-    
+
     # 强制开启 simulate
     args.simulate = True
 

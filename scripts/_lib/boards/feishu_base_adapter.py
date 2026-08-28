@@ -133,6 +133,6 @@ class FeishuBaseAdapter:
         existing_remarks = ""
         if rec and "fields" in rec:
             existing_remarks = rec["fields"].get(remarks_field_name, "") or ""
-        
+
         combined = f"{existing_remarks}\n\n{new_text}".strip() if existing_remarks else new_text
         return self.update_record(record_id, {remarks_field_name: combined})

@@ -1032,18 +1032,18 @@ class KanbanHTTPRequestHandler(SimpleHTTPRequestHandler):
         m_restore = re.match(r"^/api/(?:tasks|cards)/([A-Za-z0-9_\-]+)/restore$", path)
         if m_restore:
             task_id = m_restore.group(1)
-            
+
             def _mutate_restore(cards):
                 card = next((c for c in cards if c.get("id") == task_id), None)
                 if not card:
                     return False, 404, f"未找到任务 [{task_id}]", None
                 if not card.get("is_deleted"):
                     return True, 200, f"任务 {task_id} 并不在回收站中", {"id": task_id, "restored": 0}
-                
+
                 card["is_deleted"] = False
                 card["restored_at"] = datetime.now().isoformat()
                 card["restored_by"] = get_default_operator()
-                
+
                 append_audit_log(task_id, "PM", "已删除", card.get("status", "未知"), get_default_operator(), f"恢复任务: {task_id}")
                 return True, 200, f"成功恢复任务 {task_id}", {"id": task_id, "restored": 1, "card": card}
 

@@ -1,14 +1,22 @@
 # -*- coding: utf-8 -*-
 """
 tests/test_task_spec_loader.py
-TaskSpecLoader 单元测试与边界校验。
+TaskSpecLoader 单元测试与乐观并发对抗校验 (DEF-T0061-5)。
 """
-import os
+import hashlib
 import json
+import os
 import pytest
 import tempfile
 import yaml
 
+import sys
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SCRIPTS = os.path.join(REPO_ROOT, "scripts")
+if SCRIPTS not in sys.path:
+    sys.path.insert(0, SCRIPTS)
+
+from scripts._lib.boards.offline_board_adapter import OfflineBoardAdapter
 from scripts._lib.core.runner_schema import TaskExecutionSpec
 from scripts._lib.core.task_spec_loader import (
     load_task_execution_spec,
@@ -55,7 +63,8 @@ def mock_project_environment(tmp_path):
             "assignee": "李开发",
             "owner": "李开发",
             "handler": "李开发",
-            "process": "需求: 支持 OAuth2 登录与 Token 刷新。验收标准: 单元测试覆盖率达到 100%。",
+            "process": "需求: 支持 OAuth2 登录。验收标准: 单元测试覆盖率达到 100%。",
+            "updated_at": "1787890000",
         },
         {
             "id": "T0002",
@@ -65,6 +74,7 @@ def mock_project_environment(tmp_path):
             "owner": "李开发",
             "handler": "严经理",
             "process": "已终态验收",
+            "updated_at": "1787890000",
         },
         {
             "id": "T0003",
@@ -74,6 +84,7 @@ def mock_project_environment(tmp_path):
             "owner": "李开发",
             "handler": "严经理",
             "process": "废弃",
+            "updated_at": "1787890000",
         }
     ]
     with open(user_data_dir / "board.json", "w", encoding="utf-8") as f:
@@ -120,3 +131,33 @@ def test_load_invalid_task_id_format(mock_project_environment):
             task_id="INVALID_TASK",
             authority_root=str(mock_project_environment),
         )
+
+
+def test_optimistic_concurrency_verification(mock_project_environment):
+    spec = load_task_execution_spec(
+        project_root=str(mock_project_environment),
+        task_id="T0001",
+        authority_root=str(mock_project_environment),
+    )
+    board_file = str(mock_project_environment / "user_data" / "board.json")
+    adapter = OfflineBoardAdapter(board_file=board_file)
+
+    # 1. 正常未篡改时应通过
+    assert verify_optimistic_concurrency(spec, adapter) is True
+
+    # 2. 对抗复现：任务内容或验收标准在外部被修改 -> 应识别并发冲突返回 False
+    with open(board_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    data[0]["process"] = "篡改后的需求: 增加 SAML 支持。验收标准: 不同的验收标准。"
+    with open(board_file, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+
+    assert verify_optimistic_concurrency(spec, adapter) is False
+
+    # 3. 对抗复现：状态在外部被转变为终态已验收 -> 应返回 False
+    data[0]["process"] = "需求: 支持 OAuth2 登录。验收标准: 单元测试覆盖率达到 100%。"
+    data[0]["status"] = "已验收"
+    with open(board_file, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+
+    assert verify_optimistic_concurrency(spec, adapter) is False

@@ -79,7 +79,7 @@
   - 7abc269 feat: default kanban server to 127.0.0.1 (7.2)
   - 2ebe949 fix: add typing imports for Any, Optional (7.1)
 - git diff --stat: `git diff 43156b0` 显示 20 files changed, 1997 insertions(+), 150 deletions(-).
-- 最终 git status: 
+- 最终 git status:
   - clean
 
 ## 9. 已知问题与风险
