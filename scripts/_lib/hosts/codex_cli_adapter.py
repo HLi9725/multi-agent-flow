@@ -147,7 +147,7 @@ class CodexCliAdapter(BaseHostAdapter):
         role = (request.role or "").upper().strip()
         requested_sandbox = None
         if isinstance(request.extra_context, Mapping):
-            requested_sandbox = request.extra_context.get("sandbox_mode")
+            requested_sandbox = request.extra_context.get("sandbox_mode") or request.extra_context.get("sandbox")
 
         if requested_sandbox is not None:
             if requested_sandbox not in ALLOWED_SANDBOX_MODES:
@@ -276,7 +276,7 @@ class CodexCliAdapter(BaseHostAdapter):
                     cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
-                    stdin=subprocess.PIPE,
+                    stdin=subprocess.DEVNULL,
                     text=True,
                     encoding="utf-8",
                     errors="replace",

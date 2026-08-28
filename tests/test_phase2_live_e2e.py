@@ -396,3 +396,303 @@ def test_user_acceptance_cannot_auto_complete(tmp_path):
     )
     with pytest.raises(OrchestrationStateError, match="expected PENDING_USER_ACCEPTANCE"):
         orchestrator.confirm_user_acceptance(valid_dec)
+
+
+def test_reviewer_reject_reverts_to_building_without_qa_or_acceptance(tmp_path, monkeypatch):
+    """Adversarial test: when Reviewer detects defects or rejects, pipeline must transition to BUILDING and not advance to QA or acceptance."""
+    def mock_detect():
+        return (r"C:\fake\agy.exe", "1.1.22", "status=authenticated; Live session active and responsive (status=SUCCESS).")
+
+    monkeypatch.setattr("scripts.run_phase2_live_e2e.detect_antigravity_cli", mock_detect)
+
+    def mock_dispatch(self, req):
+        handle = AgentHandle(
+            session_id=req.session_id,
+            host_id="antigravity",
+            status="running",
+            is_real_host=True,
+            adapter_instance_id=self._instance_id,
+            invocation_token="tok_ag_live_mock_123",
+        )
+        with self._lock:
+            self._running_sessions[req.session_id] = {
+                "handle": handle,
+                "request": req,
+                "invocation_id": "inv_reviewer_exec_1",
+                "conversation_id": "conv_9d8755b1_live",
+                "completed": False,
+            }
+        return handle
+
+    def mock_wait(self, handle, timeout_seconds=None):
+        with self._lock:
+            data = self._running_sessions.pop(handle.session_id, {})
+            data["conversation_id"] = "conv_9d8755b1_live"
+            data["invocation_id"] = "conv_9d8755b1_live:step_1"
+            data["completed"] = True
+            result = AgentResult(
+                session_id=handle.session_id,
+                status=AgentStatus.SUCCESS,
+                output="REJECT: Defect detected in pure_add boundary checking.",
+                is_real_host=True,
+            )
+            data["result"] = result
+            self._session_history[handle.session_id] = data
+        return result
+
+    monkeypatch.setattr(AntigravityAdapter, "dispatch_agent", mock_dispatch)
+    monkeypatch.setattr(AntigravityAdapter, "wait_for_result", mock_wait)
+
+    def mock_codex_dispatch(self, req):
+        handle = AgentHandle(
+            session_id=req.session_id,
+            host_id="codex_cli",
+            status="running",
+            is_real_host=True,
+            adapter_instance_id=self._instance_id,
+            invocation_token=f"tok-{req.role.lower()}",
+        )
+        with self._lock:
+            self._running_sessions[req.session_id] = {
+                "handle": handle,
+                "request": req,
+                "thread_id": None,
+                "invocation_id": None,
+                "completed": False,
+            }
+        return handle
+
+    def mock_codex_wait(self, handle, timeout_seconds=None):
+        with self._lock:
+            data = self._running_sessions.pop(handle.session_id)
+            role = data["request"].role.lower()
+            data["thread_id"] = f"thread-{role}-real"
+            data["invocation_id"] = f"item-{role}-real"
+            data["completed"] = True
+            data["result"] = AgentResult(
+                session_id=handle.session_id,
+                status=AgentStatus.SUCCESS,
+                output=f"{role} completed",
+                is_real_host=True,
+            )
+            self._session_history[handle.session_id] = data
+            return data["result"]
+
+    monkeypatch.setattr(CodexCliAdapter, "dispatch_agent", mock_codex_dispatch)
+    monkeypatch.setattr(CodexCliAdapter, "wait_for_result", mock_codex_wait)
+
+    def approve(adapter, request):
+        adapter.record_permission_approval(
+            project_id="test-project",
+            auth_context="auth_ctx_live_builder",
+            session_id=request.session_id,
+            workspace_dir=request.workspace_dir,
+            command_family="safe_local:REVIEWER",
+            permission_boundary="workspace_read",
+        )
+
+    res = run_phase2_live_e2e_pipeline(
+        str(tmp_path),
+        permission_approval_hook=approve,
+        project_id="test-project",
+        baseline_commit="a" * 40,
+        candidate_commit="b" * 40,
+    )
+
+    assert res.success is False
+    assert res.is_blocked is False
+    assert res.verification_level_by_os["windows"] == "static_only"
+    assert res.dual_host_l2_result["status"] == "NOT_READY"
+    assert res.dual_host_l2_result["state_reached"] == "REJECTED_BY_REVIEWER"
+    assert "Reviewer rejected candidate" in res.diagnostics
+
+
+def test_pytest_failure_rejects_to_building_without_user_acceptance(tmp_path, monkeypatch):
+    """Adversarial test: when pytest fails in QA, pipeline must reject to BUILDING and not advance to user acceptance."""
+    def mock_detect():
+        return (r"C:\fake\agy.exe", "1.1.22", "status=authenticated; Live session active and responsive (status=SUCCESS).")
+
+    monkeypatch.setattr("scripts.run_phase2_live_e2e.detect_antigravity_cli", mock_detect)
+
+    def mock_dispatch(self, req):
+        handle = AgentHandle(
+            session_id=req.session_id,
+            host_id="antigravity",
+            status="running",
+            is_real_host=True,
+            adapter_instance_id=self._instance_id,
+            invocation_token="tok_ag_live_mock_123",
+        )
+        with self._lock:
+            self._running_sessions[req.session_id] = {
+                "handle": handle,
+                "request": req,
+                "invocation_id": "inv_reviewer_exec_1",
+                "conversation_id": "conv_9d8755b1_live",
+                "completed": False,
+            }
+        return handle
+
+    def mock_wait(self, handle, timeout_seconds=None):
+        with self._lock:
+            data = self._running_sessions.pop(handle.session_id, {})
+            data["conversation_id"] = "conv_9d8755b1_live"
+            data["invocation_id"] = "conv_9d8755b1_live:step_1"
+            data["completed"] = True
+            result = AgentResult(
+                session_id=handle.session_id,
+                status=AgentStatus.SUCCESS,
+                output="PASS: pure_add is verified as a pure function.",
+                is_real_host=True,
+            )
+            data["result"] = result
+            self._session_history[handle.session_id] = data
+        return result
+
+    monkeypatch.setattr(AntigravityAdapter, "dispatch_agent", mock_dispatch)
+    monkeypatch.setattr(AntigravityAdapter, "wait_for_result", mock_wait)
+
+    def mock_codex_dispatch(self, req):
+        handle = AgentHandle(
+            session_id=req.session_id,
+            host_id="codex_cli",
+            status="running",
+            is_real_host=True,
+            adapter_instance_id=self._instance_id,
+            invocation_token=f"tok-{req.role.lower()}",
+        )
+        with self._lock:
+            self._running_sessions[req.session_id] = {
+                "handle": handle,
+                "request": req,
+                "thread_id": None,
+                "invocation_id": None,
+                "completed": False,
+            }
+        return handle
+
+    def mock_codex_wait(self, handle, timeout_seconds=None):
+        with self._lock:
+            data = self._running_sessions.pop(handle.session_id)
+            role = data["request"].role.lower()
+            data["thread_id"] = f"thread-{role}-real"
+            data["invocation_id"] = f"item-{role}-real"
+            data["completed"] = True
+            data["result"] = AgentResult(
+                session_id=handle.session_id,
+                status=AgentStatus.SUCCESS,
+                output=f"{role} completed",
+                is_real_host=True,
+            )
+            self._session_history[handle.session_id] = data
+            return data["result"]
+
+    monkeypatch.setattr(CodexCliAdapter, "dispatch_agent", mock_codex_dispatch)
+    monkeypatch.setattr(CodexCliAdapter, "wait_for_result", mock_codex_wait)
+
+    # Mock subprocess.run for pytest to simulate test failure
+    orig_run = subprocess.run
+    def mock_failing_pytest(cmd, *args, **kwargs):
+        if isinstance(cmd, list) and "pytest" in cmd:
+            class MockProc:
+                returncode = 1
+                stdout = "FAILED tests/fixtures/test_fixture_math_util.py::test_pure_add"
+                stderr = ""
+            return MockProc()
+        return orig_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", mock_failing_pytest)
+
+    def approve(adapter, request):
+        adapter.record_permission_approval(
+            project_id="test-project",
+            auth_context="auth_ctx_live_builder",
+            session_id=request.session_id,
+            workspace_dir=request.workspace_dir,
+            command_family="safe_local:REVIEWER",
+            permission_boundary="workspace_read",
+        )
+
+    res = run_phase2_live_e2e_pipeline(
+        str(tmp_path),
+        permission_approval_hook=approve,
+        project_id="test-project",
+        baseline_commit="a" * 40,
+        candidate_commit="b" * 40,
+    )
+
+    assert res.success is False
+    assert res.is_blocked is False
+    assert res.dual_host_l2_result["status"] == "NOT_READY"
+    assert res.dual_host_l2_result["state_reached"] == "REJECTED_BY_QA"
+    assert res.qa_real_test_summary["exit_code"] == 1
+    assert res.qa_real_test_summary["failed"] == 1
+    assert "QA pytest failed" in res.diagnostics
+
+
+def test_fake_or_unverified_evidence_rejected_on_promotion(tmp_path):
+    """Adversarial test: non-existent or forged evidence must be rejected on promote_after_verified_evidence."""
+    store_dir = str(tmp_path / "evi_store")
+    os.makedirs(store_dir, exist_ok=True)
+    store = EvidenceStore(root_dir=store_dir)
+    gate = EvidenceGate(store=store, project_root=str(tmp_path))
+
+    adapter = AntigravityAdapter(is_real_host=True, verification_level=VerificationLevel.STATIC_ONLY)
+
+    # 1. Non-existent evidence ID rejected
+    with pytest.raises(AgentNotSupportedError, match="Evidence store validation failed"):
+        adapter.promote_after_verified_evidence(
+            "evi_non_existent_999",
+            host_session_id="sess_fake",
+            host_invocation_id="sess_fake:step_1",
+            store=store,
+            gate=gate,
+        )
+
+    # 2. Empty evidence ref rejected
+    with pytest.raises(ValueError, match="evidence_ref must be non-empty"):
+        adapter.promote_after_verified_evidence(
+            "",
+            host_session_id="sess_1",
+            host_invocation_id="sess_1:step_1",
+            store=store,
+            gate=gate,
+        )
+
+
+def test_builder_missing_artifacts_fails_closed(tmp_path, monkeypatch):
+    """Adversarial test: if Builder dispatch fails to create or verify valid fixture files, fail-closed occurs."""
+    def mock_detect():
+        return (r"C:\fake\agy.exe", "1.1.22", "status=authenticated; Live session active and responsive (status=SUCCESS).")
+
+    monkeypatch.setattr("scripts.run_phase2_live_e2e.detect_antigravity_cli", mock_detect)
+
+    def mock_failing_codex_dispatch(self, req):
+        handle = AgentHandle(
+            session_id=req.session_id,
+            host_id="codex_cli",
+            status="failed",
+            is_real_host=True,
+            adapter_instance_id=self._instance_id,
+            invocation_token="tok_builder_fail",
+        )
+        return handle
+
+    def mock_failing_codex_wait(self, handle, timeout_seconds=None):
+        return AgentResult(
+            session_id=handle.session_id,
+            status=AgentStatus.FAILED,
+            output="Builder crashed, no artifacts produced",
+            is_real_host=True,
+        )
+
+    monkeypatch.setattr(CodexCliAdapter, "dispatch_agent", mock_failing_codex_dispatch)
+    monkeypatch.setattr(CodexCliAdapter, "wait_for_result", mock_failing_codex_wait)
+
+    with pytest.raises(RuntimeError, match="Real Codex Builder dispatch did not complete successfully"):
+        run_phase2_live_e2e_pipeline(
+            str(tmp_path),
+            project_id="test-project",
+            baseline_commit="a" * 40,
+            candidate_commit="b" * 40,
+        )

@@ -683,14 +683,32 @@ class AntigravityAdapter(BaseHostAdapter):
         *,
         host_session_id: str,
         host_invocation_id: str,
+        store: Optional[Any] = None,
+        gate: Optional[Any] = None,
     ) -> None:
-        """Promote only when evidence names one completed canonical real session."""
+        """Promote only when evidence exists in store, is verified, and names one completed canonical real session."""
         if not isinstance(evidence_ref, str) or not evidence_ref.strip():
             raise ValueError("evidence_ref must be non-empty")
         if not isinstance(host_session_id, str) or not host_session_id.strip():
             raise ValueError("host_session_id must be non-empty")
         if not isinstance(host_invocation_id, str) or not host_invocation_id.strip():
             raise ValueError("host_invocation_id must be non-empty")
+
+        # If store is provided, verify evidence record directly
+        if store is not None:
+            try:
+                record = store.read(evidence_ref.strip())
+                if not record or not record.metadata:
+                    raise AgentNotSupportedError(f"Evidence '{evidence_ref}' not found in store")
+                if not record.metadata.is_real_host:
+                    raise AgentNotSupportedError(f"Evidence '{evidence_ref}' is not a real host evidence")
+                if record.metadata.host_session_id != host_session_id.strip():
+                    raise AgentNotSupportedError(f"Evidence '{evidence_ref}' session mismatch")
+                if record.metadata.host_invocation_id != host_invocation_id.strip():
+                    raise AgentNotSupportedError(f"Evidence '{evidence_ref}' invocation mismatch")
+            except Exception as e:
+                raise AgentNotSupportedError(f"Evidence store validation failed for '{evidence_ref}': {e}") from e
+
         with self._lock:
             data = self._session_history.get(host_session_id.strip())
             has_identity_chain = bool(

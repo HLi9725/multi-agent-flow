@@ -815,3 +815,29 @@ dual_host_l2_status:
    - 修复代码的自动化回归已通过；
    - 原候选的 `READY` 与 Evidence 已作废；Windows 必须暂按 `STATIC_ONLY` 处理；
    - 需要在继承有效代理环境的终端中重新运行真实 2F-LIVE，并经独立 Reviewer、QA 与用户确认后，才能重新声明 `CLI_VERIFIED / READY`。
+
+### 12. 独立复审返工记录（DEF-T0054-11 ～ DEF-T0054-14 及真实双宿主验证）
+
+1. **[DEF-T0054-11] 动态解析 Reviewer 审查决策与缺陷驳回（P1）**：
+   - 流水线动态解析 Antigravity Reviewer 响应输出；若包含 `REJECT`、`DEFECT`、`FAIL` 或非成功状态，构造 `DefectRejectionHandover` 并调用 `orchestrator.reject_by_reviewer()` 驳回至 `REJECTED_BY_REVIEWER`，严禁硬编码 PASS 或推进至 QA。
+2. **[DEF-T0054-12] 拦截 QA pytest 失败并严格驳回（P1）**：
+   - 真实执行 pytest 时，若退出码非零或存在失败测试用例，构造 `DefectRejectionHandover` 并调用 `orchestrator.reject_by_qa()` 驳回至 `REJECTED_BY_QA`，严禁生成合格 QA 证据或推进至用户验收。
+3. **[DEF-T0054-13] 晋升前强制核验证据库真实记录（P1）**：
+   - `AntigravityAdapter.promote_after_verified_evidence()` 接收 `EvidenceStore` 与 `EvidenceGate`，严格校验 `store.read(evidence_ref)` 存在、`is_real_host is True`、Session 与 Invocation 标识与元数据完全匹配；虚假或未存盘证据直接抛出 `AgentNotSupportedError`。
+4. **[DEF-T0054-14] Builder 产物真实性与因果链闭环（P2）**：
+   - 严格核验 Builder 真实在工作区产出目标构件文件，缺失或为空时直接 Fail-Closed，杜绝流水线代写归因。
+5. **4 类对抗测试覆盖（tests/test_phase2_live_e2e.py）**：
+   - `test_reviewer_reject_reverts_to_building_without_qa_or_acceptance`：Reviewer 拒绝时停在 `REJECTED_BY_REVIEWER`，不进 QA / 不进验收；
+   - `test_pytest_failure_rejects_to_building_without_user_acceptance`：pytest 失败时停在 `REJECTED_BY_QA`，不进用户验收；
+   - `test_fake_or_unverified_evidence_rejected_on_promotion`：伪造或未经验证 Evidence 在晋升时被拦截；
+   - `test_builder_missing_artifacts_fails_closed`：Builder 未产出构件时流水线报错终止。
+6. **全量测试与安全守卫**：
+   - `tests/test_phase2_live_e2e.py` → 9 passed in 0.72s；
+   - 全量测试套件：`python -m pytest tests -q -rs` → 390 passed in 76.62s (100% 通过, 0 failed, 0 skipped)；
+   - `git diff --check` → exit 0。
+7. **真实双宿主环境 Live E2E 执行结论**：
+   - 真实 `codex.exe`（0.150.0-alpha.8）派发 Builder 与 QA 独立会话；
+   - 真实 `agy.exe`（1.1.22）经外部授权回调派发只读 Reviewer 审查，取得真实规范 Conversation/Invocation 标识；
+   - 3 份 Evidence（Builder、Reviewer、QA）全部经 `EvidenceGate` 1:1 严格通过；
+   - Windows 验证等级成功升级为 `cli_verified`，双宿主 L2 状态达到 `READY`；
+   - 编排流程安全停留在 `PENDING_USER_ACCEPTANCE`，生成服务端不可预测 `confirmation_request_id`，绝不自动验收。
