@@ -27,7 +27,7 @@ tags: [多客户端, 多Agent, 可信化, 实施计划]
 4. 全局安装能力、按项目隔离数据，不在不同项目间串任务；
 5. 后续可通过远程 MCP Server 和 Plugin/App 接入 ChatGPT Web、Codex、Antigravity及外部系统。
 
-本文是实施依据，不代表所有阶段已经完成。第一阶段已于 2026-08-24 经用户明确验收并冻结；第二阶段（2A～2F）已于 2026-08-28 完成受控合流、全量回归与用户终态验收（T0054 已验收），最终产品代码候选固定为 `f8c04e220c7281b7c696cd770a4001d0b3b1bb0b`；Windows Codex 与 Antigravity 验证等级为 `cli_verified`，macOS/Linux 保持 `static_only`，真实双宿主 L2 达到 `READY`，Evidence 身份链（`evi_builder_1787884696`、`evi_reviewer_1787884725`、`evi_qa_1787884739`）经 EvidenceGate 3/3 PASS 校验。第三至第四阶段进入编码前仍需用户按批次确认，最终进入“已验收”状态必须再次由用户确认。当前禁止 Push、合并 main、Tag 或发布。
+本文是实施依据，不代表所有阶段已经完成。第一阶段已于 2026-08-24 经用户明确验收并冻结；第二阶段（2A～2F）已于 2026-08-28 完成受控合流、全量回归与用户终态验收（T0054、T0055 已验收），最终产品代码候选固定为 `f8c04e220c7281b7c696cd770a4001d0b3b1bb0b`；Windows Codex 与 Antigravity 验证等级为 `cli_verified`，macOS/Linux 保持 `static_only`，真实双宿主 L2 达到 `READY`，Evidence 身份链（`evi_builder_1787884696`、`evi_reviewer_1787884725`、`evi_qa_1787884739`）经 EvidenceGate 3/3 PASS 校验。第二阶段集成分支已通过 `--ff-only` 合入本地 `main`，合流后在 `main` 上独立复跑全量测试为 397 passed；尚未执行 Push、Tag 或 Release。第三至第四阶段进入编码前仍需用户按批次确认，最终进入“已验收”状态必须再次由用户确认。
 
 ## 2. 当前基线
 

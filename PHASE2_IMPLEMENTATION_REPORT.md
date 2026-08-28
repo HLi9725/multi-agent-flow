@@ -914,7 +914,18 @@ dual_host_l2_status:
 
 #### 3. 纪律与红线声明
 - 严禁且未执行 `git push`；
-- 严禁且未合并 `main` 分支；
+- DevOps 结项审查时尚未合并 `main`；此后已获得用户明确授权，并按下节记录完成本地 `main` 快进合流；
 - 严禁且未创建 Tag 或 Release；
 - 严禁且未删除任何 Worktree；
 - 未启动第三、第四阶段。
+
+### 15. 第二阶段本地主分支合流与用户验收记录
+
+- **终态验收任务**：`T0055` 已由用户明确验收；主分支合流任务 `T0059` 已完成并验收。
+- **本地 main 合流前 HEAD**：`b7c6506e8cfe9183b9c2b4d93a041e78e394bdb6`。
+- **第二阶段集成提交**：`ca48ec2a9fbed2876aa1831ae18266a144ec9cc1`，包含最终产品代码候选 `f8c04e220c7281b7c696cd770a4001d0b3b1bb0b` 及结项文档。
+- **合流命令**：`git merge --ff-only phase-2-real-agents`。
+- **合流结果**：本地 `main` 快进至 `ca48ec2`，无冲突、无额外 merge commit、工作区干净。
+- **合流后全量验证**：`python -m pytest tests -q -rs` → exit 0，`397 passed in 100.30s`，0 failed，0 skipped。
+- **格式检查**：`git diff --check` → exit 0。
+- **发布边界**：截至本记录，未执行 `git push`、Tag、Release，也未启动第三或第四阶段。
