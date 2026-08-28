@@ -1,17 +1,17 @@
 ---
 title: Multi-Agent Flow 多客户端可信化与生态改造实施方案
 module: multi-agent-flow
-stage: Phase-2
+stage: Phase-2 (Accepted & Merged) / Phase-3 & Phase-4 (Pending Approval)
 type: design-spec
-status: active
+status: Phase-1 & Phase-2 Accepted / Phase-3 & Phase-4 Pending Approval
 author: User / Codex
-updated_at: 2026-08-24
+updated_at: 2026-08-28
 tags: [多客户端, 多Agent, 可信化, 实施计划]
 ---
 
 # Multi-Agent Flow 多客户端可信化与生态改造实施方案
 
-> 文档状态：Active / 第一阶段已验收，第二阶段待分批批准
+> 文档状态：第一阶段已验收冻结，第二阶段（2A～2F）已完成受控合流与用户终态验收，第三阶段待分批批准
 > 适用仓库：`YuanYii/multi-agent-flow`  
 > 目标客户端：ChatGPT、OpenAI Codex、Google Antigravity  
 > 制定日期：2026-08-24  
@@ -27,7 +27,7 @@ tags: [多客户端, 多Agent, 可信化, 实施计划]
 4. 全局安装能力、按项目隔离数据，不在不同项目间串任务；
 5. 后续可通过远程 MCP Server 和 Plugin/App 接入 ChatGPT Web、Codex、Antigravity及外部系统。
 
-本文是实施依据，不代表所有阶段已经完成。第一阶段已于 2026-08-24 经用户明确验收并冻结；第二至第四阶段进入编码前仍需用户按批次确认，最终进入“已验收”状态必须再次由用户确认。
+本文是实施依据，不代表所有阶段已经完成。第一阶段已于 2026-08-24 经用户明确验收并冻结；第二阶段（2A～2F）已于 2026-08-28 完成受控合流、全量回归与用户终态验收（T0054 已验收），最终产品代码候选固定为 `f8c04e220c7281b7c696cd770a4001d0b3b1bb0b`；Windows Codex 与 Antigravity 验证等级为 `cli_verified`，macOS/Linux 保持 `static_only`，真实双宿主 L2 达到 `READY`，Evidence 身份链（`evi_builder_1787884696`、`evi_reviewer_1787884725`、`evi_qa_1787884739`）经 EvidenceGate 3/3 PASS 校验。第三至第四阶段进入编码前仍需用户按批次确认，最终进入“已验收”状态必须再次由用户确认。当前禁止 Push、合并 main、Tag 或发布。
 
 ## 2. 当前基线
 
@@ -1776,3 +1776,26 @@ PHASE2_IMPLEMENTATION_REPORT.md
 第二阶段 **2D-1** 可直接执行的统一基础批次合同与批准提示词见：
 
 `docs/D04-研发过程/D01-任务/Phase2-2D-1-通用Adapter基础设施实施任务书.md`
+### 7.7 第二阶段受控合流与结项结论 (2026-08-28)
+
+第二阶段（2A～2F）现已全面完成受控合流与用户终态验收：
+
+1. **子批次与工单全量验收**：
+   - 2A (T0020): Host 契约、纯只读能力探测、FakeHostAdapter（已验收冻结）；
+   - 2B (T0020): 证据存储、哈希链与 EvidenceGate 状态门禁（已验收冻结）；
+   - 2C (T0023): Worktree 隔离与 Git 操作封装（已验收冻结）；
+   - 2D-1 (T0050): 通用 Adapter Manifest、注册表与合规测试套件（已验收冻结）；
+   - 2D-2 (T0051): OpenAI Codex CLI 参考 Host Adapter（已验收冻结）；
+   - 2E (T0052): Google Antigravity 参考 Host Adapter（已验收冻结）；
+   - 2F (T0053): 独立多角色编排与会话隔离（已验收冻结）；
+   - 2F-LIVE (T0054): 真实 Codex + Antigravity 双宿主 E2E 验证（已验收冻结）。
+2. **产品代码候选与基线锁定**：
+   - 最终产品代码候选 SHA 固定为：`f8c04e220c7281b7c696cd770a4001d0b3b1bb0b`；
+   - Windows 平台 Codex 与 Antigravity 验证等级提升为 `cli_verified`；
+   - macOS / Linux 平台严格保持 `static_only`；
+   - 真实双宿主 L2 验证状态达到 `READY`；
+   - 真实 Evidence 身份链（`evi_builder_1787884696`、`evi_reviewer_1787884725`、`evi_qa_1787884739`）全部绑定候选 `f8c04e2`，并通过 `EvidenceGate` 3/3 严格强校验通过；
+   - 用户已明确终态验收 T0054。
+3. **合流方式与纪律红线**：
+   - 采用 `--ff-only` 将 `feature/phase2f-live-dual-host` 零分叉受控合流至 `phase-2-real-agents`；
+   - 严禁且未执行 `git push`、未合并至 `main` 分支、未创建 Tag 或 Release，未启动第三/第四阶段。

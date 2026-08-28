@@ -881,3 +881,40 @@ dual_host_l2_status:
    - 命令行摘要在 Reviewer/Builder 提前失败、QA 未运行时输出 `QA Real Pytest: not run`，不再因空报告触发 `KeyError`。
    - 候选 `1129eab256e26caaec79528214a258f1aada7310` 的首次真实复跑结果及两条 Evidence 因 Reviewer 自动拒绝而作废，不得用于准出；
    - 修复后带进程守卫定向测试 `53 passed in 3.15s`，完整回归 `397 passed in 101.90s`，均为 exit 0、0 failed、0 skipped；`git diff --check` exit 0。
+### 14. 第二阶段受控合流与结项报告（DevOps 结项）
+
+- **结项任务**: `T0055`（D 类 Git/DevOps 结项任务）
+- **执行人**: 吕改特 (DEVOPS)
+- **目标集成分支**: `phase-2-real-agents`
+- **来源分支**: `feature/phase2f-live-dual-host`
+- **最终产品代码候选**: `f8c04e220c7281b7c696cd770a4001d0b3b1bb0b`
+- **合流前集成分支 HEAD**: `37d43ef5e93f7d4cf1e45e12a5a215e23bb714f5`
+- **合流后集成分支 HEAD**: `f8c04e220c7281b7c696cd770a4001d0b3b1bb0b`
+- **合流方式**: `git merge --ff-only feature/phase2f-live-dual-host`（零分叉、零 cherry-pick、零无必要 merge commit）
+
+#### 1. 2A～2F 全生命周期验收总结
+| 子阶段 | 对应工单 | 核心交付内容 | 验收状态 | 最终验证等级 |
+| :--- | :--- | :--- | :--- | :--- |
+| **2A** | T0020 | Host 契约、零副作用探测、FakeHostAdapter | 已验收冻结 | `STATIC_ONLY` |
+| **2B** | T0020 | 证据存储、防篡改哈希与 EvidenceGate 门禁 | 已验收冻结 | `STATIC_ONLY` |
+| **2C** | T0023 | Worktree 隔离、安全路径与 Git 封装 | 已验收冻结 | `STATIC_ONLY` |
+| **2D-1** | T0050 | 通用 Adapter Manifest、注册表与合规套件 | 已验收冻结 | `STATIC_ONLY` |
+| **2D-2** | T0051 | OpenAI Codex CLI 参考 Host Adapter | 已验收冻结 | `CLI_VERIFIED` (Win) |
+| **2E** | T0052 | Google Antigravity 参考 Host Adapter | 已验收冻结 | `STATIC_ONLY` (Win) |
+| **2F** | T0053 | 独立多角色编排、会话隔离与状态机 | 已验收冻结 | `STATIC_ONLY` (Win) |
+| **2F-LIVE** | T0054 | 真实 Codex + Antigravity 双宿主 E2E 闭环 | 已验收冻结 | **`CLI_VERIFIED` (Win)** |
+
+#### 2. 真实 Evidence 身份链与双宿主 L2 闭环
+1. **最终候选与 Evidence 绑定**：
+   - 最终产品代码候选固定为 `f8c04e220c7281b7c696cd770a4001d0b3b1bb0b`；
+   - 真实 Builder Evidence (`evi_builder_1787884696`)、真实 Reviewer Evidence (`evi_reviewer_1787884725`)、真实 QA Evidence (`evi_qa_1787884739`) 全部绑定 `f8c04e2`，并通过 `EvidenceGate` 3/3 强校验通过；
+   - Windows 平台 Codex 与 Antigravity 验证等级提升为 `cli_verified`；macOS / Linux 平台严格保持 `static_only`；
+   - 真实双宿主 L2 状态达到 `READY`；
+   - 用户已明确终态验收 T0054。
+
+#### 3. 纪律与红线声明
+- 严禁且未执行 `git push`；
+- 严禁且未合并 `main` 分支；
+- 严禁且未创建 Tag 或 Release；
+- 严禁且未删除任何 Worktree；
+- 未启动第三、第四阶段。
