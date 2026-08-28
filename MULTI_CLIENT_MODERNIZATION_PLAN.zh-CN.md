@@ -1,9 +1,9 @@
 ---
 title: Multi-Agent Flow 多客户端可信化与生态改造实施方案
 module: multi-agent-flow
-stage: Phase-2 (Accepted & Merged) / Phase-3 & Phase-4 (Pending Approval)
+stage: Phase-2 (Reopened: 2F-PROD Pending) / Phase-3 & Phase-4 (Pending Approval)
 type: design-spec
-status: Phase-1 & Phase-2 Accepted / Phase-3 & Phase-4 Pending Approval
+status: Phase-1 Accepted / Phase-2 Infrastructure Accepted, 2F-PROD Pending / Phase-3 & Phase-4 Pending Approval
 author: User / Codex
 updated_at: 2026-08-28
 tags: [多客户端, 多Agent, 可信化, 实施计划]
@@ -11,7 +11,7 @@ tags: [多客户端, 多Agent, 可信化, 实施计划]
 
 # Multi-Agent Flow 多客户端可信化与生态改造实施方案
 
-> 文档状态：第一阶段已验收冻结，第二阶段（2A～2F）已完成受控合流与用户终态验收，第三阶段待分批批准
+> 文档状态：第一阶段已验收冻结；第二阶段基础设施（2A～2F-LIVE）已验收，但因缺少通用生产 Runner 重新开启 2F-PROD；第三阶段尚未批准
 > 适用仓库：`YuanYii/multi-agent-flow`  
 > 目标客户端：ChatGPT、OpenAI Codex、Google Antigravity  
 > 制定日期：2026-08-24  
@@ -27,7 +27,7 @@ tags: [多客户端, 多Agent, 可信化, 实施计划]
 4. 全局安装能力、按项目隔离数据，不在不同项目间串任务；
 5. 后续可通过远程 MCP Server 和 Plugin/App 接入 ChatGPT Web、Codex、Antigravity及外部系统。
 
-本文是实施依据，不代表所有阶段已经完成。第一阶段已于 2026-08-24 经用户明确验收并冻结；第二阶段（2A～2F）已于 2026-08-28 完成受控合流、全量回归与用户终态验收（T0054、T0055 已验收），最终产品代码候选固定为 `f8c04e220c7281b7c696cd770a4001d0b3b1bb0b`；Windows Codex 与 Antigravity 验证等级为 `cli_verified`，macOS/Linux 保持 `static_only`，真实双宿主 L2 达到 `READY`，Evidence 身份链（`evi_builder_1787884696`、`evi_reviewer_1787884725`、`evi_qa_1787884739`）经 EvidenceGate 3/3 PASS 校验。第二阶段集成分支已通过 `--ff-only` 合入本地 `main`，合流后在 `main` 上独立复跑全量测试为 397 passed；尚未执行 Push、Tag 或 Release。第三至第四阶段进入编码前仍需用户按批次确认，最终进入“已验收”状态必须再次由用户确认。
+本文是实施依据，不代表所有阶段已经完成。第一阶段已于 2026-08-24 经用户明确验收并冻结；第二阶段 2A～2F-LIVE 的基础设施已完成受控合流、全量回归与用户验收，产品代码候选为 `f8c04e220c7281b7c696cd770a4001d0b3b1bb0b`，Windows Codex 与 Antigravity 验证等级为 `cli_verified`，真实双宿主 L2 验证达到 `READY`。但复核发现现有 `Orchestrator` 仅为类库，`run_phase2_live_e2e.py` 是固定 T0054/fixture 的验收 Harness，旧 `auto_task.py` 又保持纯模拟，尚无可读取任意任务并持续执行 Builder → Reviewer → QA 的生产 Runner。因此第二阶段重新开启收尾批次 `2F-PROD`，在其独立 Reviewer、QA、真实任意任务 E2E 和用户验收完成前，第二阶段只能声明“基础设施已验收”，不得声明完整自动化产品已交付。第三至第四阶段仍未批准。
 
 ## 2. 当前基线
 
@@ -1201,6 +1201,29 @@ Codex 必须区分三条执行路线：
 
 第二阶段完整目标流程为：用户确认执行 → Builder 开发 → Reviewer 审核 → 有缺陷则自动退回并重新调度 Builder → Reviewer 复审 → QA 测试 → 等待用户最终验收。自动调度不等于自动验收；破坏性操作、外部发布、权限/费用扩张、合并 main 和最终验收必须暂停等待用户。
 
+#### 8.6.2 2F-PROD 通用生产 Runner 收尾批次
+
+2F-LIVE 仅证明固定验收场景的双宿主链路可行，不等于任意项目可直接使用。第二阶段重新开启 `2F-PROD`，补齐持续运行的通用生产入口。
+
+强制目标流程：
+
+```text
+读取权威任务
+  -> 创建受控 Worktree
+  -> Codex Builder 开发并提交候选
+  -> Antigravity Reviewer 独立审核
+  -> REJECT 时在原任务自动重新调度 Codex 修复
+  -> PASS 后 Codex QA 独立测试
+  -> EvidenceStore + EvidenceGate 逐阶段验证
+  -> 停在 PENDING_USER_ACCEPTANCE / 已完成
+```
+
+Runner 必须支持 `start/status/resume/cancel`，读取任意合法现有 task_id，原子保存 Checkpoint，限制退回次数，并在权限、费用、破坏性操作、合并/Push/发布和最终验收前暂停。禁止硬编码 T0054、fixture、候选 SHA 或测试数量；禁止把 `run_phase2_live_e2e.py` 包装成生产入口；禁止恢复旧 `auto_task.py` 的真实写入行为。
+
+完整实施合同与开发提示词见：
+
+`docs/D04-研发过程/D01-任务/Phase2-2F-PROD-通用自动编排Runner实施任务书.md`
+
 ### 8.7 最终验收默认要求用户确认
 
 执行流程：
@@ -1219,7 +1242,7 @@ Codex 必须区分三条执行路线：
 
 ### 8.8 第二阶段子批次与逐批授权
 
-第二阶段拆为七个可独立验收点。默认一次只批准一个，上一依赖批次达到“待用户验收”且经用户明确确认后，下一依赖批次才可开工。
+第二阶段拆为八个可独立验收点。默认一次只批准一个，上一依赖批次达到“待用户验收”且经用户明确确认后，下一依赖批次才可开工。
 
 | 批次 | 目标 | 允许的核心产出 | 本批次禁止 |
 |---|---|---|---|
@@ -1230,6 +1253,7 @@ Codex 必须区分三条执行路线：
 | 2D-2 | Codex 参考 Adapter | `CodexNativeAdapter` 或经批准的明确 Codex surface、真实 Codex E2E | Antigravity 实现、核心平台特权、未经批准的 Responses API/API Key 使用 |
 | 2E | Antigravity 真实 Adapter | `AntigravityAdapter`、真实 invocation 证据、Antigravity E2E | 写全局目录、用静态路径测试代替真实宿主 |
 | 2F | 独立 Reviewer/QA 与验收 | 独立 session 门禁、真实 L2 双宿主验证、验收请求 | 自动用户验收、进入第三阶段 |
+| 2F-PROD | 通用自动编排 Runner | 任意任务读取、Worktree、真实 Builder/Reviewer/QA、退回重做、Checkpoint、EvidenceGate、等待用户验收 | 自动验收、合并/Push/发布、硬编码验收任务、进入第三阶段 |
 
 每批开始前必须输出：
 
@@ -1763,7 +1787,7 @@ PHASE2_IMPLEMENTATION_REPORT.md
 16. 遇到范围不明、路径安全无法证明、破坏性操作、依赖升级、外部权限、需要修改冻结 2A/第一阶段或真实 Host 调用时，先请求我的确认。
 ```
 
-后续 2C、2D-1、2D-2、2E、2F 必须分别使用同等粒度的批准语句，不能用“继续第二阶段”或“批准 2D”一次性放行全部子批次。
+后续 2C、2D-1、2D-2、2E、2F、2F-PROD 必须分别使用同等粒度的批准语句，不能用“继续第二阶段”或“批准 2D”一次性放行全部子批次。
 
 第二阶段 **2C** 的完整批准语句、开发交付合同和 AutoLaw 独立复审合同见：
 
@@ -1776,9 +1800,9 @@ PHASE2_IMPLEMENTATION_REPORT.md
 第二阶段 **2D-1** 可直接执行的统一基础批次合同与批准提示词见：
 
 `docs/D04-研发过程/D01-任务/Phase2-2D-1-通用Adapter基础设施实施任务书.md`
-### 7.7 第二阶段受控合流与结项结论 (2026-08-28)
+### 7.7 第二阶段受控合流历史结论与 2F-PROD 纠偏 (2026-08-28)
 
-第二阶段（2A～2F）现已全面完成受控合流与用户终态验收：
+第二阶段 2A～2F-LIVE 的基础设施和固定验收链路已完成受控合流与用户终态验收；但该结论不再等同于“通用自动编排产品已完成”。因缺少可读取任意任务并持续调度真实 Host 的生产 Runner，第二阶段现重新开启 2F-PROD：
 
 1. **子批次与工单全量验收**：
    - 2A (T0020): Host 契约、纯只读能力探测、FakeHostAdapter（已验收冻结）；
@@ -1789,6 +1813,7 @@ PHASE2_IMPLEMENTATION_REPORT.md
    - 2E (T0052): Google Antigravity 参考 Host Adapter（已验收冻结）；
    - 2F (T0053): 独立多角色编排与会话隔离（已验收冻结）；
    - 2F-LIVE (T0054): 真实 Codex + Antigravity 双宿主 E2E 验证（已验收冻结）。
+   - 2F-PROD: 通用自动编排 Runner（待开发、独立审查、QA、真实任意任务 E2E 与用户验收）。
 2. **产品代码候选与基线锁定**：
    - 最终产品代码候选 SHA 固定为：`f8c04e220c7281b7c696cd770a4001d0b3b1bb0b`；
    - Windows 平台 Codex 与 Antigravity 验证等级提升为 `cli_verified`；

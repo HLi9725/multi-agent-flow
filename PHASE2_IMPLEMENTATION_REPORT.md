@@ -929,3 +929,24 @@ dual_host_l2_status:
 - **合流后全量验证**：`python -m pytest tests -q -rs` → exit 0，`397 passed in 100.30s`，0 failed，0 skipped。
 - **格式检查**：`git diff --check` → exit 0。
 - **发布边界**：截至本记录，未执行 `git push`、Tag、Release，也未启动第三或第四阶段。
+
+### 16. 第二阶段重新开启：2F-PROD 通用自动编排 Runner
+
+2026-08-28 的使用复核确认，既有第二阶段交付只能证明 Adapter、Orchestrator、Worktree、EvidenceGate 与固定双宿主 E2E 基础设施可用，不能证明任意项目具备一次下发需求后自动执行 Builder → Reviewer → QA 的生产能力：
+
+1. `scripts/auto_task.py` 仍被强制为纯模拟，`--run` 不可用；
+2. `scripts/_lib/core/orchestrator.py` 是编排类库，没有通用持续运行入口；
+3. `scripts/run_phase2_live_e2e.py` 默认绑定 T0054，并硬编码 `tests/fixtures/fixture_math_util.py` 验收路径；
+4. 当前日常项目仍需要用户在客户端间复制交接包，与第二阶段原定 `verified_automatic` 体验不一致。
+
+因此第二阶段重新开启 `2F-PROD`，其范围和验收合同见：
+
+`docs/D04-研发过程/D01-任务/Phase2-2F-PROD-通用自动编排Runner实施任务书.md`
+
+在 2F-PROD 完成独立 Reviewer、QA、Windows 真实任意任务 E2E 和用户终态验收前：
+
+- 2A～2F-LIVE 保持已验收冻结，不逆向修改历史证据；
+- 第二阶段状态为“基础设施已验收，生产 Runner 待完成”；
+- 不得宣称 `/yy-flow run` 已可用；
+- 不得进入第三或第四阶段；
+- 不得自动用户验收、合并 main、Push、Tag 或 Release。
