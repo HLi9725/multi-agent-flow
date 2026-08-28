@@ -4,10 +4,12 @@ tests/test_production_runner.py
 ProductionRunner 完整编排测试。
 """
 import json
+import hashlib
 import os
 import subprocess
 import time
 import pytest
+import yaml
 
 from scripts._lib.core.adapter_registry import AdapterRegistry
 from scripts._lib.core.agent_schema import (
@@ -40,6 +42,18 @@ def mock_git_repo(tmp_path):
     subprocess.run(["git", "commit", "-m", "initial commit"], cwd=repo_dir, check=True, capture_output=True)
 
     head_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo_dir, text=True).strip()
+    config_dir = repo_dir / "config"
+    config_dir.mkdir()
+    user_data_dir = repo_dir / "user_data"
+    user_data_dir.mkdir()
+    board_file = user_data_dir / "board.json"
+    with open(config_dir / "workflow.config.yaml", "w", encoding="utf-8") as stream:
+        yaml.safe_dump({"board": {"provider": "local", "board_file": str(board_file)}}, stream)
+    board_file.write_text(json.dumps([{
+        "id": "T0088", "name": "实现测试功能", "status": "进行中", "type": "A",
+        "owner": "李开发", "handler": "李开发", "updated_at": "1.0",
+        "process": "需求: 需要新增 dummy 函数。验收标准: dummy 函数正确返回 True",
+    }], ensure_ascii=False), encoding="utf-8")
     return repo_dir, head_sha
 
 
@@ -117,7 +131,7 @@ def test_production_runner_full_pass_pipeline(mock_git_repo, tmp_path, monkeypat
             "baseline_commit": baseline_sha,
             "candidate_commit": cand_sha,
             "session_id": handle.session_id,
-            "host_invocation_id": "inv_reviewer_real_456",
+            "review_request_id": "review_req_" + hashlib.sha256(handle.session_id.encode("utf-8")).hexdigest()[:24],
             "decision": "PASS",
             "defects": [],
             "summary": "Code review passed. Implementation meets all requirements.",
@@ -163,7 +177,7 @@ def test_production_runner_full_pass_pipeline(mock_git_repo, tmp_path, monkeypat
         task_name="实现测试功能",
         requirement_text="需要新增 dummy 函数",
         acceptance_criteria="验收标准: dummy 函数正确返回 True",
-        acceptance_criteria_hash="hash_888",
+        acceptance_criteria_hash="",
         task_version="1.0",
         status_at_read="进行中",
         baseline_commit=baseline_sha,

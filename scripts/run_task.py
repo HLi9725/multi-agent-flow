@@ -16,7 +16,19 @@ if _SCRIPT_DIR not in sys.path:
 
 import paths
 from _lib.core.production_runner import ProductionRunner
+from _lib.core.runner_checkpoint_store import RunnerCheckpointStore
 from _lib.core.task_spec_loader import load_task_execution_spec
+
+
+def _runner_for(project_root, authority_root, project_id=None):
+    authority = os.path.realpath(authority_root or project_root)
+    identity = project_id or os.path.basename(os.path.realpath(project_root))
+    store = RunnerCheckpointStore(
+        data_root=paths.resolve_data_root(cwd=authority),
+        project_root=os.path.realpath(project_root),
+        project_id=identity,
+    )
+    return ProductionRunner(checkpoint_store=store)
 
 
 def cmd_start(args):
@@ -54,7 +66,7 @@ def cmd_start(args):
         print(f"[ERROR] Failed to load task execution spec for {args.task_id}: {e}", file=sys.stderr)
         return 1
 
-    runner = ProductionRunner()
+    runner = _runner_for(project_root, authority_root, spec.project_id)
     result = runner.start(spec)
 
     print(json.dumps(result.to_dict(), indent=2, ensure_ascii=False))
@@ -65,7 +77,7 @@ def cmd_status(args):
     project_root = os.path.realpath(args.project_root or os.getcwd())
     authority_root = os.path.realpath(args.authority_root) if args.authority_root else None
 
-    runner = ProductionRunner()
+    runner = _runner_for(project_root, authority_root)
     status_data = runner.status(project_root=project_root, task_id=args.task_id, authority_root=authority_root)
     print(json.dumps(status_data, indent=2, ensure_ascii=False))
     return 0
@@ -75,7 +87,7 @@ def cmd_resume(args):
     project_root = os.path.realpath(args.project_root or os.getcwd())
     authority_root = os.path.realpath(args.authority_root) if args.authority_root else None
 
-    runner = ProductionRunner()
+    runner = _runner_for(project_root, authority_root)
     result = runner.resume(
         project_root=project_root,
         task_id=args.task_id,
@@ -90,7 +102,7 @@ def cmd_cancel(args):
     project_root = os.path.realpath(args.project_root or os.getcwd())
     authority_root = os.path.realpath(args.authority_root) if args.authority_root else None
 
-    runner = ProductionRunner()
+    runner = _runner_for(project_root, authority_root)
     result = runner.cancel(project_root=project_root, task_id=args.task_id, authority_root=authority_root)
     print(json.dumps(result.to_dict(), indent=2, ensure_ascii=False))
     return 0 if result.success else 1

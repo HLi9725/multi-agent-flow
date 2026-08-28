@@ -984,20 +984,20 @@ dual_host_l2_status:
 
 1. **[DEF-T0061-1] Reviewer 结构化 JSON Schema 严格校验与身份字段强匹配**：
    - 在 `ProductionRunner._parse_reviewer_structured_json` 中内置实现零外部依赖的严格 Schema 校验器（`_validate_reviewer_schema_builtin`）。
-   - 严格比对 `task_id`、`baseline_commit`、`candidate_commit`、`session_id`、`host_invocation_id` 是否与上下文精确一致，任何缺失、伪造或提交不匹配立即判定为 `REJECT` 并记录 `DEF-IDENTITY-MISMATCH` 缺陷。
+   - Reviewer 回显派发前可知的 `review_request_id`；真实 `host_invocation_id` 仅从 Adapter 的 `AgentResult` 中取得并由 Runner 绑定，不要求模型自述它无法预知的宿主调用 ID。
    - 彻底封堵普通文本 `PASS:` 匹配放行与残缺 JSON 默认值补全漏洞。
    - `test_reviewer_schema_adversarial_rejections` 对抗测试覆盖普通文本、残缺 JSON、身份不匹配及 PASS 携带缺陷 4 类绕过场景。
 
 2. **[DEF-T0061-2] 真实 Invocation 提取与候选提交校验**：
-   - `_extract_real_invocation_id` 仅从 `AgentResult.host_invocation_id`、`partial_results`（支持 Mapping 类型）及 `handle.invocation_token` 提取真实标识，若无有效标识一律 Fail-Closed 阻断，彻底移除本地生成的 `inv_builder_*` 伪造 fallback。
+   - `_extract_real_invocation_id` 仅从 `AgentResult.host_invocation_id` 或 `partial_results` 提取真实标识。`handle.invocation_token` 是本地防伪 token，不得伪装为宿主 invocation；缺失 canonical ID 时一律 Fail-Closed。
    - Builder 阶段完成后，校验 `candidate_commit` 必须为有效 40 位 SHA 且严格不同于 `baseline_commit`；若无新提交立即 Fail-Closed 终止。
 
 3. **[DEF-T0061-3] 权威看板状态机合法流转**：
-   - 废除直接调用 `OfflineBoardAdapter.update_record()` 绕过状态机的做法；Stage 4 必须通过调用 `scripts/transition_task.py` 执行合法的状态、角色（QA）、处理人（严经理）、结束时间与审计记录流转。
+   - 废除直接调用 `OfflineBoardAdapter.update_record()` 绕过状态机的做法；Runner 按 A 类任务真实执行 `待开始→进行中→审查中→测试中→已完成`，Reviewer/QA 驳回时通过 `已退回→进行中` 回到原卡修复。
    - 流转执行失败时直接捕获异常并返回 Fail-Closed 结果，严禁静默吞掉异常。
 
 4. **[DEF-T0061-4] 真实业务任务 E2E 完整生命周期闭环**：
-   - `scripts/run_runner_live_e2e.py` 重构为动态读取权威看板任务（`T0063`），通过 `load_task_execution_spec` 动态解析规范。
+   - `scripts/run_runner_live_e2e.py` 必须接收预先通过 yy-flow CLI 合法创建并领取的任务 ID；不再硬编码 `T0063`，不再直接创建或覆盖 `board.json`。
    - 启用 `workspace_mode="branch"` 并在独立 Worktree 中执行真实调度，完整覆盖“读取权威任务 -> 隔离 Worktree -> Codex Builder -> Antigravity Reviewer -> Codex QA -> EvidenceGate 逐级核验 -> 经状态机转为已完成”全链条。
 
 5. **[DEF-T0061-5] 真实严格乐观并发版本校验**：
@@ -1006,7 +1006,7 @@ dual_host_l2_status:
 
 6. **[DEF-T0061-6] Checkpoint 防路径逃逸与多项目命名空间隔离**：
    - `_validate_task_id` 严格校验 `task_id` 匹配 `^T\d+$` 正则，彻底拒绝 `../escape` 目录遍历。
-   - `RunnerCheckpointStore` 与并发排他锁按 `project_id` 执行命名空间隔离（`<data_root>/runner_checkpoints/<project_id>/<task_id>.json` 与 `.lock_runner_<project_id>_<task_id>.lock`），防止跨项目同名任务串线或冲突。
+   - `RunnerCheckpointStore` 命名空间绑定可读 `project_id` 与 canonical project root 哈希，防止清洗后同名、同任务编号跨项目串线。CLI 的 start/status/resume/cancel 使用相同的项目绑定 Store。
 
 7. **[DEF-T0061-7] 权限门禁与 APPROVAL_REQUIRED 暂停/恢复路径**：
    - 移除默认 `approval_policy="auto"`；当宿主抛出 `AgentNotSupportedError` 时，原子保存 Checkpoint 并将状态置为 `APPROVAL_REQUIRED`，记录具体审批原因。
@@ -1020,7 +1020,11 @@ dual_host_l2_status:
 9. **[DEF-T0061-9] 格式与尾随空白修复**：
    - 全仓库运行空白清理脚本，`git diff --check aa1defb` 退出码为 0，零尾随空白错误。
 
-### 修复后全量测试验证记录
-- **2F-PROD 定向单元与安全对抗测试**：`15 passed in 5.64s`
-- **全仓库全量回归测试**：`412 passed in 91.11s (100% 通过)`
-- **代码格式规范**：`git diff --check aa1defb` 退出码 0（Zero trailing whitespace）
+### 19. Codex 独立复审与二次修复
+
+- 修复 canonical invocation 本地 token 回退、Reviewer 不可预知身份字段、A 类看板跨级流转、Git 读取 fail-open、checkpoint 命名空间碰撞、CLI Store 不一致、E2E 直接写卡与 Windows UTF-8 子进程解码问题。
+- 新增对抗断言：本地 handle token 不得作为 invocation、Reviewer additionalProperties 必须拒绝、清洗碰撞项目 ID 必须分离。
+- **2F-PROD 定向单元与安全对抗测试**：`16 passed in 10.99s`。
+- **工作流 v2 回归**：`67 passed in 42.25s`。
+- **全仓库全量回归**：`413 passed in 109.83s`，退出码 `0`，`0 failed`。
+- **格式校验**：`git diff --check` 退出码 `0`。

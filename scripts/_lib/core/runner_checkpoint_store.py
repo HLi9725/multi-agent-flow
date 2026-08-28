@@ -50,13 +50,12 @@ class RunnerCheckpointStore:
         else:
             self.data_root = os.path.realpath(data_root)
 
-        # 绑定 project_id 命名空间，隔离多项目同编号任务
-        if project_id:
-            self.project_id = re.sub(r"[^a-zA-Z0-9_-]", "_", project_id.strip())
-        elif project_root:
-            self.project_id = hashlib.sha256(os.path.realpath(project_root).encode("utf-8")).hexdigest()[:16]
-        else:
-            self.project_id = "default_project"
+        # 命名空间同时绑定可读项目名和规范根路径哈希。仅做字符替换会让
+        # ``a/b`` 与 ``a?b`` 发生命名空间碰撞，因此不得单独依赖调用方传入的 project_id。
+        readable_id = re.sub(r"[^a-zA-Z0-9_-]", "_", (project_id or "project").strip()) or "project"
+        identity_root = os.path.realpath(project_root or self.data_root)
+        identity = hashlib.sha256(f"{readable_id}\0{identity_root}".encode("utf-8")).hexdigest()[:16]
+        self.project_id = f"{readable_id[:48]}_{identity}"
 
         self.checkpoint_dir = os.path.join(self.data_root, "runner_checkpoints", self.project_id)
 

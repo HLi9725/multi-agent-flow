@@ -92,7 +92,13 @@ def save_architecture_config(arch_dict: dict) -> bool:
 
     # 5. 联动重导出 Subagent (使下次唤起即刻读取生效)
     export_script = os.path.join(SCRIPT_DIR, "verify_and_export_agents.py")
-    res = subprocess.run([sys.executable, export_script, "--target-project-dir", _paths.project_root()], capture_output=True, text=True)
+    res = subprocess.run(
+        [sys.executable, export_script, "--target-project-dir", _paths.project_root()],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
     if res.returncode != 0:
         sys.stderr.write(f"[FAIL-CLOSED ERROR] Subagent 重新导出失败: {res.stderr}\n")
         return False

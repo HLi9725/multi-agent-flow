@@ -83,11 +83,10 @@ def _extract_acceptance_criteria(task_name: str, requirement_text: str) -> Tuple
     """从需求正文与任务名称中提取规范的验收标准文本与哈希"""
     acceptance_criteria = f"验收标准: 完成【{task_name}】的实现与验证，代码通过独立审查与测试全量回归，满足规范要求。"
     if "验收标准" in requirement_text:
-        parts = requirement_text.split("验收标准")
-        if len(parts) > 1 and len(parts[1].strip()) > 10:
-            lines = parts[1].strip().splitlines()
-            if lines:
-                acceptance_criteria = "验收标准" + lines[0]
+        remainder = requirement_text.split("验收标准", 1)[1].strip().lstrip(":：").strip()
+        first_line = remainder.splitlines()[0].strip().rstrip("。") if remainder else ""
+        if first_line:
+            acceptance_criteria = f"验收标准: {first_line}"
 
     criteria_hash = hashlib.sha256(acceptance_criteria.strip().encode("utf-8")).hexdigest()
     return acceptance_criteria, criteria_hash

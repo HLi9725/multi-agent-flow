@@ -11,7 +11,7 @@ def test_agent_paths_api():
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
     env["KANBAN_PORT"] = "32956"
-    p = subprocess.Popen([sys.executable, SERVER_SCRIPT, "--allow-remote"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    p = subprocess.Popen([sys.executable, SERVER_SCRIPT, "--allow-remote"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
     time.sleep(2)
 
     try:

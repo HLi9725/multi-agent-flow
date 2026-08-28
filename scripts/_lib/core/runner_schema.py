@@ -46,7 +46,7 @@ REVIEWER_JSON_SCHEMA: Dict[str, Any] = {
         "baseline_commit",
         "candidate_commit",
         "session_id",
-        "host_invocation_id",
+        "review_request_id",
         "decision",
         "defects",
         "summary",
@@ -56,7 +56,7 @@ REVIEWER_JSON_SCHEMA: Dict[str, Any] = {
         "baseline_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
         "candidate_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
         "session_id": {"type": "string"},
-        "host_invocation_id": {"type": "string"},
+        "review_request_id": {"type": "string"},
         "decision": {"type": "string", "enum": ["PASS", "REJECT"]},
         "defects": {
             "type": "array",
@@ -86,6 +86,7 @@ class ReviewerStructuredOutput:
     candidate_commit: str
     session_id: str
     host_invocation_id: str
+    review_request_id: str
     decision: str  # "PASS" or "REJECT"
     defects: Tuple[Dict[str, Any], ...] = field(default_factory=tuple)
     summary: str = ""
@@ -104,6 +105,7 @@ class ReviewerStructuredOutput:
             "candidate_commit": self.candidate_commit,
             "session_id": self.session_id,
             "host_invocation_id": self.host_invocation_id,
+            "review_request_id": self.review_request_id,
             "decision": self.decision,
             "defects": [dict(d) for d in self.defects],
             "summary": self.summary,
@@ -117,6 +119,7 @@ class ReviewerStructuredOutput:
             candidate_commit=str(data.get("candidate_commit", "")),
             session_id=str(data.get("session_id", "")),
             host_invocation_id=str(data.get("host_invocation_id", "")),
+            review_request_id=str(data.get("review_request_id", "")),
             decision=str(data.get("decision", "")),
             defects=tuple(data.get("defects", [])),
             summary=str(data.get("summary", "")),

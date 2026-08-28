@@ -36,6 +36,7 @@ def _run(args, env_extra=None, cwd=None):
     env.update(env_extra or {})
     return subprocess.run(
         [sys.executable] + args, capture_output=True, text=True,
+        encoding="utf-8", errors="replace",
         env=env, cwd=cwd or REPO_ROOT)
 
 

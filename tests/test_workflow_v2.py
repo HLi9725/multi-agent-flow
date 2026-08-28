@@ -42,7 +42,10 @@ def run(env, *args, expect=0):
         cmd = [sys.executable, os.path.join(SCRIPTS, script), "--config", str(env["cfg"]), *rest]
     sub_env = os.environ.copy()
     sub_env["YY_FLOW_PROJECT_ROOT"] = str(env.get("tmp") or env["board"].parent)
-    r = subprocess.run(cmd, capture_output=True, text=True, cwd=REPO_ROOT, env=sub_env)
+    r = subprocess.run(
+        cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+        cwd=REPO_ROOT, env=sub_env,
+    )
     assert r.returncode == expect, f"exit={r.returncode} (期望 {expect})\nstdout={r.stdout}\nstderr={r.stderr}"
     return r
 
@@ -427,7 +430,9 @@ class TestTaskTiers:
     def test_build_context_dispatch(self, env):
         """build_agent_context dispatch 动作输出三问、分级与硬红线。"""
         cmd = [sys.executable, os.path.join(SCRIPTS, "build_agent_context.py"), "--role", "PM", "--action", "dispatch"]
-        r = subprocess.run(cmd, capture_output=True, text=True, cwd=REPO_ROOT)
+        r = subprocess.run(
+            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=REPO_ROOT
+        )
         assert r.returncode == 0
         assert "L0" in r.stdout and "三问" in r.stdout and "L1" in r.stdout and "L2" in r.stdout
 
@@ -732,7 +737,6 @@ class TestTerminalStatusImmutability:
 
         r2 = run(env, "transition_task.py", "--role", "DEV", "--from-status", "已验收", "--to-status", "进行中", "--assignee", "李开发", "--task-id", "T0001", "--type", "A", expect=1)
         assert "终态防篡改" in r2.stdout or r2.returncode != 0
-
 
 
 

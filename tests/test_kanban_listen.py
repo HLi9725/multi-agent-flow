@@ -13,7 +13,7 @@ def test_default_listen_address():
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
     env["KANBAN_PORT"] = "32950"  # Pick a random port for test
-    p = subprocess.Popen([sys.executable, SERVER_SCRIPT], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    p = subprocess.Popen([sys.executable, SERVER_SCRIPT], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
     time.sleep(2)
     p.kill()
     out, err = p.communicate()
@@ -23,7 +23,7 @@ def test_default_listen_address():
 def test_remote_listen_rejected_without_flag():
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
-    p = subprocess.Popen([sys.executable, SERVER_SCRIPT, "--host", "0.0.0.0"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    p = subprocess.Popen([sys.executable, SERVER_SCRIPT, "--host", "0.0.0.0"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
     out, err = p.communicate()
     assert p.returncode != 0
     assert "非本机监听 (0.0.0.0) 必须显式添加 --allow-remote 参数" in out
@@ -32,7 +32,7 @@ def test_remote_listen_with_flag():
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
     env["KANBAN_PORT"] = "32951"
-    p = subprocess.Popen([sys.executable, SERVER_SCRIPT, "--host", "0.0.0.0", "--allow-remote"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    p = subprocess.Popen([sys.executable, SERVER_SCRIPT, "--host", "0.0.0.0", "--allow-remote"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
     time.sleep(2)
     p.kill()
     out, err = p.communicate()

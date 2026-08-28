@@ -79,6 +79,11 @@ def test_checkpoint_store_path_traversal_and_multi_project_isolation(tmp_path):
     assert loaded_a.project_id == "proj_a"
     assert loaded_b.project_id == "proj_b"
 
+    # Sanitization collisions must not share a namespace.
+    collision_a = RunnerCheckpointStore(data_root=str(tmp_path), project_root=str(tmp_path / "a"), project_id="a/b")
+    collision_b = RunnerCheckpointStore(data_root=str(tmp_path), project_root=str(tmp_path / "b"), project_id="a?b")
+    assert collision_a.checkpoint_dir != collision_b.checkpoint_dir
+
 
 def test_runner_concurrency_lock(tmp_path):
     store = RunnerCheckpointStore(data_root=str(tmp_path), project_id="proj_alpha")

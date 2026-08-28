@@ -4,6 +4,7 @@ tests/test_runner_security.py
 Runner 缺陷回环、JSON Schema 对抗校验、候选提交校验、权限暂停/恢复与源码不可变性测试。
 """
 import json
+import hashlib
 import os
 import subprocess
 import time
@@ -21,10 +22,30 @@ from scripts._lib.core.agent_schema import (
 )
 from scripts._lib.core.evidence_store import EvidenceStore
 from scripts._lib.core.production_runner import ProductionRunner
+from scripts._lib.core.production_runner import _extract_real_invocation_id
 from scripts._lib.core.runner_checkpoint_store import RunnerCheckpointStore
 from scripts._lib.core.runner_schema import RunnerState, TaskExecutionSpec
 from scripts._lib.hosts.antigravity_adapter import AntigravityAdapter, create_antigravity_manifest
 from scripts._lib.hosts.codex_cli_adapter import CodexCliAdapter, create_codex_cli_manifest
+
+
+def test_local_handle_token_is_never_accepted_as_host_invocation():
+    handle = AgentHandle(
+        session_id="sess_local",
+        host_id="codex_cli",
+        status="completed",
+        is_real_host=True,
+        adapter_instance_id="adapter_local",
+        invocation_token="locally-generated-token",
+    )
+    result = AgentResult(
+        session_id=handle.session_id,
+        status=AgentStatus.SUCCESS,
+        output="done",
+        partial_results=(),
+        is_real_host=True,
+    )
+    assert _extract_real_invocation_id(result, handle) is None
 
 
 @pytest.fixture
@@ -76,7 +97,10 @@ def mock_git_repo(tmp_path):
             "handler": "李开发",
             "process": "需求: 需要网络权限。验收标准: 权限通过。",
             "updated_at": "1787890000",
-        }
+        },
+        {"id": "T0055", "name": "无提交测试", "status": "进行中", "type": "A", "owner": "李开发", "handler": "李开发", "process": "需求: 无提交测试。验收标准: 测试", "updated_at": "1.0"},
+        {"id": "T0077", "name": "安全加固模块", "status": "进行中", "type": "A", "owner": "李开发", "handler": "李开发", "process": "需求: 实现严格安全加固。验收标准: 零漏洞", "updated_at": "1.0"},
+        {"id": "T0066", "name": "只读测试验证", "status": "进行中", "type": "A", "owner": "李开发", "handler": "李开发", "process": "需求: 只读测试。验收标准: 测试通过", "updated_at": "1.0"},
     ]
     with open(user_data_dir / "board.json", "w", encoding="utf-8") as f:
         json.dump(tasks_data, f)
@@ -108,6 +132,7 @@ def test_reviewer_schema_adversarial_rejections(mock_git_repo, tmp_path):
         candidate_commit="b" * 40,
         session_id="sess_r_1",
         invocation_id="inv_r_1",
+        review_request_id="review_req_static",
     )
     assert res1.decision == "REJECT"
     assert "DEF-T0077-SCHEMA-VIOLATION" in res1.defects[0]["defect_id"]
@@ -121,6 +146,7 @@ def test_reviewer_schema_adversarial_rejections(mock_git_repo, tmp_path):
         candidate_commit="b" * 40,
         session_id="sess_r_1",
         invocation_id="inv_r_1",
+        review_request_id="review_req_static",
     )
     assert res2.decision == "REJECT"
     assert "DEF-T0077-SCHEMA-VIOLATION" in res2.defects[0]["defect_id"]
@@ -131,7 +157,7 @@ def test_reviewer_schema_adversarial_rejections(mock_git_repo, tmp_path):
         "baseline_commit": baseline_sha,
         "candidate_commit": "b" * 40,
         "session_id": "sess_r_1",
-        "host_invocation_id": "inv_r_1",
+        "review_request_id": "review_req_static",
         "decision": "PASS",
         "defects": [],
         "summary": "pass",
@@ -143,6 +169,7 @@ def test_reviewer_schema_adversarial_rejections(mock_git_repo, tmp_path):
         candidate_commit="b" * 40,
         session_id="sess_r_1",
         invocation_id="inv_r_1",
+        review_request_id="review_req_static",
     )
     assert res3.decision == "REJECT"
     assert "IDENTITY-MISMATCH" in res3.defects[0]["defect_id"]
@@ -153,7 +180,7 @@ def test_reviewer_schema_adversarial_rejections(mock_git_repo, tmp_path):
         "baseline_commit": baseline_sha,
         "candidate_commit": "b" * 40,
         "session_id": "sess_r_1",
-        "host_invocation_id": "inv_r_1",
+        "review_request_id": "review_req_static",
         "decision": "PASS",
         "defects": [{"defect_id": "DEF-1", "severity": "P1", "description": "some error"}],
         "summary": "pass with defect",
@@ -165,9 +192,26 @@ def test_reviewer_schema_adversarial_rejections(mock_git_repo, tmp_path):
         candidate_commit="b" * 40,
         session_id="sess_r_1",
         invocation_id="inv_r_1",
+        review_request_id="review_req_static",
     )
     assert res4.decision == "REJECT"
     assert "INVALID-PASS" in res4.defects[0]["defect_id"]
+
+    # 5. Schema declares additionalProperties=false: unknown keys must fail closed.
+    extra_json = json.loads(contradictory_json)
+    extra_json["defects"] = []
+    extra_json["unexpected"] = "must-not-pass"
+    res5 = runner._parse_reviewer_structured_json(
+        raw_output=json.dumps(extra_json),
+        task_id="T0077",
+        baseline_commit=baseline_sha,
+        candidate_commit="b" * 40,
+        session_id="sess_r_1",
+        invocation_id="inv_r_1",
+        review_request_id="review_req_static",
+    )
+    assert res5.decision == "REJECT"
+    assert "SCHEMA-VIOLATION" in res5.defects[0]["defect_id"]
 
 
 def test_builder_no_commit_or_missing_invocation_fails_closed(mock_git_repo, tmp_path, monkeypatch):
@@ -235,7 +279,7 @@ def test_builder_no_commit_or_missing_invocation_fails_closed(mock_git_repo, tmp
         task_name="无提交测试",
         requirement_text="无提交测试",
         acceptance_criteria="验收标准: 测试",
-        acceptance_criteria_hash="hash_55",
+        acceptance_criteria_hash="",
         task_version="1.0",
         status_at_read="进行中",
         baseline_commit=baseline_sha,
@@ -319,8 +363,8 @@ def test_permission_approval_required_pause_and_resume(mock_git_repo, tmp_path, 
         task_name="权限测试任务",
         requirement_text="需要网络权限",
         acceptance_criteria="验收标准: 权限通过",
-        acceptance_criteria_hash="hash_33",
-        task_version="1.0",
+        acceptance_criteria_hash="",
+        task_version="1787890000",
         status_at_read="进行中",
         baseline_commit=baseline_sha,
         workspace_mode="inherit",
@@ -329,7 +373,7 @@ def test_permission_approval_required_pause_and_resume(mock_git_repo, tmp_path, 
     # 1. 首次启动应触发 APPROVAL_REQUIRED 暂停
     res1 = runner.start(spec)
     assert res1.success is False
-    assert res1.state == RunnerState.APPROVAL_REQUIRED.value
+    assert res1.state == RunnerState.APPROVAL_REQUIRED.value, res1
     assert "Operation requires explicit user permission approval" in res1.message
 
     # 2. 通过 resume 并授权后继续执行
@@ -406,7 +450,7 @@ def test_reviewer_rejection_auto_loop_to_builder_and_exceed_max_cycles(mock_git_
             "baseline_commit": baseline_sha,
             "candidate_commit": cand_sha,
             "session_id": handle.session_id,
-            "host_invocation_id": f"inv_reviewer_{reviewer_call_count}",
+            "review_request_id": "review_req_" + hashlib.sha256(handle.session_id.encode("utf-8")).hexdigest()[:24],
             "decision": "REJECT",
             "defects": [
                 {
@@ -458,7 +502,7 @@ def test_reviewer_rejection_auto_loop_to_builder_and_exceed_max_cycles(mock_git_
         task_name="安全加固模块",
         requirement_text="实现严格安全加固",
         acceptance_criteria="验收标准: 零漏洞",
-        acceptance_criteria_hash="hash_777",
+        acceptance_criteria_hash="",
         task_version="1.0",
         status_at_read="进行中",
         baseline_commit=baseline_sha,
@@ -529,7 +573,7 @@ def test_qa_source_immutability_violation_fails_closed(mock_git_repo, tmp_path, 
             "baseline_commit": baseline_sha,
             "candidate_commit": cand_sha,
             "session_id": handle.session_id,
-            "host_invocation_id": "inv_reviewer_real",
+            "review_request_id": "review_req_" + hashlib.sha256(handle.session_id.encode("utf-8")).hexdigest()[:24],
             "decision": "PASS",
             "defects": [],
             "summary": "pass",
@@ -569,7 +613,7 @@ def test_qa_source_immutability_violation_fails_closed(mock_git_repo, tmp_path, 
         task_name="只读测试验证",
         requirement_text="只读测试",
         acceptance_criteria="验收标准: 测试通过",
-        acceptance_criteria_hash="hash_666",
+        acceptance_criteria_hash="",
         task_version="1.0",
         status_at_read="进行中",
         baseline_commit=baseline_sha,

@@ -22,7 +22,6 @@ if _SCRIPTS_ROOT not in sys.path:
     sys.path.insert(0, _SCRIPTS_ROOT)
 
 import paths
-from _lib.boards.offline_board_adapter import OfflineBoardAdapter
 from _lib.core.adapter_registry import AdapterRegistry
 from _lib.core.evidence_gate import EvidenceGate
 from _lib.core.evidence_store import EvidenceStore
@@ -43,44 +42,13 @@ def mask_sensitive(text: str) -> str:
     return f"{text[:4]}...{text[-4:]} (hash:{hashlib.sha256(text.encode()).hexdigest()[:8]})"
 
 
-def ensure_authoritative_test_task(authority_root: str, task_id: str) -> None:
-    """在权威看板中确保存在待测试的任意合法任务 (非固定 fixture，非 T0054)"""
-    board_file = os.path.join(authority_root, "user_data", "board.json")
-    os.makedirs(os.path.dirname(board_file), exist_ok=True)
-    adapter = OfflineBoardAdapter(board_file=board_file)
-
-    rec = adapter.get_record(task_id)
-    if not rec:
-        task_data = {
-            "task_id": task_id,
-            "task_name": "实现通用字符串哈希与校验工具库",
-            "type": "A",
-            "status": "进行中",
-            "owner": "李开发",
-            "handler": "李开发",
-            "process": (
-                "需求: 在 string_utils.py 中实现 calculate_sha256(text: str) -> str 与 verify_sha256(text: str, expected_hash: str) -> bool 两个函数，并编写 tests/test_string_utils.py 单元测试。"
-                "验收标准: 单元测试 100% 通过，对空字符串与标准文本的 SHA256 哈希计算精确无误。"
-            ),
-        }
-        adapter.create_record(task_data)
-        print(f"[BOARD] 权威看板已建卡/初始化任务: {task_id} (进行中)")
-    else:
-        fields = rec.get("fields", {}) if "fields" in rec else rec
-        fields["status"] = "进行中"
-        fields["handler"] = "李开发"
-        fields["owner"] = "李开发"
-        adapter.update_record(task_id, fields)
-        print(f"[BOARD] 权威看板任务 {task_id} 已就绪 (进行中)")
-
-
-def run_live_e2e(authority_root: str, test_task_id: str = "T0063") -> Dict[str, Any]:
+def run_live_e2e(authority_root: str, test_task_id: str) -> Dict[str, Any]:
     print("=" * 70)
     print(f"[2F-PROD LIVE E2E] 启动 Windows 真实任意任务 E2E 编排验证: {test_task_id}")
     print("=" * 70)
 
-    # 1. 准备权威任务卡片
-    ensure_authoritative_test_task(authority_root, test_task_id)
+    # 任务必须由 quick_task.py / transition_task.py 预先合法建卡和领取。
+    # E2E 程序本身不得直接 create/update board.json。
 
     # 2. 创建真实独立宿主注册表
     registry = create_default_registry(context_id="live_prod_runner")
@@ -189,6 +157,8 @@ def run_live_e2e(authority_root: str, test_task_id: str = "T0063") -> Dict[str, 
 
 if __name__ == "__main__":
     authority_root_arg = sys.argv[1] if len(sys.argv) > 1 else r"C:\Users\user\Desktop\user\multi-agent-flow-phase2-real-agents"
-    task_id_arg = sys.argv[2] if len(sys.argv) > 2 else "T0063"
+    if len(sys.argv) <= 2:
+        raise SystemExit("Usage: run_runner_live_e2e.py <authority_root> <legally-created-task-id>")
+    task_id_arg = sys.argv[2]
     report_data = run_live_e2e(authority_root=authority_root_arg, test_task_id=task_id_arg)
     print(json.dumps(report_data, indent=2, ensure_ascii=False))

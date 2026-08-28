@@ -16,6 +16,7 @@ import subprocess
 import sys
 import time
 import uuid
+from dataclasses import replace
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 _SCRIPTS_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -100,9 +101,6 @@ def _extract_real_invocation_id(result: AgentResult, handle: AgentHandle) -> Opt
                 if inv:
                     return str(inv).strip()
 
-    if getattr(handle, "invocation_token", None):
-        return f"inv_tok_{handle.invocation_token[:16]}"
-
     return None
 
 
@@ -115,7 +113,7 @@ def _validate_reviewer_schema_builtin(data: Any) -> Tuple[bool, Optional[str]]:
         "baseline_commit",
         "candidate_commit",
         "session_id",
-        "host_invocation_id",
+        "review_request_id",
         "decision",
         "defects",
         "summary",
@@ -132,8 +130,8 @@ def _validate_reviewer_schema_builtin(data: Any) -> Tuple[bool, Optional[str]]:
         return False, "candidate_commit must be a 40-hex character SHA"
     if not isinstance(data["session_id"], str) or not data["session_id"].strip():
         return False, "session_id must be a non-empty string"
-    if not isinstance(data["host_invocation_id"], str) or not data["host_invocation_id"].strip():
-        return False, "host_invocation_id must be a non-empty string"
+    if not isinstance(data["review_request_id"], str) or not data["review_request_id"].strip():
+        return False, "review_request_id must be a non-empty string"
     if data["decision"] not in ("PASS", "REJECT"):
         return False, f"decision must be 'PASS' or 'REJECT', got '{data['decision']}'"
     if not isinstance(data["defects"], (list, tuple)):
@@ -147,6 +145,8 @@ def _validate_reviewer_schema_builtin(data: Any) -> Tuple[bool, Optional[str]]:
             return False, f"defect severity must be P0, P1, P2, or P3, got '{d.get('severity')}'"
     if not isinstance(data["summary"], str):
         return False, "summary must be a string"
+    if set(data) != set(required_fields):
+        return False, "Reviewer output contains unknown additional properties"
     return True, None
 
 
@@ -198,6 +198,8 @@ class ProductionRunner:
                 cwd=worktree_dir,
                 stderr=subprocess.DEVNULL,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=5,
             )
             status_out = subprocess.check_output(
@@ -205,11 +207,94 @@ class ProductionRunner:
                 cwd=worktree_dir,
                 stderr=subprocess.DEVNULL,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=5,
             )
             return f"{status_out.strip()}\n{diff_out.strip()}"
-        except Exception:
-            return ""
+        except Exception as exc:
+            raise ProductionRunnerError(f"Unable to verify tracked Git state for '{worktree_dir}': {exc}") from exc
+
+    def _authority_config(self, spec: TaskExecutionSpec) -> str:
+        for candidate in (
+            os.path.join(spec.authority_root, "config", "workflow.config.yaml"),
+            os.path.join(spec.authority_root, "user_data", "workflow.config.yaml"),
+        ):
+            if os.path.isfile(candidate):
+                return candidate
+        raise ProductionRunnerError(
+            f"Authoritative workflow configuration is missing under '{spec.authority_root}'."
+        )
+
+    def _authority_adapter(self, spec: TaskExecutionSpec) -> Any:
+        config_path = self._authority_config(spec)
+        import yaml
+
+        with open(config_path, "r", encoding="utf-8") as stream:
+            config = yaml.safe_load(stream) or {}
+        board_config = config.get("board", {})
+        if board_config.get("provider", "feishu_base").lower() != "local":
+            return get_board_adapter(config_path)
+        raw_path = board_config.get("board_file", "user_data/board.json")
+        board_file = raw_path if os.path.isabs(raw_path) else os.path.join(spec.authority_root, raw_path)
+        return OfflineBoardAdapter(
+            board_file=os.path.realpath(board_file),
+            field_map=board_config.get("fields", {}),
+        )
+
+    def _transition_authority(
+        self,
+        spec: TaskExecutionSpec,
+        *,
+        role: str,
+        from_status: str,
+        to_status: str,
+        assignee: str,
+        remarks: str,
+    ) -> None:
+        """Only mutate the authoritative board through the audited state-machine CLI."""
+        adapter = self._authority_adapter(spec)
+        record = adapter.get_record(spec.task_id)
+        if not record:
+            raise ProductionRunnerError(f"Authoritative task '{spec.task_id}' no longer exists.")
+        fields = record.get("fields", record) if isinstance(record, dict) else {}
+        live_status = str(fields.get("status") or record.get("status") or "").strip()
+        if live_status != from_status:
+            raise ProductionRunnerError(
+                f"Authoritative status conflict for {spec.task_id}: expected '{from_status}', got '{live_status}'."
+            )
+
+        command = [
+            sys.executable,
+            os.path.join(_SCRIPTS_ROOT, "transition_task.py"),
+            "--config", self._authority_config(spec),
+            "--task-id", spec.task_id,
+            "--role", role,
+            "--from-status", from_status,
+            "--to-status", to_status,
+            "--assignee", assignee,
+            "--type", spec.task_type,
+            "--remarks", remarks,
+        ]
+        if to_status == "已完成":
+            command.extend(["--end-time", time.strftime("%Y-%m-%d %H:%M:%S")])
+        env = os.environ.copy()
+        env["YY_FLOW_PROJECT_ROOT"] = spec.authority_root
+        env["PYTHONIOENCODING"] = "utf-8"
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            timeout=30,
+        )
+        if completed.returncode != 0:
+            raise ProductionRunnerError(
+                f"Legal board transition {from_status}->{to_status} failed: "
+                f"{(completed.stderr or completed.stdout).strip()}"
+            )
 
     def _parse_reviewer_structured_json(
         self,
@@ -219,11 +304,13 @@ class ProductionRunner:
         candidate_commit: str,
         session_id: str,
         invocation_id: str,
+        review_request_id: str,
     ) -> ReviewerStructuredOutput:
         """
         严格按 JSON Schema 解析并校验 Reviewer 响应 (DEF-T0061-1)。
         严禁使用默认值覆盖缺失字段；严禁放行普通文本 PASS；
-        所有身份字段 (task_id, baseline_commit, candidate_commit, session_id, host_invocation_id) 必须精确匹配。
+        模型只能回显派发前已知的 review_request_id；真实 host_invocation_id
+        必须由 Adapter 返回并由 Runner 绑定，不得要求模型自述或伪造。
         """
         cleaned = raw_output.strip()
         json_obj = None
@@ -254,6 +341,7 @@ class ProductionRunner:
                 candidate_commit=candidate_commit,
                 session_id=session_id,
                 host_invocation_id=invocation_id,
+                review_request_id=review_request_id,
                 decision="REJECT",
                 defects=({
                     "defect_id": f"DEF-{task_id}-SCHEMA-VIOLATION",
@@ -272,6 +360,7 @@ class ProductionRunner:
                 candidate_commit=candidate_commit,
                 session_id=session_id,
                 host_invocation_id=invocation_id,
+                review_request_id=review_request_id,
                 decision="REJECT",
                 defects=({
                     "defect_id": f"DEF-{task_id}-SCHEMA-VIOLATION",
@@ -291,8 +380,10 @@ class ProductionRunner:
             mismatches.append(f"candidate_commit mismatch: expected '{candidate_commit}', got '{json_obj.get('candidate_commit')}'")
         if json_obj.get("session_id") != session_id:
             mismatches.append(f"session_id mismatch: expected '{session_id}', got '{json_obj.get('session_id')}'")
-        if json_obj.get("host_invocation_id") != invocation_id:
-            mismatches.append(f"host_invocation_id mismatch: expected '{invocation_id}', got '{json_obj.get('host_invocation_id')}'")
+        if json_obj.get("review_request_id") != review_request_id:
+            mismatches.append(
+                f"review_request_id mismatch: expected '{review_request_id}', got '{json_obj.get('review_request_id')}'"
+            )
 
         if mismatches:
             return ReviewerStructuredOutput(
@@ -301,6 +392,7 @@ class ProductionRunner:
                 candidate_commit=candidate_commit,
                 session_id=session_id,
                 host_invocation_id=invocation_id,
+                review_request_id=review_request_id,
                 decision="REJECT",
                 defects=({
                     "defect_id": f"DEF-{task_id}-IDENTITY-MISMATCH",
@@ -320,6 +412,7 @@ class ProductionRunner:
                 candidate_commit=candidate_commit,
                 session_id=session_id,
                 host_invocation_id=invocation_id,
+                review_request_id=review_request_id,
                 decision="REJECT",
                 defects=({
                     "defect_id": f"DEF-{task_id}-INVALID-PASS",
@@ -342,6 +435,7 @@ class ProductionRunner:
             candidate_commit=candidate_commit,
             session_id=session_id,
             host_invocation_id=invocation_id,
+            review_request_id=review_request_id,
             decision=decision,
             defects=tuple(defects),
             summary=str(json_obj.get("summary", "")),
@@ -394,6 +488,33 @@ class ProductionRunner:
             evidence_gate=self.evidence_gate,
             project_root=project_root,
         )
+
+        authority_adapter = self._authority_adapter(spec)
+        if not verify_optimistic_concurrency(spec, authority_adapter):
+            return RunnerResult(
+                success=False,
+                state=RunnerState.FAILED.value,
+                task_id=task_id,
+                message="Authoritative task changed after it was read; refusing to start (optimistic concurrency conflict).",
+            )
+        board_status = spec.status_at_read
+        if board_status == "待开始":
+            self._transition_authority(
+                spec,
+                role="DEV",
+                from_status="待开始",
+                to_status="进行中",
+                assignee=spec.owner,
+                remarks="Production Runner accepted the task and started the isolated Builder stage.",
+            )
+            board_status = "进行中"
+        elif board_status != "进行中":
+            return RunnerResult(
+                success=False,
+                state=RunnerState.FAILED.value,
+                task_id=task_id,
+                message=f"Runner requires authority task status '待开始' or '进行中', got '{board_status}'.",
+            )
 
         worktree_dir = project_root
         worktree_branch = spec.baseline_branch
@@ -597,6 +718,8 @@ class ProductionRunner:
                     cwd=worktree_dir,
                     stderr=subprocess.DEVNULL,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     timeout=5,
                 ).strip()
             except Exception as ge:
@@ -621,6 +744,21 @@ class ProductionRunner:
                     state=RunnerState.FAILED.value,
                     task_id=task_id,
                     message="Builder produced no new commits on top of baseline commit (Candidate == Baseline). Fail-Closed.",
+                )
+
+            ancestry = subprocess.run(
+                ["git", "merge-base", "--is-ancestor", spec.baseline_commit, candidate_commit],
+                cwd=worktree_dir,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if ancestry.returncode != 0 or self._get_git_tracked_status(worktree_dir).strip():
+                return RunnerResult(
+                    success=False,
+                    state=RunnerState.FAILED.value,
+                    task_id=task_id,
+                    message="Builder candidate is not a clean descendant of the declared baseline (Fail-Closed).",
                 )
 
             orchestrator.start_builder(
@@ -664,6 +802,16 @@ class ProductionRunner:
             )
             self.evidence_store.append(b_record)
             evidence_ids.append(builder_evidence_id)
+
+            self._transition_authority(
+                spec,
+                role="DEV",
+                from_status=board_status,
+                to_status="审查中",
+                assignee="周审查",
+                remarks=f"Builder produced candidate {candidate_commit}; independent review requested.",
+            )
+            board_status = "审查中"
 
             b_handover = BuilderToReviewerHandover(
                 task_id=task_id,
@@ -714,11 +862,14 @@ class ProductionRunner:
                     cwd=worktree_dir,
                     stderr=subprocess.DEVNULL,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     timeout=5,
                 )
             except Exception:
                 diff_text = "(diff unavailable)"
 
+            review_request_id = "review_req_" + hashlib.sha256(sess_reviewer.encode("utf-8")).hexdigest()[:24]
             reviewer_prompt = (
                 f"You are the independent Code Reviewer for Task {spec.task_id}.\n"
                 f"Requirements: {spec.requirement_text}\n"
@@ -733,6 +884,7 @@ class ProductionRunner:
                 f"- baseline_commit: '{spec.baseline_commit}'\n"
                 f"- candidate_commit: '{candidate_commit}'\n"
                 f"- session_id: '{sess_reviewer}'\n"
+                f"- review_request_id: '{review_request_id}'\n"
                 f"- decision: 'PASS' or 'REJECT'\n"
                 f"- defects: list of defect objects if REJECT\n"
                 f"- summary: detailed review rationale\n"
@@ -795,6 +947,7 @@ class ProductionRunner:
                 candidate_commit=candidate_commit,
                 session_id=reviewer_handle.session_id,
                 invocation_id=inv_reviewer,
+                review_request_id=review_request_id,
             )
 
             reviewer_evidence_id = f"evi_reviewer_{task_id.lower()}_{int(time.time()*1000)}"
@@ -847,6 +1000,16 @@ class ProductionRunner:
                 }
                 defects_history.append(defect_record)
 
+                self._transition_authority(
+                    spec,
+                    role="REVIEWER",
+                    from_status=board_status,
+                    to_status="已退回",
+                    assignee=spec.owner,
+                    remarks=f"Independent Reviewer rejected candidate {candidate_commit}: {review_struct.summary}",
+                )
+                board_status = "已退回"
+
                 if review_cycle >= spec.max_review_cycles:
                     checkpoint = RunnerCheckpoint(
                         task_id=task_id,
@@ -876,6 +1039,15 @@ class ProductionRunner:
                         diagnostics={"defects": defects_history},
                     )
 
+                self._transition_authority(
+                    spec,
+                    role="DEV",
+                    from_status=board_status,
+                    to_status="进行中",
+                    assignee=spec.owner,
+                    remarks="Production Runner returned the original task to Builder for the next repair cycle.",
+                )
+                board_status = "进行中"
                 continue
 
             # Reviewer PASS -> Handover to QA
@@ -895,6 +1067,15 @@ class ProductionRunner:
                 billing_context=f"billing_ctx_{spec.project_id}",
             )
             orchestrator.pass_reviewer_to_qa(r_to_qa, evidence_id=reviewer_evidence_id, host_handle=reviewer_handle)
+            self._transition_authority(
+                spec,
+                role="REVIEWER",
+                from_status=board_status,
+                to_status="测试中",
+                assignee="章测试",
+                remarks=f"Independent Reviewer passed candidate {candidate_commit}; QA requested.",
+            )
+            board_status = "测试中"
 
             # ==========================================
             # STAGE 3: CODEX QA
@@ -1033,6 +1214,16 @@ class ProductionRunner:
                 }
                 defects_history.append(defect_record)
 
+                self._transition_authority(
+                    spec,
+                    role="QA",
+                    from_status=board_status,
+                    to_status="已退回",
+                    assignee=spec.owner,
+                    remarks=f"QA rejected candidate {candidate_commit}; test command exited with {test_exit_code}.",
+                )
+                board_status = "已退回"
+
                 if qa_cycle >= spec.max_qa_cycles:
                     checkpoint = RunnerCheckpoint(
                         task_id=task_id,
@@ -1062,6 +1253,15 @@ class ProductionRunner:
                         diagnostics={"defects": defects_history},
                     )
 
+                self._transition_authority(
+                    spec,
+                    role="DEV",
+                    from_status=board_status,
+                    to_status="进行中",
+                    assignee=spec.owner,
+                    remarks="Production Runner returned the original task to Builder after QA failure.",
+                )
+                board_status = "进行中"
                 continue
 
             ua_req = UserAcceptanceRequest(
@@ -1109,61 +1309,17 @@ class ProductionRunner:
         )
         self.checkpoint_store.save_checkpoint(checkpoint)
 
-        # 5. 权威看板合法状态机流转 (DEF-T0061-3)
-        try:
-            config_candidates = [
-                os.path.join(spec.authority_root, "config", "workflow.config.yaml"),
-                os.path.join(spec.authority_root, "user_data", "workflow.config.yaml"),
-            ]
-            board_cfg = None
-            for c in config_candidates:
-                if os.path.isfile(c):
-                    board_cfg = c
-                    break
-
-            if board_cfg:
-                import yaml
-                with open(board_cfg, "r", encoding="utf-8") as f:
-                    cfg_data = yaml.safe_load(f) or {}
-
-                board_sub = cfg_data.get("board", {})
-                if board_sub.get("provider", "feishu_base").lower() == "local":
-                    raw_board_file = board_sub.get("board_file", "user_data/board.json")
-                    board_file = os.path.abspath(os.path.join(spec.authority_root, raw_board_file)) if not os.path.isabs(raw_board_file) else raw_board_file
-                    b_adapter = OfflineBoardAdapter(board_file=board_file, field_map=board_sub.get("fields", {}))
-                else:
-                    b_adapter = get_board_adapter(board_cfg)
-
-                if verify_optimistic_concurrency(spec, b_adapter):
-                    transition_script = os.path.join(_SCRIPTS_ROOT, "transition_task.py")
-                    t_cmd = [
-                        sys.executable,
-                        transition_script,
-                        "--config", board_cfg,
-                        "--task-id", task_id,
-                        "--role", "QA",
-                        "--from-status", spec.status_at_read,
-                        "--to-status", "已完成",
-                        "--assignee", "严经理",
-                        "--remarks", f"Runner 完成所有 Builder/Reviewer/QA 阶段并生成 confirmation_request_id: {confirmation_request_id}，停留在 PENDING_USER_ACCEPTANCE 等待用户最终验收。",
-                    ]
-                    env = os.environ.copy()
-                    env["YY_FLOW_PROJECT_ROOT"] = spec.authority_root
-                    t_proc = subprocess.run(t_cmd, capture_output=True, text=True, env=env, timeout=20)
-                    if t_proc.returncode != 0:
-                        return RunnerResult(
-                            success=False,
-                            state=RunnerState.FAILED.value,
-                            task_id=task_id,
-                            message=f"Legal board transition failed via transition_task.py: {t_proc.stderr or t_proc.stdout}",
-                        )
-        except Exception as te:
-            return RunnerResult(
-                success=False,
-                state=RunnerState.FAILED.value,
-                task_id=task_id,
-                message=f"State machine transition error: {te}",
-            )
+        self._transition_authority(
+            spec,
+            role="QA",
+            from_status=board_status,
+            to_status="已完成",
+            assignee="严经理",
+            remarks=(
+                "Builder, independent Reviewer and QA evidence passed. "
+                f"confirmation_request_id={confirmation_request_id}; waiting for explicit user acceptance."
+            ),
+        )
 
         return RunnerResult(
             success=True,
@@ -1226,6 +1382,36 @@ class ProductionRunner:
             )
 
         spec = load_task_execution_spec(project_root=project_root, task_id=task_id, authority_root=authority_root)
+        if ckpt.state in (RunnerState.CANCELLED.value, RunnerState.PENDING_USER_ACCEPTANCE.value):
+            return RunnerResult(
+                success=False,
+                state=ckpt.state,
+                task_id=task_id,
+                candidate_commit=ckpt.candidate_commit,
+                message=f"Checkpoint state '{ckpt.state}' cannot be resumed.",
+            )
+        if ckpt.state == RunnerState.APPROVAL_REQUIRED.value and not pre_granted_approval:
+            return RunnerResult(
+                success=False,
+                state=RunnerState.APPROVAL_REQUIRED.value,
+                task_id=task_id,
+                message="Explicit --approve is required to resume this checkpoint.",
+            )
+        if ckpt.worktree_path:
+            resume_root = os.path.realpath(ckpt.worktree_path)
+            if not os.path.isdir(resume_root):
+                return RunnerResult(
+                    success=False,
+                    state=RunnerState.FAILED.value,
+                    task_id=task_id,
+                    message=f"Checkpoint worktree no longer exists: {resume_root}",
+                )
+            spec = replace(
+                spec,
+                project_id=ckpt.project_id,
+                project_root=resume_root,
+                workspace_mode="inherit",
+            )
         lock_handle, lock_file = self.checkpoint_store.acquire_runner_lock(task_id)
         if lock_handle is None:
             return RunnerResult(
