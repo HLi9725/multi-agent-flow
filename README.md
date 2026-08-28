@@ -37,7 +37,7 @@
 | **`/yy-flow kanban`** | **启动看板 Web 服务**：本地启动可视化看板服务并输出实际访问链接（默认 32886 端口） |
 | **`/yy-flow sync-pr`** | **PR 状态监听与合流解阻**：扫描【已阻塞】任务，检测 GitHub PR Merged 自动推进至【已完成】并唤起 PM 验收 |
 | **`/yy-flow auto`** | **纯模拟状态链**：零写入演示 A–G 类型流转，不调用真实 Host、不修改看板 |
-| **`/yy-flow run`** | **真实自动编排（2F-PROD 待实现）**：读取任务并自动执行 Codex Builder → Antigravity Reviewer → Codex QA，最终等待用户验收；2F-PROD 验收前不可用 |
+| **`/yy-flow run`** | **真实自动编排（2F-PROD 通用 Runner）**：读取任务并自动执行 Codex Builder → Antigravity Reviewer (JSON Schema) → Codex QA (源码不可变)，通过 EvidenceGate 验证后停在等待用户验收 |
 
 > 💡 **业务流转与协同全走自然语言**：需求拆解建卡、阶段开工、阶段结项、认领、提审、测试与打回等日常研发生命周期，直接使用自然语言与 Agent 对话沟通，由对应专家在后台自主调度底层脚本。
 

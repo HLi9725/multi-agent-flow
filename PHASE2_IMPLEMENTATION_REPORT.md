@@ -950,3 +950,31 @@ dual_host_l2_status:
 - 不得宣称 `/yy-flow run` 已可用；
 - 不得进入第三或第四阶段；
 - 不得自动用户验收、合并 main、Push、Tag 或 Release。
+### 17. 2F-PROD 通用自动编排 Runner 核心设计与执行约束
+
+依据 2026-08-28 任务授权与用户明确要求，2F-PROD 严格遵循以下 12 项设计约束：
+
+1. **[Reviewer 固定 JSON Schema 契约]**：
+   - Reviewer 返回值必须使用固定 JSON Schema（包含 `task_id`, `baseline_commit`, `candidate_commit`, `session_id`, `host_invocation_id`, `decision: PASS|REJECT`, `defects: List[Defect]`），严禁使用普通文本中的 PASS/REJECT 关键字匹配作为放行依据。
+2. **[QA 源码不可变性安全边界]**：
+   - QA 角色权限定为“版本控制源码不可变”，允许受控测试缓存（`.pytest_cache`、`__pycache__`）和构建输出；在 QA 执行前后强制核验 `git status`、`git diff`、`HEAD` 和候选 SHA，若源码发生变化立即 Fail-Closed 终止。
+3. **[工单与业务任务边界分离]**：
+   - 明确区分 Runner 实施工单（`T0061`）与 Runner 编排执行的实际业务任务；`T0061` 实施完成后停留在【审查中】移交独立审查员；Runner 执行的业务任务完成停留在【已完成】（`PENDING_USER_ACCEPTANCE`）；两者均严禁自动代行用户验收。
+4. **[Windows 真实任意任务 E2E]**：
+   - 模拟 E2E 绝不能作为真实准出依据；必须在 Windows 环境中执行一个非 T0054、非固定 fixture 的真实任意业务任务 E2E，端到端真实调用 Codex Builder、Antigravity Reviewer 和 Codex QA。
+5. **[多维独立超时与循环预算]**：
+   - Builder、Reviewer、QA 的超时时间独立配置（`builder_timeout_seconds`、`reviewer_timeout_seconds`、`qa_timeout_seconds`），增加单阶段循环上限（`max_review_cycles`、`max_qa_cycles`）、全流程总尝试上限（`max_total_attempts`）、总墙钟时间上限（`total_wall_clock_timeout_seconds`）以及预算控制，严禁硬编码单一固定超时。
+6. **[APPROVAL_REQUIRED 与断点恢复]**：
+   - 遇到权限、登录、费用或客户端安全确认无法自动满足时，原子保存 Checkpoint，安全转入 `APPROVAL_REQUIRED` 状态，允许用户处理后通过 `run_task.py resume` 继续，严禁伪造或绕过客户端安全确认。
+7. **[TaskExecutionSpec 强绑定与乐观并发校验]**：
+   - `TaskExecutionSpec` 必须不可变绑定 Authority Root、Project Root、`task_id`、任务版本/更新时间、读取状态、`baseline_commit` 和验收标准哈希（`acceptance_criteria_hash`）；每次真实状态流转前重新读取权威任务并进行乐观并发版本校验。
+8. **[缺陷自动回环与强制复审]**：
+   - Reviewer REJECT 或 QA FAIL 后必须复用原业务任务和受控 Worktree，创建新的 Codex Session/Invocation，保存结构化缺陷 Evidence，生成新候选提交，并且修复后必须重新经过 Reviewer 审查，严禁绕过 Reviewer 直接进入 QA。
+9. **[confirmation_request_id 非证据语义]**：
+   - `confirmation_request_id` 仅代表服务端生成的确认请求标识，绝不构成 `USER_CONFIRMATION` Evidence，严禁据此自动推进至已验收。
+10. **[Evidence 追加写与 1:1 Gate 校验]**：
+    - Evidence 必须追加写、不可覆盖；每轮 Builder、Reviewer、QA 均生成独立 Evidence，并由 `EvidenceGate` 严格校验 task、project、worktree、baseline、candidate、session、invocation 和 transition 1:1 契约。
+11. **[run_task status 纯只读与零副作用]**：
+    - `run_task status` 命令必须纯读取、零写入、零锁目录创建、零 Host 调用。
+12. **[全局目录不可变性]**：
+    - 严禁自动修改 `C:\Users\user\.codex\skills\yy-flow` 或其他全局安装目录，只修改仓库内 Skill 源码文件。
