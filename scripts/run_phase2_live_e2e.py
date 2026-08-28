@@ -503,7 +503,8 @@ def run_phase2_live_e2e_pipeline(
     req_reviewer = AgentRequest(
         session_id=sess_reviewer,
         prompt=(
-            "Please perform a read-only code review of tests/fixtures/fixture_math_util.py:\n\n"
+            "Review only the inline Python snippet below. Do not call tools, execute commands, "
+            "or access files.\n\n"
             "```python\n"
             "def pure_add(a: int, b: int) -> int:\n"
             "    return a + b\n"
@@ -963,6 +964,9 @@ if __name__ == "__main__":
     print(f"Masked Conversation ID: {res.masked_canonical_conversation_id}")
     print(f"Masked Invocation ID: {res.masked_canonical_invocation_id}")
     print(f"Confirmation Request ID: {res.real_host_invocations.get('confirmation_request_id')}")
-    print(f"QA Real Pytest: exit={res.qa_real_test_summary['exit_code']}, passed={res.qa_real_test_summary['passed']}")
+    if res.qa_real_test_summary:
+        print(f"QA Real Pytest: exit={res.qa_real_test_summary['exit_code']}, passed={res.qa_real_test_summary['passed']}")
+    else:
+        print("QA Real Pytest: not run")
     print(f"Evidence Records: {res.evidence_ids}")
     print(f"Diagnostics: {res.diagnostics}")

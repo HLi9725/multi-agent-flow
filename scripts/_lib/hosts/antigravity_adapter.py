@@ -509,8 +509,16 @@ class AntigravityAdapter(BaseHostAdapter):
             else:
                 exec_mode = "accept-edits"
 
-        # Determine target subagent
-        agent_name = ROLE_AGENT_MAP.get(role, "flow-dev" if role in ("DEV", "BUILDER") else "self")
+        # A one-shot verification probe reviews an inline payload and must not inherit
+        # a global Reviewer agent profile that may require command permissions.
+        verification_probe_authorized = (
+            getattr(self._verification_probe_ctx, "session_id", None) == request.session_id.strip()
+        )
+        agent_name = (
+            "self"
+            if verification_probe_authorized
+            else ROLE_AGENT_MAP.get(role, "flow-dev" if role in ("DEV", "BUILDER") else "self")
+        )
 
         cmd = [self._executable_path or "agy"]
 

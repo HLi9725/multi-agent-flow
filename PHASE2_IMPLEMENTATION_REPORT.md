@@ -874,3 +874,10 @@ dual_host_l2_status:
    - 旧 Evidence 已明确作废；本节仅证明修复代码的静态审查与受控回归通过；
    - 必须先提交形成新的固定候选 SHA，再重新运行真实双宿主 Live E2E，生成 `result_commit` 与该 SHA 一致的新 Evidence；
    - 新 Evidence 独立复核 3/3 通过之前，不得重新声明 `CLI_VERIFIED / READY`，不得完成 QA 或用户验收。
+7. **[DEF-T0054-18] Headless Reviewer 不得继承需命令授权的全局 Agent（P1）**：
+   - 新候选首次真实复跑时，Antigravity 全局 `flow-review` 配置尝试调用 command 工具；headless 模式无法交互授权，因此真实返回自动拒绝，流水线正确停在 `REJECTED_BY_REVIEWER`；
+   - 一次性 `dispatch_verification_probe()` 现固定使用 Antigravity `self` Agent，只审查 Prompt 内联代码，不继承全局 Agent 的工具需求，也不使用 `--dangerously-skip-permissions`；
+   - Prompt 明确禁止工具、命令与文件访问；普通自动 Reviewer 仍保持原 `flow-review` 路由，不扩大权限；
+   - 命令行摘要在 Reviewer/Builder 提前失败、QA 未运行时输出 `QA Real Pytest: not run`，不再因空报告触发 `KeyError`。
+   - 候选 `1129eab256e26caaec79528214a258f1aada7310` 的首次真实复跑结果及两条 Evidence 因 Reviewer 自动拒绝而作废，不得用于准出；
+   - 修复后带进程守卫定向测试 `53 passed in 3.15s`，完整回归 `397 passed in 101.90s`，均为 exit 0、0 failed、0 skipped；`git diff --check` exit 0。

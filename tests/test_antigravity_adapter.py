@@ -684,6 +684,25 @@ def test_antigravity_promotion_requires_matching_canonical_identity():
     assert adapter._verification_level == VerificationLevel.STATIC_ONLY
 
 
+def test_verification_probe_uses_self_agent_without_global_reviewer_tools():
+    """The inline bootstrap review must not inherit a command-requiring global agent profile."""
+    adapter = AntigravityAdapter(is_real_host=True)
+    request = AgentRequest(
+        session_id="sess-inline-probe",
+        prompt="Review this inline snippet only and return PASS: verified",
+        role="REVIEWER",
+        workspace_dir=os.path.abspath("."),
+        extra_context={"mode": "plan", "permission_boundary": "workspace_read"},
+    )
+    adapter._verification_probe_ctx.session_id = request.session_id
+    try:
+        command = adapter.build_antigravity_exec_command(request)
+    finally:
+        adapter._verification_probe_ctx.session_id = None
+    agent_index = command.index("--agent")
+    assert command[agent_index + 1] == "self"
+
+
 def test_antigravity_real_executable_detection_and_help(monkeypatch):
     exe_path = _find_default_antigravity_executable()
     if exe_path:
