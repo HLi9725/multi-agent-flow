@@ -11,7 +11,13 @@
 import os
 import sys
 
-import paths as _paths
+try:
+    from ... import paths
+except Exception:
+    try:
+        from scripts import paths
+    except Exception:
+        import paths as _paths
 
 
 def load_arch_data():

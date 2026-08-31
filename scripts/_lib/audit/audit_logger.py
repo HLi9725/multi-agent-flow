@@ -20,11 +20,17 @@ import logging
 from datetime import datetime, date
 from typing import Any, Dict, List, Optional
 
-import paths as _paths
+try:
+    from ... import paths
+except Exception:
+    try:
+        from scripts import paths
+    except Exception:
+        import paths
 
 def get_logs_dir() -> str:
     """日志目录：AUDIT_LOG_DIR 环境变量覆盖 > data_root/user_data/logs（惰性解析）"""
-    return _paths.audit_logs_dir()
+    return paths.audit_logs_dir()
 
 def get_audit_log_file() -> str:
     return os.path.join(get_logs_dir(), "audit_trail.log")

@@ -17,7 +17,13 @@ _SCRIPTS_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".
 if _SCRIPTS_ROOT not in sys.path:
     sys.path.insert(0, _SCRIPTS_ROOT)
 
-import paths
+try:
+    from ... import paths
+except Exception:
+    try:
+        from scripts import paths
+    except Exception:
+        import paths
 from _lib.core import file_lock
 from .runner_schema import RunnerCheckpoint
 

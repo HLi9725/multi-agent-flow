@@ -78,7 +78,7 @@ def cmd_status(args):
     authority_root = os.path.realpath(args.authority_root) if args.authority_root else None
 
     runner = _runner_for(project_root, authority_root)
-    status_data = runner.status(project_root=project_root, task_id=args.task_id, authority_root=authority_root)
+    status_data = runner.get_status(project_root=project_root, task_id=args.task_id, authority_root=authority_root)
     print(json.dumps(status_data, indent=2, ensure_ascii=False))
     return 0
 

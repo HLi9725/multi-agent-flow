@@ -882,6 +882,38 @@ def test_antigravity_adapter_dispatch_zero_self_authorization():
     assert handle_2.session_id == "sess_safe_chk_02"
 
 
+def test_antigravity_adapter_out_of_band_approval_is_exact_and_bounded():
+    adapter = AntigravityAdapter(is_real_host=False)
+    workspace = os.path.abspath(".")
+    controlled = AgentRequest(
+        session_id="sess_controlled_01",
+        prompt="curl https://example.com/status",
+        role="REVIEWER",
+        workspace_dir=workspace,
+        extra_context={
+            "project_id": "proj_controlled",
+            "auth_context": "auth_controlled",
+            "permission_boundary": "workspace_read",
+        },
+    )
+
+    with pytest.raises(AgentNotSupportedError, match="requires explicit user permission approval"):
+        adapter.dispatch_agent(controlled)
+
+    assert adapter.record_out_of_band_approval(controlled) == "controlled_external"
+    assert adapter.dispatch_agent(controlled).session_id == "sess_controlled_01"
+
+    destructive = AgentRequest(
+        session_id="sess_destructive_01",
+        prompt="git reset --hard HEAD",
+        role="REVIEWER",
+        workspace_dir=workspace,
+        extra_context={"project_id": "proj_controlled"},
+    )
+    with pytest.raises(AgentNotSupportedError, match="cannot receive out-of-band approval"):
+        adapter.record_out_of_band_approval(destructive)
+
+
 def test_antigravity_adapter_popen_sets_cwd_for_project_isolation(monkeypatch):
     adapter = AntigravityAdapter(is_real_host=True, verification_level=VerificationLevel.CLI_VERIFIED)
     target_ws = os.path.abspath(".")

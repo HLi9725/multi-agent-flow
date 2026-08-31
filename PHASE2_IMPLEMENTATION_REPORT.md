@@ -1028,3 +1028,31 @@ dual_host_l2_status:
 - **工作流 v2 回归**：`67 passed in 42.25s`。
 - **全仓库全量回归**：`413 passed in 109.83s`，退出码 `0`，`0 failed`。
 - **格式校验**：`git diff --check` 退出码 `0`。
+
+### 20. 2F-PROD 最终真实准出与 Windows 兼容修复
+
+2026-08-31 在 Windows 真实双宿主准出过程中继续执行 Fail-Closed 复核，并完成以下收口修复：
+
+1. **Codex UAC 与隔离 Worktree 兼容**：
+   - Codex CLI 每次调用显式使用 `windows.sandbox="unelevated"`，避免反复启动 `codex-windows-sandbox-setup.exe`；未修改用户全局 Codex 配置。
+   - 对隔离 Worktree 的 Git common dir 使用受控 `--add-dir`，允许 Builder 在既定仓库边界内产生真实候选提交。
+2. **Builder 候选提交确定性固化**：
+   - 真实 Builder 成功但未主动提交时，仅在 HEAD 仍为基线、工作区确有变更的前提下执行受控提交；空变更、已有提交后仍脏、Git hook 失败均 Fail-Closed。
+3. **Antigravity 无头 Reviewer 消除工具权限等待**：
+   - Runner 生成有 `180000` 字符硬上限的不可变 Git diff 并直接内联给 Reviewer，明确禁止工具、命令、浏览器、文件系统和子代理调用。
+   - `--approve` 仅通过可信外层记录精确绑定 session/project/workspace/command-family 的审批；`destructive`、`billing`、`acceptance` 操作即使显式审批仍严格拒绝。
+4. **Runner 外层硬超时**：
+   - `_wait_for_result_cancellable` 使用单调时钟独立执行角色截止时间，到期主动取消 Host 并抛出 `AgentTimeoutError`，不再完全依赖 Adapter 内部等待实现。
+5. **Windows QA 命令与源码不可变门禁**：
+   - 正确解析带引号的 Windows 绝对 Python 路径；绝对解释器必须与当前受信 `sys.executable` 的 realpath 完全一致，同名外部 `python.exe` 仍拒绝。
+   - `git status` 使用 `--untracked-files=all` 逐文件核验，允许任意层级的 `__pycache__`、`.pytest_cache` 和 `.pyc` 测试缓存，同时继续拒绝任何新增源码、配置、提交或 tracked diff。
+6. **真实任意任务 E2E 准出结果**：
+   - 命令：`python scripts/run_runner_live_e2e.py <authority_root> T0064 --approve`；退出码 `0`；耗时 `149.97s`。
+   - 状态：`PENDING_USER_ACCEPTANCE`；候选提交：`1a244a94f88178b02ddf37175ea857008712424d`；权威看板 T0064 合法停在【已完成】，处理人严经理，`end_date=2026-08-31 09:53:22`。
+   - EvidenceGate 3/3：`evi_builder_t0064_1788141158888`、`evi_reviewer_t0064_1788141175464`、`evi_qa_t0064_1788141202501`；真实宿主分别为 Codex、Antigravity、Codex，Session 与 Invocation 互不串线。
+   - 生成待用户确认请求：`conf_req_t0064_1788141202506`；该请求仅表示等待验收，不构成 USER_CONFIRMATION Evidence。
+7. **最终 QA**：
+   - 定向 Runner/Adapter/安全回归：`65 passed`，退出码 `0`。
+   - 全量测试：`421 passed in 96.22s`，退出码 `0`，`0 failed`、`0 skipped`。
+   - 权威 `board.json` 测试前后 SHA-256 均为 `1433F203CF9C0D37DFAA49377ABDCCC842C7ED57501E164CBA2351CAF7974BDF`，零污染、零直接编辑。
+   - `git diff --check`：退出码 `0`。

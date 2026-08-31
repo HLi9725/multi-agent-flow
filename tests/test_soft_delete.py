@@ -7,11 +7,15 @@ import requests
 
 SERVER_SCRIPT = os.path.join("scripts", "start_kanban_server.py")
 
-def test_soft_delete():
+def test_soft_delete(tmp_path):
+    user_data = tmp_path / "user_data"
+    user_data.mkdir()
+    (user_data / "board.json").write_text("[]", encoding="utf-8")
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
     env["KANBAN_PORT"] = "32955"
-    p = subprocess.Popen([sys.executable, SERVER_SCRIPT, "--allow-remote"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
+    env["YY_FLOW_PROJECT_ROOT"] = str(tmp_path)
+    p = subprocess.Popen([sys.executable, SERVER_SCRIPT], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
     time.sleep(2)
 
     try:

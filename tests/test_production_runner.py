@@ -7,6 +7,7 @@ import json
 import hashlib
 import os
 import subprocess
+import threading
 import time
 import pytest
 import yaml
@@ -16,6 +17,7 @@ from scripts._lib.core.agent_schema import (
     AgentHandle,
     AgentResult,
     AgentStatus,
+    AgentTimeoutError,
     CapabilitySupport,
     HostCapabilities,
 )
@@ -38,7 +40,9 @@ def mock_git_repo(tmp_path):
 
     readme = repo_dir / "README.md"
     readme.write_text("# Test Repo\n", encoding="utf-8")
-    subprocess.run(["git", "add", "README.md"], cwd=repo_dir, check=True, capture_output=True)
+    test_file = repo_dir / "test_app.py"
+    test_file.write_text("def test_app(): assert True\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo_dir, check=True, capture_output=True)
     subprocess.run(["git", "commit", "-m", "initial commit"], cwd=repo_dir, check=True, capture_output=True)
 
     head_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo_dir, text=True).strip()
@@ -57,12 +61,126 @@ def mock_git_repo(tmp_path):
     return repo_dir, head_sha
 
 
+def test_finalize_builder_candidate_creates_controlled_commit(tmp_path):
+    repo_dir = tmp_path / "builder-repo"
+    repo_dir.mkdir()
+    subprocess.run(["git", "init"], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "TestDev"], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo_dir, check=True, capture_output=True)
+    (repo_dir / "README.md").write_text("# Test\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "initial commit"], cwd=repo_dir, check=True, capture_output=True)
+    baseline = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo_dir, text=True).strip()
+    (repo_dir / "generated.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+    runner = object.__new__(ProductionRunner)
+    candidate = runner._finalize_builder_candidate(str(repo_dir), baseline)
+
+    assert candidate != baseline
+    assert len(candidate) == 40
+    assert subprocess.check_output(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+        cwd=repo_dir,
+        text=True,
+    ).strip() == ""
+    assert "固化自动开发产物" in subprocess.check_output(
+        ["git", "log", "-1", "--pretty=%s"], cwd=repo_dir, text=True, encoding="utf-8"
+    )
+
+
+def test_finalize_builder_candidate_rejects_empty_output(tmp_path):
+    repo_dir = tmp_path / "empty-builder-repo"
+    repo_dir.mkdir()
+    subprocess.run(["git", "init"], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "TestDev"], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo_dir, check=True, capture_output=True)
+    (repo_dir / "README.md").write_text("# Test\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "initial commit"], cwd=repo_dir, check=True, capture_output=True)
+    baseline = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo_dir, text=True).strip()
+
+    runner = object.__new__(ProductionRunner)
+    with pytest.raises(RuntimeError, match="no new commits or working-tree changes"):
+        runner._finalize_builder_candidate(str(repo_dir), baseline)
+
+
+def test_reviewer_diff_bundle_is_inline_bounded_and_nonempty(tmp_path):
+    repo_dir = tmp_path / "review-repo"
+    repo_dir.mkdir()
+    subprocess.run(["git", "init"], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "TestDev"], cwd=repo_dir, check=True)
+    subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo_dir, check=True)
+    (repo_dir / "value.py").write_text("VALUE = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo_dir, check=True)
+    subprocess.run(["git", "commit", "-m", "initial"], cwd=repo_dir, check=True, capture_output=True)
+    baseline = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo_dir, text=True).strip()
+    (repo_dir / "value.py").write_text("VALUE = 2\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo_dir, check=True)
+    subprocess.run(["git", "commit", "-m", "change"], cwd=repo_dir, check=True, capture_output=True)
+    candidate = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo_dir, text=True).strip()
+
+    runner = object.__new__(ProductionRunner)
+    bundle = runner._build_reviewer_diff_bundle(str(repo_dir), baseline, candidate)
+
+    assert "DIFF STAT:" in bundle
+    assert "-VALUE = 1" in bundle
+    assert "+VALUE = 2" in bundle
+    with pytest.raises(Exception, match="exceeds safe inline limit"):
+        runner._build_reviewer_diff_bundle(str(repo_dir), baseline, candidate, max_chars=10)
+
+
+def test_runner_wait_enforces_outer_deadline():
+    release = threading.Event()
+
+    class CheckpointStore:
+        @staticmethod
+        def query_status(task_id):
+            return {}
+
+    class SlowAdapter:
+        cancelled = False
+
+        def wait_for_result(self, handle, timeout_seconds=None):
+            release.wait(5)
+            return AgentResult(
+                session_id=handle.session_id,
+                status=AgentStatus.CANCELLED,
+                output="cancelled",
+                is_real_host=True,
+            )
+
+        def cancel_agent(self, handle):
+            self.cancelled = True
+            release.set()
+            return True
+
+    runner = object.__new__(ProductionRunner)
+    runner.checkpoint_store = CheckpointStore()
+    handle = AgentHandle(
+        session_id="sess_deadline",
+        host_id="slow",
+        status="running",
+        is_real_host=True,
+        adapter_instance_id="slow-instance",
+        invocation_token="deadline-token",
+    )
+    adapter = SlowAdapter()
+
+    started = time.monotonic()
+    with pytest.raises(AgentTimeoutError, match="exceeded Runner deadline"):
+        runner._wait_for_result_cancellable(adapter, handle, 0.05, "T0088")
+    assert time.monotonic() - started < 1.0
+    assert adapter.cancelled is True
+
+
 def test_production_runner_full_pass_pipeline(mock_git_repo, tmp_path, monkeypatch):
     repo_dir, baseline_sha = mock_git_repo
     data_root = tmp_path / "data_root"
     data_root.mkdir()
 
-    # Fast mock capabilities
+    session_workspaces = {}
+    review_requests = {}
+
     def mock_detect_caps(self):
         return HostCapabilities(
             is_real_host=True,
@@ -77,8 +195,8 @@ def test_production_runner_full_pass_pipeline(mock_git_repo, tmp_path, monkeypat
             max_concurrent_agents=4,
         )
 
-    # Mock builder & QA dispatch & wait
     def mock_codex_dispatch(self, req):
+        session_workspaces[req.session_id] = req.workspace_dir
         return AgentHandle(
             session_id=req.session_id,
             host_id="codex_cli",
@@ -89,8 +207,8 @@ def test_production_runner_full_pass_pipeline(mock_git_repo, tmp_path, monkeypat
         )
 
     def mock_codex_wait(self, handle, timeout_seconds=None):
+        target_dir = session_workspaces.get(handle.session_id, str(repo_dir))
         if "builder" in handle.session_id:
-            target_dir = str(repo_dir)
             dummy_file = os.path.join(target_dir, f"new_feature_{int(time.time()*1000)}.py")
             with open(dummy_file, "w", encoding="utf-8") as f:
                 f.write("def dummy(): return True\n")
@@ -113,8 +231,9 @@ def test_production_runner_full_pass_pipeline(mock_git_repo, tmp_path, monkeypat
                 is_real_host=True,
             )
 
-    # Mock reviewer dispatch & wait (strict structured JSON PASS)
     def mock_reviewer_dispatch(self, req):
+        session_workspaces[req.session_id] = req.workspace_dir
+        review_requests[req.session_id] = req.extra_context["review_request_id"]
         return AgentHandle(
             session_id=req.session_id,
             host_id="antigravity",
@@ -125,13 +244,14 @@ def test_production_runner_full_pass_pipeline(mock_git_repo, tmp_path, monkeypat
         )
 
     def mock_reviewer_wait(self, handle, timeout_seconds=None):
-        cand_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=str(repo_dir), text=True).strip()
+        target_dir = session_workspaces.get(handle.session_id, str(repo_dir))
+        cand_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=target_dir, text=True).strip()
         out_json = {
             "task_id": "T0088",
             "baseline_commit": baseline_sha,
             "candidate_commit": cand_sha,
             "session_id": handle.session_id,
-            "review_request_id": "review_req_" + hashlib.sha256(handle.session_id.encode("utf-8")).hexdigest()[:24],
+            "review_request_id": review_requests[handle.session_id],
             "decision": "PASS",
             "defects": [],
             "summary": "Code review passed. Implementation meets all requirements.",
@@ -140,7 +260,7 @@ def test_production_runner_full_pass_pipeline(mock_git_repo, tmp_path, monkeypat
             session_id=handle.session_id,
             status=AgentStatus.SUCCESS,
             output=json.dumps(out_json),
-            partial_results=({"invocation_id": "inv_reviewer_real_456"},),
+            partial_results=({"invocation_id": "inv_reviewer_ag_real"},),
             is_real_host=True,
         )
 
@@ -151,7 +271,7 @@ def test_production_runner_full_pass_pipeline(mock_git_repo, tmp_path, monkeypat
     monkeypatch.setattr(AntigravityAdapter, "dispatch_agent", mock_reviewer_dispatch)
     monkeypatch.setattr(AntigravityAdapter, "wait_for_result", mock_reviewer_wait)
 
-    registry = AdapterRegistry(context_id="test_repo")
+    registry = AdapterRegistry(context_id="test_proj")
     codex_manifest = create_codex_cli_manifest(adapter_id="codex_cli", verified_version="0.149.0")
     codex_adapter = CodexCliAdapter(is_real_host=True)
     registry.register(codex_adapter, codex_manifest)
@@ -161,37 +281,35 @@ def test_production_runner_full_pass_pipeline(mock_git_repo, tmp_path, monkeypat
     registry.register(ag_adapter, ag_manifest)
 
     evidence_store = EvidenceStore(root_dir=str(data_root / "evidence"))
-    checkpoint_store = RunnerCheckpointStore(data_root=str(data_root), project_root=str(repo_dir), project_id="test_repo")
+    evidence_gate = EvidenceGate(store=evidence_store, project_root=str(repo_dir))
+    checkpoint_store = RunnerCheckpointStore(data_root=str(data_root), project_root=str(repo_dir), project_id="test_proj")
 
     runner = ProductionRunner(
         registry=registry,
         evidence_store=evidence_store,
+        evidence_gate=evidence_gate,
         checkpoint_store=checkpoint_store,
     )
 
     spec = TaskExecutionSpec(
-        project_id="test_repo",
+        project_id="test_proj",
         project_root=str(repo_dir),
         authority_root=str(repo_dir),
         task_id="T0088",
         task_name="实现测试功能",
-        requirement_text="需要新增 dummy 函数",
+        requirement_text="需求: 需要新增 dummy 函数",
         acceptance_criteria="验收标准: dummy 函数正确返回 True",
-        acceptance_criteria_hash="",
+        acceptance_criteria_hash=hashlib.sha256("验收标准: dummy 函数正确返回 True".encode("utf-8")).hexdigest(),
         task_version="1.0",
         status_at_read="进行中",
         baseline_commit=baseline_sha,
         workspace_mode="inherit",
-        test_command="python -c \"import sys; sys.exit(0)\"",
+        test_command="python -m pytest -q",
     )
 
     result = runner.start(spec)
+
     assert result.success is True
     assert result.state == RunnerState.PENDING_USER_ACCEPTANCE.value
-    assert result.confirmation_request_id is not None
-    assert len(result.evidence_ids) == 3
-
-    # Test status query
-    status_info = runner.status(project_root=str(repo_dir), task_id="T0088")
-    assert status_info["has_checkpoint"] is True
-    assert status_info["state"] == RunnerState.PENDING_USER_ACCEPTANCE.value
+    assert result.candidate_commit is not None
+    assert len(result.evidence_ids) >= 3

@@ -1,43 +1,50 @@
 # -*- coding: utf-8 -*-
 """
 scripts/_lib/core/production_runner.py
-2F-PROD 通用自动编排 Runner 内核。
-管理完整生命周期：
-  读取权威任务 -> 隔离Worktree -> Codex Builder -> 真实候选校验 ->
-  Antigravity Reviewer (严格 JSON Schema / 驳回自动重修) -> Codex QA (源码不可变 / 失败重修) ->
-  EvidenceGate 逐阶段 1:1 强校验 -> 经合法状态机停在 PENDING_USER_ACCEPTANCE / 已完成。
+Universal Production Orchestration Runner for multi-agent-flow.
+Production-grade universal automatic runner for arbitrary projects and tasks.
 """
-import hashlib
+from dataclasses import dataclass, field, replace
 import json
 import os
 import re
 import shlex
 import subprocess
 import sys
+import threading
 import time
 import uuid
-from dataclasses import replace
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
-_SCRIPTS_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-if _SCRIPTS_ROOT not in sys.path:
-    sys.path.insert(0, _SCRIPTS_ROOT)
-
-import paths
+try:
+    from ... import paths
+except Exception:
+    try:
+        from scripts import paths
+    except Exception:
+        import paths
 from ..boards.board_adapter_factory import get_board_adapter
 from ..boards.offline_board_adapter import OfflineBoardAdapter
-from .adapter_manifest import ExecutionMode, VerificationLevel
+from .adapter_manifest import (
+    AdapterManifest,
+    AuthBoundaryType,
+    BillingBoundaryType,
+    ExecutionMode,
+    HostSurface,
+    PlatformVerification,
+    VerificationLevel,
+)
 from .adapter_registry import AdapterRegistry
 from .agent_schema import (
-    AgentCancelledError,
     AgentHandle,
+    AgentInvalidHandleError,
     AgentNotSupportedError,
     AgentRequest,
     AgentResult,
     AgentStatus,
+    AgentTimeoutError,
     CapabilitySupport,
     ConfirmationRequest,
-    ConfirmationResult,
     HostCapabilities,
 )
 from .evidence_gate import EvidenceGate, EvidenceValidationContext
@@ -63,7 +70,7 @@ from .orchestrator_schema import (
     OrchestrationState,
     UserAcceptanceRequest,
 )
-from .runner_checkpoint_store import RunnerCheckpointStore
+from .runner_checkpoint_store import RunnerCheckpointStore, _validate_task_id
 from .runner_schema import (
     REVIEWER_JSON_SCHEMA,
     ReviewerStructuredOutput,
@@ -79,6 +86,25 @@ from ..hosts.antigravity_adapter import AntigravityAdapter, create_antigravity_m
 from ..hosts.codex_cli_adapter import CodexCliAdapter, create_codex_cli_manifest
 
 
+ALLOWED_TEST_BINARIES = {
+    "pytest", "pytest.exe",
+    "python", "python.exe", "python3", "python3.exe", "py", "py.exe",
+    "npm", "npm.cmd", "npm.exe",
+    "npx", "npx.cmd", "npx.exe",
+    "cargo", "cargo.exe",
+    "go", "go.exe",
+}
+
+FORBIDDEN_SHELL_TOKENS = {
+    "|", "&", ";", ">", "<", "`", "$", "\n", "\r", "&&", "||", ";;",
+}
+
+FORBIDDEN_DANGEROUS_COMMANDS = {
+    "rm", "del", "rmdir", "rd", "format", "shutdown", "curl", "wget",
+    "nc", "netcat", "bash", "sh", "powershell", "powershell.exe", "cmd", "cmd.exe",
+}
+
+
 def _extract_capabilities_extra(caps: Any) -> Dict[str, Any]:
     if not caps:
         return {}
@@ -90,7 +116,16 @@ def _extract_capabilities_extra(caps: Any) -> Dict[str, Any]:
 
 
 def _extract_real_invocation_id(result: AgentResult, handle: AgentHandle) -> Optional[str]:
-    """从 AgentResult / AgentHandle 中提取真实非空 Invocation ID"""
+    """从 AgentResult / AgentHandle 中提取真实非空 Invocation ID (严格校验成功状态与会话一致性)"""
+    if not isinstance(result, AgentResult) or not isinstance(handle, AgentHandle):
+        return None
+    if result.status != AgentStatus.SUCCESS:
+        return None
+    if result.session_id != handle.session_id:
+        return None
+    if not result.is_real_host or not handle.is_real_host:
+        return None
+
     if getattr(result, "host_invocation_id", None):
         return str(result.host_invocation_id).strip()
 
@@ -102,6 +137,111 @@ def _extract_real_invocation_id(result: AgentResult, handle: AgentHandle) -> Opt
                     return str(inv).strip()
 
     return None
+
+
+def _validate_qa_test_command(test_cmd: str, worktree_dir: str) -> Tuple[bool, Optional[str], List[str]]:
+    """严格校验 QA 测试命令族、受控参数与路径边界（P2 门禁）"""
+    if not test_cmd or not test_cmd.strip():
+        return False, "QA test command cannot be empty", []
+
+    for token in FORBIDDEN_SHELL_TOKENS:
+        if token in test_cmd:
+            return False, f"Dangerous shell operator '{token}' forbidden in QA test command", []
+
+    try:
+        args = shlex.split(test_cmd, posix=(sys.platform != "win32"))
+    except Exception as e:
+        return False, f"Failed to parse test command: {e}", []
+
+    # Windows shlex(posix=False) preserves surrounding quotes.  Normalize only
+    # balanced outer quotes; embedded content and shell operators remain subject
+    # to the existing fail-closed checks above.
+    args = [
+        arg[1:-1] if len(arg) >= 2 and arg[0] == arg[-1] and arg[0] in {'"', "'"} else arg
+        for arg in args
+    ]
+
+    if not args:
+        return False, "QA test command parsed to empty argument list", []
+
+    raw_bin = args[0]
+    base_bin = os.path.basename(raw_bin).lower()
+
+    if os.path.isabs(raw_bin):
+        is_allowed_bin = bool(
+            sys.executable
+            and os.path.normcase(os.path.realpath(raw_bin))
+            == os.path.normcase(os.path.realpath(sys.executable))
+        )
+    else:
+        is_allowed_bin = base_bin in ALLOWED_TEST_BINARIES
+    if not is_allowed_bin:
+        return False, f"Binary '{raw_bin}' is not in allowed test runner whitelist ({sorted(ALLOWED_TEST_BINARIES)})", []
+
+    if base_bin in FORBIDDEN_DANGEROUS_COMMANDS:
+        return False, f"Command '{base_bin}' is strictly forbidden in QA test execution", []
+
+    python_bins = {"python", "python.exe", "python3", "python3.exe", "py", "py.exe"}
+    if sys.executable:
+        python_bins.add(os.path.basename(sys.executable).lower())
+    if base_bin in python_bins:
+        if len(args) < 3 or args[1:3] != ["-m", "pytest"]:
+            return False, "Python QA commands must use the controlled 'python -m pytest' entry point", []
+        runner_args = args[3:]
+    elif base_bin in {"pytest", "pytest.exe"}:
+        runner_args = args[1:]
+    elif base_bin in {"npm", "npm.cmd", "npm.exe"}:
+        if args[1:2] == ["test"]:
+            runner_args = args[2:]
+        elif args[1:3] == ["run", "test"]:
+            runner_args = args[3:]
+        else:
+            return False, "npm QA commands are limited to 'npm test' or 'npm run test'", []
+    elif base_bin in {"npx", "npx.cmd", "npx.exe"}:
+        if len(args) < 2 or args[1].lower() not in {"jest", "vitest", "mocha"}:
+            return False, "npx QA commands are limited to jest, vitest, or mocha", []
+        runner_args = args[2:]
+    elif base_bin in {"cargo", "cargo.exe", "go", "go.exe"}:
+        if args[1:2] != ["test"]:
+            return False, f"{base_bin} QA commands must use the 'test' subcommand", []
+        runner_args = args[2:]
+    else:
+        return False, f"Unsupported QA command shape for '{base_bin}'", []
+
+    forbidden_runner_flags = {
+        "-p", "--pyargs", "-c", "--config-file", "--rootdir", "--confcutdir",
+        "--override-ini", "-o", "--basetemp", "--ignore", "--ignore-glob",
+    }
+    for index, arg in enumerate(runner_args):
+        lowered = arg.lower()
+        flag_name = lowered.split("=", 1)[0]
+        if flag_name in forbidden_runner_flags:
+            return False, f"QA runner option '{arg}' is forbidden by the production allowlist", []
+        if index > 0 and runner_args[index - 1].lower() in forbidden_runner_flags:
+            return False, f"QA runner option value '{arg}' is forbidden by the production allowlist", []
+
+    norm_worktree = os.path.normcase(os.path.realpath(worktree_dir))
+    for arg in runner_args:
+        if arg.startswith("-"):
+            continue
+        looks_like_path = (
+            os.path.isabs(arg)
+            or "/" in arg
+            or "\\" in arg
+            or arg.endswith((".py", ".js", ".ts", ".java", ".go", ".rs"))
+            or os.path.exists(os.path.join(worktree_dir, arg))
+        )
+        if not looks_like_path:
+            continue
+        full_arg_path = os.path.normcase(os.path.realpath(os.path.join(worktree_dir, arg)))
+        try:
+            inside = os.path.commonpath([norm_worktree, full_arg_path]) == norm_worktree
+        except ValueError:
+            inside = False
+        if not inside:
+            return False, f"Argument path '{arg}' escapes worktree boundary '{worktree_dir}'", []
+
+    return True, None, args
 
 
 def _validate_reviewer_schema_builtin(data: Any) -> Tuple[bool, Optional[str]]:
@@ -173,6 +313,10 @@ class ProductionRunnerError(Exception):
     pass
 
 
+class RunnerCancelledError(ProductionRunnerError):
+    pass
+
+
 class ProductionRunner:
     """通用生产级自动编排 Runner 内核"""
 
@@ -189,112 +333,326 @@ class ProductionRunner:
         self.evidence_gate = evidence_gate
         self.checkpoint_store = checkpoint_store or RunnerCheckpointStore()
         self.worktree_manager = worktree_manager
+        self._active_handles: Dict[str, AgentHandle] = {}
+        self._lock = threading.Lock()
 
-    def _get_git_tracked_status(self, worktree_dir: str) -> str:
-        """获取工作区内已跟踪文件的状态摘要（排除纯未跟踪测试缓存）"""
+    def _is_cancellation_requested(self, task_id: str) -> bool:
         try:
-            diff_out = subprocess.check_output(
-                ["git", "diff", "HEAD"],
-                cwd=worktree_dir,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=5,
-            )
-            status_out = subprocess.check_output(
-                ["git", "status", "-s", "--untracked-files=no"],
-                cwd=worktree_dir,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=5,
-            )
-            return f"{status_out.strip()}\n{diff_out.strip()}"
-        except Exception as exc:
-            raise ProductionRunnerError(f"Unable to verify tracked Git state for '{worktree_dir}': {exc}") from exc
+            data = self.checkpoint_store.query_status(task_id)
+        except Exception:
+            return False
+        return bool(data and data.get("state") == RunnerState.CANCELLED.value)
 
-    def _authority_config(self, spec: TaskExecutionSpec) -> str:
-        for candidate in (
-            os.path.join(spec.authority_root, "config", "workflow.config.yaml"),
-            os.path.join(spec.authority_root, "user_data", "workflow.config.yaml"),
-        ):
-            if os.path.isfile(candidate):
-                return candidate
-        raise ProductionRunnerError(
-            f"Authoritative workflow configuration is missing under '{spec.authority_root}'."
-        )
-
-    def _authority_adapter(self, spec: TaskExecutionSpec) -> Any:
-        config_path = self._authority_config(spec)
-        import yaml
-
-        with open(config_path, "r", encoding="utf-8") as stream:
-            config = yaml.safe_load(stream) or {}
-        board_config = config.get("board", {})
-        if board_config.get("provider", "feishu_base").lower() != "local":
-            return get_board_adapter(config_path)
-        raw_path = board_config.get("board_file", "user_data/board.json")
-        board_file = raw_path if os.path.isabs(raw_path) else os.path.join(spec.authority_root, raw_path)
-        return OfflineBoardAdapter(
-            board_file=os.path.realpath(board_file),
-            field_map=board_config.get("fields", {}),
-        )
-
-    def _transition_authority(
+    def _wait_for_result_cancellable(
         self,
-        spec: TaskExecutionSpec,
-        *,
+        adapter: Any,
+        handle: AgentHandle,
+        timeout_seconds: float,
+        task_id: str,
+    ) -> AgentResult:
+        """在原 Runner 进程中轮询跨进程取消标记，并由持有真实句柄的 Adapter 取消 Host。"""
+        result_box: Dict[str, Any] = {}
+        done = threading.Event()
+
+        def _wait() -> None:
+            try:
+                result_box["result"] = adapter.wait_for_result(handle, timeout_seconds=timeout_seconds)
+            except BaseException as exc:
+                result_box["error"] = exc
+            finally:
+                done.set()
+
+        timeout_seconds = max(0.001, float(timeout_seconds))
+        deadline = time.monotonic() + timeout_seconds
+        waiter = threading.Thread(target=_wait, name=f"yy-flow-wait-{task_id}", daemon=True)
+        waiter.start()
+        while not done.wait(min(0.1, max(0.001, deadline - time.monotonic()))):
+            if self._is_cancellation_requested(task_id):
+                try:
+                    adapter.cancel_agent(handle)
+                finally:
+                    raise RunnerCancelledError(f"Task {task_id} was cancelled by user command.")
+            if time.monotonic() >= deadline:
+                try:
+                    adapter.cancel_agent(handle)
+                finally:
+                    raise AgentTimeoutError(
+                        f"Host session '{handle.session_id}' exceeded Runner deadline after {timeout_seconds}s"
+                    )
+
+        if self._is_cancellation_requested(task_id):
+            try:
+                adapter.cancel_agent(handle)
+            finally:
+                raise RunnerCancelledError(f"Task {task_id} was cancelled by user command.")
+        if "error" in result_box:
+            raise result_box["error"]
+        result = result_box.get("result")
+        if not isinstance(result, AgentResult):
+            raise ProductionRunnerError("Host adapter returned an invalid AgentResult (Fail-Closed).")
+        return result
+
+    def _do_state_transition(
+        self,
+        authority_root: str,
+        task_id: str,
         role: str,
         from_status: str,
         to_status: str,
         assignee: str,
         remarks: str,
-    ) -> None:
-        """Only mutate the authoritative board through the audited state-machine CLI."""
-        adapter = self._authority_adapter(spec)
-        record = adapter.get_record(spec.task_id)
-        if not record:
-            raise ProductionRunnerError(f"Authoritative task '{spec.task_id}' no longer exists.")
-        fields = record.get("fields", record) if isinstance(record, dict) else {}
-        live_status = str(fields.get("status") or record.get("status") or "").strip()
-        if live_status != from_status:
-            raise ProductionRunnerError(
-                f"Authoritative status conflict for {spec.task_id}: expected '{from_status}', got '{live_status}'."
+        task_type: str = "A",
+    ) -> Tuple[bool, Optional[str]]:
+        """调用权威 transition_task.py 进行强门控与状态机流转"""
+        transition_script = os.path.join(authority_root, "scripts", "transition_task.py")
+        local_transition_script = os.path.realpath(
+            os.path.join(os.path.dirname(__file__), "..", "..", "transition_task.py")
+        )
+        if not os.path.isfile(transition_script):
+            transition_script = local_transition_script
+        if not os.path.isfile(transition_script):
+            try:
+                transition_script = os.path.join(paths.skill_root(), "scripts", "transition_task.py")
+            except Exception:
+                pass
+        if not os.path.isfile(transition_script):
+            try:
+                transition_script = os.path.join(paths.project_root(), "scripts", "transition_task.py")
+            except Exception:
+                pass
+
+        if not os.path.isfile(transition_script):
+            return False, "Unable to locate transition_task.py (Fail-Closed)."
+
+        config_candidates = (
+            os.path.join(authority_root, "user_data", "workflow.config.yaml"),
+            os.path.join(authority_root, "config", "workflow.config.yaml"),
+        )
+        config_path = next((p for p in config_candidates if os.path.isfile(p)), None)
+        if config_path is None:
+            return False, (
+                "Unable to locate authoritative workflow.config.yaml under "
+                f"'{authority_root}' (Fail-Closed)."
             )
 
-        command = [
+        env = dict(os.environ)
+        env["YY_FLOW_PROJECT_ROOT"] = authority_root
+        cmd = [
             sys.executable,
-            os.path.join(_SCRIPTS_ROOT, "transition_task.py"),
-            "--config", self._authority_config(spec),
-            "--task-id", spec.task_id,
+            transition_script,
+            "--config", config_path,
+            "--task-id", task_id,
             "--role", role,
             "--from-status", from_status,
             "--to-status", to_status,
             "--assignee", assignee,
-            "--type", spec.task_type,
             "--remarks", remarks,
+            "--type", task_type,
         ]
-        if to_status == "已完成":
-            command.extend(["--end-time", time.strftime("%Y-%m-%d %H:%M:%S")])
-        env = os.environ.copy()
-        env["YY_FLOW_PROJECT_ROOT"] = spec.authority_root
-        env["PYTHONIOENCODING"] = "utf-8"
-        completed = subprocess.run(
-            command,
+        if to_status in ("已完成", "已验收"):
+            import datetime
+            cmd.extend(["--end-time", datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
+        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", env=env)
+        if proc.returncode != 0:
+            return False, proc.stderr or proc.stdout
+        return True, None
+
+    def _get_git_commit(self, worktree_dir: str) -> str:
+        """获取工作区当前 HEAD commit SHA"""
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=worktree_dir,
+            stderr=subprocess.DEVNULL,
+            encoding="utf-8",
+            errors="replace",
+        ).strip()
+
+    def _build_reviewer_diff_bundle(
+        self,
+        worktree_dir: str,
+        baseline_commit: str,
+        candidate_commit: str,
+        max_chars: int = 180_000,
+    ) -> str:
+        """Build a bounded, immutable review payload without Reviewer tool access."""
+        if not re.fullmatch(r"[0-9a-fA-F]{40}", baseline_commit or ""):
+            raise ProductionRunnerError("Invalid baseline commit for Reviewer bundle (Fail-Closed).")
+        if not re.fullmatch(r"[0-9a-fA-F]{40}", candidate_commit or ""):
+            raise ProductionRunnerError("Invalid candidate commit for Reviewer bundle (Fail-Closed).")
+
+        stat = subprocess.check_output(
+            ["git", "diff", "--stat", baseline_commit, candidate_commit, "--"],
+            cwd=worktree_dir,
+            stderr=subprocess.STDOUT,
+            encoding="utf-8",
+            errors="replace",
+        ).strip()
+        patch = subprocess.check_output(
+            ["git", "diff", "--no-ext-diff", "--unified=40", baseline_commit, candidate_commit, "--"],
+            cwd=worktree_dir,
+            stderr=subprocess.STDOUT,
+            encoding="utf-8",
+            errors="replace",
+        )
+        bundle = f"DIFF STAT:\n{stat or '(no stat)'}\n\nPATCH:\n{patch}"
+        if not patch.strip():
+            raise ProductionRunnerError("Reviewer bundle contains no candidate diff (Fail-Closed).")
+        if len(bundle) > max_chars:
+            raise ProductionRunnerError(
+                f"Reviewer bundle exceeds safe inline limit ({len(bundle)} > {max_chars}); user input required."
+            )
+        return bundle
+
+    def _finalize_builder_candidate(self, worktree_dir: str, baseline_commit: str) -> str:
+        """将真实 Builder 已完成但未提交的隔离工作区变更固化为候选提交。
+
+        仅当真实 Builder 已成功返回、HEAD 仍等于基线且工作区确有变更时
+        执行受控提交。已有候选提交却遗留脏文件、空变更、Git hook 失败
+        或提交后仍不干净都会 Fail-Closed。
+        """
+        head = self._get_git_commit(worktree_dir)
+        status = subprocess.check_output(
+            ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+            cwd=worktree_dir,
+            encoding="utf-8",
+            errors="replace",
+        ).strip()
+
+        if head.lower() != baseline_commit.lower():
+            if status:
+                raise RuntimeError(
+                    "Builder created a candidate commit but left additional uncommitted changes (Fail-Closed)."
+                )
+            return head
+
+        if not status:
+            raise RuntimeError(
+                "Builder produced no new commits or working-tree changes (Fail-Closed)."
+            )
+
+        add_proc = subprocess.run(
+            ["git", "add", "--all", "--", "."],
+            cwd=worktree_dir,
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
-            env=env,
-            timeout=30,
         )
-        if completed.returncode != 0:
-            raise ProductionRunnerError(
-                f"Legal board transition {from_status}->{to_status} failed: "
-                f"{(completed.stderr or completed.stdout).strip()}"
+        if add_proc.returncode != 0:
+            raise RuntimeError(f"Failed to stage Builder changes: {add_proc.stderr or add_proc.stdout}")
+
+        commit_proc = subprocess.run(
+            ["git", "commit", "-m", "feat(runner): 固化自动开发产物"],
+            cwd=worktree_dir,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if commit_proc.returncode != 0:
+            raise RuntimeError(f"Failed to commit Builder changes: {commit_proc.stderr or commit_proc.stdout}")
+
+        candidate = self._get_git_commit(worktree_dir)
+        if candidate.lower() == baseline_commit.lower():
+            raise RuntimeError("Controlled Builder commit did not advance HEAD (Fail-Closed).")
+
+        remaining = subprocess.check_output(
+            ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+            cwd=worktree_dir,
+            encoding="utf-8",
+            errors="replace",
+        ).strip()
+        if remaining:
+            raise RuntimeError("Builder worktree remained dirty after controlled commit (Fail-Closed).")
+        return candidate
+
+    def _verify_qa_immutability(self, worktree_dir: str, expected_candidate: str) -> Tuple[bool, Optional[str]]:
+        """严格核验 QA 前后源码不可变性（P1 门禁）"""
+        try:
+            head_commit = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"],
+                cwd=worktree_dir,
+                stderr=subprocess.DEVNULL,
+                encoding="utf-8",
+                errors="replace",
+            ).strip()
+        except Exception as e:
+            return False, f"Failed to inspect HEAD in QA worktree: {e}"
+
+        if head_commit != expected_candidate:
+            return False, f"QA modified HEAD or committed code illegally (expected {expected_candidate}, got {head_commit})! Fail-Closed."
+
+        try:
+            diff_out = subprocess.check_output(
+                ["git", "diff", expected_candidate, "--", ".", ":!user_data", ":!.yy-flow"],
+                cwd=worktree_dir,
+                stderr=subprocess.DEVNULL,
+                encoding="utf-8",
+                errors="replace",
+            ).strip()
+            if diff_out:
+                return False, f"QA modified tracked source code files relative to candidate commit! Fail-Closed. Diff: {diff_out[:200]}"
+        except Exception as e:
+            return False, f"Failed to check git diff in QA worktree: {e}"
+
+        try:
+            cached_diff = subprocess.check_output(
+                ["git", "diff", "--cached", "--", ".", ":!user_data", ":!.yy-flow"],
+                cwd=worktree_dir,
+                stderr=subprocess.DEVNULL,
+                encoding="utf-8",
+                errors="replace",
+            ).strip()
+            if cached_diff:
+                return False, "QA staged modifications to index! Fail-Closed."
+        except Exception as e:
+            return False, f"Failed to check git cached diff in QA worktree: {e}"
+
+        ALLOWED_ROOT_PREFIXES = (
+            "user_data",
+            ".yy-flow",
+        )
+        ALLOWED_CACHE_COMPONENTS = {
+            ".pytest_cache",
+            "__pycache__",
+            ".coverage",
+            "htmlcov",
+            ".tox",
+            ".hypothesis",
+            "test-results",
+            "junit.xml",
+        }
+        try:
+            status_out = subprocess.check_output(
+                ["git", "status", "--porcelain", "--untracked-files=all"],
+                cwd=worktree_dir,
+                stderr=subprocess.DEVNULL,
+                encoding="utf-8",
+                errors="replace",
             )
+            for line in status_out.splitlines():
+                if not line.strip():
+                    continue
+                file_rel = line[3:].strip()
+                if file_rel.startswith('"') and file_rel.endswith('"'):
+                    file_rel = file_rel[1:-1]
+                normalized_rel = file_rel.replace("\\", "/").rstrip("/")
+                path_parts = tuple(part for part in normalized_rel.split("/") if part)
+                is_safe_root = any(
+                    normalized_rel == prefix or normalized_rel.startswith(prefix + "/")
+                    for prefix in ALLOWED_ROOT_PREFIXES
+                )
+                is_safe_cache = (
+                    is_safe_root
+                    or any(part in ALLOWED_CACHE_COMPONENTS for part in path_parts)
+                    or normalized_rel.endswith(".pyc")
+                )
+                if not is_safe_cache:
+                    return False, f"QA created or modified untracked/source file '{file_rel}'! Code immutability boundary violated! Fail-Closed."
+        except Exception as e:
+            return False, f"Failed to check git status in QA worktree: {e}"
+
+        return True, None
 
     def _parse_reviewer_structured_json(
         self,
@@ -306,35 +664,25 @@ class ProductionRunner:
         invocation_id: str,
         review_request_id: str,
     ) -> ReviewerStructuredOutput:
-        """
-        严格按 JSON Schema 解析并校验 Reviewer 响应 (DEF-T0061-1)。
-        严禁使用默认值覆盖缺失字段；严禁放行普通文本 PASS；
-        模型只能回显派发前已知的 review_request_id；真实 host_invocation_id
-        必须由 Adapter 返回并由 Runner 绑定，不得要求模型自述或伪造。
-        """
+        """严格解析 Reviewer 结构化 JSON 返回值并强制核验 Schema 与身份绑定（DEF-T0061-1）"""
+        json_obj: Optional[Dict[str, Any]] = None
         cleaned = raw_output.strip()
-        json_obj = None
 
-        try:
-            json_obj = json.loads(cleaned)
-        except Exception:
-            match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", cleaned, re.DOTALL)
+        if cleaned.startswith("{") and cleaned.endswith("}"):
+            try:
+                json_obj = json.loads(cleaned)
+            except Exception:
+                json_obj = None
+
+        if json_obj is None:
+            match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw_output, re.DOTALL)
             if match:
                 try:
                     json_obj = json.loads(match.group(1))
                 except Exception:
-                    pass
+                    json_obj = None
 
         if json_obj is None:
-            start_idx = cleaned.find("{")
-            end_idx = cleaned.rfind("}")
-            if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
-                try:
-                    json_obj = json.loads(cleaned[start_idx : end_idx + 1])
-                except Exception:
-                    pass
-
-        if not isinstance(json_obj, dict):
             return ReviewerStructuredOutput(
                 task_id=task_id,
                 baseline_commit=baseline_commit,
@@ -343,17 +691,18 @@ class ProductionRunner:
                 host_invocation_id=invocation_id,
                 review_request_id=review_request_id,
                 decision="REJECT",
-                defects=({
-                    "defect_id": f"DEF-{task_id}-SCHEMA-VIOLATION",
-                    "severity": "P1",
-                    "description": f"Reviewer did not return valid JSON object matching schema: {cleaned[:200]}",
-                },),
-                summary="Invalid non-JSON reviewer output",
+                defects=(
+                    {
+                        "defect_id": f"DEF-{task_id}-SCHEMA-VIOLATION",
+                        "severity": "P1",
+                        "description": f"Reviewer did not return valid JSON according to schema: {raw_output[:200]}",
+                    },
+                ),
+                summary="Reviewer response violated structured JSON schema.",
             )
 
-        # 校验 JSON Schema 规范
-        is_valid, err_msg = _validate_reviewer_schema_builtin(json_obj)
-        if not is_valid:
+        valid, err_msg = _validate_reviewer_schema_builtin(json_obj)
+        if not valid:
             return ReviewerStructuredOutput(
                 task_id=task_id,
                 baseline_commit=baseline_commit,
@@ -362,15 +711,16 @@ class ProductionRunner:
                 host_invocation_id=invocation_id,
                 review_request_id=review_request_id,
                 decision="REJECT",
-                defects=({
-                    "defect_id": f"DEF-{task_id}-SCHEMA-VIOLATION",
-                    "severity": "P1",
-                    "description": f"Reviewer output failed JSON schema validation: {err_msg}",
-                },),
-                summary="Schema validation failed",
+                defects=(
+                    {
+                        "defect_id": f"DEF-{task_id}-SCHEMA-VIOLATION",
+                        "severity": "P1",
+                        "description": f"Reviewer JSON failed schema validation: {err_msg}",
+                    },
+                ),
+                summary="Reviewer response violated structured JSON schema.",
             )
 
-        # 严格比对身份字段与上下文一致性
         mismatches = []
         if json_obj.get("task_id") != task_id:
             mismatches.append(f"task_id mismatch: expected '{task_id}', got '{json_obj.get('task_id')}'")
@@ -382,7 +732,8 @@ class ProductionRunner:
             mismatches.append(f"session_id mismatch: expected '{session_id}', got '{json_obj.get('session_id')}'")
         if json_obj.get("review_request_id") != review_request_id:
             mismatches.append(
-                f"review_request_id mismatch: expected '{review_request_id}', got '{json_obj.get('review_request_id')}'"
+                "review_request_id mismatch: "
+                f"expected '{review_request_id}', got '{json_obj.get('review_request_id')}'"
             )
 
         if mismatches:
@@ -394,18 +745,19 @@ class ProductionRunner:
                 host_invocation_id=invocation_id,
                 review_request_id=review_request_id,
                 decision="REJECT",
-                defects=({
-                    "defect_id": f"DEF-{task_id}-IDENTITY-MISMATCH",
-                    "severity": "P1",
-                    "description": "; ".join(mismatches),
-                },),
+                defects=(
+                    {
+                        "defect_id": f"DEF-{task_id}-IDENTITY-MISMATCH",
+                        "severity": "P1",
+                        "description": "; ".join(mismatches),
+                    },
+                ),
                 summary="Identity binding mismatch in reviewer structured output",
             )
 
-        decision = str(json_obj.get("decision", "")).strip().upper()
-        defects = json_obj.get("defects", [])
-
-        if decision == "PASS" and len(defects) > 0:
+        decision = json_obj["decision"]
+        raw_defects = json_obj.get("defects", [])
+        if decision == "PASS" and raw_defects:
             return ReviewerStructuredOutput(
                 task_id=task_id,
                 baseline_commit=baseline_commit,
@@ -414,20 +766,15 @@ class ProductionRunner:
                 host_invocation_id=invocation_id,
                 review_request_id=review_request_id,
                 decision="REJECT",
-                defects=({
-                    "defect_id": f"DEF-{task_id}-INVALID-PASS",
-                    "severity": "P1",
-                    "description": f"Reviewer returned PASS decision but included {len(defects)} defects.",
-                },),
-                summary="Contradictory reviewer output: PASS with defects",
+                defects=(
+                    {
+                        "defect_id": f"DEF-{task_id}-INVALID-PASS",
+                        "severity": "P1",
+                        "description": "Reviewer returned decision 'PASS' but provided non-empty defects list.",
+                    },
+                ),
+                summary="Reviewer returned contradictory PASS decision with non-empty defects list.",
             )
-
-        if decision == "REJECT" and len(defects) == 0:
-            defects = [{
-                "defect_id": f"DEF-{task_id}-REJECT-NO-ITEMS",
-                "severity": "P1",
-                "description": json_obj.get("summary") or "Reviewer rejected candidate without specific defect items.",
-            }]
 
         return ReviewerStructuredOutput(
             task_id=task_id,
@@ -437,28 +784,43 @@ class ProductionRunner:
             host_invocation_id=invocation_id,
             review_request_id=review_request_id,
             decision=decision,
-            defects=tuple(defects),
-            summary=str(json_obj.get("summary", "")),
+            defects=tuple(raw_defects),
+            summary=json_obj.get("summary", ""),
         )
 
     def start(
         self,
         spec: TaskExecutionSpec,
         interactive_approval_cb: Optional[Callable[[str, Dict[str, Any]], bool]] = None,
+        pre_granted_approval: bool = False,
     ) -> RunnerResult:
-        """启动生产 Runner 执行任务"""
+        """启动新任务的自动编排"""
+        _validate_task_id(spec.task_id)
+        if not verify_optimistic_concurrency(spec):
+            return RunnerResult(
+                success=False,
+                state=RunnerState.FAILED.value,
+                task_id=spec.task_id,
+                message="Optimistic concurrency verification failed: task is in terminal status or modified concurrently.",
+            )
+
         lock_handle, lock_file = self.checkpoint_store.acquire_runner_lock(spec.task_id)
         if lock_handle is None:
             return RunnerResult(
                 success=False,
                 state=RunnerState.FAILED.value,
                 task_id=spec.task_id,
-                message=f"Task {spec.task_id} is already locked by another running Runner process.",
-                diagnostics={"lock_error": "LockBusyError"},
+                message=f"Task {spec.task_id} is already locked by another running process.",
             )
 
         try:
-            return self._execute_loop(spec, lock_tuple=(lock_handle, lock_file), interactive_approval_cb=interactive_approval_cb)
+            return self._execute_loop(
+                spec,
+                lock_tuple=(lock_handle, lock_file),
+                interactive_approval_cb=interactive_approval_cb,
+                existing_checkpoint=None,
+                pre_granted_approval=pre_granted_approval,
+            )
         finally:
             self.checkpoint_store.release_runner_lock((lock_handle, lock_file))
 
@@ -488,33 +850,6 @@ class ProductionRunner:
             evidence_gate=self.evidence_gate,
             project_root=project_root,
         )
-
-        authority_adapter = self._authority_adapter(spec)
-        if not verify_optimistic_concurrency(spec, authority_adapter):
-            return RunnerResult(
-                success=False,
-                state=RunnerState.FAILED.value,
-                task_id=task_id,
-                message="Authoritative task changed after it was read; refusing to start (optimistic concurrency conflict).",
-            )
-        board_status = spec.status_at_read
-        if board_status == "待开始":
-            self._transition_authority(
-                spec,
-                role="DEV",
-                from_status="待开始",
-                to_status="进行中",
-                assignee=spec.owner,
-                remarks="Production Runner accepted the task and started the isolated Builder stage.",
-            )
-            board_status = "进行中"
-        elif board_status != "进行中":
-            return RunnerResult(
-                success=False,
-                state=RunnerState.FAILED.value,
-                task_id=task_id,
-                message=f"Runner requires authority task status '待开始' or '进行中', got '{board_status}'.",
-            )
 
         worktree_dir = project_root
         worktree_branch = spec.baseline_branch
@@ -559,15 +894,6 @@ class ProductionRunner:
             total_attempts=0,
             worktree_path=worktree_dir,
             worktree_branch=worktree_branch,
-            builder_session_id=None,
-            builder_invocation_id=None,
-            reviewer_session_id=None,
-            reviewer_invocation_id=None,
-            qa_session_id=None,
-            qa_invocation_id=None,
-            evidence_ids=(),
-            confirmation_request_id=None,
-            defects_history=(),
         )
         self.checkpoint_store.save_checkpoint(checkpoint)
 
@@ -583,87 +909,127 @@ class ProductionRunner:
                 message=f"Missing adapter: builder={spec.builder_adapter_id}, reviewer={spec.reviewer_adapter_id}, qa={spec.qa_adapter_id}",
             )
 
+        candidate_commit = checkpoint.candidate_commit
         candidate_generation = checkpoint.candidate_generation
         review_cycle = checkpoint.review_cycle
         qa_cycle = checkpoint.qa_cycle
         total_attempts = checkpoint.total_attempts
-        evidence_ids = list(checkpoint.evidence_ids)
-        defects_history = list(checkpoint.defects_history)
-        candidate_commit = checkpoint.candidate_commit
+        evidence_ids: List[str] = list(checkpoint.evidence_ids)
+        defects_history: List[Dict[str, Any]] = list(checkpoint.defects_history)
+        current_board_status = spec.status_at_read
 
-        while total_attempts < spec.max_total_attempts:
-            if (time.time() - start_wall_clock) > spec.total_wall_clock_timeout_seconds:
+        start_role = checkpoint.current_role if existing_checkpoint else "BUILDER"
+        skip_builder = (start_role in ("REVIEWER", "QA") and candidate_commit is not None)
+        skip_reviewer = (start_role == "QA" and candidate_commit is not None)
+
+        while True:
+            total_attempts += 1
+            if total_attempts > spec.max_total_attempts:
                 return RunnerResult(
                     success=False,
-                    state=RunnerState.FAILED.value,
+                    state=RunnerState.NEEDS_USER_INPUT.value,
                     task_id=task_id,
                     candidate_commit=candidate_commit,
                     candidate_generation=candidate_generation,
                     evidence_ids=tuple(evidence_ids),
-                    message="Total wall-clock timeout exceeded.",
+                    message=f"Task exceeded max total attempts ({spec.max_total_attempts}). Paused at NEEDS_USER_INPUT.",
+                    diagnostics={"total_attempts": total_attempts, "defects": defects_history},
+                )
+
+            if time.time() - start_wall_clock > spec.total_wall_clock_timeout_seconds:
+                return RunnerResult(
+                    success=False,
+                    state=RunnerState.NEEDS_USER_INPUT.value,
+                    task_id=task_id,
+                    candidate_commit=candidate_commit,
+                    candidate_generation=candidate_generation,
+                    evidence_ids=tuple(evidence_ids),
+                    message=f"Task exceeded wall clock timeout ({spec.total_wall_clock_timeout_seconds}s). Paused at NEEDS_USER_INPUT.",
+                    diagnostics={"elapsed": time.time() - start_wall_clock},
                 )
 
             # ==========================================
             # STAGE 1: CODEX BUILDER
             # ==========================================
-            total_attempts += 1
-            candidate_generation += 1
-            sess_builder = f"sess_builder_runner_{int(time.time()*1000)}"
+            if not skip_builder:
+                sess_builder = f"sess_builder_runner_{task_id.lower()}_{int(time.time()*1000)}"
+                candidate_generation += 1
 
-            checkpoint = RunnerCheckpoint(
-                task_id=task_id,
-                project_id=spec.project_id,
-                state=RunnerState.BUILDING.value,
-                current_role="BUILDER",
-                candidate_commit=candidate_commit,
-                candidate_generation=candidate_generation,
-                review_cycle=review_cycle,
-                qa_cycle=qa_cycle,
-                total_attempts=total_attempts,
-                worktree_path=worktree_dir,
-                worktree_branch=worktree_branch,
-                builder_session_id=sess_builder,
-                evidence_ids=tuple(evidence_ids),
-                defects_history=tuple(defects_history),
-            )
-            self.checkpoint_store.save_checkpoint(checkpoint)
+                checkpoint = RunnerCheckpoint(
+                    task_id=task_id,
+                    project_id=spec.project_id,
+                    state=RunnerState.BUILDING.value,
+                    current_role="BUILDER",
+                    candidate_commit=candidate_commit,
+                    candidate_generation=candidate_generation,
+                    review_cycle=review_cycle,
+                    qa_cycle=qa_cycle,
+                    total_attempts=total_attempts,
+                    worktree_path=worktree_dir,
+                    worktree_branch=worktree_branch,
+                    builder_session_id=sess_builder,
+                    evidence_ids=tuple(evidence_ids),
+                    defects_history=tuple(defects_history),
+                )
+                self.checkpoint_store.save_checkpoint(checkpoint)
 
-            defects_str = ""
-            if defects_history:
-                defects_str = "\n\n【上一轮审查/测试驳回缺陷】:\n" + json.dumps(defects_history[-1], indent=2, ensure_ascii=False)
+                if defects_history:
+                    last_defect = defects_history[-1]
+                    builder_prompt = (
+                        f"Task {task_id}: Previous attempt was rejected by {last_defect.get('role', 'REVIEWER')}.\n"
+                        f"Defects: {json.dumps(last_defect.get('defects', []), ensure_ascii=False)}\n"
+                        f"Summary: {last_defect.get('summary', '')}\n"
+                        f"Please fix the defects in {worktree_dir}, verify your changes, and make a git commit."
+                    )
+                else:
+                    custom_prompts = getattr(spec, "custom_prompts", {}) or {}
+                    builder_prompt = (
+                        custom_prompts.get("BUILDER")
+                        or f"Task {task_id}: {spec.task_name}\n"
+                        f"Requirements:\n{spec.requirement_text}\n"
+                        f"Acceptance Criteria:\n{spec.acceptance_criteria}\n"
+                        f"Please implement the requirements in {worktree_dir}, write unit tests, verify your implementation, and make a git commit."
+                    )
 
-            builder_prompt = (
-                f"【任务名称】: {spec.task_name}\n"
-                f"【任务ID】: {spec.task_id}\n"
-                f"【需求正文】: {spec.requirement_text}\n"
-                f"【验收标准】: {spec.acceptance_criteria}"
-                f"{defects_str}\n\n"
-                f"请在当前工作区完成代码修改与测试，确保功能完整且测试通过，并在完成修改后执行 git commit 提交代码。"
-            )
+                builder_request = AgentRequest(
+                    session_id=sess_builder,
+                    prompt=builder_prompt,
+                    role="BUILDER",
+                    workspace_dir=worktree_dir,
+                    timeout_seconds=float(spec.builder_timeout_seconds),
+                    extra_context={
+                        "sandbox_mode": "workspace-write",
+                        "worktree_dir": worktree_dir,
+                        "project_id": spec.project_id,
+                        "pre_granted_approval": pre_granted_approval,
+                        "approve_for_me": pre_granted_approval,
+                    },
+                )
 
-            builder_request = AgentRequest(
-                session_id=sess_builder,
-                prompt=builder_prompt,
-                role="BUILDER",
-                workspace_dir=worktree_dir,
-                timeout_seconds=float(spec.builder_timeout_seconds),
-                extra_context={
-                    "sandbox": "workspace-write",
-                    "worktree_dir": worktree_dir,
-                    "project_id": spec.project_id,
-                    "permission_boundary": "workspace_write",
-                },
-            )
+                try:
+                    builder_handle = builder_adapter.dispatch_agent(builder_request)
+                    with self._lock:
+                        self._active_handles[task_id] = builder_handle
 
-            try:
-                builder_handle = builder_adapter.dispatch_agent(builder_request)
-                builder_result = builder_adapter.wait_for_result(builder_handle, timeout_seconds=float(spec.builder_timeout_seconds))
-            except AgentNotSupportedError as se:
-                # 权限门禁拦截 -> 检查是否可交互批准 (DEF-T0061-7)
-                approval_granted = pre_granted_approval
-                if not approval_granted and interactive_approval_cb:
-                    approval_granted = interactive_approval_cb(str(se), {"role": "BUILDER", "task_id": task_id})
-                if not approval_granted:
+                    builder_result = self._wait_for_result_cancellable(
+                        builder_adapter,
+                        builder_handle,
+                        timeout_seconds=float(spec.builder_timeout_seconds),
+                        task_id=task_id,
+                    )
+                except RunnerCancelledError as ce:
+                    return RunnerResult(
+                        success=True,
+                        state=RunnerState.CANCELLED.value,
+                        task_id=task_id,
+                        candidate_commit=candidate_commit,
+                        candidate_generation=candidate_generation,
+                        evidence_ids=tuple(evidence_ids),
+                        message=str(ce),
+                    )
+                except AgentNotSupportedError as se:
+                    with self._lock:
+                        self._active_handles.pop(task_id, None)
                     checkpoint = RunnerCheckpoint(
                         task_id=task_id,
                         project_id=spec.project_id,
@@ -676,6 +1042,7 @@ class ProductionRunner:
                         total_attempts=total_attempts,
                         worktree_path=worktree_dir,
                         worktree_branch=worktree_branch,
+                        builder_session_id=sess_builder,
                         evidence_ids=tuple(evidence_ids),
                         defects_history=tuple(defects_history),
                         approval_reason=str(se),
@@ -686,335 +1053,274 @@ class ProductionRunner:
                         success=False,
                         state=RunnerState.APPROVAL_REQUIRED.value,
                         task_id=task_id,
-                        message=f"Operation requires explicit user permission approval: {se}. Paused at APPROVAL_REQUIRED.",
+                        candidate_commit=candidate_commit,
+                        candidate_generation=candidate_generation,
+                        evidence_ids=tuple(evidence_ids),
+                        message=f"Execution paused at APPROVAL_REQUIRED: {se}",
                         diagnostics={"approval_reason": str(se)},
                     )
-                # 授权后重试
-                builder_handle = builder_adapter.dispatch_agent(builder_request)
-                builder_result = builder_adapter.wait_for_result(builder_handle, timeout_seconds=float(spec.builder_timeout_seconds))
-            except Exception as e:
-                return RunnerResult(
-                    success=False,
-                    state=RunnerState.FAILED.value,
+                except Exception as e:
+                    with self._lock:
+                        self._active_handles.pop(task_id, None)
+                    return RunnerResult(
+                        success=False,
+                        state=RunnerState.FAILED.value,
+                        task_id=task_id,
+                        candidate_commit=candidate_commit,
+                        candidate_generation=candidate_generation,
+                        message=f"Builder dispatch/wait failed: {e}",
+                        diagnostics={"error": str(e)},
+                    )
+                finally:
+                    with self._lock:
+                        self._active_handles.pop(task_id, None)
+
+                if builder_result.status != AgentStatus.SUCCESS:
+                    return RunnerResult(
+                        success=False,
+                        state=RunnerState.FAILED.value,
+                        task_id=task_id,
+                        message=f"Builder execution failed with status: {builder_result.status.value}",
+                    )
+                if builder_result.session_id != builder_handle.session_id:
+                    return RunnerResult(
+                        success=False,
+                        state=RunnerState.FAILED.value,
+                        task_id=task_id,
+                        message="Builder session ID mismatch (Fail-Closed).",
+                    )
+                if not builder_result.is_real_host:
+                    return RunnerResult(
+                        success=False,
+                        state=RunnerState.FAILED.value,
+                        task_id=task_id,
+                        message="Builder result is not from a real host (Fail-Closed).",
+                    )
+
+                inv_builder = _extract_real_invocation_id(builder_result, builder_handle)
+                if not inv_builder:
+                    return RunnerResult(
+                        success=False,
+                        state=RunnerState.FAILED.value,
+                        task_id=task_id,
+                        message="Builder host did not produce a valid canonical invocation identity (Fail-Closed).",
+                    )
+
+                try:
+                    candidate_commit = self._finalize_builder_candidate(
+                        worktree_dir,
+                        spec.baseline_commit,
+                    )
+                except Exception as e:
+                    return RunnerResult(
+                        success=False,
+                        state=RunnerState.FAILED.value,
+                        task_id=task_id,
+                        message=f"Failed to finalize candidate commit from Builder worktree: {e}",
+                    )
+
+                if not re.match(r"^[0-9a-f]{40}$", candidate_commit):
+                    return RunnerResult(
+                        success=False,
+                        state=RunnerState.FAILED.value,
+                        task_id=task_id,
+                        message=f"Invalid candidate commit SHA: '{candidate_commit}' (Fail-Closed).",
+                    )
+
+                if spec.baseline_commit and candidate_commit.lower() == spec.baseline_commit.lower():
+                    return RunnerResult(
+                        success=False,
+                        state=RunnerState.FAILED.value,
+                        task_id=task_id,
+                        message="Builder produced no new commits on top of baseline commit (Candidate == Baseline). Fail-Closed.",
+                    )
+
+                builder_evidence_id = f"evi_builder_{task_id.lower()}_{int(time.time()*1000)}"
+                builder_caps = builder_adapter.detect_capabilities()
+                b_meta = EvidenceMetadata(
+                    project_id=spec.project_id,
                     task_id=task_id,
-                    message=f"Builder dispatch/wait failed: {e}",
-                    diagnostics={"error": str(e)},
+                    actor_role="BUILDER",
+                    host_id=spec.builder_adapter_id,
+                    adapter=spec.builder_adapter_id,
+                    host_session_id=sess_builder,
+                    host_invocation_id=inv_builder,
+                    is_real_host=builder_result.is_real_host,
+                    workspace_mode="workspace_write",
+                    transition_from="BUILDING",
+                    transition_to="REVIEWING",
+                    created_at=time.time(),
+                    extra=_extract_capabilities_extra(builder_caps),
                 )
-
-            # 真实 Invocation ID 提取 (DEF-T0061-2)
-            inv_builder = _extract_real_invocation_id(builder_result, builder_handle)
-            if not inv_builder:
-                return RunnerResult(
-                    success=False,
-                    state=RunnerState.FAILED.value,
-                    task_id=task_id,
-                    message="Builder host did not produce a valid canonical invocation identity (Fail-Closed).",
+                b_record = EvidenceRecord(
+                    evidence_id=builder_evidence_id,
+                    evidence_type=EvidenceType.TASK_TRANSITION,
+                    baseline_commit=spec.baseline_commit,
+                    result_commit=candidate_commit,
+                    artifacts=(),
+                    metadata=b_meta,
                 )
+                self.evidence_store.append(b_record)
+                try:
+                    self.evidence_gate.validate_evidence(
+                        builder_evidence_id,
+                        EvidenceValidationContext(
+                            project_id=spec.project_id,
+                            task_id=task_id,
+                            actor_role="BUILDER",
+                            transition_from="BUILDING",
+                            transition_to="REVIEWING",
+                            baseline_commit=spec.baseline_commit,
+                            result_commit=candidate_commit,
+                            expected_invocation_id=inv_builder,
+                            expected_adapter=spec.builder_adapter_id,
+                            expected_workspace_mode="workspace_write",
+                            expected_evidence_type=EvidenceType.TASK_TRANSITION,
+                            host_handle=builder_handle,
+                            expected_capabilities=builder_caps,
+                            agent_result=builder_result,
+                        ),
+                    )
+                except Exception as gate_error:
+                    return RunnerResult(
+                        success=False,
+                        state=RunnerState.FAILED.value,
+                        task_id=task_id,
+                        candidate_commit=candidate_commit,
+                        message=f"Builder EvidenceGate validation failed: {gate_error}",
+                    )
+                evidence_ids.append(builder_evidence_id)
 
-            # 真实 Candidate Commit 校验 (DEF-T0061-2)
-            try:
-                candidate_commit = subprocess.check_output(
-                    ["git", "rev-parse", "HEAD"],
-                    cwd=worktree_dir,
-                    stderr=subprocess.DEVNULL,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=5,
-                ).strip()
-            except Exception as ge:
-                return RunnerResult(
-                    success=False,
-                    state=RunnerState.FAILED.value,
-                    task_id=task_id,
-                    message=f"Failed to read candidate commit HEAD from worktree: {ge}",
-                )
-
-            if not candidate_commit or not re.match(r"^[0-9a-f]{40}$", candidate_commit):
-                return RunnerResult(
-                    success=False,
-                    state=RunnerState.FAILED.value,
-                    task_id=task_id,
-                    message=f"Invalid candidate commit SHA '{candidate_commit}' in worktree (Fail-Closed).",
-                )
-
-            if spec.baseline_commit and candidate_commit == spec.baseline_commit:
-                return RunnerResult(
-                    success=False,
-                    state=RunnerState.FAILED.value,
-                    task_id=task_id,
-                    message="Builder produced no new commits on top of baseline commit (Candidate == Baseline). Fail-Closed.",
-                )
-
-            ancestry = subprocess.run(
-                ["git", "merge-base", "--is-ancestor", spec.baseline_commit, candidate_commit],
-                cwd=worktree_dir,
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if ancestry.returncode != 0 or self._get_git_tracked_status(worktree_dir).strip():
-                return RunnerResult(
-                    success=False,
-                    state=RunnerState.FAILED.value,
-                    task_id=task_id,
-                    message="Builder candidate is not a clean descendant of the declared baseline (Fail-Closed).",
-                )
-
-            orchestrator.start_builder(
-                task_id=task_id,
-                project_id=spec.project_id,
-                branch=worktree_branch,
-                baseline_commit=spec.baseline_commit,
-                assignee=spec.owner,
-                workspace_dir=worktree_dir,
-                worktree_dir=worktree_dir,
-                auth_context=f"auth_ctx_{spec.project_id}",
-                billing_context=f"billing_ctx_{spec.project_id}",
-                builder_session_id=sess_builder,
-                builder_invocation_id=inv_builder,
-                builder_adapter_id=spec.builder_adapter_id,
-            )
-
-            builder_evidence_id = f"evi_builder_{task_id.lower()}_{int(time.time()*1000)}"
-            b_meta = EvidenceMetadata(
-                project_id=spec.project_id,
-                task_id=task_id,
-                actor_role="BUILDER",
-                host_id=spec.builder_adapter_id,
-                adapter=spec.builder_adapter_id,
-                host_session_id=sess_builder,
-                host_invocation_id=inv_builder,
-                is_real_host=builder_result.is_real_host,
-                workspace_mode="workspace_write",
-                transition_from="BUILDING",
-                transition_to="REVIEWING",
-                created_at=time.time(),
-                extra=_extract_capabilities_extra(builder_adapter.detect_capabilities()),
-            )
-            b_record = EvidenceRecord(
-                evidence_id=builder_evidence_id,
-                evidence_type=EvidenceType.TASK_TRANSITION,
-                baseline_commit=spec.baseline_commit,
-                result_commit=candidate_commit,
-                artifacts=(),
-                metadata=b_meta,
-            )
-            self.evidence_store.append(b_record)
-            evidence_ids.append(builder_evidence_id)
-
-            self._transition_authority(
-                spec,
-                role="DEV",
-                from_status=board_status,
-                to_status="审查中",
-                assignee="周审查",
-                remarks=f"Builder produced candidate {candidate_commit}; independent review requested.",
-            )
-            board_status = "审查中"
-
-            b_handover = BuilderToReviewerHandover(
-                task_id=task_id,
-                project_id=spec.project_id,
-                branch=worktree_branch,
-                baseline_commit=spec.baseline_commit,
-                candidate_commit=candidate_commit,
-                modified_files=(),
-                diff_stat={},
-                test_summary={},
-                workspace_dir=worktree_dir,
-                worktree_dir=worktree_dir,
-                builder_session_id=sess_builder,
-                builder_invocation_id=inv_builder,
-                auth_context=f"auth_ctx_{spec.project_id}",
-                billing_context=f"billing_ctx_{spec.project_id}",
-            )
-            orchestrator.submit_to_reviewer(b_handover, evidence_id=builder_evidence_id, host_handle=builder_handle)
+                # 状态机推进: 进行中 -> 审查中 (DEV)
+                if current_board_status == "进行中":
+                    ok_trans, err_trans = self._do_state_transition(
+                        spec.authority_root, task_id, "DEV", "进行中", "审查中", "周审查",
+                        f"Codex Builder 完成开发，候选提交: {candidate_commit}", spec.task_type
+                    )
+                    if not ok_trans:
+                        return RunnerResult(
+                            success=False, state=RunnerState.FAILED.value, task_id=task_id,
+                            message=f"Failed to transition state to 审查中: {err_trans}"
+                        )
+                    current_board_status = "审查中"
+            else:
+                skip_builder = False
 
             # ==========================================
             # STAGE 2: ANTIGRAVITY REVIEWER
             # ==========================================
-            review_cycle += 1
-            sess_reviewer = f"sess_reviewer_runner_{int(time.time()*1000)}"
+            if not skip_reviewer:
+                review_cycle += 1
+                sess_reviewer = f"sess_reviewer_runner_{task_id.lower()}_{int(time.time()*1000)}"
+                review_request_id = f"rev_req_{uuid.uuid4().hex}"
 
-            checkpoint = RunnerCheckpoint(
-                task_id=task_id,
-                project_id=spec.project_id,
-                state=RunnerState.REVIEWING.value,
-                current_role="REVIEWER",
-                candidate_commit=candidate_commit,
-                candidate_generation=candidate_generation,
-                review_cycle=review_cycle,
-                qa_cycle=qa_cycle,
-                total_attempts=total_attempts,
-                worktree_path=worktree_dir,
-                worktree_branch=worktree_branch,
-                builder_session_id=sess_builder,
-                reviewer_session_id=sess_reviewer,
-                evidence_ids=tuple(evidence_ids),
-                defects_history=tuple(defects_history),
-            )
-            self.checkpoint_store.save_checkpoint(checkpoint)
-
-            try:
-                diff_text = subprocess.check_output(
-                    ["git", "diff", f"{spec.baseline_commit}..{candidate_commit}"],
-                    cwd=worktree_dir,
-                    stderr=subprocess.DEVNULL,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=5,
-                )
-            except Exception:
-                diff_text = "(diff unavailable)"
-
-            review_request_id = "review_req_" + hashlib.sha256(sess_reviewer.encode("utf-8")).hexdigest()[:24]
-            reviewer_prompt = (
-                f"You are the independent Code Reviewer for Task {spec.task_id}.\n"
-                f"Requirements: {spec.requirement_text}\n"
-                f"Acceptance Criteria: {spec.acceptance_criteria}\n"
-                f"Baseline: {spec.baseline_commit}\n"
-                f"Candidate: {candidate_commit}\n\n"
-                f"Code Diff:\n```\n{diff_text[:4000]}\n```\n\n"
-                f"CRITICAL: You MUST reply with a JSON object matching this schema:\n"
-                f"{json.dumps(REVIEWER_JSON_SCHEMA, indent=2)}\n"
-                f"Required exact fields:\n"
-                f"- task_id: '{spec.task_id}'\n"
-                f"- baseline_commit: '{spec.baseline_commit}'\n"
-                f"- candidate_commit: '{candidate_commit}'\n"
-                f"- session_id: '{sess_reviewer}'\n"
-                f"- review_request_id: '{review_request_id}'\n"
-                f"- decision: 'PASS' or 'REJECT'\n"
-                f"- defects: list of defect objects if REJECT\n"
-                f"- summary: detailed review rationale\n"
-            )
-
-            if hasattr(reviewer_adapter, "grant_permission"):
-                try:
-                    reviewer_adapter.grant_permission(
-                        project_id=spec.project_id,
-                        auth_context=f"auth_ctx_{spec.project_id}",
-                        session_id=sess_reviewer,
-                        workspace_dir=worktree_dir,
-                        command_family="safe_local:REVIEWER",
-                        permission_boundary="workspace_read",
-                    )
-                except Exception:
-                    pass
-
-            reviewer_request = AgentRequest(
-                session_id=sess_reviewer,
-                prompt=reviewer_prompt,
-                role="REVIEWER",
-                workspace_dir=worktree_dir,
-                timeout_seconds=float(spec.reviewer_timeout_seconds),
-                extra_context={
-                    "sandbox": "workspace_read",
-                    "mode": "plan",
-                    "worktree_dir": worktree_dir,
-                    "project_id": spec.project_id,
-                    "auth_context": f"auth_ctx_{spec.project_id}",
-                    "permission_boundary": "workspace_read",
-                },
-            )
-
-            try:
-                reviewer_handle = reviewer_adapter.dispatch_agent(reviewer_request)
-                reviewer_result = reviewer_adapter.wait_for_result(reviewer_handle, timeout_seconds=float(spec.reviewer_timeout_seconds))
-            except Exception as e:
-                return RunnerResult(
-                    success=False,
-                    state=RunnerState.FAILED.value,
-                    task_id=task_id,
-                    message=f"Reviewer dispatch/wait failed: {e}",
-                    diagnostics={"error": str(e)},
-                )
-
-            inv_reviewer = _extract_real_invocation_id(reviewer_result, reviewer_handle)
-            if not inv_reviewer:
-                return RunnerResult(
-                    success=False,
-                    state=RunnerState.FAILED.value,
-                    task_id=task_id,
-                    message="Reviewer host did not produce a valid canonical invocation identity (Fail-Closed).",
-                )
-
-            review_struct = self._parse_reviewer_structured_json(
-                raw_output=reviewer_result.output,
-                task_id=task_id,
-                baseline_commit=spec.baseline_commit,
-                candidate_commit=candidate_commit,
-                session_id=reviewer_handle.session_id,
-                invocation_id=inv_reviewer,
-                review_request_id=review_request_id,
-            )
-
-            reviewer_evidence_id = f"evi_reviewer_{task_id.lower()}_{int(time.time()*1000)}"
-            r_meta = EvidenceMetadata(
-                project_id=spec.project_id,
-                task_id=task_id,
-                actor_role="REVIEWER",
-                host_id=spec.reviewer_adapter_id,
-                adapter=spec.reviewer_adapter_id,
-                host_session_id=sess_reviewer,
-                host_invocation_id=inv_reviewer,
-                is_real_host=reviewer_result.is_real_host,
-                workspace_mode="workspace_read",
-                transition_from="REVIEWING",
-                transition_to="TESTING" if review_struct.decision == "PASS" else "BUILDING",
-                created_at=time.time(),
-                extra=_extract_capabilities_extra(reviewer_adapter.detect_capabilities()),
-            )
-            r_record = EvidenceRecord(
-                evidence_id=reviewer_evidence_id,
-                evidence_type=EvidenceType.TASK_TRANSITION,
-                baseline_commit=spec.baseline_commit,
-                result_commit=candidate_commit,
-                artifacts=(),
-                metadata=r_meta,
-            )
-            self.evidence_store.append(r_record)
-            evidence_ids.append(reviewer_evidence_id)
-
-            if review_struct.decision == "REJECT":
-                defect_handover = DefectRejectionHandover(
+                checkpoint = RunnerCheckpoint(
                     task_id=task_id,
                     project_id=spec.project_id,
-                    source_role=OrchestrationRole.REVIEWER,
-                    defect_list=tuple(d.get("description", str(d)) for d in review_struct.defects),
-                    comments=review_struct.summary,
+                    state=RunnerState.REVIEWING.value,
+                    current_role="REVIEWER",
                     candidate_commit=candidate_commit,
-                    source_session_id=sess_reviewer,
-                    source_invocation_id=inv_reviewer,
-                    target_builder_role=OrchestrationRole.BUILDER,
-                    target_builder_assignee=spec.owner,
+                    candidate_generation=candidate_generation,
+                    review_cycle=review_cycle,
+                    qa_cycle=qa_cycle,
+                    total_attempts=total_attempts,
+                    worktree_path=worktree_dir,
+                    worktree_branch=worktree_branch,
+                    builder_session_id=sess_builder if "sess_builder" in locals() else None,
+                    reviewer_session_id=sess_reviewer,
+                    evidence_ids=tuple(evidence_ids),
+                    defects_history=tuple(defects_history),
                 )
-                orchestrator.reject_by_reviewer(defect_handover)
+                self.checkpoint_store.save_checkpoint(checkpoint)
 
-                defect_record = {
-                    "cycle": review_cycle,
-                    "role": "REVIEWER",
-                    "defects": [dict(d) for d in review_struct.defects],
-                    "summary": review_struct.summary,
-                }
-                defects_history.append(defect_record)
+                try:
+                    reviewer_diff_bundle = self._build_reviewer_diff_bundle(
+                        worktree_dir,
+                        spec.baseline_commit,
+                        candidate_commit,
+                    )
+                except Exception as exc:
+                    return RunnerResult(
+                        success=False,
+                        state=RunnerState.NEEDS_USER_INPUT.value,
+                        task_id=task_id,
+                        candidate_commit=candidate_commit,
+                        evidence_ids=tuple(evidence_ids),
+                        message=f"Unable to create bounded Reviewer payload: {exc}",
+                    )
 
-                self._transition_authority(
-                    spec,
+                reviewer_prompt = (
+                    (getattr(spec, 'custom_prompts', {}) or {}).get("REVIEWER")
+                    or f"You are Antigravity Reviewer for Task {task_id}.\n"
+                    f"Requirements: {spec.requirement_text}\n"
+                    f"Acceptance Criteria: {spec.acceptance_criteria}\n"
+                    f"Baseline Commit: {spec.baseline_commit}\n"
+                    f"Candidate Commit: {candidate_commit}\n\n"
+                    "Review ONLY the immutable diff embedded below. Do not invoke tools, commands, "
+                    "browsers, file-system access, subagents, or permission prompts.\n\n"
+                    f"{reviewer_diff_bundle}\n\n"
+                    f"You MUST return ONLY a JSON object strictly matching this schema:\n"
+                    f"```json\n"
+                    f"{json.dumps(REVIEWER_JSON_SCHEMA, ensure_ascii=False, sort_keys=True)}\n"
+                    f"```\n"
+                    f"Required fields:\n"
+                    f"- task_id: '{task_id}'\n"
+                    f"- baseline_commit: '{spec.baseline_commit}'\n"
+                    f"- candidate_commit: '{candidate_commit}'\n"
+                    f"- session_id: '{sess_reviewer}'\n"
+                    f"- review_request_id: '{review_request_id}'\n"
+                    f"- decision: 'PASS' or 'REJECT'\n"
+                    f"- defects: [ {{\"defect_id\": \"...\", \"severity\": \"P1\", \"description\": \"...\"}} ]\n"
+                    f"- summary: 'summary text'\n"
+                )
+
+                reviewer_request = AgentRequest(
+                    session_id=sess_reviewer,
+                    prompt=reviewer_prompt,
                     role="REVIEWER",
-                    from_status=board_status,
-                    to_status="已退回",
-                    assignee=spec.owner,
-                    remarks=f"Independent Reviewer rejected candidate {candidate_commit}: {review_struct.summary}",
+                    workspace_dir=worktree_dir,
+                    timeout_seconds=float(spec.reviewer_timeout_seconds),
+                    extra_context={
+                        "sandbox": "read-only",
+                        "worktree_dir": worktree_dir,
+                        "project_id": spec.project_id,
+                        "review_request_id": review_request_id,
+                        "pre_granted_approval": pre_granted_approval,
+                    },
                 )
-                board_status = "已退回"
 
-                if review_cycle >= spec.max_review_cycles:
+                try:
+                    if pre_granted_approval:
+                        approval_recorder = getattr(reviewer_adapter, "record_out_of_band_approval", None)
+                        if callable(approval_recorder):
+                            approval_recorder(reviewer_request)
+                    reviewer_handle = reviewer_adapter.dispatch_agent(reviewer_request)
+                    with self._lock:
+                        self._active_handles[task_id] = reviewer_handle
+
+                    reviewer_result = self._wait_for_result_cancellable(
+                        reviewer_adapter,
+                        reviewer_handle,
+                        timeout_seconds=float(spec.reviewer_timeout_seconds),
+                        task_id=task_id,
+                    )
+                except RunnerCancelledError as ce:
+                    return RunnerResult(
+                        success=True,
+                        state=RunnerState.CANCELLED.value,
+                        task_id=task_id,
+                        candidate_commit=candidate_commit,
+                        candidate_generation=candidate_generation,
+                        evidence_ids=tuple(evidence_ids),
+                        message=str(ce),
+                    )
+                except AgentNotSupportedError as se:
+                    with self._lock:
+                        self._active_handles.pop(task_id, None)
                     checkpoint = RunnerCheckpoint(
                         task_id=task_id,
                         project_id=spec.project_id,
-                        state=RunnerState.NEEDS_USER_INPUT.value,
+                        state=RunnerState.APPROVAL_REQUIRED.value,
                         current_role="REVIEWER",
                         candidate_commit=candidate_commit,
                         candidate_generation=candidate_generation,
@@ -1023,65 +1329,201 @@ class ProductionRunner:
                         total_attempts=total_attempts,
                         worktree_path=worktree_dir,
                         worktree_branch=worktree_branch,
+                        reviewer_session_id=sess_reviewer,
                         evidence_ids=tuple(evidence_ids),
                         defects_history=tuple(defects_history),
-                        last_error=f"Exceeded max review cycles ({spec.max_review_cycles})",
+                        approval_reason=str(se),
+                        last_error="Permission approval required",
                     )
                     self.checkpoint_store.save_checkpoint(checkpoint)
                     return RunnerResult(
                         success=False,
-                        state=RunnerState.NEEDS_USER_INPUT.value,
+                        state=RunnerState.APPROVAL_REQUIRED.value,
                         task_id=task_id,
                         candidate_commit=candidate_commit,
                         candidate_generation=candidate_generation,
                         evidence_ids=tuple(evidence_ids),
-                        message=f"Reviewer rejected candidate and exceeded max review cycles ({spec.max_review_cycles}). Paused at NEEDS_USER_INPUT.",
-                        diagnostics={"defects": defects_history},
+                        message=f"Execution paused at APPROVAL_REQUIRED: {se}",
+                        diagnostics={"approval_reason": str(se)},
+                    )
+                except Exception as e:
+                    with self._lock:
+                        self._active_handles.pop(task_id, None)
+                    return RunnerResult(
+                        success=False,
+                        state=RunnerState.FAILED.value,
+                        task_id=task_id,
+                        candidate_commit=candidate_commit,
+                        candidate_generation=candidate_generation,
+                        message=f"Reviewer dispatch/wait failed: {e}",
+                        diagnostics={"error": str(e)},
+                    )
+                finally:
+                    with self._lock:
+                        self._active_handles.pop(task_id, None)
+
+                if reviewer_result.status != AgentStatus.SUCCESS:
+                    return RunnerResult(
+                        success=False,
+                        state=RunnerState.FAILED.value,
+                        task_id=task_id,
+                        message=f"Reviewer execution failed with status: {reviewer_result.status.value}",
+                    )
+                if reviewer_result.session_id != reviewer_handle.session_id:
+                    return RunnerResult(
+                        success=False,
+                        state=RunnerState.FAILED.value,
+                        task_id=task_id,
+                        message="Reviewer session ID mismatch (Fail-Closed).",
+                    )
+                if not reviewer_result.is_real_host:
+                    return RunnerResult(
+                        success=False,
+                        state=RunnerState.FAILED.value,
+                        task_id=task_id,
+                        message="Reviewer result is not from a real host (Fail-Closed).",
                     )
 
-                self._transition_authority(
-                    spec,
-                    role="DEV",
-                    from_status=board_status,
-                    to_status="进行中",
-                    assignee=spec.owner,
-                    remarks="Production Runner returned the original task to Builder for the next repair cycle.",
-                )
-                board_status = "进行中"
-                continue
+                inv_reviewer = _extract_real_invocation_id(reviewer_result, reviewer_handle)
+                if not inv_reviewer:
+                    return RunnerResult(
+                        success=False,
+                        state=RunnerState.FAILED.value,
+                        task_id=task_id,
+                        message="Reviewer host did not produce a valid canonical invocation identity (Fail-Closed).",
+                    )
 
-            # Reviewer PASS -> Handover to QA
-            r_to_qa = ReviewerToQAHandover(
-                task_id=task_id,
-                project_id=spec.project_id,
-                branch=worktree_branch,
-                candidate_commit=candidate_commit,
-                reviewer_decision="PASS",
-                review_comments=review_struct.summary,
-                review_evidence_id=reviewer_evidence_id,
-                reviewer_session_id=sess_reviewer,
-                reviewer_invocation_id=inv_reviewer,
-                workspace_dir=worktree_dir,
-                worktree_dir=worktree_dir,
-                auth_context=f"auth_ctx_{spec.project_id}",
-                billing_context=f"billing_ctx_{spec.project_id}",
-            )
-            orchestrator.pass_reviewer_to_qa(r_to_qa, evidence_id=reviewer_evidence_id, host_handle=reviewer_handle)
-            self._transition_authority(
-                spec,
-                role="REVIEWER",
-                from_status=board_status,
-                to_status="测试中",
-                assignee="章测试",
-                remarks=f"Independent Reviewer passed candidate {candidate_commit}; QA requested.",
-            )
-            board_status = "测试中"
+                review_output = self._parse_reviewer_structured_json(
+                    raw_output=reviewer_result.output,
+                    task_id=task_id,
+                    baseline_commit=spec.baseline_commit,
+                    candidate_commit=candidate_commit,
+                    session_id=sess_reviewer,
+                    invocation_id=inv_reviewer,
+                    review_request_id=review_request_id,
+                )
+
+                reviewer_evidence_id = f"evi_reviewer_{task_id.lower()}_{int(time.time()*1000)}"
+                reviewer_caps = reviewer_adapter.detect_capabilities()
+                r_meta = EvidenceMetadata(
+                    project_id=spec.project_id,
+                    task_id=task_id,
+                    actor_role="REVIEWER",
+                    host_id=spec.reviewer_adapter_id,
+                    adapter=spec.reviewer_adapter_id,
+                    host_session_id=sess_reviewer,
+                    host_invocation_id=inv_reviewer,
+                    is_real_host=reviewer_result.is_real_host,
+                    workspace_mode="workspace_read",
+                    transition_from="REVIEWING",
+                    transition_to="TESTING" if review_output.decision == "PASS" else "BUILDING",
+                    created_at=time.time(),
+                    extra=_extract_capabilities_extra(reviewer_caps),
+                )
+                r_record = EvidenceRecord(
+                    evidence_id=reviewer_evidence_id,
+                    evidence_type=EvidenceType.TASK_TRANSITION,
+                    baseline_commit=spec.baseline_commit,
+                    result_commit=candidate_commit,
+                    artifacts=(),
+                    metadata=r_meta,
+                )
+                self.evidence_store.append(r_record)
+                try:
+                    self.evidence_gate.validate_evidence(
+                        reviewer_evidence_id,
+                        EvidenceValidationContext(
+                            project_id=spec.project_id,
+                            task_id=task_id,
+                            actor_role="REVIEWER",
+                            transition_from="REVIEWING",
+                            transition_to="TESTING" if review_output.decision == "PASS" else "BUILDING",
+                            baseline_commit=spec.baseline_commit,
+                            result_commit=candidate_commit,
+                            expected_invocation_id=inv_reviewer,
+                            expected_adapter=spec.reviewer_adapter_id,
+                            expected_workspace_mode="workspace_read",
+                            expected_evidence_type=EvidenceType.TASK_TRANSITION,
+                            host_handle=reviewer_handle,
+                            expected_capabilities=reviewer_caps,
+                            agent_result=reviewer_result,
+                        ),
+                    )
+                except Exception as gate_error:
+                    return RunnerResult(
+                        success=False,
+                        state=RunnerState.FAILED.value,
+                        task_id=task_id,
+                        candidate_commit=candidate_commit,
+                        message=f"Reviewer EvidenceGate validation failed: {gate_error}",
+                    )
+                evidence_ids.append(reviewer_evidence_id)
+
+                if review_output.decision == "PASS":
+                    # 状态机推进: 审查中 -> 测试中 (REVIEWER)
+                    if current_board_status == "审查中":
+                        ok_trans, err_trans = self._do_state_transition(
+                            spec.authority_root, task_id, "REVIEWER", "审查中", "测试中", "章测试",
+                            f"Antigravity Reviewer 审核通过，候选提交: {candidate_commit}", spec.task_type
+                        )
+                        if not ok_trans:
+                            return RunnerResult(
+                                success=False, state=RunnerState.FAILED.value, task_id=task_id,
+                                message=f"Failed to transition state to 测试中: {err_trans}"
+                            )
+                        current_board_status = "测试中"
+                else:
+                    # 状态机回退: 审查中 -> 已退回 -> 进行中 (REVIEWER & DEV)
+                    review_exhausted = review_cycle >= spec.max_review_cycles
+                    if current_board_status == "审查中":
+                        ok_return, err_return = self._do_state_transition(
+                            spec.authority_root, task_id, "REVIEWER", "审查中", "已退回", "李开发",
+                            f"Antigravity Reviewer 审核退回: {review_output.summary}", spec.task_type
+                        )
+                        if not ok_return:
+                            return RunnerResult(
+                                success=False, state=RunnerState.FAILED.value, task_id=task_id,
+                                message=f"Failed to return rejected review to 已退回: {err_return}",
+                            )
+                        current_board_status = "已退回"
+                        if not review_exhausted:
+                            ok_reclaim, err_reclaim = self._do_state_transition(
+                                spec.authority_root, task_id, "DEV", "已退回", "进行中", "李开发",
+                                "Builder 重新认领任务进行缺陷修复", spec.task_type
+                            )
+                            if not ok_reclaim:
+                                return RunnerResult(
+                                    success=False, state=RunnerState.FAILED.value, task_id=task_id,
+                                    message=f"Failed to reclaim rejected review for Builder: {err_reclaim}",
+                                )
+                            current_board_status = "进行中"
+
+                    defects_history.append({
+                        "cycle": review_cycle,
+                        "role": "REVIEWER",
+                        "defects": list(review_output.defects),
+                        "summary": review_output.summary,
+                    })
+                    if review_exhausted:
+                        return RunnerResult(
+                            success=False,
+                            state=RunnerState.NEEDS_USER_INPUT.value,
+                            task_id=task_id,
+                            candidate_commit=candidate_commit,
+                            candidate_generation=candidate_generation,
+                            evidence_ids=tuple(evidence_ids),
+                            message=f"Reviewer rejected candidate and exceeded max review cycles ({spec.max_review_cycles}). Paused at NEEDS_USER_INPUT.",
+                            diagnostics={"defects": defects_history},
+                        )
+                    continue
+            else:
+                skip_reviewer = False
 
             # ==========================================
             # STAGE 3: CODEX QA
             # ==========================================
             qa_cycle += 1
-            sess_qa = f"sess_qa_runner_{int(time.time()*1000)}"
+            sess_qa = f"sess_qa_runner_{task_id.lower()}_{int(time.time()*1000)}"
 
             checkpoint = RunnerCheckpoint(
                 task_id=task_id,
@@ -1095,17 +1537,45 @@ class ProductionRunner:
                 total_attempts=total_attempts,
                 worktree_path=worktree_dir,
                 worktree_branch=worktree_branch,
-                builder_session_id=sess_builder,
-                reviewer_session_id=sess_reviewer,
+                builder_session_id=sess_builder if "sess_builder" in locals() else None,
+                reviewer_session_id=sess_reviewer if "sess_reviewer" in locals() else None,
                 qa_session_id=sess_qa,
                 evidence_ids=tuple(evidence_ids),
                 defects_history=tuple(defects_history),
             )
             self.checkpoint_store.save_checkpoint(checkpoint)
 
-            git_status_before_qa = self._get_git_tracked_status(worktree_dir)
+            # QA 前核验 candidate_commit 与 HEAD 一致
+            try:
+                head_before_qa = self._get_git_commit(worktree_dir)
+            except Exception as e:
+                return RunnerResult(
+                    success=False,
+                    state=RunnerState.FAILED.value,
+                    task_id=task_id,
+                    message=f"Failed to inspect HEAD before QA: {e}",
+                )
+
+            if head_before_qa != candidate_commit:
+                return RunnerResult(
+                    success=False,
+                    state=RunnerState.FAILED.value,
+                    task_id=task_id,
+                    candidate_commit=candidate_commit,
+                    message=f"Worktree HEAD ({head_before_qa}) does not match candidate commit ({candidate_commit}) before QA! Fail-Closed.",
+                )
 
             test_cmd = spec.test_command or "python -m pytest -q"
+            valid_cmd, cmd_err, cmd_args = _validate_qa_test_command(test_cmd, worktree_dir)
+            if not valid_cmd:
+                return RunnerResult(
+                    success=False,
+                    state=RunnerState.FAILED.value,
+                    task_id=task_id,
+                    candidate_commit=candidate_commit,
+                    message=f"QA test command security validation failed: {cmd_err}",
+                )
+
             qa_request = AgentRequest(
                 session_id=sess_qa,
                 prompt=f"Execute verification test suite in {worktree_dir} using: {test_cmd}. Report test results.",
@@ -1116,19 +1586,97 @@ class ProductionRunner:
                     "sandbox": "read-only",
                     "worktree_dir": worktree_dir,
                     "project_id": spec.project_id,
+                    "pre_granted_approval": pre_granted_approval,
                 },
             )
 
             try:
                 qa_handle = qa_adapter.dispatch_agent(qa_request)
-                qa_result = qa_adapter.wait_for_result(qa_handle, timeout_seconds=float(spec.qa_timeout_seconds))
+                with self._lock:
+                    self._active_handles[task_id] = qa_handle
+
+                qa_result = self._wait_for_result_cancellable(
+                    qa_adapter,
+                    qa_handle,
+                    timeout_seconds=float(spec.qa_timeout_seconds),
+                    task_id=task_id,
+                )
+            except RunnerCancelledError as ce:
+                return RunnerResult(
+                    success=True,
+                    state=RunnerState.CANCELLED.value,
+                    task_id=task_id,
+                    candidate_commit=candidate_commit,
+                    candidate_generation=candidate_generation,
+                    evidence_ids=tuple(evidence_ids),
+                    message=str(ce),
+                )
+            except AgentNotSupportedError as se:
+                with self._lock:
+                    self._active_handles.pop(task_id, None)
+                checkpoint = RunnerCheckpoint(
+                    task_id=task_id,
+                    project_id=spec.project_id,
+                    state=RunnerState.APPROVAL_REQUIRED.value,
+                    current_role="QA",
+                    candidate_commit=candidate_commit,
+                    candidate_generation=candidate_generation,
+                    review_cycle=review_cycle,
+                    qa_cycle=qa_cycle,
+                    total_attempts=total_attempts,
+                    worktree_path=worktree_dir,
+                    worktree_branch=worktree_branch,
+                    qa_session_id=sess_qa,
+                    evidence_ids=tuple(evidence_ids),
+                    defects_history=tuple(defects_history),
+                    approval_reason=str(se),
+                    last_error="Permission approval required",
+                )
+                self.checkpoint_store.save_checkpoint(checkpoint)
+                return RunnerResult(
+                    success=False,
+                    state=RunnerState.APPROVAL_REQUIRED.value,
+                    task_id=task_id,
+                    candidate_commit=candidate_commit,
+                    candidate_generation=candidate_generation,
+                    evidence_ids=tuple(evidence_ids),
+                    message=f"Execution paused at APPROVAL_REQUIRED: {se}",
+                    diagnostics={"approval_reason": str(se)},
+                )
             except Exception as e:
+                with self._lock:
+                    self._active_handles.pop(task_id, None)
                 return RunnerResult(
                     success=False,
                     state=RunnerState.FAILED.value,
                     task_id=task_id,
                     message=f"QA dispatch/wait failed: {e}",
                     diagnostics={"error": str(e)},
+                )
+            finally:
+                with self._lock:
+                    self._active_handles.pop(task_id, None)
+
+            if qa_result.status != AgentStatus.SUCCESS:
+                return RunnerResult(
+                    success=False,
+                    state=RunnerState.FAILED.value,
+                    task_id=task_id,
+                    message=f"QA execution failed with status: {qa_result.status.value}",
+                )
+            if qa_result.session_id != qa_handle.session_id:
+                return RunnerResult(
+                    success=False,
+                    state=RunnerState.FAILED.value,
+                    task_id=task_id,
+                    message="QA session ID mismatch (Fail-Closed).",
+                )
+            if not qa_result.is_real_host:
+                return RunnerResult(
+                    success=False,
+                    state=RunnerState.FAILED.value,
+                    task_id=task_id,
+                    message="QA result is not from a real host (Fail-Closed).",
                 )
 
             inv_qa = _extract_real_invocation_id(qa_result, qa_handle)
@@ -1140,32 +1688,35 @@ class ProductionRunner:
                     message="QA host did not produce a valid canonical invocation identity (Fail-Closed).",
                 )
 
-            # 安全执行测试命令（防止 shell 注入并核验退出码，DEF-T0061-8）
+            # 执行受控的 QA 测试命令
             test_exit_code = 0
             try:
-                cmd_args = shlex.split(test_cmd, posix=(sys.platform != "win32"))
                 test_proc = subprocess.run(
                     cmd_args,
                     cwd=worktree_dir,
                     capture_output=True,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     timeout=spec.qa_timeout_seconds,
                 )
                 test_exit_code = test_proc.returncode
             except Exception:
                 test_exit_code = 1
 
-            git_status_after_qa = self._get_git_tracked_status(worktree_dir)
-            if git_status_before_qa != git_status_after_qa:
+            # 严格核验 QA 前后源码不可变性（P1 门禁：HEAD、diff、cached diff、status）
+            immutability_ok, immutability_err = self._verify_qa_immutability(worktree_dir, candidate_commit)
+            if not immutability_ok:
                 return RunnerResult(
                     success=False,
                     state=RunnerState.FAILED.value,
                     task_id=task_id,
                     candidate_commit=candidate_commit,
-                    message="QA modified tracked source code files. Code immutability boundary violated! Fail-Closed.",
+                    message=f"QA violated code immutability boundary: {immutability_err}",
                 )
 
             qa_evidence_id = f"evi_qa_{task_id.lower()}_{int(time.time()*1000)}"
+            qa_caps = qa_adapter.detect_capabilities()
             qa_meta = EvidenceMetadata(
                 project_id=spec.project_id,
                 task_id=task_id,
@@ -1179,7 +1730,7 @@ class ProductionRunner:
                 transition_from="TESTING",
                 transition_to="PENDING_USER_ACCEPTANCE" if test_exit_code == 0 else "BUILDING",
                 created_at=time.time(),
-                extra=_extract_capabilities_extra(qa_adapter.detect_capabilities()),
+                extra=_extract_capabilities_extra(qa_caps),
             )
             qa_record = EvidenceRecord(
                 evidence_id=qa_evidence_id,
@@ -1190,58 +1741,69 @@ class ProductionRunner:
                 metadata=qa_meta,
             )
             self.evidence_store.append(qa_record)
+            try:
+                self.evidence_gate.validate_evidence(
+                    qa_evidence_id,
+                    EvidenceValidationContext(
+                        project_id=spec.project_id,
+                        task_id=task_id,
+                        actor_role="QA",
+                        transition_from="TESTING",
+                        transition_to="PENDING_USER_ACCEPTANCE" if test_exit_code == 0 else "BUILDING",
+                        baseline_commit=spec.baseline_commit,
+                        result_commit=candidate_commit,
+                        expected_invocation_id=inv_qa,
+                        expected_adapter=spec.qa_adapter_id,
+                        expected_workspace_mode="workspace_read",
+                        expected_evidence_type=EvidenceType.TASK_TRANSITION,
+                        host_handle=qa_handle,
+                        expected_capabilities=qa_caps,
+                        agent_result=qa_result,
+                    ),
+                )
+            except Exception as gate_error:
+                return RunnerResult(
+                    success=False,
+                    state=RunnerState.FAILED.value,
+                    task_id=task_id,
+                    candidate_commit=candidate_commit,
+                    message=f"QA EvidenceGate validation failed: {gate_error}",
+                )
             evidence_ids.append(qa_evidence_id)
 
             if test_exit_code != 0:
-                qa_defect_handover = DefectRejectionHandover(
-                    task_id=task_id,
-                    project_id=spec.project_id,
-                    source_role=OrchestrationRole.QA,
-                    defect_list=(f"QA test command failed with exit code {test_exit_code}",),
-                    comments="Automated test execution failed in QA.",
-                    candidate_commit=candidate_commit,
-                    source_session_id=sess_qa,
-                    source_invocation_id=inv_qa,
-                    target_builder_role=OrchestrationRole.BUILDER,
-                    target_builder_assignee=spec.owner,
-                )
-                orchestrator.reject_by_qa(qa_defect_handover)
-
-                defect_record = {
+                qa_exhausted = qa_cycle >= spec.max_qa_cycles
+                if current_board_status == "测试中":
+                    ok_return, err_return = self._do_state_transition(
+                        spec.authority_root, task_id, "QA", "测试中", "已退回", "李开发",
+                        f"Codex QA 测试失败，退出码: {test_exit_code}", spec.task_type,
+                    )
+                    if not ok_return:
+                        return RunnerResult(
+                            success=False, state=RunnerState.FAILED.value, task_id=task_id,
+                            candidate_commit=candidate_commit,
+                            message=f"Failed to return QA failure to 已退回: {err_return}",
+                        )
+                    current_board_status = "已退回"
+                    if not qa_exhausted:
+                        ok_reclaim, err_reclaim = self._do_state_transition(
+                            spec.authority_root, task_id, "DEV", "已退回", "进行中", "李开发",
+                            "Builder 重新认领任务修复 QA 缺陷", spec.task_type,
+                        )
+                        if not ok_reclaim:
+                            return RunnerResult(
+                                success=False, state=RunnerState.FAILED.value, task_id=task_id,
+                                candidate_commit=candidate_commit,
+                                message=f"Failed to reclaim QA failure for Builder: {err_reclaim}",
+                            )
+                        current_board_status = "进行中"
+                defects_history.append({
                     "cycle": qa_cycle,
                     "role": "QA",
-                    "description": f"QA test suite failed with exit code {test_exit_code}.",
-                }
-                defects_history.append(defect_record)
-
-                self._transition_authority(
-                    spec,
-                    role="QA",
-                    from_status=board_status,
-                    to_status="已退回",
-                    assignee=spec.owner,
-                    remarks=f"QA rejected candidate {candidate_commit}; test command exited with {test_exit_code}.",
-                )
-                board_status = "已退回"
-
-                if qa_cycle >= spec.max_qa_cycles:
-                    checkpoint = RunnerCheckpoint(
-                        task_id=task_id,
-                        project_id=spec.project_id,
-                        state=RunnerState.NEEDS_USER_INPUT.value,
-                        current_role="QA",
-                        candidate_commit=candidate_commit,
-                        candidate_generation=candidate_generation,
-                        review_cycle=review_cycle,
-                        qa_cycle=qa_cycle,
-                        total_attempts=total_attempts,
-                        worktree_path=worktree_dir,
-                        worktree_branch=worktree_branch,
-                        evidence_ids=tuple(evidence_ids),
-                        defects_history=tuple(defects_history),
-                        last_error=f"Exceeded max QA cycles ({spec.max_qa_cycles})",
-                    )
-                    self.checkpoint_store.save_checkpoint(checkpoint)
+                    "defects": [{"defect_id": f"DEF-{task_id}-QA-FAIL", "severity": "P1", "description": "QA test execution exited with non-zero code."}],
+                    "summary": f"QA test suite failed with exit code {test_exit_code}.",
+                })
+                if qa_exhausted:
                     return RunnerResult(
                         success=False,
                         state=RunnerState.NEEDS_USER_INPUT.value,
@@ -1249,112 +1811,92 @@ class ProductionRunner:
                         candidate_commit=candidate_commit,
                         candidate_generation=candidate_generation,
                         evidence_ids=tuple(evidence_ids),
-                        message=f"QA failed and exceeded max QA cycles ({spec.max_qa_cycles}). Paused at NEEDS_USER_INPUT.",
+                        message=f"QA tests failed and exceeded max QA cycles ({spec.max_qa_cycles}). Paused at NEEDS_USER_INPUT.",
                         diagnostics={"defects": defects_history},
                     )
-
-                self._transition_authority(
-                    spec,
-                    role="DEV",
-                    from_status=board_status,
-                    to_status="进行中",
-                    assignee=spec.owner,
-                    remarks="Production Runner returned the original task to Builder after QA failure.",
-                )
-                board_status = "进行中"
                 continue
 
-            ua_req = UserAcceptanceRequest(
+            # ==========================================
+            # STAGE 4: USER ACCEPTANCE & COMPLETION
+            # ==========================================
+            confirmation_req_id = f"conf_req_{task_id.lower()}_{int(time.time()*1000)}"
+
+            checkpoint = RunnerCheckpoint(
                 task_id=task_id,
                 project_id=spec.project_id,
-                branch=worktree_branch,
+                state=RunnerState.PENDING_USER_ACCEPTANCE.value,
+                current_role="QA",
                 candidate_commit=candidate_commit,
-                qa_report={"passed": 1, "failed": 0},
-                reviewer_report={"decision": "PASS", "summary": review_struct.summary},
-                artifacts=(),
-                user_confirmation_prompt=f"请验收任务 {task_id} (候选提交: {candidate_commit[:8]})",
-                auth_context=f"auth_ctx_{spec.project_id}",
+                candidate_generation=candidate_generation,
+                review_cycle=review_cycle,
+                qa_cycle=qa_cycle,
+                total_attempts=total_attempts,
+                worktree_path=worktree_dir,
+                worktree_branch=worktree_branch,
+                evidence_ids=tuple(evidence_ids),
+                confirmation_request_id=confirmation_req_id,
+                defects_history=tuple(defects_history),
             )
-            orchestrator.pass_qa_to_user_acceptance(
-                request=ua_req,
-                qa_session_id=sess_qa,
-                qa_invocation_id=inv_qa,
-                evidence_id=qa_evidence_id,
-                host_handle=qa_handle,
+            self.checkpoint_store.save_checkpoint(checkpoint)
+
+            # 通过合法状态机 transition_task.py 将任务流转至 已完成 (DEF-T0061-3)
+            ok_trans, err_trans = self._do_state_transition(
+                spec.authority_root,
+                task_id=task_id,
+                role="QA",
+                from_status=current_board_status,
+                to_status="已完成",
+                assignee="严经理",
+                remarks=f"2F-PROD通用自动编排Runner完成全流水线验证，候选提交: {candidate_commit}，停在已完成待用户验收",
+                task_type=spec.task_type,
             )
-            break
+            if not ok_trans:
+                return RunnerResult(
+                    success=False,
+                    state=RunnerState.FAILED.value,
+                    task_id=task_id,
+                    candidate_commit=candidate_commit,
+                    candidate_generation=candidate_generation,
+                    evidence_ids=tuple(evidence_ids),
+                    message=f"Failed to execute legal state transition to '已完成': {err_trans}",
+                )
 
-        # ==========================================
-        # STAGE 4: USER ACCEPTANCE PREPARATION
-        # ==========================================
-        session = orchestrator.get_session(task_id)
-        confirmation_request_id = session.confirmation_request_id if session else f"conf_req_{uuid.uuid4().hex[:16]}"
-        final_state = RunnerState.PENDING_USER_ACCEPTANCE.value
+            return RunnerResult(
+                success=True,
+                state=RunnerState.PENDING_USER_ACCEPTANCE.value,
+                task_id=task_id,
+                candidate_commit=candidate_commit,
+                candidate_generation=candidate_generation,
+                evidence_ids=tuple(evidence_ids),
+                confirmation_request_id=confirmation_req_id,
+                message=f"Production orchestration pipeline succeeded for {task_id}. State transitioned to 已完成 (PENDING_USER_ACCEPTANCE). Awaiting explicit user acceptance.",
+                diagnostics={
+                    "total_attempts": total_attempts,
+                    "review_cycles": review_cycle,
+                    "qa_cycles": qa_cycle,
+                    "candidate_commit": candidate_commit,
+                },
+            )
 
-        checkpoint = RunnerCheckpoint(
-            task_id=task_id,
-            project_id=spec.project_id,
-            state=final_state,
-            current_role="USER",
-            candidate_commit=candidate_commit,
-            candidate_generation=candidate_generation,
-            review_cycle=review_cycle,
-            qa_cycle=qa_cycle,
-            total_attempts=total_attempts,
-            worktree_path=worktree_dir,
-            worktree_branch=worktree_branch,
-            evidence_ids=tuple(evidence_ids),
-            confirmation_request_id=confirmation_request_id,
-            defects_history=tuple(defects_history),
-        )
-        self.checkpoint_store.save_checkpoint(checkpoint)
-
-        self._transition_authority(
-            spec,
-            role="QA",
-            from_status=board_status,
-            to_status="已完成",
-            assignee="严经理",
-            remarks=(
-                "Builder, independent Reviewer and QA evidence passed. "
-                f"confirmation_request_id={confirmation_request_id}; waiting for explicit user acceptance."
-            ),
-        )
-
-        return RunnerResult(
-            success=True,
-            state=final_state,
-            task_id=task_id,
-            candidate_commit=candidate_commit,
-            candidate_generation=candidate_generation,
-            evidence_ids=tuple(evidence_ids),
-            confirmation_request_id=confirmation_request_id,
-            message="Runner successfully executed Builder -> Reviewer -> QA cycle. Validated all evidence via EvidenceGate. Stopped at PENDING_USER_ACCEPTANCE / 已完成.",
-            diagnostics={
-                "worktree_path": worktree_dir,
-                "review_cycles": review_cycle,
-                "qa_cycles": qa_cycle,
-                "total_attempts": total_attempts,
-            },
-        )
-
-    def status(self, project_root: str, task_id: str, authority_root: Optional[str] = None) -> Dict[str, Any]:
-        """纯只读状态查询：零写入、零宿主调用、零锁目录创建"""
-        ckpt = self.checkpoint_store.query_status(task_id)
+    def get_status(self, project_root: str, task_id: str, authority_root: Optional[str] = None) -> Dict[str, Any]:
+        """纯只读查询当前任务与 Checkpoint 状态（零写入、零锁、零 Host 调用）"""
+        _validate_task_id(task_id)
+        ckpt = self.checkpoint_store.load_checkpoint(task_id)
         if ckpt:
             return {
                 "task_id": task_id,
+                "project_id": ckpt.project_id,
                 "has_checkpoint": True,
-                "state": ckpt.get("state"),
-                "current_role": ckpt.get("current_role"),
-                "candidate_commit": ckpt.get("candidate_commit"),
-                "candidate_generation": ckpt.get("candidate_generation"),
-                "review_cycle": ckpt.get("review_cycle"),
-                "qa_cycle": ckpt.get("qa_cycle"),
-                "evidence_ids": ckpt.get("evidence_ids", []),
-                "confirmation_request_id": ckpt.get("confirmation_request_id"),
-                "last_error": ckpt.get("last_error"),
-                "approval_reason": ckpt.get("approval_reason"),
+                "state": ckpt.state,
+                "current_role": ckpt.current_role,
+                "candidate_commit": ckpt.candidate_commit,
+                "candidate_generation": ckpt.candidate_generation,
+                "review_cycle": ckpt.review_cycle,
+                "qa_cycle": ckpt.qa_cycle,
+                "evidence_ids": list(ckpt.evidence_ids),
+                "confirmation_request_id": ckpt.confirmation_request_id,
+                "last_error": ckpt.last_error,
+                "approval_reason": ckpt.approval_reason,
             }
         return {
             "task_id": task_id,
@@ -1371,7 +1913,8 @@ class ProductionRunner:
         interactive_approval_cb: Optional[Callable[[str, Dict[str, Any]], bool]] = None,
         pre_granted_approval: bool = False,
     ) -> RunnerResult:
-        """从 Checkpoint 恢复执行 (支持 APPROVAL_REQUIRED 授权后恢复)"""
+        """从 Checkpoint 恢复执行 (支持断点恢复、完整复核 HEAD、Evidence 与权威状态)"""
+        _validate_task_id(task_id)
         ckpt = self.checkpoint_store.load_checkpoint(task_id)
         if not ckpt:
             return RunnerResult(
@@ -1382,6 +1925,16 @@ class ProductionRunner:
             )
 
         spec = load_task_execution_spec(project_root=project_root, task_id=task_id, authority_root=authority_root)
+
+        # 1. 严格乐观并发校验权威看板状态
+        if not verify_optimistic_concurrency(spec):
+            return RunnerResult(
+                success=False,
+                state=RunnerState.FAILED.value,
+                task_id=task_id,
+                message="Optimistic concurrency verification failed: task is in terminal status or modified in authoritative board.",
+            )
+
         if ckpt.state in (RunnerState.CANCELLED.value, RunnerState.PENDING_USER_ACCEPTANCE.value):
             return RunnerResult(
                 success=False,
@@ -1390,6 +1943,7 @@ class ProductionRunner:
                 candidate_commit=ckpt.candidate_commit,
                 message=f"Checkpoint state '{ckpt.state}' cannot be resumed.",
             )
+
         if ckpt.state == RunnerState.APPROVAL_REQUIRED.value and not pre_granted_approval:
             return RunnerResult(
                 success=False,
@@ -1397,21 +1951,67 @@ class ProductionRunner:
                 task_id=task_id,
                 message="Explicit --approve is required to resume this checkpoint.",
             )
-        if ckpt.worktree_path:
-            resume_root = os.path.realpath(ckpt.worktree_path)
-            if not os.path.isdir(resume_root):
+
+        # 2. 严格核验 Worktree 路径与 Git 仓库完整性
+        resume_root = os.path.realpath(ckpt.worktree_path) if ckpt.worktree_path else os.path.realpath(project_root)
+        if not os.path.isdir(resume_root):
+            return RunnerResult(
+                success=False,
+                state=RunnerState.FAILED.value,
+                task_id=task_id,
+                message=f"Checkpoint worktree no longer exists: {resume_root}",
+            )
+
+        # 3. 严格核验 Candidate Commit 是否在 Git 仓库中有效存在
+        if ckpt.candidate_commit:
+            try:
+                subprocess.run(
+                    ["git", "cat-file", "-e", f"{ckpt.candidate_commit}^{{commit}}"],
+                    cwd=resume_root,
+                    check=True,
+                    capture_output=True,
+                )
+            except Exception:
                 return RunnerResult(
                     success=False,
                     state=RunnerState.FAILED.value,
                     task_id=task_id,
-                    message=f"Checkpoint worktree no longer exists: {resume_root}",
+                    message=f"Candidate commit '{ckpt.candidate_commit}' referenced in checkpoint does not exist in worktree Git history.",
                 )
-            spec = replace(
-                spec,
-                project_id=ckpt.project_id,
-                project_root=resume_root,
-                workspace_mode="inherit",
-            )
+
+        # 4. 严格核验 Checkpoint 中所有 Evidence 是否在 EvidenceStore 中有效存在
+        if ckpt.evidence_ids:
+            if self.evidence_store is None:
+                evidence_dir = os.path.join(project_root, "user_data", "runner_evidence")
+                self.evidence_store = EvidenceStore(root_dir=evidence_dir)
+            for evi_id in ckpt.evidence_ids:
+                try:
+                    self.evidence_store.read(evi_id)
+                except Exception:
+                    return RunnerResult(
+                        success=False,
+                        state=RunnerState.FAILED.value,
+                        task_id=task_id,
+                        message=f"Evidence record '{evi_id}' referenced in checkpoint not found in EvidenceStore.",
+                    )
+
+        resumed_baseline = spec.baseline_commit
+        if ckpt.evidence_ids and self.evidence_store is not None:
+            try:
+                first_evi = self.evidence_store.read(ckpt.evidence_ids[0])
+                if first_evi.baseline_commit and re.match(r"^[0-9a-f]{40}$", first_evi.baseline_commit):
+                    resumed_baseline = first_evi.baseline_commit
+            except Exception:
+                pass
+
+        spec = replace(
+            spec,
+            project_id=ckpt.project_id,
+            project_root=resume_root,
+            baseline_commit=resumed_baseline,
+            workspace_mode="inherit",
+        )
+
         lock_handle, lock_file = self.checkpoint_store.acquire_runner_lock(task_id)
         if lock_handle is None:
             return RunnerResult(
@@ -1433,8 +2033,57 @@ class ProductionRunner:
             self.checkpoint_store.release_runner_lock((lock_handle, lock_file))
 
     def cancel(self, project_root: str, task_id: str, authority_root: Optional[str] = None) -> RunnerResult:
-        """安全取消任务：不删除 Worktree，不清除 Evidence"""
+        """安全取消任务：向所有正在运行的 Host 发送 cancel 请求，不删除 Worktree，不清除 Evidence"""
+        _validate_task_id(task_id)
+
         ckpt = self.checkpoint_store.load_checkpoint(task_id)
+        if not ckpt:
+            return RunnerResult(
+                success=False,
+                state=RunnerState.FAILED.value,
+                task_id=task_id,
+                message=f"Cannot cancel: No checkpoint found for task {task_id}.",
+            )
+        if ckpt.state in (RunnerState.CANCELLED.value, RunnerState.PENDING_USER_ACCEPTANCE.value):
+            return RunnerResult(
+                success=False,
+                state=ckpt.state,
+                task_id=task_id,
+                candidate_commit=ckpt.candidate_commit,
+                message=f"Checkpoint state '{ckpt.state}' cannot be cancelled.",
+            )
+
+        # 1. 取消活动的代理句柄与 Host 进程
+        active_handle = None
+        with self._lock:
+            active_handle = self._active_handles.pop(task_id, None)
+
+        if active_handle and self.registry:
+            try:
+                adapter = self.registry.get(active_handle.host_id)
+                if adapter and hasattr(adapter, "cancel_agent"):
+                    adapter.cancel_agent(active_handle)
+            except Exception:
+                pass
+
+        # 遍历注册表中的适配器，取消与该 task 关联的正在运行会话
+        if self.registry and getattr(self.registry, "_adapters", None):
+            for adapter in self.registry._adapters.values():
+                try:
+                    if hasattr(adapter, "_running_sessions") and hasattr(adapter, "cancel_agent"):
+                        with getattr(adapter, "_lock", threading.Lock()):
+                            sessions_to_cancel = [
+                                s_data.get("handle")
+                                for s_data in adapter._running_sessions.values()
+                                if s_data.get("handle") and (task_id in s_data.get("handle").session_id or task_id.lower() in s_data.get("handle").session_id)
+                            ]
+                        for h in sessions_to_cancel:
+                            if h:
+                                adapter.cancel_agent(h)
+                except Exception:
+                    pass
+
+        # 2. 更新 Checkpoint 状态为 CANCELLED
         if ckpt:
             updated = RunnerCheckpoint(
                 task_id=task_id,
@@ -1448,6 +2097,9 @@ class ProductionRunner:
                 total_attempts=ckpt.total_attempts,
                 worktree_path=ckpt.worktree_path,
                 worktree_branch=ckpt.worktree_branch,
+                builder_session_id=ckpt.builder_session_id,
+                reviewer_session_id=ckpt.reviewer_session_id,
+                qa_session_id=ckpt.qa_session_id,
                 evidence_ids=ckpt.evidence_ids,
                 confirmation_request_id=ckpt.confirmation_request_id,
                 defects_history=ckpt.defects_history,
@@ -1459,5 +2111,5 @@ class ProductionRunner:
             success=True,
             state=RunnerState.CANCELLED.value,
             task_id=task_id,
-            message=f"Task {task_id} successfully cancelled. Checkpoint updated, worktree and evidence preserved.",
+            message=f"Task {task_id} successfully cancelled. Running host sessions cancelled, checkpoint updated, worktree and evidence preserved.",
         )

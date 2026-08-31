@@ -7,6 +7,7 @@ import os
 import sys
 import json
 import pytest
+import yaml
 from unittest.mock import patch, MagicMock
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -115,6 +116,14 @@ def mock_pr_board_env(tmp_path):
     ]
     with open(user_data / "board.json", "w", encoding="utf-8") as f:
         json.dump(board_cards, f, ensure_ascii=False)
+
+    with open(user_data / "workflow.config.yaml", "w", encoding="utf-8") as f:
+        yaml.safe_dump({
+            "board": {
+                "provider": "local",
+                "board_file": str(user_data / "board.json"),
+            }
+        }, f, allow_unicode=True)
 
     return str(proj_dir)
 

@@ -12,6 +12,8 @@ def test_default_listen_address():
     # Start server with default args (should be 127.0.0.1)
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
     env["KANBAN_PORT"] = "32950"  # Pick a random port for test
     p = subprocess.Popen([sys.executable, SERVER_SCRIPT], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
     time.sleep(2)
@@ -23,6 +25,8 @@ def test_default_listen_address():
 def test_remote_listen_rejected_without_flag():
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
     p = subprocess.Popen([sys.executable, SERVER_SCRIPT, "--host", "0.0.0.0"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
     out, err = p.communicate()
     assert p.returncode != 0
@@ -31,6 +35,8 @@ def test_remote_listen_rejected_without_flag():
 def test_remote_listen_with_flag():
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
     env["KANBAN_PORT"] = "32951"
     p = subprocess.Popen([sys.executable, SERVER_SCRIPT, "--host", "0.0.0.0", "--allow-remote"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
     time.sleep(2)

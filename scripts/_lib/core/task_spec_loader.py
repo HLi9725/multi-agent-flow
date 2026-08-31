@@ -21,7 +21,13 @@ _SCRIPTS_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".
 if _SCRIPTS_ROOT not in sys.path:
     sys.path.insert(0, _SCRIPTS_ROOT)
 
-import paths
+try:
+    from ... import paths
+except Exception:
+    try:
+        from scripts import paths
+    except Exception:
+        import paths
 from ..boards.board_adapter_factory import get_board_adapter
 from ..boards.offline_board_adapter import OfflineBoardAdapter
 from .runner_schema import TaskExecutionSpec
@@ -237,12 +243,25 @@ def load_task_execution_spec(
     return spec
 
 
-def verify_optimistic_concurrency(spec: TaskExecutionSpec, board_adapter: Any) -> bool:
+def verify_optimistic_concurrency(spec: TaskExecutionSpec, board_adapter: Optional[Any] = None) -> bool:
     """
     在执行真实状态流转前，对权威看板进行严格乐观并发检查。
     比对任务是否存在、当前状态是否与读取时一致、验收标准哈希是否一致、版本是否一致、是否终态。
     """
     try:
+        if board_adapter is None:
+            board_config = None
+            for cand_dir in [spec.authority_root, spec.project_root, paths.project_root()]:
+                if not cand_dir:
+                    continue
+                cfg = os.path.join(cand_dir, "config", "workflow.config.yaml")
+                if os.path.isfile(cfg):
+                    board_config = cfg
+                    break
+            if not board_config:
+                return False
+            board_adapter = get_board_adapter(board_config)
+
         record = board_adapter.get_record(spec.task_id)
         if not record:
             return False

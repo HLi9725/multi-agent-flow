@@ -7,11 +7,23 @@ import os
 import json
 import yaml
 from typing import Any
-import paths
-from _lib.boards.feishu_base_adapter import FeishuBaseAdapter
-from _lib.boards.jira_adapter import JiraAdapter
-from _lib.boards.github_projects_adapter import GitHubProjectsAdapter
-from _lib.boards.offline_board_adapter import OfflineBoardAdapter
+try:
+    from ... import paths
+except Exception:
+    try:
+        from scripts import paths
+    except Exception:
+        import paths
+try:
+    from .feishu_base_adapter import FeishuBaseAdapter
+    from .jira_adapter import JiraAdapter
+    from .github_projects_adapter import GitHubProjectsAdapter
+    from .offline_board_adapter import OfflineBoardAdapter
+except Exception:
+    from _lib.boards.feishu_base_adapter import FeishuBaseAdapter
+    from _lib.boards.jira_adapter import JiraAdapter
+    from _lib.boards.github_projects_adapter import GitHubProjectsAdapter
+    from _lib.boards.offline_board_adapter import OfflineBoardAdapter
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -71,8 +83,13 @@ def get_board_adapter(config_file: str = None) -> Any:
         # 离线看板：相对路径锚定 data_root（宿主项目根 / legacy skill 拷贝），不再锚定 skill_root
         raw_board_file = board_cfg.get("board_file", "user_data/board.json")
         if not os.path.isabs(raw_board_file):
-            data_root = paths.resolve_data_root()
-            board_file = os.path.abspath(os.path.join(data_root, raw_board_file))
+            cfg_dir = os.path.dirname(os.path.abspath(config_file))
+            proj_candidate = os.path.abspath(os.path.join(cfg_dir, ".."))
+            if os.path.isfile(os.path.join(proj_candidate, raw_board_file)):
+                board_file = os.path.abspath(os.path.join(proj_candidate, raw_board_file))
+            else:
+                data_root = paths.resolve_data_root(cwd=proj_candidate)
+                board_file = os.path.abspath(os.path.join(data_root, raw_board_file))
         else:
             board_file = raw_board_file
         os.makedirs(os.path.dirname(board_file), exist_ok=True)

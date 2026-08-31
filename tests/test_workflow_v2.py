@@ -41,6 +41,8 @@ def run(env, *args, expect=0):
     else:
         cmd = [sys.executable, os.path.join(SCRIPTS, script), "--config", str(env["cfg"]), *rest]
     sub_env = os.environ.copy()
+    sub_env["PYTHONIOENCODING"] = "utf-8"
+    sub_env["PYTHONUTF8"] = "1"
     sub_env["YY_FLOW_PROJECT_ROOT"] = str(env.get("tmp") or env["board"].parent)
     r = subprocess.run(
         cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
@@ -430,8 +432,11 @@ class TestTaskTiers:
     def test_build_context_dispatch(self, env):
         """build_agent_context dispatch 动作输出三问、分级与硬红线。"""
         cmd = [sys.executable, os.path.join(SCRIPTS, "build_agent_context.py"), "--role", "PM", "--action", "dispatch"]
+        sub_env = os.environ.copy()
+        sub_env["PYTHONIOENCODING"] = "utf-8"
+        sub_env["PYTHONUTF8"] = "1"
         r = subprocess.run(
-            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=REPO_ROOT
+            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=REPO_ROOT, env=sub_env
         )
         assert r.returncode == 0
         assert "L0" in r.stdout and "三问" in r.stdout and "L1" in r.stdout and "L2" in r.stdout

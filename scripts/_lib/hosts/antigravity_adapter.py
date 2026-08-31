@@ -572,13 +572,15 @@ class AntigravityAdapter(BaseHostAdapter):
 
         command_family = f"{risk}:{request.role or 'default'}"
 
-        if risk != "safe_local":
-            # Non-interactive CLI surface strictly forbids self-authorization / non-safe operations (Fail-Closed)
+        if risk in {"destructive", "billing", "acceptance"}:
+            # An out-of-band approval may authorize controlled external reads, but it
+            # must never authorize destructive, billing, or acceptance operations.
             raise AgentNotSupportedError(
                 f"Operation classified as '{risk}' is strictly forbidden on non-interactive Antigravity CLI surface (Fail-Closed)."
             )
 
-        # safe_local: Check permission cache (specific session or project/workspace scope)
+        # safe_local / controlled_external: require an approval recorded by the
+        # trusted outer host.  Request fields themselves can never self-authorize.
         has_approval = self.has_permission_approval(
             project_id=project_id,
             auth_context=auth_context,
@@ -893,6 +895,40 @@ class AntigravityAdapter(BaseHostAdapter):
         )
         with self._lock:
             self._permission_cache[cache_key] = True
+
+    def record_out_of_band_approval(self, request: AgentRequest) -> str:
+        """Record explicit outer-host approval for one exact request identity.
+
+        This method is intentionally separate from ``dispatch_agent`` so an
+        untrusted request cannot approve itself.  Only safe-local and
+        controlled-external requests are eligible; destructive, billing and
+        acceptance operations remain fail-closed even after user approval.
+        """
+        if not isinstance(request, AgentRequest):
+            raise TypeError("request must be an AgentRequest instance")
+        risk = evaluate_command_risk(request.prompt, request.workspace_dir)
+        if risk not in {"safe_local", "controlled_external"}:
+            raise AgentNotSupportedError(
+                f"Operation classified as '{risk}' cannot receive out-of-band approval (Fail-Closed)."
+            )
+
+        project_id = "default_project"
+        auth_context = "user_local_ctx"
+        permission_boundary = "workspace_read" if risk == "safe_local" else "workspace_write"
+        if isinstance(request.extra_context, Mapping):
+            project_id = str(request.extra_context.get("project_id", project_id))
+            auth_context = str(request.extra_context.get("auth_context", auth_context))
+            permission_boundary = str(request.extra_context.get("permission_boundary", permission_boundary))
+
+        self.record_permission_approval(
+            project_id=project_id,
+            auth_context=auth_context,
+            session_id=request.session_id.strip(),
+            workspace_dir=request.workspace_dir,
+            command_family=f"{risk}:{request.role or 'default'}",
+            permission_boundary=permission_boundary,
+        )
+        return risk
 
     def has_permission_approval(
         self,

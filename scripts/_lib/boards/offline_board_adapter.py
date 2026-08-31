@@ -31,8 +31,16 @@ if __package__ in (None, ""):
     if _scripts_root not in sys.path:
         sys.path.insert(0, _scripts_root)
 
-from enums import TaskStatus
-from _lib.core import file_lock
+try:
+    from ...enums import TaskStatus
+    from ..core import file_lock
+except Exception:
+    try:
+        from scripts.enums import TaskStatus
+        from scripts._lib.core import file_lock
+    except Exception:
+        from enums import TaskStatus
+        from _lib.core import file_lock
 
 
 def get_current_os_user() -> str:

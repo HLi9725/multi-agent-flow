@@ -41,6 +41,7 @@ from ..core.adapter_manifest import (
 # Whitelist of permissible sandbox modes and approval policies (DEF-T0050-1 & DEF-T0050-2)
 ALLOWED_SANDBOX_MODES: Set[str] = {"read-only", "workspace-write"}
 ALLOWED_APPROVAL_POLICIES: Set[str] = {"on-request", "never"}
+ALLOWED_WINDOWS_SANDBOX_IMPLEMENTATIONS: Set[str] = {"elevated", "unelevated"}
 
 
 def _find_default_codex_executable() -> Optional[str]:
@@ -83,6 +84,25 @@ def _is_git_repository(path: str) -> bool:
     return False
 
 
+def _resolve_git_common_dir(workspace_dir: str) -> Optional[str]:
+    """解析当前仓库的 Git 公共元数据目录，供隔离 Worktree 的 Builder 精确写入提交对象。"""
+    try:
+        raw = subprocess.check_output(
+            ["git", "rev-parse", "--git-common-dir"],
+            cwd=workspace_dir,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        ).strip()
+    except Exception:
+        return None
+    if not raw:
+        return None
+    resolved = os.path.realpath(raw if os.path.isabs(raw) else os.path.join(workspace_dir, raw))
+    return resolved if os.path.isdir(resolved) else None
+
+
 class CodexCliAdapter(BaseHostAdapter):
     """
     Reference Host Adapter for OpenAI Codex CLI.
@@ -96,14 +116,25 @@ class CodexCliAdapter(BaseHostAdapter):
         is_real_host: bool = True,
         default_sandbox_mode: str = "workspace-write",
         default_approval_policy: str = "on-request",
+        windows_sandbox_implementation: str = "unelevated",
         default_timeout_seconds: float = 60.0
     ):
+        if windows_sandbox_implementation not in ALLOWED_WINDOWS_SANDBOX_IMPLEMENTATIONS:
+            raise ValueError(
+                "windows_sandbox_implementation must be one of "
+                f"{sorted(ALLOWED_WINDOWS_SANDBOX_IMPLEMENTATIONS)}"
+            )
         self.adapter_id = adapter_id
         self._instance_id = f"codex-cli-inst:{uuid.uuid4().hex[:8]}"
         self._is_real_host = is_real_host
         self._executable_path = executable_path or _find_default_codex_executable()
         self._default_sandbox_mode = default_sandbox_mode
         self._default_approval_policy = default_approval_policy
+        # Production automation must not repeatedly invoke the administrator-only
+        # elevated sandbox bootstrap.  The official unelevated implementation
+        # remains sandboxed and is the supported fallback when elevated setup is
+        # unavailable.  Callers may opt in to elevated only after provisioning it.
+        self._windows_sandbox_implementation = windows_sandbox_implementation
         self._default_timeout_seconds = default_timeout_seconds
         self._running_sessions: Dict[str, Dict[str, Any]] = {}
         self._session_history: Dict[str, Dict[str, Any]] = {}
@@ -128,6 +159,7 @@ class CodexCliAdapter(BaseHostAdapter):
                 "cli_binary": os.path.basename(self._executable_path) if self._executable_path else "codex",
                 "sandbox_policy": self._default_sandbox_mode,
                 "approval_policy": self._default_approval_policy,
+                "windows_sandbox_implementation": self._windows_sandbox_implementation,
             })
         )
 
@@ -177,6 +209,10 @@ class CodexCliAdapter(BaseHostAdapter):
             if custom_policy in ("auto", "approve-for-me") or request.extra_context.get("approve_for_me"):
                 is_auto_approval = True
 
+        git_common_dir = None
+        if role not in ("REVIEWER", "QA") and sandbox_mode == "workspace-write":
+            git_common_dir = _resolve_git_common_dir(request.workspace_dir)
+
         if is_auto_approval:
             # DEF-T0050-7: REVIEWER cannot use --approve-for-me because it implies workspace-write
             if role == "REVIEWER":
@@ -190,7 +226,6 @@ class CodexCliAdapter(BaseHostAdapter):
                 "--json",
                 "-C", request.workspace_dir,
                 "--approve-for-me",
-                request.prompt
             ]
         else:
             cmd = [
@@ -199,8 +234,23 @@ class CodexCliAdapter(BaseHostAdapter):
                 "--json",
                 "-C", request.workspace_dir,
                 "-s", sandbox_mode,
-                request.prompt
             ]
+
+        if sys.platform.startswith("win"):
+            # Per-invocation override: do not mutate the user's global Codex
+            # configuration. This prevents an unprovisioned elevated sandbox
+            # from opening a UAC installer for every Builder/QA subprocess.
+            cmd[2:2] = [
+                "-c",
+                f'windows.sandbox="{self._windows_sandbox_implementation}"',
+            ]
+
+        if git_common_dir and os.path.commonpath([
+            os.path.normcase(os.path.realpath(request.workspace_dir)),
+            os.path.normcase(git_common_dir),
+        ]) != os.path.normcase(os.path.realpath(request.workspace_dir)):
+            cmd.extend(["--add-dir", git_common_dir])
+        cmd.append(request.prompt)
 
         return cmd
 

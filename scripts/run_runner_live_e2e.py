@@ -9,6 +9,7 @@ Phase 2F-PROD: Windows 真实任意任务 Universal Production Orchestration Run
   EvidenceGate 逐级 1:1 强校验 -> 经合法状态机停在 PENDING_USER_ACCEPTANCE / 已完成。
 """
 import hashlib
+import argparse
 import json
 import os
 import subprocess
@@ -42,7 +43,12 @@ def mask_sensitive(text: str) -> str:
     return f"{text[:4]}...{text[-4:]} (hash:{hashlib.sha256(text.encode()).hexdigest()[:8]})"
 
 
-def run_live_e2e(authority_root: str, test_task_id: str) -> Dict[str, Any]:
+def run_live_e2e(
+    authority_root: str,
+    test_task_id: str,
+    *,
+    pre_granted_approval: bool = False,
+) -> Dict[str, Any]:
     print("=" * 70)
     print(f"[2F-PROD LIVE E2E] 启动 Windows 真实任意任务 E2E 编排验证: {test_task_id}")
     print("=" * 70)
@@ -73,7 +79,11 @@ def run_live_e2e(authority_root: str, test_task_id: str) -> Dict[str, Any]:
     readme = os.path.join(temp_repo_dir, "README.md")
     with open(readme, "w", encoding="utf-8") as f:
         f.write("# Live Runner Arbitrary Task Target Repo\n")
-    subprocess.run(["git", "add", "README.md"], cwd=temp_repo_dir, check=True, capture_output=True)
+    tests_dir = os.path.join(temp_repo_dir, "tests")
+    os.makedirs(tests_dir, exist_ok=True)
+    with open(os.path.join(tests_dir, "test_smoke.py"), "w", encoding="utf-8") as f:
+        f.write("def test_smoke(): assert True\n")
+    subprocess.run(["git", "add", "."], cwd=temp_repo_dir, check=True, capture_output=True)
     subprocess.run(["git", "commit", "-m", "chore: initial commit"], cwd=temp_repo_dir, check=True, capture_output=True)
 
     baseline_commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=temp_repo_dir, text=True).strip()
@@ -105,6 +115,7 @@ def run_live_e2e(authority_root: str, test_task_id: str) -> Dict[str, Any]:
             "builder_timeout_seconds": 300,
             "reviewer_timeout_seconds": 300,
             "qa_timeout_seconds": 300,
+            "total_wall_clock_timeout_seconds": 1800,
         },
     )
     print(f"[SPEC LOADED] 任务: {spec.task_id} ({spec.task_name})")
@@ -113,7 +124,7 @@ def run_live_e2e(authority_root: str, test_task_id: str) -> Dict[str, Any]:
 
     # 6. 启动 ProductionRunner 执行真实多阶段编排
     start_time = time.time()
-    result = runner.start(spec)
+    result = runner.start(spec, pre_granted_approval=pre_granted_approval)
     elapsed = time.time() - start_time
 
     print("=" * 70)
@@ -128,12 +139,17 @@ def run_live_e2e(authority_root: str, test_task_id: str) -> Dict[str, Any]:
 
     # 7. 逐级验证 Evidence 完整性
     for evi_id in result.evidence_ids:
-        rec = evidence_store.get(evi_id)
-        if rec:
-            print(f"[EVIDENCE AUDIT] ID={rec.evidence_id}, Type={rec.evidence_type.value}, Actor={rec.metadata.actor_role}, Host={rec.metadata.host_id}, Invocation={mask_sensitive(rec.metadata.host_invocation_id)}, Session={mask_sensitive(rec.metadata.host_session_id)}")
+        try:
+            rec = evidence_store.read(evi_id)
+            if rec:
+                print(f"[EVIDENCE AUDIT] ID={rec.evidence_id}, Type={rec.evidence_type.value}, Actor={rec.metadata.actor_role}, Host={rec.metadata.host_id}, Invocation={mask_sensitive(rec.metadata.host_invocation_id)}, Session={mask_sensitive(rec.metadata.host_session_id)}")
+        except Exception as e:
+            print(f"[EVIDENCE AUDIT WARNING] {evi_id}: {e}")
 
     # 8. 核验权威看板最终状态
-    adapter = OfflineBoardAdapter(board_file=os.path.join(authority_root, "user_data", "board.json"))
+    from _lib.boards.board_adapter_factory import get_board_adapter
+    cfg_file = os.path.join(authority_root, "config", "workflow.config.yaml")
+    adapter = get_board_adapter(config_file=cfg_file)
     final_rec = adapter.get_record(test_task_id)
     final_status = final_rec.get("fields", {}).get("status") if final_rec else "UNKNOWN"
     final_handler = final_rec.get("fields", {}).get("handler") if final_rec else "UNKNOWN"
@@ -156,9 +172,19 @@ def run_live_e2e(authority_root: str, test_task_id: str) -> Dict[str, Any]:
 
 
 if __name__ == "__main__":
-    authority_root_arg = sys.argv[1] if len(sys.argv) > 1 else r"C:\Users\user\Desktop\user\multi-agent-flow-phase2-real-agents"
-    if len(sys.argv) <= 2:
-        raise SystemExit("Usage: run_runner_live_e2e.py <authority_root> <legally-created-task-id>")
-    task_id_arg = sys.argv[2]
-    report_data = run_live_e2e(authority_root=authority_root_arg, test_task_id=task_id_arg)
+    parser = argparse.ArgumentParser(description="Run the real 2F-PROD dual-host E2E workflow.")
+    parser.add_argument("authority_root")
+    parser.add_argument("task_id", help="Legally-created task ID")
+    parser.add_argument(
+        "--approve",
+        action="store_true",
+        help="Grant this E2E run one-time permission approval for controlled host dispatch.",
+    )
+    args = parser.parse_args()
+    report_data = run_live_e2e(
+        authority_root=args.authority_root,
+        test_task_id=args.task_id,
+        pre_granted_approval=args.approve,
+    )
     print(json.dumps(report_data, indent=2, ensure_ascii=False))
+    raise SystemExit(0 if report_data.get("success") else 1)

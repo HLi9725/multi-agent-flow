@@ -141,11 +141,16 @@ def sync_blocked_prs(
     """
     扫描并同步所有处于【已阻塞】状态且绑定 PR 的任务卡。
     """
-    if project_dir:
-        os.environ["YY_FLOW_PROJECT_ROOT"] = os.path.abspath(project_dir)
-
     data_root = resolve_data_root(explicit=project_dir)
     board_file = os.path.join(data_root, "user_data", "board.json")
+
+    transition_config = config_path
+    if project_dir and not transition_config:
+        config_candidates = (
+            os.path.join(data_root, "user_data", "workflow.config.yaml"),
+            os.path.join(data_root, "config", "workflow.config.yaml"),
+        )
+        transition_config = next((p for p in config_candidates if os.path.isfile(p)), None)
 
     if not config_path and os.path.isfile(board_file):
         adapter = OfflineBoardAdapter(board_file=board_file)
@@ -179,6 +184,17 @@ def sync_blocked_prs(
             "rejected_tasks": [],
             "pending_tasks": [],
             "pm_notifications": [],
+        }
+
+    if not dry_run and not transition_config:
+        return {
+            "success": False,
+            "error": (
+                "缺少项目本地 workflow.config.yaml，拒绝回退到其他项目配置以防跨项目串写。"
+            ),
+            "unblocked_tasks": [],
+            "rejected_tasks": [],
+            "pending_tasks": [],
         }
 
     unblocked_tasks = []
@@ -229,7 +245,7 @@ def sync_blocked_prs(
 
             if not dry_run:
                 ok = transition_task_pipeline(
-                    config_path=config_path,
+                    config_path=transition_config,
                     task_id=tid,
                     current_role="PM",
                     from_status="已阻塞",
@@ -283,7 +299,7 @@ def sync_blocked_prs(
                 reject_remarks = f"【打回】PR #{pr_ref} 已被关闭且未合并，请原开发者重新排查"
                 if not dry_run:
                     ok = transition_task_pipeline(
-                        config_path=config_path,
+                        config_path=transition_config,
                         task_id=tid,
                         current_role="PM",
                         from_status="已阻塞",

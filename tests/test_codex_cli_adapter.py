@@ -170,6 +170,17 @@ def test_codex_cli_adapter_command_building_and_no_invalid_a_flag():
     assert "-a" not in cmd_dev_auto
     assert "--approve-for-me" in cmd_dev_auto
     assert "-s" not in cmd_dev_auto  # Mutually exclusive: -s must NOT be present!
+    if sys.platform.startswith("win"):
+        assert 'windows.sandbox="unelevated"' in cmd_dev_auto
+    common_dir = subprocess.check_output(
+        ["git", "rev-parse", "--git-common-dir"], cwd=os.path.abspath("."), text=True
+    ).strip()
+    common_dir = os.path.realpath(common_dir if os.path.isabs(common_dir) else os.path.join(os.path.abspath("."), common_dir))
+    if os.path.commonpath([os.path.realpath(os.path.abspath(".")), common_dir]) != os.path.realpath(os.path.abspath(".")):
+        assert cmd_dev_auto[cmd_dev_auto.index("--add-dir") + 1] == common_dir
+
+    with pytest.raises(ValueError, match="windows_sandbox_implementation"):
+        CodexCliAdapter(is_real_host=False, windows_sandbox_implementation="disabled")
 
     # 3. REVIEWER attempting auto approval / approve_for_me must be rejected!
     req_rev_auto = AgentRequest(
