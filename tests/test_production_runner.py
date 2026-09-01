@@ -54,7 +54,7 @@ def mock_git_repo(tmp_path):
     with open(config_dir / "workflow.config.yaml", "w", encoding="utf-8") as stream:
         yaml.safe_dump({"board": {"provider": "local", "board_file": str(board_file)}}, stream)
     board_file.write_text(json.dumps([{
-        "id": "T0088", "name": "实现测试功能", "status": "进行中", "type": "A",
+        "id": "T0088", "name": "实现测试功能", "status": "待开始", "type": "A",
         "owner": "李开发", "handler": "李开发", "updated_at": "1.0",
         "process": "需求: 需要新增 dummy 函数。验收标准: dummy 函数正确返回 True",
     }], ensure_ascii=False), encoding="utf-8")
@@ -301,7 +301,7 @@ def test_production_runner_full_pass_pipeline(mock_git_repo, tmp_path, monkeypat
         acceptance_criteria="验收标准: dummy 函数正确返回 True",
         acceptance_criteria_hash=hashlib.sha256("验收标准: dummy 函数正确返回 True".encode("utf-8")).hexdigest(),
         task_version="1.0",
-        status_at_read="进行中",
+        status_at_read="待开始",
         baseline_commit=baseline_sha,
         workspace_mode="inherit",
         test_command="python -m pytest -q",
@@ -313,3 +313,13 @@ def test_production_runner_full_pass_pipeline(mock_git_repo, tmp_path, monkeypat
     assert result.state == RunnerState.PENDING_USER_ACCEPTANCE.value
     assert result.candidate_commit is not None
     assert len(result.evidence_ids) >= 3
+    board = json.loads((repo_dir / "user_data" / "board.json").read_text(encoding="utf-8"))
+    assert board[0]["status"] == "已完成"
+    process = board[0]["process"]
+    for transition in (
+        "待开始】更新至【进行中",
+        "进行中】更新至【审查中",
+        "审查中】更新至【测试中",
+        "测试中】更新至【已完成",
+    ):
+        assert transition in process

@@ -835,6 +835,41 @@ class ProductionRunner:
         start_wall_clock = time.time()
         project_root = spec.project_root
         task_id = spec.task_id
+        current_board_status = spec.status_at_read
+
+        # Fresh start owns the initial claim: PM creates/assigns the A-class card,
+        # then Runner legally claims it as DEV before any host is dispatched.
+        # Progressed tasks require checkpoint-backed resume to avoid replaying stages.
+        if existing_checkpoint is None:
+            if current_board_status == "待开始":
+                claimed, claim_error = self._do_state_transition(
+                    spec.authority_root,
+                    task_id=task_id,
+                    role="DEV",
+                    from_status="待开始",
+                    to_status="进行中",
+                    assignee="李开发",
+                    remarks="Production Runner 启动并由 Builder 合法领取任务",
+                    task_type=spec.task_type,
+                )
+                if not claimed:
+                    return RunnerResult(
+                        success=False,
+                        state=RunnerState.FAILED.value,
+                        task_id=task_id,
+                        message=f"Failed to claim waiting task before Builder dispatch: {claim_error}",
+                    )
+                current_board_status = "进行中"
+            elif current_board_status != "进行中":
+                return RunnerResult(
+                    success=False,
+                    state=RunnerState.FAILED.value,
+                    task_id=task_id,
+                    message=(
+                        f"Fresh start requires task status 待开始 or 进行中; got "
+                        f"'{current_board_status}'. Use resume for a checkpointed task."
+                    ),
+                )
 
         if self.evidence_store is None:
             evidence_dir = os.path.join(project_root, "user_data", "runner_evidence")
@@ -916,8 +951,6 @@ class ProductionRunner:
         total_attempts = checkpoint.total_attempts
         evidence_ids: List[str] = list(checkpoint.evidence_ids)
         defects_history: List[Dict[str, Any]] = list(checkpoint.defects_history)
-        current_board_status = spec.status_at_read
-
         start_role = checkpoint.current_role if existing_checkpoint else "BUILDER"
         skip_builder = (start_role in ("REVIEWER", "QA") and candidate_commit is not None)
         skip_reviewer = (start_role == "QA" and candidate_commit is not None)
