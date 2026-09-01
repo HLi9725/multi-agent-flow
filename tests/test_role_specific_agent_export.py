@@ -116,3 +116,18 @@ def test_export_fails_closed_without_declared_transitions():
     role.pop("allowed_transitions")
     with pytest.raises(ValueError, match="缺少 allowed_transitions"):
         serialize_subagent(role, meta, "antigravity", ANTIGRAVITY_SPEC)
+
+
+def test_skill_permission_matrix_matches_export_contract():
+    with open(os.path.join(ROOT, "SKILL.md"), "r", encoding="utf-8") as fp:
+        skill = fp.read()
+
+    reviewer_row = next(line for line in skill.splitlines() if "`@flow-reviewer`" in line)
+    qa_row = next(line for line in skill.splitlines() if "`@flow-qa`" in line)
+    pm_row = next(line for line in skill.splitlines() if "`@flow-pm`" in line)
+
+    assert "只读 + run_command（不得直接写看板）" in reviewer_row
+    assert "只读 + run_command（不得直接写看板）" in qa_row
+    assert "完整读写" not in reviewer_row + qa_row
+    assert "待开始->进行中" not in pm_row
+    assert "已完成->已验收 / 已完成->已退回" in pm_row
