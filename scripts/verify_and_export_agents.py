@@ -40,6 +40,86 @@ PLATFORM_TOOLS = {
     "zcode": ["run_command", "replace_file_content", "write_to_file", "view_file", "list_dir", "grep_search"],
 }
 DEFAULT_TOOLS = ["run_command", "replace_file_content", "write_to_file", "view_file", "list_dir", "grep_search"]
+WRITE_TOOL_NAMES = {
+    "edit", "write", "replace_file_content", "write_to_file",
+}
+
+
+def _as_bullets(value):
+    """把 YAML 列表或标量稳定渲染为 Markdown 列表。"""
+    if isinstance(value, list):
+        return "\n".join(f"- {item}" for item in value)
+    if value in (None, ""):
+        return "- （未声明）"
+    return f"- {value}"
+
+
+def _role_contract(role_data, role_meta, py_cmd, script_prefix):
+    """仅依据角色 YAML 生成职责、权限和状态契约，禁止通用 SOP 覆盖角色边界。"""
+    role_code = str(
+        role_data.get("role_code")
+        or role_data.get("role")
+        or role_meta.get("role_code", "")
+    ).upper()
+    transitions = role_data.get("allowed_transitions")
+    if not isinstance(transitions, list) or not transitions:
+        raise ValueError(f"{role_meta['id']} 缺少 allowed_transitions，拒绝导出")
+
+    boundaries = role_data.get("boundaries")
+    if not isinstance(boundaries, dict):
+        raise ValueError(f"{role_meta['id']} 缺少 boundaries，拒绝导出")
+
+    transition_lines = []
+    command_lines = []
+    for transition in transitions:
+        text = str(transition).strip()
+        if "->" not in text:
+            raise ValueError(f"{role_meta['id']} 存在非法状态流转声明: {text}")
+        from_status, remainder = (part.strip() for part in text.split("->", 1))
+        to_status = remainder.split("(", 1)[0].strip()
+        if not from_status or not to_status:
+            raise ValueError(f"{role_meta['id']} 存在非法状态流转声明: {text}")
+        transition_lines.append(f"- {text}")
+        command_lines.append(
+            f"- `{py_cmd} {script_prefix}/transition_task.py --role {role_code} "
+            f"--from-status {from_status} --to-status {to_status} "
+            "--task-id <TASK_ID> --assignee <下一处理人>`"
+        )
+
+    can_transition_task = bool(boundaries.get("can_transition_task", True))
+    permission_lines = [
+        f"- 可运行 CLI：{bool(boundaries.get('can_run_cli', False))}",
+        f"- 可写领域文件：{bool(boundaries.get('can_write_domain_files', False))}",
+        f"- 可修改业务代码：{bool(boundaries.get('can_modify_business_code', False))}",
+        f"- 可执行用户验收：{bool(boundaries.get('can_approve', False))}",
+        f"- 可自行领取任务：{bool(boundaries.get('can_self_claim', False))}",
+        f"- 可直接落库任务状态：{can_transition_task}",
+    ]
+    if can_transition_task:
+        transition_execution = (
+            "获得任务状态锁后，可使用以下 CLI 模板执行允许的流转：\n"
+            + "\n".join(command_lines)
+        )
+    else:
+        transition_execution = (
+            "本角色不得直接调用 transition_task.py 或其他看板写入命令。"
+            "只返回绑定 task_id、候选 SHA、会话身份和 PASS/REJECT（或 PASS/FAIL）的结构化结论；"
+            "由 Production Runner 或主协调者核验后执行状态落库。"
+        )
+    return (
+        role_code,
+        transitions,
+        "\n".join(transition_lines),
+        transition_execution,
+        "\n".join(permission_lines),
+    )
+
+
+def _platform_tools(platform_key, can_write):
+    tools = list(PLATFORM_TOOLS.get(platform_key, DEFAULT_TOOLS))
+    if can_write:
+        return tools
+    return [tool for tool in tools if tool.lower() not in WRITE_TOOL_NAMES]
 
 def load_platforms_config():
     """读取声明式平台配置"""
@@ -114,18 +194,9 @@ def serialize_subagent(role_data, role_meta, platform_key, subagent_spec, skill_
     use_frontmatter = subagent_spec.get("frontmatter_subagent", True)
 
     core_duties = role_data.get("core_duties") or role_data.get("responsibilities", [])
-    duty_str = "\n".join([f"- {d}" for d in core_duties]) if isinstance(core_duties, list) else str(core_duties)
+    duty_str = _as_bullets(core_duties)
     redlines = role_data.get("redlines") or role_data.get("orchestration_rules", [])
-    redline_str = "\n".join([f"- {r}" for r in redlines]) if isinstance(redlines, list) else str(redlines)
-    tools = PLATFORM_TOOLS.get(platform_key, DEFAULT_TOOLS)
-
-    role_name_map = {
-        "PM": "严经理", "ARCHITECT": "钱架构", "DEV": "李开发",
-        "FRONTEND": "马前端", "REVIEWER": "周审查", "QA": "章测试",
-        "DOCS": "李文通", "DEVOPS": "吕改特"
-    }
-    self_role_name = role_name_map.get(role_code.upper(), agent_name.split()[0])
-    next_handler_name = "周审查" if role_code.upper() in ["DEV", "FRONTEND"] else "严经理"
+    redline_str = _as_bullets(redlines)
 
     # 动态确定脚本执行路径前缀，确保宿主项目下直接执行有效
     if skill_target:
@@ -141,7 +212,14 @@ def serialize_subagent(role_data, role_meta, platform_key, subagent_spec, skill_
 
     py_cmd = "python" if sys.platform == "win32" else "python3"
 
-    # 1. 状态机 SOP 引导提示词 (三步闭环)
+    role_code, _, transition_str, transition_execution, permission_str = _role_contract(
+        role_data, role_meta, py_cmd, script_prefix
+    )
+    boundaries = role_data["boundaries"]
+    can_write = bool(boundaries.get("can_write_domain_files", False))
+    tools = _platform_tools(platform_key, can_write)
+
+    # 1. 角色专属状态机 SOP。所有内容来自角色 YAML，不再给各角色套用同一三步闭环。
     sop_prompt = f"""# 角色定义：{agent_name} ({agent_id})
 
 ## 核心职责
@@ -150,19 +228,25 @@ def serialize_subagent(role_data, role_meta, platform_key, subagent_spec, skill_
 ## 协作规约与红线
 {redline_str}
 
-## 自动化任务流转 SOP (CLI 三步闭环)
-在执行本角色相关任务时，必须严格执行以下三步物理命令流转：
-1. **建卡/领单/开工（动手前硬门禁）**：
-   - 凡涉及任何文件创建/修改/删除（L1/L2 级），若当前无对应任务卡，动手前第一步必须执行建卡并领单：
-     `{py_cmd} {script_prefix}/transition_task.py --role {role_code.upper()} --create --task-name "<任务名称>" --assignee {self_role_name}`
-   - 若已有任务卡，执行领单开工：
-     `{py_cmd} {script_prefix}/transition_task.py --role {role_code.upper()} --from-status 待开始 --to-status 进行中 --task-id <TASK_ID> --assignee {self_role_name}`
-2. **业务执行**：执行架构/编码/审查/测试/文档核心工作，产出交付物。
-3. **完工/提审/流转（交付后硬门禁）**：
-   `{py_cmd} {script_prefix}/transition_task.py --role {role_code.upper()} --from-status 进行中 --to-status 审查中 --task-id <第一步任务ID> --assignee {next_handler_name}`
-4. **完工硬门禁（动工与完工双门禁铁律）**：
-   - 【动工前门禁】：严禁“无卡改文件”（Fail-Closed）。仅 L0 纯文本咨询直答可免建卡；一旦有物理文件交付产出，动手前必须先建卡置为【进行中】。
-   - 【完工后门禁】：交付产出完成后，最后一步必须执行【完工硬门禁】流转推进状态（A 类开发推至【审查中】，B/C/D/G 类推至【已完成】并补填 end_time），否则视为未交付。
+## 权限边界
+{permission_str}
+
+## 角色专属状态流转 SOP
+本角色只允许执行角色源文件声明的以下流转：
+{transition_str}
+
+状态落库所有权：
+{transition_execution}
+
+PM 建卡规则：
+{f'- `{py_cmd} {script_prefix}/transition_task.py --role PM --create --task-name "<任务名称>" --assignee <负责人>`' if role_code == 'PM' else '- 本角色不得代替 PM 创建 A 类开发任务。'}
+
+执行铁律：
+1. 开始工作前必须读取任务当前状态；状态不匹配上述任一来源状态时立即 Fail-Closed。
+2. 仅执行本角色核心职责，不得在同一会话中改扮其他角色，也不得越过中间角色或并行启动存在先后依赖的角色。
+3. 状态流转描述是允许的结果契约，不自动授予状态写入权；必须服从“状态落库所有权”，不得拼接通用状态链或代行用户验收。
+4. 文件写入和业务代码修改必须同时满足本节权限边界；只读角色即使可运行测试或审查命令，也不得修改受跟踪文件或创建 Commit。
+5. 【完工硬门禁】：L0 纯文本即时问答可免建卡；L1/L2 工作必须在任务卡和角色状态契约内执行，交付后只能推进到本角色允许的目标状态。
 """
 
     # 2. 格式 A: Codex 官方 TOML 格式
@@ -183,7 +267,7 @@ developer_instructions = \"\"\"
             "name": agent_id,
             "description": f"multi-agent-flow 中的 {agent_name} 专家子代理",
             "tools": tools,
-            "enable_write_tools": True,
+            "enable_write_tools": can_write,
             "subagent": True if platform_key == "antigravity" else None,
         }
         # 移除 None

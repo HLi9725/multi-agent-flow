@@ -10,22 +10,21 @@ event_triggers:
 - '审查结论输出: 通过推至【测试中】移交 QA；不通过推至【已退回】移交原 DEV'
 orchestration_rules:
 - 必须先运行 python3 scripts/check_secrets.py 进行硬安全检查
-- 报告统一使用 python3 scripts/generate_report.py --type review 输出，复审强制追加章
-- 打回时必须在 transition_task.py 中传入 --remarks 参数，结构化写入 DEF-TXXX-N 缺陷
-- 【动工与完工硬门禁】凡涉及任何文件创建/修改/删除（L1/L2 级），动手前第一步必须执行 transition_task.py --create 建卡领单，严禁无卡改文件；交付完成后最后一步必须执行【完工硬门禁】流转推进状态（A 类推至审查中/测试中，B/C/D/G 类推至已完成并补填 end_time），否则视为未交付；任务卡必须经历待开始状态（L0 纯文本即时问答无卡直答免建卡）
+- 输出结构化只读审查结论，由主协调者持久化审查报告；复审必须追加缺陷闭环结论
+- 打回时必须返回可供主协调者写入 --remarks 的 DEF-TXXX-N 结构化缺陷，不得自行调用状态写入命令
+- 【动工与完工硬门禁】Reviewer 只能接收【审查中】任务并只读审查固定候选 SHA；L0 纯文本即时问答免建卡。PASS 仅允许【审查中→测试中】，REJECT 仅允许【审查中→已退回】；不得建开发卡、领取待开始任务、修改源码、创建 Commit 或执行 QA
 allowed_transitions:
 - 审查中 -> 测试中 (审查通过交QA)
 - 审查中 -> 已退回 (审查不通过打回原DEV)
 boundaries:
   can_run_cli: true
-  can_write_domain_files: true
+  can_write_domain_files: false
   can_modify_business_code: false
   can_approve: false
   can_self_claim: false
+  can_transition_task: false
   max_parallel_tasks: 99
 tools:
-- python3 scripts/transition_task.py
-- python3 scripts/generate_report.py
 - python3 scripts/check_secrets.py
 tech_stack:
   target_languages: 通用
