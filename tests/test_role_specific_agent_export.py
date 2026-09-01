@@ -25,6 +25,14 @@ CODEX_SPEC = {
     "format": "codex_toml",
     "frontmatter_subagent": False,
 }
+MARKDOWN_PLATFORMS = (
+    "antigravity",
+    "antigravity_cli",
+    "claude_code",
+    "cursor",
+    "opencode",
+    "zcode",
+)
 
 
 def _role(filename):
@@ -37,6 +45,19 @@ def _markdown(filename):
     content = serialize_subagent(
         role, meta, "antigravity", ANTIGRAVITY_SPEC,
         skill_target=".agents/skills/yy-flow",
+    )
+    _, frontmatter, body = content.split("---", 2)
+    return yaml.safe_load(frontmatter), body
+
+
+def _markdown_for(platform, filename):
+    role, meta = _role(filename)
+    content = serialize_subagent(
+        role,
+        meta,
+        platform,
+        ANTIGRAVITY_SPEC,
+        skill_target=f".{platform}/skills/yy-flow",
     )
     _, frontmatter, body = content.split("---", 2)
     return yaml.safe_load(frontmatter), body
@@ -83,6 +104,28 @@ def test_antigravity_permissions_are_role_specific():
         assert "write_to_file" not in frontmatter["tools"]
         assert "replace_file_content" not in frontmatter["tools"]
         assert "run_command" in frontmatter["tools"]
+
+
+@pytest.mark.parametrize("platform", MARKDOWN_PLATFORMS)
+def test_all_markdown_platforms_export_role_specific_permissions(platform):
+    dev_fm, dev_body = _markdown_for(platform, "03-dev.yaml")
+    frontend_fm, _ = _markdown_for(platform, "08-frontend.yaml")
+    reviewer_fm, reviewer_body = _markdown_for(platform, "04-reviewer.yaml")
+    qa_fm, qa_body = _markdown_for(platform, "05-qa.yaml")
+
+    assert dev_fm["enable_write_tools"] is True
+    assert frontend_fm["enable_write_tools"] is True
+    assert "进行中 -> 审查中" in dev_body
+    for frontmatter, body, expected in (
+        (reviewer_fm, reviewer_body, "审查中 -> 测试中"),
+        (qa_fm, qa_body, "测试中 -> 已完成"),
+    ):
+        assert frontmatter["enable_write_tools"] is False
+        assert not {tool.lower() for tool in frontmatter["tools"]} & {
+            "edit", "write", "replace_file_content", "write_to_file",
+        }
+        assert expected in body
+        assert "待开始 -> 进行中" not in body
 
 
 @pytest.mark.parametrize("filename", ["04-reviewer.yaml", "05-qa.yaml"])
