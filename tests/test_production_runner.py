@@ -323,3 +323,46 @@ def test_production_runner_full_pass_pipeline(mock_git_repo, tmp_path, monkeypat
         "测试中】更新至【已完成",
     ):
         assert transition in process
+
+
+def test_waiting_task_is_not_claimed_when_adapters_are_missing(mock_git_repo, tmp_path):
+    repo_dir, baseline_sha = mock_git_repo
+    data_root = tmp_path / "missing-adapter-data"
+    data_root.mkdir()
+    runner = ProductionRunner(
+        registry=AdapterRegistry(context_id="missing_adapters"),
+        evidence_store=EvidenceStore(root_dir=str(data_root / "evidence")),
+        evidence_gate=EvidenceGate(
+            store=EvidenceStore(root_dir=str(data_root / "gate-evidence")),
+            project_root=str(repo_dir),
+        ),
+        checkpoint_store=RunnerCheckpointStore(
+            data_root=str(data_root),
+            project_root=str(repo_dir),
+            project_id="test_proj",
+        ),
+    )
+    spec = TaskExecutionSpec(
+        project_id="test_proj",
+        project_root=str(repo_dir),
+        authority_root=str(repo_dir),
+        task_id="T0088",
+        task_name="实现测试功能",
+        requirement_text="需求: 需要新增 dummy 函数",
+        acceptance_criteria="验收标准: dummy 函数正确返回 True",
+        acceptance_criteria_hash=hashlib.sha256(
+            "验收标准: dummy 函数正确返回 True".encode("utf-8")
+        ).hexdigest(),
+        task_version="1.0",
+        status_at_read="待开始",
+        baseline_commit=baseline_sha,
+        workspace_mode="inherit",
+        test_command="python -m pytest -q",
+    )
+
+    result = runner.start(spec)
+
+    assert result.success is False
+    assert "Missing adapter" in result.message
+    board = json.loads((repo_dir / "user_data" / "board.json").read_text(encoding="utf-8"))
+    assert board[0]["status"] == "待开始"

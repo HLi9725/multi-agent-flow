@@ -837,30 +837,11 @@ class ProductionRunner:
         task_id = spec.task_id
         current_board_status = spec.status_at_read
 
-        # Fresh start owns the initial claim: PM creates/assigns the A-class card,
-        # then Runner legally claims it as DEV before any host is dispatched.
-        # Progressed tasks require checkpoint-backed resume to avoid replaying stages.
+        # Fresh starts only accept the initial states. The actual claim is delayed
+        # until the worktree and all adapters are ready, avoiding a dangling
+        # 进行中 card when local orchestration prerequisites are missing.
         if existing_checkpoint is None:
-            if current_board_status == "待开始":
-                claimed, claim_error = self._do_state_transition(
-                    spec.authority_root,
-                    task_id=task_id,
-                    role="DEV",
-                    from_status="待开始",
-                    to_status="进行中",
-                    assignee="李开发",
-                    remarks="Production Runner 启动并由 Builder 合法领取任务",
-                    task_type=spec.task_type,
-                )
-                if not claimed:
-                    return RunnerResult(
-                        success=False,
-                        state=RunnerState.FAILED.value,
-                        task_id=task_id,
-                        message=f"Failed to claim waiting task before Builder dispatch: {claim_error}",
-                    )
-                current_board_status = "进行中"
-            elif current_board_status != "进行中":
+            if current_board_status not in ("待开始", "进行中"):
                 return RunnerResult(
                     success=False,
                     state=RunnerState.FAILED.value,
@@ -943,6 +924,28 @@ class ProductionRunner:
                 task_id=task_id,
                 message=f"Missing adapter: builder={spec.builder_adapter_id}, reviewer={spec.reviewer_adapter_id}, qa={spec.qa_adapter_id}",
             )
+
+        # PM creates/assigns the A-class card; once all local prerequisites are
+        # ready, Runner legally claims it as DEV immediately before host dispatch.
+        if existing_checkpoint is None and current_board_status == "待开始":
+            claimed, claim_error = self._do_state_transition(
+                spec.authority_root,
+                task_id=task_id,
+                role="DEV",
+                from_status="待开始",
+                to_status="进行中",
+                assignee="李开发",
+                remarks="Production Runner 启动并由 Builder 合法领取任务",
+                task_type=spec.task_type,
+            )
+            if not claimed:
+                return RunnerResult(
+                    success=False,
+                    state=RunnerState.FAILED.value,
+                    task_id=task_id,
+                    message=f"Failed to claim waiting task before Builder dispatch: {claim_error}",
+                )
+            current_board_status = "进行中"
 
         candidate_commit = checkpoint.candidate_commit
         candidate_generation = checkpoint.candidate_generation
