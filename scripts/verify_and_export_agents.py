@@ -86,7 +86,11 @@ def _role_contract(role_data, role_meta, py_cmd, script_prefix):
             "--task-id <TASK_ID> --assignee <下一处理人>`"
         )
 
-    can_transition_task = bool(boundaries.get("can_transition_task", True))
+    if "can_transition_task" not in boundaries:
+        raise ValueError(f"{role_meta['id']} 缺少 boundaries.can_transition_task，拒绝导出")
+    can_transition_task = boundaries["can_transition_task"]
+    if not isinstance(can_transition_task, bool):
+        raise ValueError(f"{role_meta['id']} 的 boundaries.can_transition_task 必须是布尔值")
     permission_lines = [
         f"- 可运行 CLI：{bool(boundaries.get('can_run_cli', False))}",
         f"- 可写领域文件：{bool(boundaries.get('can_write_domain_files', False))}",

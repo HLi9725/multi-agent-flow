@@ -34,8 +34,8 @@
 
 | 状态变更动作 | 合法操作人集合 (Allowed Operators) | 变更后处理人 (Assignee Target) | 关联场景 |
 |-------------|-----------------------------------|------------------------------|---------|
-| `待开始` → `进行中` | 所有执行角色 (`PM`, `DEV`, `FRONTEND`, `ARCHITECT`, `REVIEWER`, `QA`, `DOCS`, `DEVOPS`) | 自身或被分配者 | A~G 类各类任务自领取启动 |
-| `已退回` → `进行中` | 所有执行角色 (`DEV`, `FRONTEND`, `ARCHITECT`, `REVIEWER`, `QA`, `DOCS`, `DEVOPS`, `PM`) | 原负责人 | 返工修复领单开工 |
+| `待开始` → `进行中` | A 类仅 `DEV` / `FRONTEND`；B/C/D/F/G 独立短链由被分配的专业角色领取 | 自身或被分配者 | PM 只建卡/分配，不开工 A 类；REVIEWER/QA 不得领取 A 类待开始任务 |
+| `已退回` → `进行中` | A 类仅原 `DEV` / `FRONTEND`；独立短链回到原专业角色 | 原负责人 | Reviewer/QA 的 A 类 REJECT/FAIL 必须回到开发角色修复 |
 | `待开始` → `已验收` | `PM` (直接确认完成) | `PM` (负责人保持为 User) | E 类用户自执行任务快捷验收 |
 | `进行中` → `已验收` | `PM` (直接确认完成) | `PM` (负责人保持为 User) | E 类用户自执行任务快捷验收 |
 | `进行中` → `审查中` | `DEV` / `FRONTEND` (代码/前端开发完成) / `ARCHITECT` (架构完成) | `REVIEWER` (代码/前端) 或 `PM` (架构) | A 类开发/前端、B 类架构提审 |
@@ -47,6 +47,8 @@
 | `已完成` → `已验收` | `PM` (最终验收通过) | `PM` (保持不变) | A/B/C/D/F/G 类终态验收 |
 | `任意状态` → `已阻塞` | 所有 8 个角色 (PM, ARCHITECT, DEV, FRONTEND, REVIEWER, QA, DOCS, DEVOPS) | 保持不变 | 遭遇依赖未就绪或环境卡顿 |
 | `已阻塞` → `进行中` | 所有 8 个角色 (PM, ARCHITECT, DEV, FRONTEND, REVIEWER, QA, DOCS, DEVOPS) | 原处理人 | 阻塞解除恢复执行 |
+
+> **A 类状态落库所有权**：Production Runner 模式下，Reviewer/QA 子 Agent 只返回绑定 task_id、候选 SHA、会话身份的结构化结论，不得直接调用看板写入命令；Runner 或主协调者完成 Evidence 校验后，以对应合法角色执行状态落库。B/C/D/F/G 独立专项短链不属于该限制，可由被分配角色按短链完成。
 
 ---
 

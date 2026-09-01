@@ -47,13 +47,13 @@
 > [!NOTE]
 > **跨平台提示**：以下命令在 Linux/macOS 下使用 `python3`，Windows 环境请自动替换为 `python`。
 
-| 流转方向 | 发起角色 | 接收角色 | 必填交接产物 (Required Artifacts) | 门控校验脚本调用命令 |
+| 流转方向 | 发起角色 | 接收角色 | 必填交接产物 (Required Artifacts) | 状态持久化责任与门控命令 |
 | :--- | :--- | :--- | :--- | :--- |
 | **自领取** | PM/看板 | DEV / FRONTEND | WBS 任务包条目、需求约束 | `python3 scripts/transition_task.py --role DEV --from-status 待开始 --to-status 进行中 ...` (FRONTEND 同命令,仅 `--role` 改) |
 | **提代码审查**| DEV / FRONTEND | REVIEWER | 修改代码列表、单测结果、开发任务报告 (前端含 UX 验收清单) | `python3 scripts/transition_task.py --role DEV --from-status 进行中 --to-status 审查中 ...` (FRONTEND 同命令) |
-| **审查通过** | REVIEWER | QA | 审查报告、安全/规范评估 (前端含可访问性/响应式) | `python3 scripts/transition_task.py --role REVIEWER --from-status 审查中 --to-status 测试中 ...` |
-| **审查打回** | REVIEWER | DEV / FRONTEND | 结构化缺陷信息 `DEF-TXXX-N` | `python3 scripts/transition_task.py --role REVIEWER --from-status 审查中 --to-status 已退回 ...` |
-| **测试通过** | QA | PM | 测试报告、功能点复验覆盖表、`end_time` | `python3 scripts/transition_task.py --role QA --from-status 测试中 --to-status 已完成 ...` |
+| **审查通过** | REVIEWER | QA | 绑定 task_id/候选 SHA/会话身份的结构化 PASS、安全/规范评估 | REVIEWER 只返回结论；Runner/主协调者核验后执行 `transition_task.py --role REVIEWER --from-status 审查中 --to-status 测试中 ...` |
+| **审查打回** | REVIEWER | DEV / FRONTEND | 绑定身份的 REJECT 与结构化缺陷 `DEF-TXXX-N` | REVIEWER 只返回结论；Runner/主协调者核验后执行 `transition_task.py --role REVIEWER --from-status 审查中 --to-status 已退回 ...` |
+| **测试通过** | QA | PM | 绑定同一候选 SHA 的 PASS、测试结果、`end_time` | QA 只返回结论；Runner/主协调者核验后执行 `transition_task.py --role QA --from-status 测试中 --to-status 已完成 ...` |
 | **PM 验收终态**| PM | 终态记录 | 终态验收评级、文档结项 | `python3 scripts/transition_task.py --role PM --from-status 已完成 --to-status 已验收 ...` |
 
 ---

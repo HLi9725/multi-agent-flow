@@ -181,6 +181,16 @@ def validate(role: str, from_status: str, to_status: str, assignee: str, end_tim
         print(f"[REJECT 越权拦截] {role_upper} 角色在 A 类 (常规代码开发) 任务中禁止直接推动至 '已完成'！必须先提交审查 (审查中 -> 测试中)！")
         return False
 
+    # A 类角色起点强约束：PM 只建卡/分配，Reviewer/QA 仅消费前序阶段结论。
+    # 独立 Reviewer/QA 专项任务仍可使用 B/C/D/F/G 短链，不受此规则影响。
+    if type_upper == "A" and transition_key in ["待开始 -> 进行中", "已退回 -> 进行中"]:
+        if role_upper in ["PM", "REVIEWER", "QA"]:
+            print(
+                f"[REJECT A类角色起点越权] {role_upper} 不得在 A 类开发任务执行 "
+                f"'{transition_key}'；待开始任务应由 DEV/FRONTEND 领取，退回任务应回到原开发角色。"
+            )
+            return False
+
     # A 类 (常规代码开发) 任务 PM 强行推待开始/进行中 -> 已验收 判断为违规越权 (跳过 Review 与 QA)
     if role_upper == "PM" and type_upper == "A" and transition_key in ["待开始 -> 已验收", "进行中 -> 已验收"] and not is_hotfix:
         print(f"[REJECT 越权拦截] PM 角色在 A 类 (常规代码开发) 任务中禁止直接由 '{from_status}' 推动至 '已验收'！必须经过代码审查与测试流程！")

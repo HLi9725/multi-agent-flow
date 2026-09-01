@@ -22,6 +22,7 @@ boundaries:
   can_modify_business_code: true
   can_approve: false
   can_self_claim: false
+  can_transition_task: true
   max_parallel_tasks: 99
 tools:
 - python3 scripts/transition_task.py

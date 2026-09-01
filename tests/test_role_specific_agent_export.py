@@ -14,6 +14,7 @@ if SCRIPTS not in sys.path:
     sys.path.insert(0, SCRIPTS)
 
 from verify_and_export_agents import ROLES_MAP, serialize_subagent  # noqa: E402
+from _lib.core.validate_transition import validate  # noqa: E402
 
 
 ANTIGRAVITY_SPEC = {
@@ -118,6 +119,37 @@ def test_export_fails_closed_without_declared_transitions():
         serialize_subagent(role, meta, "antigravity", ANTIGRAVITY_SPEC)
 
 
+def test_export_fails_closed_without_state_write_permission():
+    role, meta = _role("04-reviewer.yaml")
+    role["boundaries"].pop("can_transition_task")
+    with pytest.raises(ValueError, match="缺少 boundaries.can_transition_task"):
+        serialize_subagent(role, meta, "antigravity", ANTIGRAVITY_SPEC)
+
+
+def test_all_roles_explicitly_declare_state_write_ownership():
+    for filename in ROLES_MAP:
+        role, _ = _role(filename)
+        assert isinstance(role["boundaries"].get("can_transition_task"), bool), filename
+
+
+@pytest.mark.parametrize("role", ["PM", "REVIEWER", "QA"])
+def test_a_class_task_cannot_be_started_by_non_development_roles(role):
+    assert not validate(
+        role=role,
+        from_status="待开始",
+        to_status="进行中",
+        assignee=role,
+        end_time="",
+        active_dev_count=0,
+        task_type="A",
+    )
+
+
+def test_independent_reviewer_and_qa_short_chain_start_remains_supported():
+    assert validate("REVIEWER", "待开始", "进行中", "REVIEWER", "", 0, task_type="B")
+    assert validate("QA", "待开始", "进行中", "QA", "", 0, task_type="C")
+
+
 def test_skill_permission_matrix_matches_export_contract():
     with open(os.path.join(ROOT, "SKILL.md"), "r", encoding="utf-8") as fp:
         skill = fp.read()
@@ -131,3 +163,18 @@ def test_skill_permission_matrix_matches_export_contract():
     assert "完整读写" not in reviewer_row + qa_row
     assert "待开始->进行中" not in pm_row
     assert "已完成->已验收 / 已完成->已退回" in pm_row
+
+
+def test_reference_contracts_distinguish_runner_and_independent_tasks():
+    anti_error = open(
+        os.path.join(ROOT, "references", "03-Anti-Error-Mechanism.md"),
+        encoding="utf-8",
+    ).read()
+    handover = open(
+        os.path.join(ROOT, "references", "06-Inter-Agent-Handover-Protocol.md"),
+        encoding="utf-8",
+    ).read()
+    assert "REVIEWER/QA 不得领取 A 类待开始任务" in anti_error
+    assert "B/C/D/F/G 独立专项短链不属于该限制" in anti_error
+    assert "REVIEWER 只返回结论；Runner/主协调者核验后执行" in handover
+    assert "QA 只返回结论；Runner/主协调者核验后执行" in handover
