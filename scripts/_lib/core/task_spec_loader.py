@@ -196,6 +196,23 @@ def _extract_acceptance_criteria(
     return acceptance_criteria, criteria_hash, items
 
 
+def _find_non_executable_criteria(
+    items: Tuple[AcceptanceCriterion, ...],
+) -> Tuple[str, ...]:
+    """Reject placeholders and generic green-test statements for A-class gates."""
+    blocked = {
+        "待补充", "待定", "暂无", "无", "tbd", "todo", "na", "n/a",
+        "测试", "功能正常", "页面正常", "代码无bug", "无bug", "测试通过",
+        "通过测试", "全量测试通过", "满足需求", "按需求实现",
+    }
+    invalid = []
+    for item in items:
+        normalized = re.sub(r"[\s，。；：:,.!?！？_-]+", "", item.text).lower()
+        if normalized in blocked or normalized.startswith(("待补充", "todo", "tbd")):
+            invalid.append(item.criterion_id)
+    return tuple(invalid)
+
+
 def load_task_execution_spec(
     project_root: str,
     task_id: str,
@@ -299,6 +316,12 @@ def load_task_execution_spec(
         raise TaskSpecIncompleteError(
             f"Task '{task_id}' is A-class but has no explicit, executable acceptance criteria. "
             "Add an '验收标准' section before starting Production Runner."
+        )
+    invalid_criteria = _find_non_executable_criteria(acceptance_criteria_items)
+    if task_type == "A" and invalid_criteria:
+        raise TaskSpecIncompleteError(
+            f"Task '{task_id}' has non-executable acceptance criteria at {list(invalid_criteria)}. "
+            "Replace placeholders or generic green-test statements with observable outcomes."
         )
     if not acceptance_criteria_items:
         fallback = f"完成【{task_name}】的实现与验证"

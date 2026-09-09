@@ -1067,6 +1067,7 @@ dual_host_l2_status:
 4. **Runner 独立复跑**：`--test-command` 支持重复传入，Runner 在同一候选 SHA 上独立执行全部白名单命令；QA 自述结果不能替代真实退出码，重复、缺失或额外命令证据均拒绝。
 5. **自包含 EvidenceGate**：Production Runner 的 QA Evidence 保存结构化报告、命令清单、Runner 结果及其哈希；EvidenceGate 从磁盘 Evidence 独立重算报告/命令/输出哈希和各类计数，再决定是否允许进入 `PENDING_USER_ACCEPTANCE`。旧版演示 Orchestrator 保持兼容，但不声明具备此语义 QA 准出等级。
 6. **角色导出同步**：PM、Reviewer、QA 的 YAML 源定义同步了可执行验收标准、外围调用链与反向场景要求，所有平台仍由确定性生成器导出，未直接硬编码生成文件。
-7. **验证记录**：角色导出与跨平台专项 `58 passed`；最终全仓回归 `454 passed in 100.52s`，`0 failed`、`0 skipped`；Python 语法编译、敏感凭证扫描及 `git diff --check` 均通过。
+7. **审查返工**：独立审查发现 QA 格式/覆盖失败生成的结构化 FAIL Evidence 仍被 PASS 专属的“报告命令必须完整”规则拒绝，导致无法自动回到 Builder。已将完整 QA 报告命令约束限定为 PASS；FAIL 仍强制绑定缺陷、Runner 独立命令结果、身份及哈希，从而既不降低准出强度，也保留原任务自动修复回环。
+8. **验证记录**：角色导出与跨平台专项 `58 passed`；审查返工后最终全仓回归 `455 passed in 97.27s`，`0 failed`、`0 skipped`；Python 语法编译、敏感凭证扫描及 `git diff --check` 均通过。
 
 本轮未调用真实 Codex/Antigravity Host，未修改任何业务项目；真实 Host 行为应在安装此候选版本后通过一个新的、隔离的非生产任务再次观察。

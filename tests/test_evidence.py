@@ -282,6 +282,58 @@ def test_gate_requires_qa_semantic_coverage_metadata(store, caps, tmp_path):
     with pytest.raises(EvidenceGateError, match="no negative scenario evidence"):
         gate.validate_evidence("evt_qa_no_negative", bad_context)
 
+    # A structured QA FAIL may be incomplete by definition. It must still be
+    # accepted as rejection Evidence so the Runner can return to Builder.
+    fail_report = {
+        **qa_report,
+        "decision": "FAIL",
+        "acceptance_coverage": [],
+        "test_commands": [],
+        "negative_scenarios": [],
+        "uncovered_risks": ["QA response was incomplete"],
+        "defects": [{
+            "defect_id": "DEF-T001-QA-SCHEMA",
+            "severity": "P1",
+            "description": "QA response was incomplete",
+        }],
+        "summary": "return to builder",
+    }
+    fail_semantic = {
+        **semantic,
+        "qa_decision": "FAIL",
+        "qa_report": fail_report,
+        "qa_report_hash": hashlib.sha256(
+            json.dumps(fail_report, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest(),
+        "covered_criterion_ids": (),
+        "negative_scenario_count": 0,
+        "uncovered_risk_count": 1,
+        "defect_count": 1,
+    }
+    fail_extra = dict(fail_semantic)
+    for key, value in caps.__dict__.items():
+        if key != "extra":
+            fail_extra[f"capability_{key}"] = value
+    fail_metadata = EvidenceMetadata(**{
+        **metadata.__dict__,
+        "transition_to": "BUILDING",
+        "extra": fail_extra,
+    })
+    store.append(EvidenceRecord(
+        evidence_id="evt_qa_structured_fail",
+        evidence_type=EvidenceType.TASK_TRANSITION,
+        baseline_commit="a" * 40,
+        result_commit="b" * 40,
+        artifacts=(),
+        metadata=fail_metadata,
+    ))
+    fail_context = EvidenceValidationContext(**{
+        **context.__dict__,
+        "transition_to": "BUILDING",
+        "expected_metadata": fail_semantic,
+    })
+    assert gate.validate_evidence("evt_qa_structured_fail", fail_context) is True
+
 # 6. Valid Artifact Check
 def test_gate_validate_artifact(store, expected_context, dummy_metadata, tmp_path):
     art_path = tmp_path / "test_file.txt"

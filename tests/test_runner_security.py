@@ -91,7 +91,7 @@ def mock_git_repo(tmp_path):
             "assignee": "李开发",
             "owner": "李开发",
             "handler": "李开发",
-            "process": "需求: 无提交测试。验收标准: 测试。",
+            "process": "需求: 无提交测试。验收标准: Builder 必须生成不同于基线的候选提交。",
             "updated_at": "1.0",
         },
         {
@@ -101,7 +101,7 @@ def mock_git_repo(tmp_path):
             "assignee": "李开发",
             "owner": "李开发",
             "handler": "李开发",
-            "process": "需求: 只读测试。验收标准: 测试通过。",
+            "process": "需求: 只读测试。验收标准: QA 修改候选提交时 Runner 必须阻断准出。",
             "updated_at": "1.0",
         },
         {

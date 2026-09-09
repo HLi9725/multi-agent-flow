@@ -217,8 +217,6 @@ class EvidenceGate:
                 if len(output_hash) != 64 or any(char not in "0123456789abcdef" for char in output_hash):
                     raise EvidenceGateError("Evidence rejected: Runner QA output hash is invalid.")
             self._check_match("runner_test_commands_recomputed", result_commands, tuple(required_commands))
-            if len(report_commands) != len(set(report_commands)) or set(report_commands) != set(required_commands):
-                raise EvidenceGateError("Evidence rejected: QA report commands do not match required commands exactly once.")
             self._check_match("covered_criterion_ids_recomputed", tuple(meta.extra.get("covered_criterion_ids") or ()), report_coverage)
             self._check_match("required_test_command_count_recomputed", meta.extra.get("required_test_command_count"), len(required_commands))
             self._check_match("negative_scenario_count_recomputed", meta.extra.get("negative_scenario_count"), len(report_negative))
@@ -227,6 +225,8 @@ class EvidenceGate:
             self._check_match("defect_count_recomputed", meta.extra.get("defect_count"), expected_defect_count)
             self._check_match("test_exit_codes_recomputed", exit_codes, result_exit_codes)
             if decision == "PASS":
+                if len(report_commands) != len(set(report_commands)) or set(report_commands) != set(required_commands):
+                    raise EvidenceGateError("Evidence rejected: QA PASS report commands do not match required commands exactly once.")
                 if ctx.transition_to != "PENDING_USER_ACCEPTANCE":
                     raise EvidenceGateError("Evidence rejected: QA PASS has an invalid transition target.")
                 if not meta.extra.get("covered_criterion_ids"):

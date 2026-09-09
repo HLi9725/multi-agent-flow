@@ -120,6 +120,17 @@ def mock_project_environment(tmp_path):
             "process": "[T0005-N01] 待开始 -> 进行中 | 已领取任务",
             "updated_at": "1787890000",
         },
+        {
+            "id": "T0006",
+            "name": "占位验收任务",
+            "status": "待开始",
+            "assignee": "李开发",
+            "owner": "李开发",
+            "handler": "李开发",
+            "type": "A",
+            "remarks": "需求: 实现报表。\n验收标准: 全量测试通过。",
+            "updated_at": "1787890000",
+        },
     ]
     with open(user_data_dir / "board.json", "w", encoding="utf-8") as f:
         json.dump(tasks_data, f)
@@ -148,6 +159,15 @@ def test_a_class_task_without_explicit_acceptance_criteria_fails_closed(mock_pro
         load_task_execution_spec(
             project_root=str(mock_project_environment),
             task_id="T0004",
+            authority_root=str(mock_project_environment),
+        )
+
+
+def test_a_class_task_with_generic_acceptance_placeholder_fails_closed(mock_project_environment):
+    with pytest.raises(TaskSpecIncompleteError, match="non-executable acceptance criteria"):
+        load_task_execution_spec(
+            project_root=str(mock_project_environment),
+            task_id="T0006",
             authority_root=str(mock_project_environment),
         )
 
