@@ -133,6 +133,155 @@ def test_gate_reject_fake_session(store, expected_context, dummy_metadata, tmp_p
     with pytest.raises(EvidenceGateError, match="fake/test/mock/simulate"):
         gate.validate_evidence("evt_fake", expected_context)
 
+
+def test_gate_requires_qa_semantic_coverage_metadata(store, caps, tmp_path):
+    qa_report = {
+        "task_id": "T001",
+        "baseline_commit": "a" * 40,
+        "candidate_commit": "b" * 40,
+        "session_id": "session_xyz",
+        "host_invocation_id": "inv_xyz",
+        "qa_request_id": "qa_req_real_1",
+        "acceptance_criteria_hash": "b" * 64,
+        "decision": "PASS",
+        "acceptance_coverage": [
+            {"criterion_id": "AC-01", "status": "PASS", "evidence": "positive"},
+            {"criterion_id": "AC-02", "status": "PASS", "evidence": "boundary"},
+        ],
+        "test_commands": [
+            {"command": "python -m pytest tests/unit -q", "exit_code": 0, "summary": "passed"},
+            {"command": "npm run build", "exit_code": 0, "summary": "built"},
+        ],
+        "negative_scenarios": [{"name": "unauthorized", "status": "PASS", "evidence": "401"}],
+        "uncovered_risks": [],
+        "defects": [],
+        "summary": "all criteria covered",
+    }
+    required_commands = ["python -m pytest tests/unit -q", "npm run build"]
+    runner_results = [
+        {"command": required_commands[0], "exit_code": 0, "output_hash": "e" * 64},
+        {"command": required_commands[1], "exit_code": 0, "output_hash": "f" * 64},
+    ]
+    semantic = {
+        "qa_decision": "PASS",
+        "qa_request_id": "qa_req_real_1",
+        "qa_report_hash": hashlib.sha256(json.dumps(qa_report, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest(),
+        "acceptance_criteria_hash": "b" * 64,
+        "covered_criterion_ids": ("AC-01", "AC-02"),
+        "required_test_command_count": 2,
+        "negative_scenario_count": 1,
+        "uncovered_risk_count": 0,
+        "defect_count": 0,
+        "test_command_hash": hashlib.sha256(json.dumps(required_commands, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest(),
+        "test_output_hash": hashlib.sha256(json.dumps(runner_results, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest(),
+        "test_exit_codes": (0, 0),
+        "qa_report": qa_report,
+        "required_test_commands": required_commands,
+        "runner_test_results": runner_results,
+    }
+    extra = dict(semantic)
+    for key, value in caps.__dict__.items():
+        if key != "extra":
+            extra[f"capability_{key}"] = value
+    metadata = EvidenceMetadata(
+        project_id="proj1",
+        task_id="T001",
+        actor_role="QA",
+        host_id="real_host",
+        adapter="real_adapter",
+        host_session_id="session_xyz",
+        host_invocation_id="inv_xyz",
+        is_real_host=True,
+        workspace_mode="workspace_read",
+        transition_from="TESTING",
+        transition_to="PENDING_USER_ACCEPTANCE",
+        created_at=time.time(),
+        extra=extra,
+    )
+    record = EvidenceRecord(
+        evidence_id="evt_qa_semantic",
+        evidence_type=EvidenceType.TASK_TRANSITION,
+        baseline_commit="a" * 40,
+        result_commit="b" * 40,
+        artifacts=(),
+        metadata=metadata,
+    )
+    store.append(record)
+    context = EvidenceValidationContext(
+        project_id="proj1",
+        task_id="T001",
+        actor_role="QA",
+        transition_from="TESTING",
+        transition_to="PENDING_USER_ACCEPTANCE",
+        baseline_commit="a" * 40,
+        result_commit="b" * 40,
+        expected_invocation_id="inv_xyz",
+        expected_adapter="real_adapter",
+        expected_workspace_mode="workspace_read",
+        expected_evidence_type=EvidenceType.TASK_TRANSITION,
+        host_handle=AgentHandle(session_id="session_xyz", host_id="real_host", is_real_host=True),
+        expected_capabilities=caps,
+        agent_result=AgentResult(
+            session_id="session_xyz",
+            status=AgentStatus.SUCCESS,
+            output="done",
+            is_real_host=True,
+        ),
+        expected_metadata=semantic,
+        require_qa_semantics=True,
+    )
+    gate = EvidenceGate(store, str(tmp_path))
+    assert gate.validate_evidence("evt_qa_semantic", context) is True
+
+    capability_only = {
+        key: value for key, value in extra.items() if key.startswith("capability_")
+    }
+    missing_metadata = EvidenceMetadata(**{**metadata.__dict__, "extra": capability_only})
+    store.append(EvidenceRecord(
+        evidence_id="evt_qa_missing_semantics",
+        evidence_type=EvidenceType.TASK_TRANSITION,
+        baseline_commit="a" * 40,
+        result_commit="b" * 40,
+        artifacts=(),
+        metadata=missing_metadata,
+    ))
+    strict_context = EvidenceValidationContext(
+        **{**context.__dict__, "expected_metadata": None, "require_qa_semantics": True}
+    )
+    with pytest.raises(EvidenceGateError, match="QA semantic field 'qa_decision' is missing"):
+        gate.validate_evidence("evt_qa_missing_semantics", strict_context)
+
+    bad_extra = dict(extra)
+    bad_report = dict(qa_report)
+    bad_report["negative_scenarios"] = []
+    bad_extra["qa_report"] = bad_report
+    bad_extra["qa_report_hash"] = hashlib.sha256(
+        json.dumps(bad_report, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    bad_extra["negative_scenario_count"] = 0
+    bad_metadata = EvidenceMetadata(**{**metadata.__dict__, "extra": bad_extra})
+    store.append(EvidenceRecord(
+        evidence_id="evt_qa_no_negative",
+        evidence_type=EvidenceType.TASK_TRANSITION,
+        baseline_commit="a" * 40,
+        result_commit="b" * 40,
+        artifacts=(),
+        metadata=bad_metadata,
+    ))
+    bad_context = EvidenceValidationContext(
+        **{
+            **context.__dict__,
+            "expected_metadata": {
+                **semantic,
+                "qa_report": bad_report,
+                "qa_report_hash": bad_extra["qa_report_hash"],
+                "negative_scenario_count": 0,
+            },
+        }
+    )
+    with pytest.raises(EvidenceGateError, match="no negative scenario evidence"):
+        gate.validate_evidence("evt_qa_no_negative", bad_context)
+
 # 6. Valid Artifact Check
 def test_gate_validate_artifact(store, expected_context, dummy_metadata, tmp_path):
     art_path = tmp_path / "test_file.txt"

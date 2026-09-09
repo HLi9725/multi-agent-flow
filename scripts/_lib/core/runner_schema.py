@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 import hashlib
 import json
+import re
 import time
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -79,6 +80,107 @@ REVIEWER_JSON_SCHEMA: Dict[str, Any] = {
 }
 
 
+QA_JSON_SCHEMA: Dict[str, Any] = {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "title": "QAStructuredOutput",
+    "type": "object",
+    "required": [
+        "task_id",
+        "baseline_commit",
+        "candidate_commit",
+        "session_id",
+        "qa_request_id",
+        "acceptance_criteria_hash",
+        "decision",
+        "acceptance_coverage",
+        "test_commands",
+        "negative_scenarios",
+        "uncovered_risks",
+        "defects",
+        "summary",
+    ],
+    "properties": {
+        "task_id": {"type": "string"},
+        "baseline_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "candidate_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "session_id": {"type": "string"},
+        "qa_request_id": {"type": "string"},
+        "acceptance_criteria_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "decision": {"type": "string", "enum": ["PASS", "FAIL"]},
+        "acceptance_coverage": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["criterion_id", "status", "evidence"],
+                "properties": {
+                    "criterion_id": {"type": "string"},
+                    "status": {"type": "string", "enum": ["PASS", "FAIL"]},
+                    "evidence": {"type": "string"},
+                },
+                "additionalProperties": False,
+            },
+        },
+        "test_commands": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["command", "exit_code", "summary"],
+                "properties": {
+                    "command": {"type": "string"},
+                    "exit_code": {"type": "integer"},
+                    "summary": {"type": "string"},
+                },
+                "additionalProperties": False,
+            },
+        },
+        "negative_scenarios": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["name", "status", "evidence"],
+                "properties": {
+                    "name": {"type": "string"},
+                    "status": {"type": "string", "enum": ["PASS", "FAIL"]},
+                    "evidence": {"type": "string"},
+                },
+                "additionalProperties": False,
+            },
+        },
+        "uncovered_risks": {"type": "array", "items": {"type": "string"}},
+        "defects": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["defect_id", "severity", "description"],
+                "properties": {
+                    "defect_id": {"type": "string"},
+                    "severity": {"type": "string", "enum": ["P0", "P1", "P2", "P3"]},
+                    "description": {"type": "string"},
+                    "file_path": {"type": ["string", "null"]},
+                    "line_range": {"type": ["string", "null"]},
+                    "suggested_fix": {"type": ["string", "null"]},
+                },
+            },
+        },
+        "summary": {"type": "string"},
+    },
+    "additionalProperties": False,
+}
+
+
+@dataclass(frozen=True)
+class AcceptanceCriterion:
+    criterion_id: str
+    text: str
+
+    def __post_init__(self):
+        if not self.criterion_id.strip() or not self.text.strip():
+            raise ValueError("AcceptanceCriterion requires non-empty id and text")
+
+    def to_dict(self) -> Dict[str, str]:
+        return {"criterion_id": self.criterion_id, "text": self.text}
+
+
 @dataclass(frozen=True)
 class ReviewerStructuredOutput:
     task_id: str
@@ -127,6 +229,53 @@ class ReviewerStructuredOutput:
 
 
 @dataclass(frozen=True)
+class QAStructuredOutput:
+    task_id: str
+    baseline_commit: str
+    candidate_commit: str
+    session_id: str
+    host_invocation_id: str
+    qa_request_id: str
+    acceptance_criteria_hash: str
+    decision: str  # "PASS" or "FAIL"
+    acceptance_coverage: Tuple[Dict[str, Any], ...] = field(default_factory=tuple)
+    test_commands: Tuple[Dict[str, Any], ...] = field(default_factory=tuple)
+    negative_scenarios: Tuple[Dict[str, Any], ...] = field(default_factory=tuple)
+    uncovered_risks: Tuple[str, ...] = field(default_factory=tuple)
+    defects: Tuple[Dict[str, Any], ...] = field(default_factory=tuple)
+    summary: str = ""
+
+    def __post_init__(self):
+        if self.decision not in ("PASS", "FAIL"):
+            raise ValueError(f"Invalid QA decision: {self.decision}. Must be 'PASS' or 'FAIL'.")
+        if self.decision == "FAIL" and not self.defects:
+            raise ValueError("QA decision is FAIL but defects list is empty.")
+        object.__setattr__(self, "acceptance_coverage", _freeze_runner_value(list(self.acceptance_coverage)))
+        object.__setattr__(self, "test_commands", _freeze_runner_value(list(self.test_commands)))
+        object.__setattr__(self, "negative_scenarios", _freeze_runner_value(list(self.negative_scenarios)))
+        object.__setattr__(self, "uncovered_risks", tuple(str(item) for item in self.uncovered_risks))
+        object.__setattr__(self, "defects", _freeze_runner_value(list(self.defects)))
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "task_id": self.task_id,
+            "baseline_commit": self.baseline_commit,
+            "candidate_commit": self.candidate_commit,
+            "session_id": self.session_id,
+            "host_invocation_id": self.host_invocation_id,
+            "qa_request_id": self.qa_request_id,
+            "acceptance_criteria_hash": self.acceptance_criteria_hash,
+            "decision": self.decision,
+            "acceptance_coverage": [dict(item) for item in self.acceptance_coverage],
+            "test_commands": [dict(item) for item in self.test_commands],
+            "negative_scenarios": [dict(item) for item in self.negative_scenarios],
+            "uncovered_risks": list(self.uncovered_risks),
+            "defects": [dict(item) for item in self.defects],
+            "summary": self.summary,
+        }
+
+
+@dataclass(frozen=True)
 class TaskExecutionSpec:
     """不可变任务执行规范，绑定项目与任务上下文"""
     project_id: str
@@ -139,6 +288,7 @@ class TaskExecutionSpec:
     acceptance_criteria_hash: str
     task_version: str
     status_at_read: str
+    requirement_hash: str = ""
     owner: str = "李开发"
     handler: str = "李开发"
     task_type: str = "A"
@@ -150,6 +300,8 @@ class TaskExecutionSpec:
     workspace_mode: str = "branch"
     worktree_root: Optional[str] = None
     test_command: Optional[str] = None
+    test_commands: Tuple[str, ...] = field(default_factory=tuple)
+    acceptance_criteria_items: Tuple[AcceptanceCriterion, ...] = field(default_factory=tuple)
     builder_timeout_seconds: int = 300
     reviewer_timeout_seconds: int = 300
     qa_timeout_seconds: int = 300
@@ -176,6 +328,22 @@ class TaskExecutionSpec:
         if not self.acceptance_criteria_hash:
             calculated_hash = hashlib.sha256(self.acceptance_criteria.strip().encode("utf-8")).hexdigest()
             object.__setattr__(self, "acceptance_criteria_hash", calculated_hash)
+        criteria_items = tuple(self.acceptance_criteria_items)
+        if not criteria_items:
+            fallback_text = re.sub(r"^验收标准\s*[:：]\s*", "", self.acceptance_criteria).strip()
+            criteria_items = (AcceptanceCriterion("AC-01", fallback_text),)
+        object.__setattr__(self, "acceptance_criteria_items", criteria_items)
+
+        raw_commands = (self.test_commands,) if isinstance(self.test_commands, str) else self.test_commands
+        commands = []
+        for command in raw_commands:
+            normalized = str(command).strip()
+            if normalized and normalized not in commands:
+                commands.append(normalized)
+        if self.test_command and self.test_command.strip() and self.test_command.strip() not in commands:
+            commands.insert(0, self.test_command.strip())
+        commands = tuple(commands)
+        object.__setattr__(self, "test_commands", commands)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -189,6 +357,7 @@ class TaskExecutionSpec:
             "acceptance_criteria_hash": self.acceptance_criteria_hash,
             "task_version": self.task_version,
             "status_at_read": self.status_at_read,
+            "requirement_hash": self.requirement_hash,
             "owner": self.owner,
             "handler": self.handler,
             "task_type": self.task_type,
@@ -200,6 +369,8 @@ class TaskExecutionSpec:
             "workspace_mode": self.workspace_mode,
             "worktree_root": self.worktree_root,
             "test_command": self.test_command,
+            "test_commands": list(self.test_commands),
+            "acceptance_criteria_items": [item.to_dict() for item in self.acceptance_criteria_items],
             "builder_timeout_seconds": self.builder_timeout_seconds,
             "reviewer_timeout_seconds": self.reviewer_timeout_seconds,
             "qa_timeout_seconds": self.qa_timeout_seconds,

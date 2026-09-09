@@ -1056,3 +1056,17 @@ dual_host_l2_status:
    - 全量测试：`421 passed in 96.22s`，退出码 `0`，`0 failed`、`0 skipped`。
    - 权威 `board.json` 测试前后 SHA-256 均为 `1433F203CF9C0D37DFAA49377ABDCCC842C7ED57501E164CBA2351CAF7974BDF`，零污染、零直接编辑。
    - `git diff --check`：退出码 `0`。
+
+### 21. Production Runner 语义审查与 QA Evidence 强化
+
+2026-09-09 针对“角色只复跑已有测试、无法在最终验收前发现跨层缺陷”的实际反馈，完成以下机制修复：
+
+1. **任务契约可执行化**：A 类任务必须提供显式 `验收标准:` 段落；Runner 将多条标准稳定编号为 `AC-01...`，同时绑定需求正文与验收标准 SHA-256。状态机追加的流程节点不进入需求哈希，但运行期间真正修改需求或验收标准会在 Reviewer 前、QA 前及 QA 后被拦截。
+2. **Reviewer 影响面审查**：Reviewer 除固定候选 Diff 外，还接收变更文件、适用的 API/数据库/前端/安全边界提示与仓库符号引用索引；角色契约明确禁止用“已有测试为绿”替代调用链审查。
+3. **QA 结构化准出**：QA 必须返回严格 JSON，逐项覆盖全部验收标准、逐项报告受控测试命令、至少一个独立反向/异常场景，并显式列出未覆盖风险与缺陷；身份、任务、基线、候选、会话、请求和验收哈希任一不匹配即 Fail-Closed。
+4. **Runner 独立复跑**：`--test-command` 支持重复传入，Runner 在同一候选 SHA 上独立执行全部白名单命令；QA 自述结果不能替代真实退出码，重复、缺失或额外命令证据均拒绝。
+5. **自包含 EvidenceGate**：Production Runner 的 QA Evidence 保存结构化报告、命令清单、Runner 结果及其哈希；EvidenceGate 从磁盘 Evidence 独立重算报告/命令/输出哈希和各类计数，再决定是否允许进入 `PENDING_USER_ACCEPTANCE`。旧版演示 Orchestrator 保持兼容，但不声明具备此语义 QA 准出等级。
+6. **角色导出同步**：PM、Reviewer、QA 的 YAML 源定义同步了可执行验收标准、外围调用链与反向场景要求，所有平台仍由确定性生成器导出，未直接硬编码生成文件。
+7. **验证记录**：角色导出与跨平台专项 `58 passed`；最终全仓回归 `454 passed in 100.52s`，`0 failed`、`0 skipped`；Python 语法编译、敏感凭证扫描及 `git diff --check` 均通过。
+
+本轮未调用真实 Codex/Antigravity Host，未修改任何业务项目；真实 Host 行为应在安装此候选版本后通过一个新的、隔离的非生产任务再次观察。

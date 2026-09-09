@@ -357,6 +357,7 @@ def test_runner_resume_breakpoint_and_integrity_verification(tmp_path, monkeypat
     builder_called = False
     reviewer_called = False
     review_requests = {}
+    qa_requests = {}
 
     def mock_detect_caps(self):
         return HostCapabilities(
@@ -376,6 +377,8 @@ def test_runner_resume_breakpoint_and_integrity_verification(tmp_path, monkeypat
         nonlocal builder_called
         if req.role == "BUILDER":
             builder_called = True
+        elif req.role == "QA":
+            qa_requests[req.session_id] = req
         return AgentHandle(session_id=req.session_id, host_id="codex_cli", status="completed", is_real_host=True, adapter_instance_id="inst_c", invocation_token="tok_b")
 
     def mock_reviewer_dispatch(self, req):
@@ -397,11 +400,30 @@ def test_runner_resume_breakpoint_and_integrity_verification(tmp_path, monkeypat
         }
         return AgentResult(session_id=handle.session_id, status=AgentStatus.SUCCESS, output=json.dumps(out_json), partial_results=({"invocation_id": "inv_r"},), is_real_host=True)
 
-    def mock_qa_dispatch(self, req):
-        return AgentHandle(session_id=req.session_id, host_id="codex_cli", status="completed", is_real_host=True, adapter_instance_id="inst_c", invocation_token="tok_qa")
-
     def mock_qa_wait(self, handle, timeout_seconds=None):
-        return AgentResult(session_id=handle.session_id, status=AgentStatus.SUCCESS, output="QA pass", partial_results=({"invocation_id": "inv_qa"},), is_real_host=True)
+        req = qa_requests[handle.session_id]
+        output = {
+            "task_id": "T0099",
+            "baseline_commit": baseline_sha,
+            "candidate_commit": cand_sha,
+            "session_id": handle.session_id,
+            "qa_request_id": req.extra_context["qa_request_id"],
+            "acceptance_criteria_hash": req.extra_context["acceptance_criteria_hash"],
+            "decision": "PASS",
+            "acceptance_coverage": [
+                {"criterion_id": "AC-01", "status": "PASS", "evidence": "test_app.py::test_app"},
+            ],
+            "test_commands": [
+                {"command": "python -m pytest -q", "exit_code": 0, "summary": "1 passed"},
+            ],
+            "negative_scenarios": [
+                {"name": "resume idempotency", "status": "PASS", "evidence": "checkpoint recovery test"},
+            ],
+            "uncovered_risks": [],
+            "defects": [],
+            "summary": "QA pass with complete coverage.",
+        }
+        return AgentResult(session_id=handle.session_id, status=AgentStatus.SUCCESS, output=json.dumps(output), partial_results=({"invocation_id": "inv_qa"},), is_real_host=True)
 
     monkeypatch.setattr(CodexCliAdapter, "detect_capabilities", mock_detect_caps)
     monkeypatch.setattr(AntigravityAdapter, "detect_capabilities", mock_detect_caps)

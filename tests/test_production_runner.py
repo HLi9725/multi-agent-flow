@@ -180,6 +180,7 @@ def test_production_runner_full_pass_pipeline(mock_git_repo, tmp_path, monkeypat
 
     session_workspaces = {}
     review_requests = {}
+    qa_requests = {}
 
     def mock_detect_caps(self):
         return HostCapabilities(
@@ -197,6 +198,8 @@ def test_production_runner_full_pass_pipeline(mock_git_repo, tmp_path, monkeypat
 
     def mock_codex_dispatch(self, req):
         session_workspaces[req.session_id] = req.workspace_dir
+        if req.role == "QA":
+            qa_requests[req.session_id] = req
         return AgentHandle(
             session_id=req.session_id,
             host_id="codex_cli",
@@ -223,10 +226,39 @@ def test_production_runner_full_pass_pipeline(mock_git_repo, tmp_path, monkeypat
                 is_real_host=True,
             )
         else:
+            qa_req = qa_requests[handle.session_id]
+            cand_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=target_dir, text=True).strip()
+            qa_json = {
+                "task_id": "T0088",
+                "baseline_commit": baseline_sha,
+                "candidate_commit": cand_sha,
+                "session_id": handle.session_id,
+                "qa_request_id": qa_req.extra_context["qa_request_id"],
+                "acceptance_criteria_hash": qa_req.extra_context["acceptance_criteria_hash"],
+                "decision": "PASS",
+                "acceptance_coverage": [{
+                    "criterion_id": "AC-01",
+                    "status": "PASS",
+                    "evidence": "test_app.py::test_app",
+                }],
+                "test_commands": [{
+                    "command": "python -m pytest -q",
+                    "exit_code": 0,
+                    "summary": "1 passed",
+                }],
+                "negative_scenarios": [{
+                    "name": "unexpected false result",
+                    "status": "PASS",
+                    "evidence": "test_app.py::test_app",
+                }],
+                "uncovered_risks": [],
+                "defects": [],
+                "summary": "All acceptance criteria and negative scenarios passed.",
+            }
             return AgentResult(
                 session_id=handle.session_id,
                 status=AgentStatus.SUCCESS,
-                output="QA test suite passed: 1 passed in 0.01s",
+                output=json.dumps(qa_json),
                 partial_results=({"invocation_id": "inv_qa_codex_real"},),
                 is_real_host=True,
             )

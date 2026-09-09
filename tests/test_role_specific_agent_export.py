@@ -145,6 +145,18 @@ def test_pm_requires_serial_independent_agents():
     assert "Reviewer 与 QA 严禁并行" in body
     assert "禁止退化为单对话多角色扮演" in body
     assert "并行调度 DEV/QA/REVIEWER" not in body
+    assert "正向验证和反向/异常场景" in body
+
+
+def test_reviewer_and_qa_exports_require_semantic_quality_evidence():
+    _, reviewer_body = _markdown("04-reviewer.yaml")
+    _, qa_body = _markdown("05-qa.yaml")
+
+    assert "已有测试为绿" in reviewer_body
+    assert "仓库外围调用链" in reviewer_body
+    assert "完整验收覆盖矩阵" in qa_body
+    assert "反向场景" in qa_body
+    assert "零未覆盖风险" in qa_body
 
 
 def test_dev_reviewer_qa_contracts_are_not_identical():

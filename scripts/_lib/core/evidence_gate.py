@@ -1,6 +1,7 @@
 import os
 import hashlib
-from typing import Optional, Dict, Any
+import json
+from typing import Optional, Dict, Any, Mapping
 from dataclasses import dataclass
 
 from .evidence_schema import (
@@ -8,6 +9,15 @@ from .evidence_schema import (
 )
 from .evidence_store import EvidenceStore
 from .agent_schema import HostCapabilities, AgentHandle, AgentResult, ConfirmationResult
+
+
+def _plain_evidence_value(value: Any) -> Any:
+    """Convert frozen Evidence payloads into deterministic JSON-compatible values."""
+    if isinstance(value, Mapping):
+        return {str(key): _plain_evidence_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain_evidence_value(item) for item in value]
+    return value
 
 @dataclass(frozen=True)
 class EvidenceValidationContext:
@@ -26,6 +36,8 @@ class EvidenceValidationContext:
     expected_capabilities: HostCapabilities
     agent_result: Optional[AgentResult] = None
     confirmation_result: Optional[ConfirmationResult] = None
+    expected_metadata: Optional[Mapping[str, Any]] = None
+    require_qa_semantics: bool = False
 
 class EvidenceGate:
     def __init__(self, store: EvidenceStore, project_root: str):
@@ -44,7 +56,7 @@ class EvidenceGate:
     def _check_match(self, field_name: str, actual: Any, expected: Any):
         if actual is None or expected is None:
             raise EvidenceGateError(f"Evidence rejected: {field_name} is missing in context or evidence (None is not allowed).")
-        if actual != expected:
+        if _plain_evidence_value(actual) != _plain_evidence_value(expected):
             raise EvidenceGateError(f"Evidence rejected: Context mismatch for {field_name}. Expected {expected}, got {actual}")
 
     def validate_evidence(self, evidence_id: str, ctx: EvidenceValidationContext) -> bool:
@@ -100,6 +112,142 @@ class EvidenceGate:
         for k, v in ctx.expected_capabilities.__dict__.items():
             if k == "extra": continue
             self._check_match(f"capability_{k}", meta.extra.get(f"capability_{k}"), v)
+
+        if ctx.expected_metadata:
+            for key, expected in ctx.expected_metadata.items():
+                self._check_match(f"metadata_{key}", meta.extra.get(key), expected)
+
+        # QA Evidence must prove semantic coverage, not merely a successful host call.
+        if ctx.actor_role == "QA" and ctx.require_qa_semantics:
+            required_qa_fields = (
+                "qa_decision",
+                "qa_request_id",
+                "qa_report_hash",
+                "acceptance_criteria_hash",
+                "covered_criterion_ids",
+                "required_test_command_count",
+                "negative_scenario_count",
+                "uncovered_risk_count",
+                "defect_count",
+                "test_command_hash",
+                "test_output_hash",
+                "test_exit_codes",
+                "qa_report",
+                "required_test_commands",
+                "runner_test_results",
+            )
+            for field_name in required_qa_fields:
+                if field_name not in meta.extra:
+                    raise EvidenceGateError(f"Evidence rejected: QA semantic field '{field_name}' is missing.")
+            for hash_field in (
+                "qa_report_hash",
+                "acceptance_criteria_hash",
+                "test_command_hash",
+                "test_output_hash",
+            ):
+                value = str(meta.extra.get(hash_field, ""))
+                if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+                    raise EvidenceGateError(f"Evidence rejected: QA semantic hash '{hash_field}' is invalid.")
+
+            decision = meta.extra.get("qa_decision")
+            exit_codes = tuple(meta.extra.get("test_exit_codes") or ())
+            qa_report = meta.extra.get("qa_report")
+            required_commands = meta.extra.get("required_test_commands")
+            runner_results = meta.extra.get("runner_test_results")
+            if not isinstance(qa_report, Mapping):
+                raise EvidenceGateError("Evidence rejected: QA report payload is not an object.")
+            if not isinstance(required_commands, (list, tuple)) or not required_commands:
+                raise EvidenceGateError("Evidence rejected: Required QA command payload is empty or invalid.")
+            if not isinstance(runner_results, (list, tuple)) or not runner_results:
+                raise EvidenceGateError("Evidence rejected: Runner QA result payload is empty or invalid.")
+
+            recomputed_report_hash = hashlib.sha256(
+                json.dumps(_plain_evidence_value(qa_report), ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest()
+            recomputed_command_hash = hashlib.sha256(
+                json.dumps(_plain_evidence_value(required_commands), ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest()
+            recomputed_output_hash = hashlib.sha256(
+                json.dumps(_plain_evidence_value(runner_results), ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest()
+            self._check_match("qa_report_hash_recomputed", meta.extra.get("qa_report_hash"), recomputed_report_hash)
+            self._check_match("test_command_hash_recomputed", meta.extra.get("test_command_hash"), recomputed_command_hash)
+            self._check_match("test_output_hash_recomputed", meta.extra.get("test_output_hash"), recomputed_output_hash)
+            self._check_match("qa_report_decision", qa_report.get("decision"), decision)
+            self._check_match("qa_report_task_id", qa_report.get("task_id"), ctx.task_id)
+            self._check_match("qa_report_baseline_commit", qa_report.get("baseline_commit"), ctx.baseline_commit)
+            self._check_match("qa_report_candidate_commit", qa_report.get("candidate_commit"), ctx.result_commit)
+            self._check_match("qa_report_session_id", qa_report.get("session_id"), ctx.host_handle.session_id)
+            self._check_match("qa_report_request_id", qa_report.get("qa_request_id"), meta.extra.get("qa_request_id"))
+            self._check_match(
+                "qa_report_acceptance_criteria_hash",
+                qa_report.get("acceptance_criteria_hash"),
+                meta.extra.get("acceptance_criteria_hash"),
+            )
+
+            report_coverage = tuple(
+                item.get("criterion_id")
+                for item in qa_report.get("acceptance_coverage", ())
+                if isinstance(item, Mapping) and item.get("status") == "PASS"
+            )
+            report_negative = tuple(qa_report.get("negative_scenarios") or ())
+            report_risks = tuple(qa_report.get("uncovered_risks") or ())
+            report_defects = tuple(qa_report.get("defects") or ())
+            result_exit_codes = tuple(
+                item.get("exit_code")
+                for item in runner_results
+                if isinstance(item, Mapping)
+            )
+            result_commands = tuple(
+                item.get("command")
+                for item in runner_results
+                if isinstance(item, Mapping)
+            )
+            report_commands = tuple(
+                item.get("command")
+                for item in qa_report.get("test_commands", ())
+                if isinstance(item, Mapping)
+            )
+            if len(result_commands) != len(runner_results):
+                raise EvidenceGateError("Evidence rejected: Runner QA results contain a non-object item.")
+            for item in runner_results:
+                if not isinstance(item.get("exit_code"), int) or isinstance(item.get("exit_code"), bool):
+                    raise EvidenceGateError("Evidence rejected: Runner QA exit code is invalid.")
+                output_hash = str(item.get("output_hash", ""))
+                if len(output_hash) != 64 or any(char not in "0123456789abcdef" for char in output_hash):
+                    raise EvidenceGateError("Evidence rejected: Runner QA output hash is invalid.")
+            self._check_match("runner_test_commands_recomputed", result_commands, tuple(required_commands))
+            if len(report_commands) != len(set(report_commands)) or set(report_commands) != set(required_commands):
+                raise EvidenceGateError("Evidence rejected: QA report commands do not match required commands exactly once.")
+            self._check_match("covered_criterion_ids_recomputed", tuple(meta.extra.get("covered_criterion_ids") or ()), report_coverage)
+            self._check_match("required_test_command_count_recomputed", meta.extra.get("required_test_command_count"), len(required_commands))
+            self._check_match("negative_scenario_count_recomputed", meta.extra.get("negative_scenario_count"), len(report_negative))
+            self._check_match("uncovered_risk_count_recomputed", meta.extra.get("uncovered_risk_count"), len(report_risks))
+            expected_defect_count = len(report_defects) + (0 if result_exit_codes and all(code == 0 for code in result_exit_codes) else 1)
+            self._check_match("defect_count_recomputed", meta.extra.get("defect_count"), expected_defect_count)
+            self._check_match("test_exit_codes_recomputed", exit_codes, result_exit_codes)
+            if decision == "PASS":
+                if ctx.transition_to != "PENDING_USER_ACCEPTANCE":
+                    raise EvidenceGateError("Evidence rejected: QA PASS has an invalid transition target.")
+                if not meta.extra.get("covered_criterion_ids"):
+                    raise EvidenceGateError("Evidence rejected: QA PASS has no acceptance coverage.")
+                if int(meta.extra.get("required_test_command_count", 0)) < 1:
+                    raise EvidenceGateError("Evidence rejected: QA PASS has no required command evidence.")
+                if int(meta.extra.get("negative_scenario_count", 0)) < 1:
+                    raise EvidenceGateError("Evidence rejected: QA PASS has no negative scenario evidence.")
+                if int(meta.extra.get("uncovered_risk_count", 0)) != 0:
+                    raise EvidenceGateError("Evidence rejected: QA PASS contains uncovered risks.")
+                if int(meta.extra.get("defect_count", 0)) != 0:
+                    raise EvidenceGateError("Evidence rejected: QA PASS contains defects.")
+                if not exit_codes or any(code != 0 for code in exit_codes):
+                    raise EvidenceGateError("Evidence rejected: QA PASS contains a failing or missing test command.")
+            elif decision == "FAIL":
+                if ctx.transition_to != "BUILDING":
+                    raise EvidenceGateError("Evidence rejected: QA FAIL has an invalid transition target.")
+                if int(meta.extra.get("defect_count", 0)) < 1:
+                    raise EvidenceGateError("Evidence rejected: QA FAIL must contain a structured defect.")
+            else:
+                raise EvidenceGateError(f"Evidence rejected: Unknown QA decision '{decision}'.")
 
         # 5. Artifact Validation
         if record.evidence_type == EvidenceType.TASK_COMPLETE:

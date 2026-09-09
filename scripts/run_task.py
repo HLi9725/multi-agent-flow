@@ -50,8 +50,8 @@ def cmd_start(args):
         overrides["builder_timeout_seconds"] = args.timeout_seconds
         overrides["reviewer_timeout_seconds"] = args.timeout_seconds
         overrides["qa_timeout_seconds"] = args.timeout_seconds
-    if args.test_command:
-        overrides["test_command"] = args.test_command
+    if args.test_commands:
+        overrides["test_commands"] = tuple(args.test_commands)
     if args.workspace_mode:
         overrides["workspace_mode"] = args.workspace_mode
 
@@ -123,7 +123,13 @@ def main():
     p_start.add_argument("--max-review-cycles", type=int, default=3, help="Max review rejection loop cycles")
     p_start.add_argument("--max-qa-cycles", type=int, default=3, help="Max QA failure loop cycles")
     p_start.add_argument("--timeout-seconds", type=int, default=300, help="Timeout per host dispatch")
-    p_start.add_argument("--test-command", default=None, help="Test command to run in QA")
+    p_start.add_argument(
+        "--test-command",
+        dest="test_commands",
+        action="append",
+        default=None,
+        help="Controlled QA command; repeat the option to require backend, frontend, and build checks",
+    )
     p_start.add_argument("--workspace-mode", default="branch", choices=["branch", "inherit", "share"], help="Workspace isolation mode")
     p_start.set_defaults(func=cmd_start)
 

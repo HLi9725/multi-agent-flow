@@ -211,6 +211,104 @@ def test_reviewer_schema_adversarial_rejections(mock_git_repo, tmp_path):
     assert "INVALID-PASS" in res4.defects[0]["defect_id"]
 
 
+def test_qa_schema_and_semantic_coverage_fail_closed():
+    runner = object.__new__(ProductionRunner)
+    baseline = "a" * 40
+    candidate = "b" * 40
+    criteria_hash = hashlib.sha256(b"criteria").hexdigest()
+
+    valid = {
+        "task_id": "T0077",
+        "baseline_commit": baseline,
+        "candidate_commit": candidate,
+        "session_id": "sess_qa_1",
+        "qa_request_id": "qa_req_1",
+        "acceptance_criteria_hash": criteria_hash,
+        "decision": "PASS",
+        "acceptance_coverage": [
+            {"criterion_id": "AC-01", "status": "PASS", "evidence": "tests/test_api.py::test_ok"},
+            {"criterion_id": "AC-02", "status": "PASS", "evidence": "tests/test_api.py::test_401"},
+        ],
+        "test_commands": [
+            {"command": "python -m pytest -q", "exit_code": 0, "summary": "2 passed"},
+        ],
+        "negative_scenarios": [
+            {"name": "unauthenticated request", "status": "PASS", "evidence": "test_401"},
+        ],
+        "uncovered_risks": [],
+        "defects": [],
+        "summary": "All criteria covered.",
+    }
+    kwargs = {
+        "task_id": "T0077",
+        "baseline_commit": baseline,
+        "candidate_commit": candidate,
+        "session_id": "sess_qa_1",
+        "invocation_id": "inv_qa_1",
+        "qa_request_id": "qa_req_1",
+        "acceptance_criteria_hash": criteria_hash,
+        "expected_criterion_ids": ["AC-01", "AC-02"],
+        "expected_test_commands": ["python -m pytest -q"],
+    }
+
+    parsed = runner._parse_qa_structured_json(json.dumps(valid), **kwargs)
+    assert parsed.decision == "PASS"
+
+    plain_text = runner._parse_qa_structured_json("all tests passed", **kwargs)
+    assert plain_text.decision == "FAIL"
+    assert "SCHEMA-VIOLATION" in plain_text.defects[0]["defect_id"]
+
+    missing_criterion = dict(valid)
+    missing_criterion["acceptance_coverage"] = valid["acceptance_coverage"][:1]
+    parsed = runner._parse_qa_structured_json(json.dumps(missing_criterion), **kwargs)
+    assert parsed.decision == "FAIL"
+    assert "COVERAGE-GAP" in parsed.defects[0]["defect_id"]
+
+    no_negative = dict(valid)
+    no_negative["negative_scenarios"] = []
+    parsed = runner._parse_qa_structured_json(json.dumps(no_negative), **kwargs)
+    assert parsed.decision == "FAIL"
+    assert "NEGATIVE-GAP" in parsed.defects[0]["defect_id"]
+
+    uncovered = dict(valid)
+    uncovered["uncovered_risks"] = ["OpenAPI contract was not checked"]
+    parsed = runner._parse_qa_structured_json(json.dumps(uncovered), **kwargs)
+    assert parsed.decision == "FAIL"
+    assert "UNCOVERED-RISK" in parsed.defects[0]["defect_id"]
+
+    extra_command = dict(valid)
+    extra_command["test_commands"] = valid["test_commands"] + [
+        {"command": "npm run build", "exit_code": 0, "summary": "built"},
+    ]
+    parsed = runner._parse_qa_structured_json(json.dumps(extra_command), **kwargs)
+    assert parsed.decision == "FAIL"
+    assert "COMMAND-GAP" in parsed.defects[0]["defect_id"]
+
+
+def test_task_execution_spec_normalizes_and_deduplicates_test_commands(tmp_path):
+    base = {
+        "project_id": "project",
+        "project_root": str(tmp_path),
+        "authority_root": str(tmp_path),
+        "task_id": "T0077",
+        "task_name": "test",
+        "requirement_text": "requirement",
+        "acceptance_criteria": "验收标准: pass",
+        "acceptance_criteria_hash": hashlib.sha256("验收标准: pass".encode("utf-8")).hexdigest(),
+        "task_version": "1",
+        "status_at_read": "进行中",
+    }
+    one = TaskExecutionSpec(**base, test_commands="python -m pytest -q")
+    assert one.test_commands == ("python -m pytest -q",)
+
+    duplicate = TaskExecutionSpec(
+        **base,
+        test_command="python -m pytest -q",
+        test_commands=("python -m pytest -q", " npm run build ", "npm run build"),
+    )
+    assert duplicate.test_commands == ("python -m pytest -q", "npm run build")
+
+
 def test_agent_result_status_and_identity_validation():
     """
     P1 对抗测试：
@@ -299,6 +397,10 @@ def test_qa_test_command_security_and_path_boundary_validation(tmp_path):
     ok, err, args = _validate_qa_test_command("python -m pytest tests/ -q", worktree_dir)
     assert ok is True
     assert args == ["python", "-m", "pytest", "tests/", "-q"]
+
+    ok, err, args = _validate_qa_test_command("npm run build", worktree_dir)
+    assert ok is True
+    assert args == ["npm", "run", "build"]
 
     # Windows quoted absolute interpreter is accepted only when it is the
     # currently trusted Python executable.

@@ -37,7 +37,7 @@
 | **`/yy-flow kanban`** | **启动看板 Web 服务**：本地启动可视化看板服务并输出实际访问链接（默认 32886 端口） |
 | **`/yy-flow sync-pr`** | **PR 状态监听与合流解阻**：扫描【已阻塞】任务，检测 GitHub PR Merged 自动推进至【已完成】并唤起 PM 验收 |
 | **`/yy-flow auto`** | **纯模拟状态链**：零写入演示 A–G 类型流转，不调用真实 Host、不修改看板 |
-| **`/yy-flow run`** | **真实自动编排（2F-PROD 通用 Runner）**：读取任务并自动执行 Codex Builder → Antigravity Reviewer (JSON Schema) → Codex QA (源码不可变)，通过 EvidenceGate 验证后停在等待用户验收 |
+| **`/yy-flow run`** | **真实自动编排（2F-PROD 通用 Runner）**：读取带逐项验收标准的任务，串行执行 Builder → Reviewer → QA；要求影响面审查、逐项验收覆盖、反向场景和受控命令证据，通过语义 EvidenceGate 后停在等待用户验收 |
 
 > 💡 **业务流转与协同全走自然语言**：需求拆解建卡、阶段开工、阶段结项、认领、提审、测试与打回等日常研发生命周期，直接使用自然语言与 Agent 对话沟通，由对应专家在后台自主调度底层脚本。
 
@@ -115,6 +115,24 @@ Agent 将自动执行 7 步标准初始化：
 | **阶段结项** | “结束当前阶段 S1” / `/yy-flow gate S1` | 自动运行 `check_stage_gate.py` 进行 5 项硬核验，全绿后触发 DevOps 合流打 Tag |
 | **PR 合流解阻** | “同步 PR 状态” / `/yy-flow sync-pr` | 自动感知 GitHub PR Merged 状态，秒级解除【已阻塞】推至【已完成】并通知 PM 验收 |
 
+### Production Runner 的准出要求
+
+正式 A 类任务不能只写“功能正常”或“全量测试通过”。任务卡必须包含明确的 `验收标准:` 段落，每一项应能对应具体入口、正向结果和异常/反向场景；缺少时 Runner 会停止，不会让 Agent 自行猜测。
+
+Runner 的 Reviewer 会收到固定候选差异、变更文件、公开符号引用和适用影响面提示，不能只凭已有测试为绿放行。QA 必须返回结构化的逐项覆盖矩阵、至少一个独立反向场景、所有受控命令结果和未覆盖风险；Runner 随后会在同一候选提交上独立复跑命令，EvidenceGate 再从磁盘 Evidence 重算报告与命令哈希。任何缺项、身份/SHA 不匹配、未覆盖风险或命令失败都会自动打回。
+
+```powershell
+# 一个命令
+python scripts/run_task.py start --task-id T0003 --test-command "python -m pytest tests -q"
+
+# 后端、前端等多项门禁：重复传入 --test-command
+python scripts/run_task.py start --task-id T0003 `
+  --test-command "python -m pytest tests -q" `
+  --test-command "npm run build"
+```
+
+`status` 是纯只读查询；`resume` 用于审批或故障消除后的断点恢复。Runner 成功只停在【已完成】/`PENDING_USER_ACCEPTANCE`，不会替用户验收、合并、Push 或创建 Tag。
+
 ---
 
 ## 🚀 本地可视化看板启动
@@ -172,7 +190,7 @@ python scripts/start_kanban_server.py
 ├── config/                  # 工作流与架构配置模板
 ├── references/              # 6 大核心规范（路由/流转/防错/Git/文档/交接）
 ├── templates/               # 标准化报告与文档模板
-├── tests/                   # 217 项自动化测试套件（覆盖 14 大模块）
+├── tests/                   # 450+ 项自动化测试套件（覆盖 Runner、Evidence、角色导出等模块）
 └── scripts/                 # 初始化/流转/门禁/度量/看板服务/PR解阻 CLI 引擎
 
 # 初始化后在目标项目生成：

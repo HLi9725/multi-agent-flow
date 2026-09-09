@@ -30,7 +30,7 @@ except Exception:
         import paths
 from ..boards.board_adapter_factory import get_board_adapter
 from ..boards.offline_board_adapter import OfflineBoardAdapter
-from .runner_schema import TaskExecutionSpec
+from .runner_schema import AcceptanceCriterion, TaskExecutionSpec
 
 
 class TaskSpecError(Exception):
@@ -85,17 +85,115 @@ def _get_git_head_and_branch(repo_path: str) -> Tuple[str, str]:
     return head_sha, branch_name
 
 
-def _extract_acceptance_criteria(task_name: str, requirement_text: str) -> Tuple[str, str]:
-    """从需求正文与任务名称中提取规范的验收标准文本与哈希"""
-    acceptance_criteria = f"验收标准: 完成【{task_name}】的实现与验证，代码通过独立审查与测试全量回归，满足规范要求。"
-    if "验收标准" in requirement_text:
-        remainder = requirement_text.split("验收标准", 1)[1].strip().lstrip(":：").strip()
-        first_line = remainder.splitlines()[0].strip().rstrip("。") if remainder else ""
-        if first_line:
-            acceptance_criteria = f"验收标准: {first_line}"
+def _is_acceptance_section_boundary(line: str) -> bool:
+    """识别验收标准之后的新章节或看板流程节点。"""
+    stripped = line.strip()
+    if not stripped:
+        return False
+    if re.match(r"^\[T\d+-N\d+\]", stripped):
+        return True
+    if re.match(r"^#{1,6}\s+", stripped):
+        return True
+    if stripped.startswith("【") and "验收标准" not in stripped:
+        return True
+    if re.match(r"^[一二三四五六七八九十]+[、.]", stripped):
+        return True
+    return False
 
-    criteria_hash = hashlib.sha256(acceptance_criteria.strip().encode("utf-8")).hexdigest()
-    return acceptance_criteria, criteria_hash
+
+def _normalise_acceptance_line(line: str) -> str:
+    stripped = line.strip()
+    stripped = re.sub(r"^(?:[-*+]\s+|\d+[.)、]\s*)", "", stripped)
+    return stripped.strip().rstrip("。")
+
+
+def _compose_requirement_text(
+    task_name: str,
+    description: str,
+    remarks: str,
+    process: str,
+) -> str:
+    """Prefer stable requirement fields; use process only for legacy boards.
+
+    ``process`` is normally an append-only transition log.  Including it when
+    description/remarks already contain the requirement would change the
+    immutable task hash after every workflow transition and can also hide the
+    actual requirement behind operational history.
+    """
+    description = description.strip()
+    remarks = remarks.strip()
+    acceptance_marker = re.compile(r"(?:【\s*验收标准\s*】\s*[:：]?|验收标准\s*[:：])")
+    requirement_lines = []
+    for line in process.splitlines():
+        # append_process_node writes a multi-line audit block.  Everything from
+        # the first node marker onward is mutable workflow history.
+        if re.match(r"^\s*\[T\d+-N\d+\]", line):
+            break
+        requirement_lines.append(line)
+    process_without_history = "\n".join(requirement_lines).strip()
+    if remarks and acceptance_marker.search(remarks):
+        return "\n\n".join(part for part in (description, remarks) if part)
+    if description and acceptance_marker.search(description):
+        return description
+    if process_without_history and acceptance_marker.search(process_without_history):
+        return "\n\n".join(part for part in (description, process_without_history) if part)
+    return description or remarks or process_without_history or task_name.strip()
+
+
+def _extract_acceptance_criteria(
+    task_name: str,
+    requirement_text: str,
+) -> Tuple[str, str, Tuple[AcceptanceCriterion, ...]]:
+    """完整提取多行验收标准，并生成稳定的逐项 ID 与哈希。"""
+    marker = re.search(
+        r"(?:【\s*验收标准\s*】\s*[:：]?|验收标准\s*[:：])",
+        requirement_text,
+    )
+    if marker is None:
+        return "", "", ()
+
+    remainder = requirement_text[marker.end():]
+    lines = remainder.splitlines()
+    criteria_texts = []
+    blank_after_content = False
+
+    for raw_line in lines:
+        stripped = raw_line.strip()
+        if not stripped:
+            if criteria_texts:
+                blank_after_content = True
+            continue
+        if _is_acceptance_section_boundary(stripped):
+            break
+
+        is_list_item = bool(re.match(r"^(?:[-*+]\s+|\d+[.)、]\s*)", stripped))
+        if blank_after_content and not is_list_item:
+            break
+
+        criterion = _normalise_acceptance_line(stripped)
+        if criterion:
+            criteria_texts.append(criterion)
+        blank_after_content = False
+
+    # 支持“验收标准: 单行内容”且后续没有换行的常见写法。
+    if not criteria_texts:
+        inline = _normalise_acceptance_line(remainder.strip())
+        if inline:
+            criteria_texts.append(inline)
+
+    items = tuple(
+        AcceptanceCriterion(criterion_id=f"AC-{index:02d}", text=text)
+        for index, text in enumerate(criteria_texts, start=1)
+    )
+    if not items:
+        return "", "", ()
+
+    if len(items) == 1:
+        acceptance_criteria = f"验收标准: {items[0].text}"
+    else:
+        acceptance_criteria = "验收标准:\n" + "\n".join(f"- {item.text}" for item in items)
+    criteria_hash = hashlib.sha256(acceptance_criteria.encode("utf-8")).hexdigest()
+    return acceptance_criteria, criteria_hash, items
 
 
 def load_task_execution_spec(
@@ -185,17 +283,32 @@ def load_task_execution_spec(
         )
 
     # 提取需求正文与验收标准
-    process_remarks = str(fields.get("process") or fields.get("remarks") or record.get("process") or record.get("remarks") or "").strip()
+    process_text = str(fields.get("process") or record.get("process") or "").strip()
+    remarks_text = str(fields.get("remarks") or record.get("remarks") or "").strip()
     desc = str(fields.get("description") or record.get("description") or "").strip()
 
-    requirement_text = process_remarks or desc or task_name
+    requirement_text = _compose_requirement_text(task_name, desc, remarks_text, process_text)
     if not requirement_text:
         raise TaskSpecIncompleteError(f"Task '{task_id}' has no requirement text or process description.")
 
-    acceptance_criteria, acceptance_criteria_hash = _extract_acceptance_criteria(task_name, requirement_text)
+    acceptance_criteria, acceptance_criteria_hash, acceptance_criteria_items = _extract_acceptance_criteria(
+        task_name,
+        requirement_text,
+    )
+    if task_type == "A" and not acceptance_criteria_items:
+        raise TaskSpecIncompleteError(
+            f"Task '{task_id}' is A-class but has no explicit, executable acceptance criteria. "
+            "Add an '验收标准' section before starting Production Runner."
+        )
+    if not acceptance_criteria_items:
+        fallback = f"完成【{task_name}】的实现与验证"
+        acceptance_criteria_items = (AcceptanceCriterion("AC-01", fallback),)
+        acceptance_criteria = f"验收标准: {fallback}"
+        acceptance_criteria_hash = hashlib.sha256(acceptance_criteria.encode("utf-8")).hexdigest()
+    requirement_hash = hashlib.sha256(requirement_text.strip().encode("utf-8")).hexdigest()
 
     # 任务版本与更新标识
-    task_version = str(fields.get("updated_at") or record.get("updated_at") or fields.get("seq") or record.get("seq") or hashlib.sha256(process_remarks.encode("utf-8")).hexdigest()[:16])
+    task_version = str(fields.get("updated_at") or record.get("updated_at") or fields.get("seq") or record.get("seq") or requirement_hash[:16])
 
     # Git 基线获取
     baseline_commit, baseline_branch = _get_git_head_and_branch(norm_project_root)
@@ -217,6 +330,7 @@ def load_task_execution_spec(
         acceptance_criteria_hash=acceptance_criteria_hash,
         task_version=task_version,
         status_at_read=status,
+        requirement_hash=requirement_hash,
         owner=owner,
         handler=handler,
         task_type=task_type,
@@ -228,6 +342,8 @@ def load_task_execution_spec(
         workspace_mode=str(ov.get("workspace_mode", "branch")),
         worktree_root=ov.get("worktree_root"),
         test_command=ov.get("test_command"),
+        test_commands=ov.get("test_commands") or (),
+        acceptance_criteria_items=acceptance_criteria_items,
         builder_timeout_seconds=int(ov.get("builder_timeout_seconds", 300)),
         reviewer_timeout_seconds=int(ov.get("reviewer_timeout_seconds", 300)),
         qa_timeout_seconds=int(ov.get("qa_timeout_seconds", 300)),
@@ -243,7 +359,13 @@ def load_task_execution_spec(
     return spec
 
 
-def verify_optimistic_concurrency(spec: TaskExecutionSpec, board_adapter: Optional[Any] = None) -> bool:
+def verify_optimistic_concurrency(
+    spec: TaskExecutionSpec,
+    board_adapter: Optional[Any] = None,
+    *,
+    enforce_status: bool = True,
+    enforce_version: bool = True,
+) -> bool:
     """
     在执行真实状态流转前，对权威看板进行严格乐观并发检查。
     比对任务是否存在、当前状态是否与读取时一致、验收标准哈希是否一致、版本是否一致、是否终态。
@@ -276,22 +398,26 @@ def verify_optimistic_concurrency(spec: TaskExecutionSpec, board_adapter: Option
             return False
 
         # 2. 状态一致性检查（必须等于 spec.status_at_read）
-        if spec.status_at_read and current_status != spec.status_at_read:
+        if enforce_status and spec.status_at_read and current_status != spec.status_at_read:
             return False
 
         # 3. 验收标准与需求正文哈希校验
         task_name = str(fields.get("name") or fields.get("task_name") or record.get("name") or "").strip()
-        process_remarks = str(fields.get("process") or fields.get("remarks") or record.get("process") or record.get("remarks") or "").strip()
+        process_text = str(fields.get("process") or record.get("process") or "").strip()
+        remarks_text = str(fields.get("remarks") or record.get("remarks") or "").strip()
         desc = str(fields.get("description") or record.get("description") or "").strip()
-        live_req = process_remarks or desc or task_name
+        live_req = _compose_requirement_text(task_name, desc, remarks_text, process_text)
 
-        _, live_criteria_hash = _extract_acceptance_criteria(task_name, live_req)
+        _, live_criteria_hash, _ = _extract_acceptance_criteria(task_name, live_req)
         if spec.acceptance_criteria_hash and live_criteria_hash != spec.acceptance_criteria_hash:
+            return False
+        live_requirement_hash = hashlib.sha256(live_req.strip().encode("utf-8")).hexdigest()
+        if spec.requirement_hash and live_requirement_hash != spec.requirement_hash:
             return False
 
         # 4. 任务版本校验
-        live_version = str(fields.get("updated_at") or record.get("updated_at") or fields.get("seq") or record.get("seq") or hashlib.sha256(process_remarks.encode("utf-8")).hexdigest()[:16])
-        if spec.task_version and live_version != spec.task_version:
+        live_version = str(fields.get("updated_at") or record.get("updated_at") or fields.get("seq") or record.get("seq") or live_requirement_hash[:16])
+        if enforce_version and spec.task_version and live_version != spec.task_version:
             return False
 
         return True

@@ -5,6 +5,7 @@ Universal Production Orchestration Runner for multi-agent-flow.
 Production-grade universal automatic runner for arbitrary projects and tasks.
 """
 from dataclasses import dataclass, field, replace
+import hashlib
 import json
 import os
 import re
@@ -72,7 +73,9 @@ from .orchestrator_schema import (
 )
 from .runner_checkpoint_store import RunnerCheckpointStore, _validate_task_id
 from .runner_schema import (
+    QA_JSON_SCHEMA,
     REVIEWER_JSON_SCHEMA,
+    QAStructuredOutput,
     ReviewerStructuredOutput,
     RunnerCheckpoint,
     RunnerResult,
@@ -195,8 +198,10 @@ def _validate_qa_test_command(test_cmd: str, worktree_dir: str) -> Tuple[bool, O
             runner_args = args[2:]
         elif args[1:3] == ["run", "test"]:
             runner_args = args[3:]
+        elif args[1:3] == ["run", "build"]:
+            runner_args = args[3:]
         else:
-            return False, "npm QA commands are limited to 'npm test' or 'npm run test'", []
+            return False, "npm QA commands are limited to 'npm test', 'npm run test', or 'npm run build'", []
     elif base_bin in {"npx", "npx.cmd", "npx.exe"}:
         if len(args) < 2 or args[1].lower() not in {"jest", "vitest", "mocha"}:
             return False, "npx QA commands are limited to jest, vitest, or mocha", []
@@ -287,6 +292,79 @@ def _validate_reviewer_schema_builtin(data: Any) -> Tuple[bool, Optional[str]]:
         return False, "summary must be a string"
     if set(data) != set(required_fields):
         return False, "Reviewer output contains unknown additional properties"
+    return True, None
+
+
+def _validate_qa_schema_builtin(data: Any) -> Tuple[bool, Optional[str]]:
+    """Strictly validate QA identity, coverage, negative cases, and command evidence."""
+    if not isinstance(data, dict):
+        return False, "Root must be a JSON object"
+    required_fields = list(QA_JSON_SCHEMA["required"])
+    actual_fields = set(data)
+    if actual_fields != set(required_fields):
+        missing = sorted(set(required_fields) - actual_fields)
+        unknown = sorted(actual_fields - set(required_fields))
+        return False, f"QA output fields mismatch; missing={missing}, unknown={unknown}"
+
+    non_empty_strings = (
+        "task_id",
+        "baseline_commit",
+        "candidate_commit",
+        "session_id",
+        "qa_request_id",
+        "acceptance_criteria_hash",
+        "summary",
+    )
+    for field_name in non_empty_strings:
+        if not isinstance(data[field_name], str) or not data[field_name].strip():
+            return False, f"{field_name} must be a non-empty string"
+    if not re.fullmatch(r"[0-9a-f]{40}", data["baseline_commit"]):
+        return False, "baseline_commit must be a 40-hex character SHA"
+    if not re.fullmatch(r"[0-9a-f]{40}", data["candidate_commit"]):
+        return False, "candidate_commit must be a 40-hex character SHA"
+    if not re.fullmatch(r"[0-9a-f]{64}", data["acceptance_criteria_hash"]):
+        return False, "acceptance_criteria_hash must be a 64-hex character SHA"
+    if data["decision"] not in ("PASS", "FAIL"):
+        return False, "decision must be 'PASS' or 'FAIL'"
+
+    item_contracts = {
+        "acceptance_coverage": ({"criterion_id", "status", "evidence"}, "criterion_id"),
+        "test_commands": ({"command", "exit_code", "summary"}, "command"),
+        "negative_scenarios": ({"name", "status", "evidence"}, "name"),
+    }
+    for collection_name, (allowed_fields, identity_field) in item_contracts.items():
+        value = data[collection_name]
+        if not isinstance(value, list):
+            return False, f"{collection_name} must be an array"
+        for item in value:
+            if not isinstance(item, dict) or set(item) != allowed_fields:
+                return False, f"{collection_name} items must contain only {sorted(allowed_fields)}"
+            if not isinstance(item[identity_field], str) or not item[identity_field].strip():
+                return False, f"{collection_name}.{identity_field} must be a non-empty string"
+            if collection_name == "test_commands":
+                if not isinstance(item["exit_code"], int) or isinstance(item["exit_code"], bool):
+                    return False, "test_commands.exit_code must be an integer"
+                if not isinstance(item["summary"], str) or not item["summary"].strip():
+                    return False, "test_commands.summary must be a non-empty string"
+            else:
+                if item["status"] not in ("PASS", "FAIL"):
+                    return False, f"{collection_name}.status must be PASS or FAIL"
+                if not isinstance(item["evidence"], str) or not item["evidence"].strip():
+                    return False, f"{collection_name}.evidence must be a non-empty string"
+
+    if not isinstance(data["uncovered_risks"], list) or any(
+        not isinstance(item, str) or not item.strip() for item in data["uncovered_risks"]
+    ):
+        return False, "uncovered_risks must be an array of non-empty strings"
+    if not isinstance(data["defects"], list):
+        return False, "defects must be an array"
+    for defect in data["defects"]:
+        if not isinstance(defect, dict):
+            return False, "defects items must be objects"
+        if not defect.get("defect_id") or not defect.get("severity") or not defect.get("description"):
+            return False, "defect item missing defect_id, severity, or description"
+        if defect["severity"] not in ("P0", "P1", "P2", "P3"):
+            return False, "defect severity must be P0, P1, P2, or P3"
     return True, None
 
 
@@ -494,7 +572,66 @@ class ProductionRunner:
             encoding="utf-8",
             errors="replace",
         )
-        bundle = f"DIFF STAT:\n{stat or '(no stat)'}\n\nPATCH:\n{patch}"
+        changed_output = subprocess.check_output(
+            ["git", "diff", "--name-only", baseline_commit, candidate_commit, "--"],
+            cwd=worktree_dir,
+            stderr=subprocess.STDOUT,
+            encoding="utf-8",
+            errors="replace",
+        )
+        changed_files = tuple(line.strip() for line in changed_output.splitlines() if line.strip())
+
+        symbols = []
+        symbol_pattern = re.compile(
+            r"^\+\s*(?:(?:async\s+)?def|class|function|const|let|var)\s+([A-Za-z_$][\w$]*)",
+            re.MULTILINE,
+        )
+        for symbol in symbol_pattern.findall(patch):
+            if len(symbol) >= 4 and symbol not in symbols:
+                symbols.append(symbol)
+            if len(symbols) >= 20:
+                break
+
+        reference_lines = []
+        for symbol in symbols:
+            proc = subprocess.run(
+                ["git", "grep", "-n", "-F", symbol, candidate_commit, "--"],
+                cwd=worktree_dir,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            if proc.returncode not in (0, 1):
+                raise ProductionRunnerError(
+                    f"Unable to build Reviewer repository impact index for symbol '{symbol}'."
+                )
+            matches = [line for line in proc.stdout.splitlines() if line.strip()][:8]
+            if matches:
+                reference_lines.append(f"[{symbol}]\n" + "\n".join(matches))
+
+        surfaces = []
+        lower_paths = tuple(path.lower().replace("\\", "/") for path in changed_files)
+        if any("/api/" in f"/{path}" or "/schemas/" in f"/{path}" for path in lower_paths):
+            surfaces.append("API/schema changed: verify runtime API, persisted contract, generated SDK, and every caller.")
+        if any("/models/" in f"/{path}" or "migration" in path or "/database" in path for path in lower_paths):
+            surfaces.append("Model/database changed: verify migration, existing-data compatibility, indexes, and isolation.")
+        if any(path.endswith((".ts", ".tsx", ".js", ".jsx", ".vue")) for path in lower_paths):
+            surfaces.append("Frontend changed: verify production build, generated clients, routing, and visible error states.")
+        if any("auth" in path or "security" in path or "permission" in path for path in lower_paths):
+            surfaces.append("Security boundary changed: verify unauthenticated, unauthorized, and cross-user negative paths.")
+        if not surfaces:
+            surfaces.append("Trace every changed public symbol to unchanged callers and relevant regression tests.")
+
+        impact = (
+            "CHANGED FILES:\n"
+            + ("\n".join(changed_files) or "(none)")
+            + "\n\nMANDATORY IMPACT CHECKS:\n- "
+            + "\n- ".join(surfaces)
+            + "\n\nREPOSITORY REFERENCE INDEX:\n"
+            + ("\n\n".join(reference_lines) or "(no changed public symbols detected)")
+        )
+        bundle = f"DIFF STAT:\n{stat or '(no stat)'}\n\n{impact}\n\nPATCH:\n{patch}"
         if not patch.strip():
             raise ProductionRunnerError("Reviewer bundle contains no candidate diff (Fail-Closed).")
         if len(bundle) > max_chars:
@@ -786,6 +923,139 @@ class ProductionRunner:
             decision=decision,
             defects=tuple(raw_defects),
             summary=json_obj.get("summary", ""),
+        )
+
+    def _parse_qa_structured_json(
+        self,
+        raw_output: str,
+        task_id: str,
+        baseline_commit: str,
+        candidate_commit: str,
+        session_id: str,
+        invocation_id: str,
+        qa_request_id: str,
+        acceptance_criteria_hash: str,
+        expected_criterion_ids: Sequence[str],
+        expected_test_commands: Sequence[str],
+    ) -> QAStructuredOutput:
+        """Parse QA output and fail closed on identity, coverage, or adversarial-test gaps."""
+
+        def failed(defect_suffix: str, description: str) -> QAStructuredOutput:
+            return QAStructuredOutput(
+                task_id=task_id,
+                baseline_commit=baseline_commit,
+                candidate_commit=candidate_commit,
+                session_id=session_id,
+                host_invocation_id=invocation_id,
+                qa_request_id=qa_request_id,
+                acceptance_criteria_hash=acceptance_criteria_hash,
+                decision="FAIL",
+                uncovered_risks=(description,),
+                defects=({
+                    "defect_id": f"DEF-{task_id}-{defect_suffix}",
+                    "severity": "P1",
+                    "description": description,
+                },),
+                summary=description,
+            )
+
+        json_obj: Optional[Dict[str, Any]] = None
+        cleaned = raw_output.strip()
+        if cleaned.startswith("{") and cleaned.endswith("}"):
+            try:
+                json_obj = json.loads(cleaned)
+            except Exception:
+                json_obj = None
+        if json_obj is None:
+            match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw_output, re.DOTALL)
+            if match:
+                try:
+                    json_obj = json.loads(match.group(1))
+                except Exception:
+                    json_obj = None
+        if json_obj is None:
+            return failed("QA-SCHEMA-VIOLATION", "QA did not return a valid structured JSON object.")
+
+        valid, error = _validate_qa_schema_builtin(json_obj)
+        if not valid:
+            return failed("QA-SCHEMA-VIOLATION", f"QA JSON failed schema validation: {error}")
+
+        expected_identity = {
+            "task_id": task_id,
+            "baseline_commit": baseline_commit,
+            "candidate_commit": candidate_commit,
+            "session_id": session_id,
+            "qa_request_id": qa_request_id,
+            "acceptance_criteria_hash": acceptance_criteria_hash,
+        }
+        mismatches = [
+            f"{name} mismatch: expected '{expected}', got '{json_obj.get(name)}'"
+            for name, expected in expected_identity.items()
+            if json_obj.get(name) != expected
+        ]
+        if mismatches:
+            return failed("QA-IDENTITY-MISMATCH", "; ".join(mismatches))
+
+        decision = json_obj["decision"]
+        defects = tuple(json_obj["defects"])
+        uncovered_risks = tuple(json_obj["uncovered_risks"])
+        coverage = tuple(json_obj["acceptance_coverage"])
+        command_reports = tuple(json_obj["test_commands"])
+        negative_scenarios = tuple(json_obj["negative_scenarios"])
+
+        if decision == "PASS":
+            expected_ids = tuple(expected_criterion_ids)
+            actual_ids = tuple(item["criterion_id"] for item in coverage)
+            if len(actual_ids) != len(set(actual_ids)) or set(actual_ids) != set(expected_ids):
+                return failed(
+                    "QA-COVERAGE-GAP",
+                    f"QA acceptance coverage must match every criterion exactly once; expected={list(expected_ids)}, actual={list(actual_ids)}",
+                )
+            if any(item["status"] != "PASS" for item in coverage):
+                return failed("QA-COVERAGE-FAIL", "QA cannot PASS while an acceptance criterion is not PASS.")
+
+            reported_commands = tuple(item["command"] for item in command_reports)
+            reports_by_command = {item["command"]: item for item in command_reports}
+            missing_commands = [command for command in expected_test_commands if command not in reports_by_command]
+            unexpected_commands = [command for command in reported_commands if command not in expected_test_commands]
+            duplicate_commands = len(reported_commands) != len(set(reported_commands))
+            failed_commands = [
+                command for command in expected_test_commands
+                if command in reports_by_command and reports_by_command[command]["exit_code"] != 0
+            ]
+            if missing_commands or unexpected_commands or duplicate_commands or failed_commands:
+                return failed(
+                    "QA-COMMAND-GAP",
+                    "QA command evidence must match every required command exactly once; "
+                    f"missing={missing_commands}, unexpected={unexpected_commands}, "
+                    f"duplicates={duplicate_commands}, failed={failed_commands}",
+                )
+            if not negative_scenarios:
+                return failed("QA-NEGATIVE-GAP", "QA PASS requires at least one independently verified negative scenario.")
+            if any(item["status"] != "PASS" for item in negative_scenarios):
+                return failed("QA-NEGATIVE-FAIL", "QA cannot PASS while a negative scenario is not PASS.")
+            if uncovered_risks:
+                return failed("QA-UNCOVERED-RISK", "QA cannot PASS with uncovered risks: " + "; ".join(uncovered_risks))
+            if defects:
+                return failed("QA-INVALID-PASS", "QA returned PASS with non-empty defects.")
+        elif not defects:
+            return failed("QA-INVALID-FAIL", "QA returned FAIL without structured defects.")
+
+        return QAStructuredOutput(
+            task_id=task_id,
+            baseline_commit=baseline_commit,
+            candidate_commit=candidate_commit,
+            session_id=session_id,
+            host_invocation_id=invocation_id,
+            qa_request_id=qa_request_id,
+            acceptance_criteria_hash=acceptance_criteria_hash,
+            decision=decision,
+            acceptance_coverage=coverage,
+            test_commands=command_reports,
+            negative_scenarios=negative_scenarios,
+            uncovered_risks=uncovered_risks,
+            defects=defects,
+            summary=json_obj["summary"],
         )
 
     def start(
@@ -1246,6 +1516,19 @@ class ProductionRunner:
             # STAGE 2: ANTIGRAVITY REVIEWER
             # ==========================================
             if not skip_reviewer:
+                if not verify_optimistic_concurrency(
+                    spec,
+                    enforce_status=False,
+                    enforce_version=False,
+                ):
+                    return RunnerResult(
+                        success=False,
+                        state=RunnerState.NEEDS_USER_INPUT.value,
+                        task_id=task_id,
+                        candidate_commit=candidate_commit,
+                        evidence_ids=tuple(evidence_ids),
+                        message="Task requirements or acceptance criteria changed before Reviewer dispatch.",
+                    )
                 review_cycle += 1
                 sess_reviewer = f"sess_reviewer_runner_{task_id.lower()}_{int(time.time()*1000)}"
                 review_request_id = f"rev_req_{uuid.uuid4().hex}"
@@ -1558,6 +1841,19 @@ class ProductionRunner:
             # ==========================================
             # STAGE 3: CODEX QA
             # ==========================================
+            if not verify_optimistic_concurrency(
+                spec,
+                enforce_status=False,
+                enforce_version=False,
+            ):
+                return RunnerResult(
+                    success=False,
+                    state=RunnerState.NEEDS_USER_INPUT.value,
+                    task_id=task_id,
+                    candidate_commit=candidate_commit,
+                    evidence_ids=tuple(evidence_ids),
+                    message="Task requirements or acceptance criteria changed before QA dispatch.",
+                )
             qa_cycle += 1
             sess_qa = f"sess_qa_runner_{task_id.lower()}_{int(time.time()*1000)}"
 
@@ -1601,20 +1897,46 @@ class ProductionRunner:
                     message=f"Worktree HEAD ({head_before_qa}) does not match candidate commit ({candidate_commit}) before QA! Fail-Closed.",
                 )
 
-            test_cmd = spec.test_command or "python -m pytest -q"
-            valid_cmd, cmd_err, cmd_args = _validate_qa_test_command(test_cmd, worktree_dir)
-            if not valid_cmd:
-                return RunnerResult(
-                    success=False,
-                    state=RunnerState.FAILED.value,
-                    task_id=task_id,
-                    candidate_commit=candidate_commit,
-                    message=f"QA test command security validation failed: {cmd_err}",
-                )
+            test_commands = spec.test_commands or (spec.test_command or "python -m pytest -q",)
+            validated_commands = []
+            for test_cmd in test_commands:
+                valid_cmd, cmd_err, cmd_args = _validate_qa_test_command(test_cmd, worktree_dir)
+                if not valid_cmd:
+                    return RunnerResult(
+                        success=False,
+                        state=RunnerState.FAILED.value,
+                        task_id=task_id,
+                        candidate_commit=candidate_commit,
+                        message=f"QA test command security validation failed for '{test_cmd}': {cmd_err}",
+                    )
+                validated_commands.append((test_cmd, cmd_args))
+
+            qa_request_id = f"qa_req_{uuid.uuid4().hex}"
+            criteria_payload = [item.to_dict() for item in spec.acceptance_criteria_items]
+            qa_prompt = (
+                f"You are the independent QA gate for Task {task_id}.\n"
+                f"Requirements:\n{spec.requirement_text}\n\n"
+                f"Acceptance criteria hash: {spec.acceptance_criteria_hash}\n"
+                f"Acceptance criteria (cover every ID exactly once):\n"
+                f"{json.dumps(criteria_payload, ensure_ascii=False, indent=2)}\n\n"
+                f"Baseline Commit: {spec.baseline_commit}\n"
+                f"Candidate Commit: {candidate_commit}\n"
+                f"Reviewer PASS summary: {review_output.summary if 'review_output' in locals() else 'validated reviewer evidence'}\n\n"
+                "Inspect the candidate read-only. Trace changed behavior through every API, background worker, "
+                "database, authorization, contract/SDK, and frontend boundary that applies. Execute the required "
+                "commands below and independently test at least one negative/adversarial scenario. If any criterion "
+                "or risk is not verifiable, return FAIL; never infer PASS from a green regression suite alone.\n\n"
+                f"Required commands:\n{json.dumps(list(test_commands), ensure_ascii=False, indent=2)}\n\n"
+                "Return ONLY a JSON object matching this schema:\n"
+                f"{json.dumps(QA_JSON_SCHEMA, ensure_ascii=False, sort_keys=True)}\n"
+                f"Identity bindings: task_id={task_id}, baseline_commit={spec.baseline_commit}, "
+                f"candidate_commit={candidate_commit}, session_id={sess_qa}, qa_request_id={qa_request_id}, "
+                f"acceptance_criteria_hash={spec.acceptance_criteria_hash}."
+            )
 
             qa_request = AgentRequest(
                 session_id=sess_qa,
-                prompt=f"Execute verification test suite in {worktree_dir} using: {test_cmd}. Report test results.",
+                prompt=qa_prompt,
                 role="QA",
                 workspace_dir=worktree_dir,
                 timeout_seconds=float(spec.qa_timeout_seconds),
@@ -1622,6 +1944,8 @@ class ProductionRunner:
                     "sandbox": "read-only",
                     "worktree_dir": worktree_dir,
                     "project_id": spec.project_id,
+                    "qa_request_id": qa_request_id,
+                    "acceptance_criteria_hash": spec.acceptance_criteria_hash,
                     "pre_granted_approval": pre_granted_approval,
                 },
             )
@@ -1724,21 +2048,46 @@ class ProductionRunner:
                     message="QA host did not produce a valid canonical invocation identity (Fail-Closed).",
                 )
 
-            # 执行受控的 QA 测试命令
-            test_exit_code = 0
-            try:
-                test_proc = subprocess.run(
-                    cmd_args,
-                    cwd=worktree_dir,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=spec.qa_timeout_seconds,
-                )
-                test_exit_code = test_proc.returncode
-            except Exception:
-                test_exit_code = 1
+            qa_output = self._parse_qa_structured_json(
+                raw_output=qa_result.output,
+                task_id=task_id,
+                baseline_commit=spec.baseline_commit,
+                candidate_commit=candidate_commit,
+                session_id=sess_qa,
+                invocation_id=inv_qa,
+                qa_request_id=qa_request_id,
+                acceptance_criteria_hash=spec.acceptance_criteria_hash,
+                expected_criterion_ids=[item.criterion_id for item in spec.acceptance_criteria_items],
+                expected_test_commands=test_commands,
+            )
+
+            # Runner independently reruns every controlled command. Agent claims never replace executable evidence.
+            command_results = []
+            for command, command_args in validated_commands:
+                try:
+                    test_proc = subprocess.run(
+                        command_args,
+                        cwd=worktree_dir,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=spec.qa_timeout_seconds,
+                    )
+                    exit_code = test_proc.returncode
+                    output_material = (test_proc.stdout or "") + "\n" + (test_proc.stderr or "")
+                except Exception as exc:
+                    exit_code = 1
+                    output_material = f"Runner command exception: {type(exc).__name__}: {exc}"
+                command_results.append({
+                    "command": command,
+                    "exit_code": exit_code,
+                    "output_hash": hashlib.sha256(output_material.encode("utf-8", errors="replace")).hexdigest(),
+                })
+
+            test_exit_codes = tuple(item["exit_code"] for item in command_results)
+            commands_passed = bool(test_exit_codes) and all(code == 0 for code in test_exit_codes)
+            qa_passed = qa_output.decision == "PASS" and commands_passed
 
             # 严格核验 QA 前后源码不可变性（P1 门禁：HEAD、diff、cached diff、status）
             immutability_ok, immutability_err = self._verify_qa_immutability(worktree_dir, candidate_commit)
@@ -1751,8 +2100,54 @@ class ProductionRunner:
                     message=f"QA violated code immutability boundary: {immutability_err}",
                 )
 
+            if not verify_optimistic_concurrency(
+                spec,
+                enforce_status=False,
+                enforce_version=False,
+            ):
+                return RunnerResult(
+                    success=False,
+                    state=RunnerState.NEEDS_USER_INPUT.value,
+                    task_id=task_id,
+                    candidate_commit=candidate_commit,
+                    evidence_ids=tuple(evidence_ids),
+                    message="Task requirements or acceptance criteria changed during QA execution.",
+                )
+
             qa_evidence_id = f"evi_qa_{task_id.lower()}_{int(time.time()*1000)}"
             qa_caps = qa_adapter.detect_capabilities()
+            qa_report = qa_output.to_dict()
+            qa_report_hash = hashlib.sha256(
+                json.dumps(qa_report, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest()
+            test_command_hash = hashlib.sha256(
+                json.dumps(list(test_commands), ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest()
+            test_output_hash = hashlib.sha256(
+                json.dumps(command_results, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest()
+            covered_criterion_ids = tuple(
+                item["criterion_id"] for item in qa_output.acceptance_coverage if item.get("status") == "PASS"
+            )
+            qa_semantic_metadata = {
+                "qa_decision": "PASS" if qa_passed else "FAIL",
+                "qa_request_id": qa_request_id,
+                "qa_report_hash": qa_report_hash,
+                "acceptance_criteria_hash": spec.acceptance_criteria_hash,
+                "covered_criterion_ids": covered_criterion_ids,
+                "required_test_command_count": len(test_commands),
+                "negative_scenario_count": len(qa_output.negative_scenarios),
+                "uncovered_risk_count": len(qa_output.uncovered_risks),
+                "defect_count": len(qa_output.defects) + (0 if commands_passed else 1),
+                "test_command_hash": test_command_hash,
+                "test_output_hash": test_output_hash,
+                "test_exit_codes": test_exit_codes,
+                "qa_report": qa_report,
+                "required_test_commands": list(test_commands),
+                "runner_test_results": command_results,
+            }
+            qa_extra = _extract_capabilities_extra(qa_caps)
+            qa_extra.update(qa_semantic_metadata)
             qa_meta = EvidenceMetadata(
                 project_id=spec.project_id,
                 task_id=task_id,
@@ -1764,9 +2159,9 @@ class ProductionRunner:
                 is_real_host=qa_result.is_real_host,
                 workspace_mode="workspace_read",
                 transition_from="TESTING",
-                transition_to="PENDING_USER_ACCEPTANCE" if test_exit_code == 0 else "BUILDING",
+                transition_to="PENDING_USER_ACCEPTANCE" if qa_passed else "BUILDING",
                 created_at=time.time(),
-                extra=_extract_capabilities_extra(qa_caps),
+                extra=qa_extra,
             )
             qa_record = EvidenceRecord(
                 evidence_id=qa_evidence_id,
@@ -1785,7 +2180,7 @@ class ProductionRunner:
                         task_id=task_id,
                         actor_role="QA",
                         transition_from="TESTING",
-                        transition_to="PENDING_USER_ACCEPTANCE" if test_exit_code == 0 else "BUILDING",
+                        transition_to="PENDING_USER_ACCEPTANCE" if qa_passed else "BUILDING",
                         baseline_commit=spec.baseline_commit,
                         result_commit=candidate_commit,
                         expected_invocation_id=inv_qa,
@@ -1795,6 +2190,8 @@ class ProductionRunner:
                         host_handle=qa_handle,
                         expected_capabilities=qa_caps,
                         agent_result=qa_result,
+                        expected_metadata=qa_semantic_metadata,
+                        require_qa_semantics=True,
                     ),
                 )
             except Exception as gate_error:
@@ -1807,12 +2204,19 @@ class ProductionRunner:
                 )
             evidence_ids.append(qa_evidence_id)
 
-            if test_exit_code != 0:
+            if not qa_passed:
+                qa_defects = [dict(item) for item in qa_output.defects]
+                if not commands_passed:
+                    qa_defects.append({
+                        "defect_id": f"DEF-{task_id}-QA-COMMAND-FAIL",
+                        "severity": "P1",
+                        "description": f"Runner-controlled QA commands failed with exit codes {list(test_exit_codes)}.",
+                    })
                 qa_exhausted = qa_cycle >= spec.max_qa_cycles
                 if current_board_status == "测试中":
                     ok_return, err_return = self._do_state_transition(
                         spec.authority_root, task_id, "QA", "测试中", "已退回", "李开发",
-                        f"Codex QA 测试失败，退出码: {test_exit_code}", spec.task_type,
+                        f"QA 未通过语义覆盖门禁：{qa_output.summary}；命令退出码: {list(test_exit_codes)}", spec.task_type,
                     )
                     if not ok_return:
                         return RunnerResult(
@@ -1836,8 +2240,8 @@ class ProductionRunner:
                 defects_history.append({
                     "cycle": qa_cycle,
                     "role": "QA",
-                    "defects": [{"defect_id": f"DEF-{task_id}-QA-FAIL", "severity": "P1", "description": "QA test execution exited with non-zero code."}],
-                    "summary": f"QA test suite failed with exit code {test_exit_code}.",
+                    "defects": qa_defects,
+                    "summary": qa_output.summary,
                 })
                 if qa_exhausted:
                     return RunnerResult(
@@ -1847,7 +2251,7 @@ class ProductionRunner:
                         candidate_commit=candidate_commit,
                         candidate_generation=candidate_generation,
                         evidence_ids=tuple(evidence_ids),
-                        message=f"QA tests failed and exceeded max QA cycles ({spec.max_qa_cycles}). Paused at NEEDS_USER_INPUT.",
+                        message=f"QA semantic or command gate failed and exceeded max QA cycles ({spec.max_qa_cycles}). Paused at NEEDS_USER_INPUT.",
                         diagnostics={"defects": defects_history},
                     )
                 continue
