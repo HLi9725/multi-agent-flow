@@ -2943,6 +2943,7 @@ class ProductionRunner:
         interactive_approval_cb: Optional[Callable[[str, Dict[str, Any]], bool]] = None,
         pre_granted_approval: bool = False,
         overrides: Optional[Dict[str, Any]] = None,
+        rejection_reason: Optional[str] = None,
     ) -> RunnerResult:
         """从 Checkpoint 恢复执行 (支持断点恢复、完整复核 HEAD、Evidence 与权威状态)"""
         _validate_task_id(task_id)
@@ -2977,6 +2978,9 @@ class ProductionRunner:
         # a returned card must resume the original task at Builder, not strand a
         # stale PENDING checkpoint or create a replacement task.
         if ckpt.state == RunnerState.PENDING_USER_ACCEPTANCE.value and spec.status_at_read == "已退回":
+            reconciled_reason = (rejection_reason or "").strip() or (
+                "Authoritative board returned the pending candidate during user acceptance."
+            )
             defects = list(ckpt.defects_history)
             defects.append({
                 "cycle": ckpt.candidate_generation,
@@ -2984,16 +2988,16 @@ class ProductionRunner:
                 "defects": [{
                     "defect_id": f"DEF-{task_id}-USER-ACCEPTANCE",
                     "severity": "P1",
-                    "description": "Authoritative board returned the pending candidate during user acceptance.",
+                    "description": reconciled_reason,
                 }],
-                "summary": "Reconciled an externally returned acceptance with the Runner checkpoint.",
+                "summary": reconciled_reason,
             })
             ckpt = replace(
                 ckpt,
                 state=RunnerState.NEEDS_USER_INPUT.value,
                 current_role="BUILDER",
                 defects_history=tuple(defects),
-                last_error="User acceptance returned the candidate for repair.",
+                last_error=reconciled_reason,
                 updated_at=time.time(),
             )
             self.checkpoint_store.save_checkpoint(ckpt)

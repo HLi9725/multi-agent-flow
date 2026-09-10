@@ -105,6 +105,7 @@ def cmd_resume(args):
         authority_root=authority_root,
         pre_granted_approval=getattr(args, "approve", False),
         overrides=overrides,
+        rejection_reason=getattr(args, "reason", None),
     )
     print(json.dumps(result.to_dict(), indent=2, ensure_ascii=False))
     return 0 if result.success else 1
@@ -183,6 +184,11 @@ def main():
     p_resume.add_argument("--project-root", default=".", help="Project root directory")
     p_resume.add_argument("--authority-root", default=None, help="Authoritative board root directory")
     p_resume.add_argument("--approve", action="store_true", help="Grant permission approval if task was paused at APPROVAL_REQUIRED")
+    p_resume.add_argument(
+        "--reason",
+        default=None,
+        help="Inject acceptance defects when reconciling a legacy pending checkpoint with an already-returned task",
+    )
     p_resume.add_argument("--builder-adapter", default=None, help="Override persisted Builder adapter ID")
     p_resume.add_argument("--reviewer-adapter", default=None, help="Override persisted Reviewer adapter ID")
     p_resume.add_argument("--qa-adapter", default=None, help="Override persisted QA adapter ID")
