@@ -1094,6 +1094,8 @@ dual_host_l2_status:
 1. **Windows 可执行文件确定性解析**：裸 `npm`/`npx`/`cargo`/`go` 通过 PATH 解析为工作区外的绝对可执行文件，解决 `shell=False` 下 `npm` 无法定位 `npm.cmd`；`python`/`pytest` 固定使用启动 Runner 的可信 `sys.executable`。
 2. **PATH 劫持与参数逃逸门禁**：拒绝带相对路径的同名执行文件、拒绝解析到候选工作区内部的工具，并校验 `--option=../outside` 形式的路径参数；`npx` 强制 `--no-install`，避免隐式下载执行包。
 3. **基础设施与代码缺陷分流**：工具缺失、权限拒绝或进程无法启动时，Checkpoint 停在 `NEEDS_USER_INPUT / QA`，看板保持【测试中】，不派发 QA、不退回 Builder；真实非零测试结果和语义缺陷仍按原任务回环。
+4. **Antigravity 结构化终态隔离**：stream-json 中最终 `structured_output` 优先于 Planner/进度消息，字符串或对象形式均规范化为单一 JSON；Runner 额外兼容过程文本后附带的裸 JSON，并只接受与角色 Schema 顶层字段完全一致的对象。
+5. **协议熔断状态持久化**：Reviewer/QA 协议错误达到循环上限时，先原子写入 `NEEDS_USER_INPUT`、最新会话/调用标识、Evidence 与缺陷历史，再返回失败结果，避免报告显示已暂停而磁盘仍停在 `REVIEWING`/`QA_TESTING`。
 4. **空修复防循环**：修复轮次必须生成不同于上一候选的完整 SHA；Builder 未产生新提交时 Fail-Closed，禁止同一候选反复进入 Reviewer/QA。
 5. **测试环境凭证隔离**：受控测试子进程保留必要系统环境，但剥离 Token、密码、认证、Cookie、代理及云访问密钥变量，并设置 CI/npm 非交互参数。
 6. **可观测性**：每条受控命令输出 `qa_command_started`、`qa_command_completed` 或 `qa_command_cache_hit` 事件，主窗口可区分“正在测试”和“等待 QA”。

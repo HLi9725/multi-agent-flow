@@ -145,7 +145,7 @@ python scripts/run_task.py start --task-id T0003 --approve `
 
 在 Windows 上，Runner 会将裸 `npm`/`npx` 确定性解析为 PATH 中工作区外的真实 `.cmd/.exe`，并把 `python`/`pytest` 固定到启动 Runner 的可信解释器。测试子进程不会继承 Token、密码、认证头或代理凭据；找不到工具时返回 `NEEDS_USER_INPUT`，不会伪装成代码测试失败或触发无效 Builder 修复。
 
-Antigravity Prompt 通过官方 stdin `stream-json` 协议传输，不进入 Windows 命令行参数，因此完整 Reviewer diff 不受约 32 KiB 的 `CreateProcess` 命令行上限影响。运行期间 stderr 会持续输出 `[YY-FLOW]` JSONL 事件，明确显示 `BUILDER -> REVIEWER -> QA -> PENDING_USER_ACCEPTANCE`；最终 stdout 仍是单一结果 JSON，便于脚本解析。
+Antigravity Prompt 通过官方 stdin `stream-json` 协议传输，不进入 Windows 命令行参数，因此完整 Reviewer diff 不受约 32 KiB 的 `CreateProcess` 命令行上限影响。适配器会把最终 `structured_output` 与 Planner/进度消息隔离，并兼容过程文本后附带的裸 JSON；运行期间 stderr 会持续输出 `[YY-FLOW]` JSONL 事件，明确显示 `BUILDER -> REVIEWER -> QA -> PENDING_USER_ACCEPTANCE`。Reviewer/QA 协议重试达到上限时，Runner 会先原子保存 `NEEDS_USER_INPUT` Checkpoint，再返回最终结果，确保状态查询与恢复依据一致。
 
 如果 Antigravity GUI 已登录但 `agy` 无头 CLI 仍提示 OAuth，需先在运行 Runner 的同一 Windows 用户/终端上下文完成 CLI 登录。Runner 不会绕过该认证，也不会把登录失败伪装成 Reviewer 或 QA 成功。
 

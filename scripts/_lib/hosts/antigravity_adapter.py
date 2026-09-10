@@ -1110,6 +1110,7 @@ class AntigravityAdapter(BaseHostAdapter):
         """
         events: List[Dict[str, Any]] = []
         messages: List[str] = []
+        structured_outputs: List[str] = []
         error_msg: Optional[str] = None
         detected_conv_id: Optional[str] = None
         detected_step_id: Optional[str] = None
@@ -1124,6 +1125,16 @@ class AntigravityAdapter(BaseHostAdapter):
                     ev = json.loads(line)
                     if isinstance(ev, dict):
                         events.append(ev)
+
+                        # Some CLI builds place the schema result directly on
+                        # the stream event instead of nesting it under result.
+                        top_status = str(ev.get("status") or "").strip().upper()
+                        if ev.get("structured_output") is not None and top_status in ("", "SUCCESS"):
+                            structured_value = ev["structured_output"]
+                            if isinstance(structured_value, str):
+                                structured_outputs.append(structured_value.strip())
+                            else:
+                                structured_outputs.append(json.dumps(structured_value, ensure_ascii=False))
 
                         # Extract conversation / session ID
                         c_id = None
@@ -1173,7 +1184,10 @@ class AntigravityAdapter(BaseHostAdapter):
                         elif isinstance(ev.get("result"), dict) and isinstance(ev["result"].get("usage"), dict):
                             detected_usage.update(ev["result"]["usage"])
 
-                        # Extract content / response
+                        # Extract content / response. Agy may emit planner/progress
+                        # messages before the final schema-constrained result. The
+                        # structured result is authoritative and must not be joined
+                        # with those messages.
                         ev_type = ev.get("type", "")
                         if ev_type in ("message", "assistant_message", "output", "text", "PLANNER_RESPONSE"):
                             content = ev.get("content") or ev.get("text") or ev.get("message")
@@ -1185,7 +1199,11 @@ class AntigravityAdapter(BaseHostAdapter):
                             res_obj = ev["result"]
                             result_status = str(res_obj.get("status") or "").strip().upper()
                             if result_status == "SUCCESS" and res_obj.get("structured_output") is not None:
-                                messages.append(json.dumps(res_obj["structured_output"], ensure_ascii=False))
+                                structured_value = res_obj["structured_output"]
+                                if isinstance(structured_value, str):
+                                    structured_outputs.append(structured_value.strip())
+                                else:
+                                    structured_outputs.append(json.dumps(structured_value, ensure_ascii=False))
                             elif result_status == "SUCCESS" and isinstance(res_obj.get("response"), str):
                                 messages.append(res_obj["response"])
                             elif result_status and result_status != "SUCCESS":
@@ -1207,7 +1225,9 @@ class AntigravityAdapter(BaseHostAdapter):
         if detected_conv_id and detected_step_id:
             detected_invocation_id = f"{detected_conv_id}:{detected_step_id}"
 
-        output_text = "\n".join(messages).strip()
+        # Prefer the last successful structured result. Earlier stream events are
+        # telemetry, not part of the Agent's schema-bound response.
+        output_text = structured_outputs[-1] if structured_outputs else "\n".join(messages).strip()
         if not output_text and stderr:
             output_text = stderr.strip()
 

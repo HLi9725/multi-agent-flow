@@ -233,6 +233,46 @@ def test_antigravity_adapter_parses_structured_output_result():
     assert json.loads(text) == {"decision": "PASS", "defects": []}
 
 
+def test_antigravity_adapter_prefers_structured_output_over_planner_chatter():
+    adapter = AntigravityAdapter(is_real_host=False)
+    sample = (
+        '{"type":"PLANNER_RESPONSE","step_index":1,"content":"I am checking the evidence."}\n'
+        '{"event":"result","result":{"conversation_id":"conv-structured","status":"SUCCESS",'
+        '"structured_output":{"decision":"PASS","defects":[]}}}\n'
+    )
+    text, _, err, _, _, _ = adapter._parse_antigravity_output(sample, "")
+    assert err is None
+    assert json.loads(text) == {"decision": "PASS", "defects": []}
+
+
+def test_antigravity_adapter_accepts_string_structured_output():
+    adapter = AntigravityAdapter(is_real_host=False)
+    structured = json.dumps({"decision": "PASS", "defects": []})
+    sample = json.dumps({
+        "event": "result",
+        "result": {
+            "conversation_id": "conv-string",
+            "status": "SUCCESS",
+            "structured_output": structured,
+        },
+    })
+    text, _, err, _, _, _ = adapter._parse_antigravity_output(sample, "")
+    assert err is None
+    assert json.loads(text) == {"decision": "PASS", "defects": []}
+
+
+def test_antigravity_adapter_accepts_top_level_structured_output():
+    adapter = AntigravityAdapter(is_real_host=False)
+    sample = json.dumps({
+        "event": "result",
+        "status": "SUCCESS",
+        "structured_output": {"decision": "PASS", "defects": []},
+    })
+    text, _, err, _, _, _ = adapter._parse_antigravity_output(sample, "")
+    assert err is None
+    assert json.loads(text) == {"decision": "PASS", "defects": []}
+
+
 @pytest.mark.parametrize("result_status", ["CANCELED", "INTERRUPTED", "INVALID", "WAITING", "RUNNING"])
 def test_antigravity_adapter_rejects_non_success_result_status(result_status):
     adapter = AntigravityAdapter(is_real_host=False)

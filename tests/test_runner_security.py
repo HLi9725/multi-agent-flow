@@ -307,6 +307,10 @@ def test_qa_schema_and_semantic_coverage_fail_closed():
     parsed = runner._parse_qa_structured_json(json.dumps(valid), **kwargs)
     assert parsed.decision == "PASS"
 
+    mixed_output = "QA assessment complete.\n" + json.dumps(valid)
+    parsed = runner._parse_qa_structured_json(mixed_output, **kwargs)
+    assert parsed.decision == "PASS"
+
     plain_text = runner._parse_qa_structured_json("all tests passed", **kwargs)
     assert plain_text.decision == "FAIL"
     assert "SCHEMA-VIOLATION" in plain_text.defects[0]["defect_id"]

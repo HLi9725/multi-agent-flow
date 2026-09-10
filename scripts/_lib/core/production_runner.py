@@ -145,6 +145,47 @@ def _has_protocol_defect(defects: Sequence[Mapping[str, Any]], suffixes: Sequenc
     )
 
 
+def _extract_embedded_json_object(raw_output: str, required_fields: Sequence[str]) -> Optional[Dict[str, Any]]:
+    """Extract one schema-shaped object without accepting arbitrary host telemetry."""
+    cleaned = raw_output.strip()
+    candidates: List[Dict[str, Any]] = []
+    if cleaned.startswith("{") and cleaned.endswith("}"):
+        try:
+            value = json.loads(cleaned)
+            if isinstance(value, dict):
+                candidates.append(value)
+        except Exception:
+            pass
+
+    for match in re.finditer(r"```(?:json)?\s*(\{.*?\})\s*```", raw_output, re.DOTALL):
+        try:
+            value = json.loads(match.group(1))
+            if isinstance(value, dict):
+                candidates.append(value)
+        except Exception:
+            continue
+
+    # A stream-json host can emit progress text followed by an unfenced final
+    # object. Decode every object boundary, then accept only an exact schema
+    # shape so that unrelated telemetry objects cannot be mistaken for a verdict.
+    decoder = json.JSONDecoder()
+    scan_text = raw_output[-1_000_000:]
+    object_starts = [index for index, char in enumerate(scan_text) if char == "{"][-256:]
+    for index in object_starts:
+        try:
+            value, _ = decoder.raw_decode(scan_text[index:])
+        except Exception:
+            continue
+        if isinstance(value, dict):
+            candidates.append(value)
+
+    expected = set(required_fields)
+    for candidate in reversed(candidates):
+        if set(candidate) == expected:
+            return candidate
+    return candidates[0] if len(candidates) == 1 else None
+
+
 def _build_qa_subprocess_env() -> Dict[str, str]:
     """Create a deterministic test environment without inherited host credentials."""
     clean_env = {
@@ -962,22 +1003,7 @@ class ProductionRunner:
         review_request_id: str,
     ) -> ReviewerStructuredOutput:
         """严格解析 Reviewer 结构化 JSON 返回值并强制核验 Schema 与身份绑定（DEF-T0061-1）"""
-        json_obj: Optional[Dict[str, Any]] = None
-        cleaned = raw_output.strip()
-
-        if cleaned.startswith("{") and cleaned.endswith("}"):
-            try:
-                json_obj = json.loads(cleaned)
-            except Exception:
-                json_obj = None
-
-        if json_obj is None:
-            match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw_output, re.DOTALL)
-            if match:
-                try:
-                    json_obj = json.loads(match.group(1))
-                except Exception:
-                    json_obj = None
+        json_obj = _extract_embedded_json_object(raw_output, REVIEWER_JSON_SCHEMA["required"])
 
         if json_obj is None:
             return ReviewerStructuredOutput(
@@ -1119,20 +1145,7 @@ class ProductionRunner:
                 summary=description,
             )
 
-        json_obj: Optional[Dict[str, Any]] = None
-        cleaned = raw_output.strip()
-        if cleaned.startswith("{") and cleaned.endswith("}"):
-            try:
-                json_obj = json.loads(cleaned)
-            except Exception:
-                json_obj = None
-        if json_obj is None:
-            match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw_output, re.DOTALL)
-            if match:
-                try:
-                    json_obj = json.loads(match.group(1))
-                except Exception:
-                    json_obj = None
+        json_obj = _extract_embedded_json_object(raw_output, QA_JSON_SCHEMA["required"])
         if json_obj is None:
             return failed("QA-SCHEMA-VIOLATION", "QA did not return a valid structured JSON object.")
 
@@ -2030,6 +2043,26 @@ class ProductionRunner:
                             "summary": review_output.summary,
                         })
                         if review_exhausted:
+                            pause_message = (
+                                "Reviewer protocol output remained invalid and exceeded "
+                                f"max review cycles ({spec.max_review_cycles}). Business code was not returned to Builder."
+                            )
+                            checkpoint = replace(
+                                checkpoint,
+                                state=RunnerState.NEEDS_USER_INPUT.value,
+                                current_role="REVIEWER",
+                                candidate_commit=candidate_commit,
+                                candidate_generation=candidate_generation,
+                                review_cycle=review_cycle,
+                                qa_cycle=qa_cycle,
+                                total_attempts=total_attempts,
+                                reviewer_invocation_id=inv_reviewer,
+                                evidence_ids=tuple(evidence_ids),
+                                defects_history=tuple(defects_history),
+                                last_error=pause_message,
+                                updated_at=time.time(),
+                            )
+                            self.checkpoint_store.save_checkpoint(checkpoint)
                             return RunnerResult(
                                 success=False,
                                 state=RunnerState.NEEDS_USER_INPUT.value,
@@ -2037,10 +2070,7 @@ class ProductionRunner:
                                 candidate_commit=candidate_commit,
                                 candidate_generation=candidate_generation,
                                 evidence_ids=tuple(evidence_ids),
-                                message=(
-                                    "Reviewer protocol output remained invalid and exceeded "
-                                    f"max review cycles ({spec.max_review_cycles}). Business code was not returned to Builder."
-                                ),
+                                message=pause_message,
                                 diagnostics={"defects": defects_history},
                             )
                         # The candidate is unchanged. Retry only the independent
@@ -2639,6 +2669,26 @@ class ProductionRunner:
                         "summary": qa_output.summary,
                     })
                     if qa_exhausted:
+                        pause_message = (
+                            "QA protocol output remained invalid and exceeded "
+                            f"max QA cycles ({spec.max_qa_cycles}). Business code was not returned to Builder."
+                        )
+                        checkpoint = replace(
+                            checkpoint,
+                            state=RunnerState.NEEDS_USER_INPUT.value,
+                            current_role="QA",
+                            candidate_commit=candidate_commit,
+                            candidate_generation=candidate_generation,
+                            review_cycle=review_cycle,
+                            qa_cycle=qa_cycle,
+                            total_attempts=total_attempts,
+                            qa_invocation_id=inv_qa,
+                            evidence_ids=tuple(evidence_ids),
+                            defects_history=tuple(defects_history),
+                            last_error=pause_message,
+                            updated_at=time.time(),
+                        )
+                        self.checkpoint_store.save_checkpoint(checkpoint)
                         return RunnerResult(
                             success=False,
                             state=RunnerState.NEEDS_USER_INPUT.value,
@@ -2646,10 +2696,7 @@ class ProductionRunner:
                             candidate_commit=candidate_commit,
                             candidate_generation=candidate_generation,
                             evidence_ids=tuple(evidence_ids),
-                            message=(
-                                "QA protocol output remained invalid and exceeded "
-                                f"max QA cycles ({spec.max_qa_cycles}). Business code was not returned to Builder."
-                            ),
+                            message=pause_message,
                             diagnostics={"defects": defects_history},
                         )
                     # Keep the board in 测试中 and retry only QA. The Runner test
