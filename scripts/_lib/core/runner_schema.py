@@ -406,6 +406,7 @@ class RunnerCheckpoint:
     qa_session_id: Optional[str] = None
     qa_invocation_id: Optional[str] = None
     evidence_ids: Tuple[str, ...] = field(default_factory=tuple)
+    execution_options: Mapping[str, Any] = field(default_factory=dict)
     confirmation_request_id: Optional[str] = None
     defects_history: Tuple[Dict[str, Any], ...] = field(default_factory=tuple)
     approval_reason: Optional[str] = None
@@ -416,6 +417,7 @@ class RunnerCheckpoint:
     def __post_init__(self):
         object.__setattr__(self, "evidence_ids", tuple(self.evidence_ids))
         object.__setattr__(self, "defects_history", tuple(self.defects_history))
+        object.__setattr__(self, "execution_options", _freeze_runner_value(dict(self.execution_options)))
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -437,6 +439,7 @@ class RunnerCheckpoint:
             "qa_session_id": self.qa_session_id,
             "qa_invocation_id": self.qa_invocation_id,
             "evidence_ids": list(self.evidence_ids),
+            "execution_options": dict(self.execution_options),
             "confirmation_request_id": self.confirmation_request_id,
             "defects_history": [dict(d) for d in self.defects_history],
             "approval_reason": self.approval_reason,
@@ -466,6 +469,7 @@ class RunnerCheckpoint:
             qa_session_id=data.get("qa_session_id"),
             qa_invocation_id=data.get("qa_invocation_id"),
             evidence_ids=tuple(data.get("evidence_ids", [])),
+            execution_options=dict(data.get("execution_options", {})),
             confirmation_request_id=data.get("confirmation_request_id"),
             defects_history=tuple(data.get("defects_history", [])),
             approval_reason=data.get("approval_reason"),

@@ -1071,3 +1071,18 @@ dual_host_l2_status:
 8. **验证记录**：角色导出与跨平台专项 `58 passed`；审查返工后最终全仓回归 `455 passed in 97.27s`，`0 failed`、`0 skipped`；Python 语法编译、敏感凭证扫描及 `git diff --check` 均通过。
 
 本轮未调用真实 Codex/Antigravity Host，未修改任何业务项目；真实 Host 行为应在安装此候选版本后通过一个新的、隔离的非生产任务再次观察。
+
+### 22. Antigravity Production Runner 可靠性、恢复与可观测性修复
+
+2026-09-10 针对 Windows 下长时间无角色切换、Reviewer 完整 Diff 导致启动失败、重复审批以及恢复后配置漂移问题，完成以下收口：
+
+1. **Prompt 改用官方 stdin 流协议**：Antigravity 请求使用 `--input-format stream-json --output-format stream-json`，Prompt 以单条 NDJSON user event 写入 stdin，不再放入 Windows 命令行参数；Reviewer 完整 Diff 不再受约 32 KiB `CreateProcess` 参数上限影响，也不进行静默截断。
+2. **结构化输出与失败终态 Fail-Closed**：Reviewer/QA 通过 `--json-schema` 绑定输出契约；优先解析 `structured_output`。`CANCELED`、`INTERRUPTED`、`INVALID`、`WAITING`、`RUNNING` 等任何非 `SUCCESS` 结果均明确失败，不得仅凭进程退出码误判通过。
+3. **审批风险分类收口**：风险评估只读取 Runner 生成的可信 `operation_intent`，不再扫描 Prompt 内的需求、源码或 Diff 文本，避免 `delete/drop/push` 等业务文字触发伪破坏性审批；真正的 destructive、billing、acceptance 意图仍不可通过外层授权绕过。
+4. **单宿主三角色一致授权**：用户显式提供 `start --approve` 或 `resume --approve` 后，Builder、Reviewer、QA 都按各自 session/project/workspace/role/权限边界记录一次精确授权；Reviewer/QA 保持只读 sandbox，Builder 仅限隔离工作区写入。
+5. **角色顺序可观测**：Runner 通过 stderr 连续输出 `[YY-FLOW]` JSONL 事件，显示 Worktree、Builder、Reviewer、QA 和 `PENDING_USER_ACCEPTANCE`；最终 stdout 保持单一结果 JSON，兼顾人类观察和脚本解析。
+6. **Checkpoint 完整恢复**：持久化 Builder/Reviewer/QA Adapter、工作区模式、测试命令、各阶段超时、循环与总预算；`resume` 默认继承，只有显式 CLI 参数才覆盖。`status` 只读返回生效配置，便于诊断速度和宿主选择。
+7. **项目级配置与锁隔离**：任务初次读取和乐观并发复核统一识别 `.yy-flow/user_data/workflow.config.yaml`；Checkpoint 与互斥锁固定使用同一显式数据根，避免共享 Skill 服务多个项目时跨项目串线。
+8. **验证结果**：Runner/Adapter/恢复/CLI 定向回归 `58 passed`；审查返工后的全仓最终回归 `466 passed in 101.75s`，`0 failed`。长 Prompt、嵌套 JSON Schema、非成功终态、配置恢复、角色顺序、`.yy-flow` 看板归属和锁数据根均有专项断言。
+
+为避免再次弹出登录授权并干扰用户正在运行的业务任务，本轮最终 QA 未再次启动真实 Antigravity Host；传输协议按 Antigravity Headless CLI 官方契约实现并由受控进程桩验证。真实宿主仍须在同一 Windows 用户和 CLI 认证上下文中，用隔离的非生产任务完成一次安装后观察；认证失败必须停在 `APPROVAL_REQUIRED` 或失败状态，不得伪造成功 Evidence。

@@ -58,6 +58,48 @@ class TaskOptimisticConcurrencyError(TaskSpecError):
     pass
 
 
+def _resolve_board_config(authority_root: str, project_root: str) -> str:
+    """Resolve legacy and .yy-flow layouts identically for load and revalidation."""
+    candidates = []
+    for root in (authority_root, project_root):
+        if not root:
+            continue
+        candidates.extend([
+            os.path.join(root, ".yy-flow", "user_data", "workflow.config.yaml"),
+            os.path.join(root, "user_data", "workflow.config.yaml"),
+            os.path.join(root, "config", "workflow.config.yaml"),
+        ])
+    candidates.append(paths.resolve_runtime_config(cwd=authority_root or project_root))
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate):
+            return os.path.realpath(candidate)
+    return os.path.realpath(candidates[-1])
+
+
+def _resolve_local_board_file(board_config: str, raw_board_file: str, authority_root: str) -> str:
+    """Anchor a relative board path to the data root that owns its config."""
+    if os.path.isabs(raw_board_file):
+        return os.path.realpath(raw_board_file)
+
+    config_dir = os.path.dirname(os.path.realpath(board_config))
+    config_parent = os.path.basename(config_dir).lower()
+    config_data_root = (
+        os.path.dirname(config_dir)
+        if config_parent in {"user_data", "config"}
+        else config_dir
+    )
+    candidates = [
+        os.path.join(config_data_root, raw_board_file),
+        os.path.join(authority_root, raw_board_file),
+    ]
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return os.path.realpath(candidate)
+    # Preserve Fail-Closed behavior: point at the owning data root rather than
+    # silently falling back to another project's existing board.
+    return os.path.realpath(candidates[0])
+
+
 def _get_git_head_and_branch(repo_path: str) -> Tuple[str, str]:
     """从指定 Git 仓库读取当前 HEAD Commit SHA 与分支名称"""
     try:
@@ -235,21 +277,8 @@ def load_task_execution_spec(
     norm_project_root = os.path.abspath(project_root)
     norm_authority_root = os.path.abspath(authority_root) if authority_root else paths.resolve_data_root(cwd=norm_project_root)
 
-    # 寻找看板配置文件
-    config_candidates = [
-        os.path.join(norm_authority_root, "config", "workflow.config.yaml"),
-        os.path.join(norm_authority_root, "user_data", "workflow.config.yaml"),
-        os.path.join(norm_project_root, "config", "workflow.config.yaml"),
-        os.path.join(norm_project_root, "user_data", "workflow.config.yaml"),
-    ]
-    board_config = None
-    for candidate in config_candidates:
-        if os.path.isfile(candidate):
-            board_config = candidate
-            break
-
-    if not board_config:
-        board_config = paths.resolve_runtime_config(cwd=norm_authority_root)
+    # 寻找看板配置文件（legacy 与项目级 .yy-flow 使用同一解析链）
+    board_config = _resolve_board_config(norm_authority_root, norm_project_root)
 
     if not os.path.isfile(board_config):
         raise TaskSpecNotFoundError(
@@ -266,10 +295,11 @@ def load_task_execution_spec(
 
     if provider == "local":
         raw_board_file = board_cfg.get("board_file", "user_data/board.json")
-        if not os.path.isabs(raw_board_file):
-            board_file = os.path.abspath(os.path.join(norm_authority_root, raw_board_file))
-        else:
-            board_file = raw_board_file
+        board_file = _resolve_local_board_file(
+            board_config,
+            raw_board_file,
+            norm_authority_root,
+        )
         adapter = OfflineBoardAdapter(board_file=board_file, field_map=board_cfg.get("fields", {}))
     else:
         adapter = get_board_adapter(board_config)
@@ -395,15 +425,8 @@ def verify_optimistic_concurrency(
     """
     try:
         if board_adapter is None:
-            board_config = None
-            for cand_dir in [spec.authority_root, spec.project_root, paths.project_root()]:
-                if not cand_dir:
-                    continue
-                cfg = os.path.join(cand_dir, "config", "workflow.config.yaml")
-                if os.path.isfile(cfg):
-                    board_config = cfg
-                    break
-            if not board_config:
+            board_config = _resolve_board_config(spec.authority_root, spec.project_root)
+            if not os.path.isfile(board_config):
                 return False
             board_adapter = get_board_adapter(board_config)
 

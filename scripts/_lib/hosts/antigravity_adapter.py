@@ -1,6 +1,7 @@
 from collections.abc import Mapping
 import glob
 import json
+import math
 import os
 import platform
 import re
@@ -135,7 +136,8 @@ def _evaluate_single_command_risk(cmd_line: str, workspace_dir: Optional[str] = 
                 return "destructive"
 
         if git_sub in ("status", "diff", "log", "show", "rev-parse"):
-            if not any(f in cmd_lower for f in ("-f", "--force", "--hard", "--delete", "-d")):
+            dangerous_flags = {"-f", "--force", "--hard", "--delete", "-d"}
+            if not any(arg.lower() in dangerous_flags for arg in parts[2:]):
                 return "safe_local"
         elif git_sub == "branch":
             # Safe read-only branch listing vs destructive branch creation/deletion
@@ -267,6 +269,48 @@ def evaluate_command_risk(cmd_line: str, workspace_dir: Optional[str] = None) ->
             max_risk = risk
 
     return max_risk
+
+
+def _evaluate_request_risk(request: AgentRequest) -> str:
+    """Classify the operation plan, never arbitrary source text embedded in a prompt.
+
+    Production Runner prompts legitimately contain patches, requirements, and defect
+    descriptions with words such as ``delete`` or ``drop``.  Treating that material as
+    an executable command produced false destructive classifications.  A trusted
+    orchestrator may therefore provide a narrow ``operation_intent`` describing the
+    actual host operation.  Direct callers that omit it retain the legacy fail-closed
+    prompt classification.
+    """
+    operation_intent = None
+    if isinstance(request.extra_context, Mapping):
+        operation_intent = request.extra_context.get("operation_intent")
+    material = str(operation_intent).strip() if operation_intent is not None else ""
+    if not material:
+        material = request.prompt
+    return evaluate_command_risk(material, request.workspace_dir)
+
+
+def _format_print_timeout(timeout_seconds: float) -> str:
+    """Return a valid agy duration while keeping Runner and CLI deadlines aligned."""
+    return f"{max(1, int(math.ceil(float(timeout_seconds))))}s"
+
+
+def _build_stream_input(prompt: str) -> str:
+    """Encode one Antigravity user turn as documented NDJSON for stdin transport."""
+    return json.dumps(
+        {"event": "user", "message": {"content": prompt}},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ) + "\n"
+
+
+def _json_compatible(value: Any) -> Any:
+    """Thaw immutable AgentRequest context into JSON-compatible containers."""
+    if isinstance(value, Mapping):
+        return {str(key): _json_compatible(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_json_compatible(item) for item in value]
+    return value
 
 
 def _find_default_antigravity_executable() -> Optional[str]:
@@ -540,8 +584,24 @@ class AntigravityAdapter(BaseHostAdapter):
         if isinstance(request.extra_context, Mapping) and request.extra_context.get("project_id"):
             cmd.extend(["--project", str(request.extra_context["project_id"])])
 
+        # Prompts travel over stdin rather than argv.  Windows CreateProcess limits
+        # the complete command line to roughly 32 KiB, while Reviewer prompts may
+        # contain a complete candidate diff.  Antigravity's documented stream-json
+        # input mode removes that platform limit without truncating review context.
+        cmd.extend(["--input-format", "stream-json"])
         cmd.extend(["--output-format", "stream-json"])
-        cmd.extend(["--print", request.prompt])
+
+        if isinstance(request.extra_context, Mapping):
+            output_schema = request.extra_context.get("json_schema")
+            if output_schema is not None:
+                if not isinstance(output_schema, Mapping):
+                    raise AgentNotSupportedError("json_schema must be a mapping")
+                cmd.extend([
+                    "--json-schema",
+                    json.dumps(_json_compatible(output_schema), ensure_ascii=False, separators=(",", ":")),
+                ])
+
+        cmd.extend(["--print-timeout", _format_print_timeout(request.timeout_seconds)])
         return cmd
 
     def dispatch_agent(self, request: AgentRequest) -> AgentHandle:
@@ -561,7 +621,7 @@ class AntigravityAdapter(BaseHostAdapter):
         invocation_token = secrets.token_urlsafe(32)
 
         # 5-Tier Permission check & 6-tuple cache integration
-        risk = evaluate_command_risk(request.prompt, request.workspace_dir)
+        risk = _evaluate_request_risk(request)
         project_id = "default_project"
         auth_context = "user_local_ctx"
         permission_boundary = "workspace_read" if risk == "safe_local" else "workspace_write"
@@ -785,7 +845,10 @@ class AntigravityAdapter(BaseHostAdapter):
 
         # Real process execution and parsing
         try:
-            stdout_data, stderr_data = process.communicate(timeout=timeout)
+            stdout_data, stderr_data = process.communicate(
+                input=_build_stream_input(session_data["request"].prompt),
+                timeout=timeout,
+            )
         except subprocess.TimeoutExpired:
             self._terminate_process_tree(process)
             with self._lock:
@@ -815,6 +878,7 @@ class AntigravityAdapter(BaseHostAdapter):
             "invocation_id": final_invocation_id,
             "usage": detected_usage,
             "exit_code": exit_code,
+            "prompt_transport": "stdin_stream_json",
             "host_identity_source": "antigravity_host_conversation_id" if status == AgentStatus.SUCCESS else None,
         }
 
@@ -906,7 +970,7 @@ class AntigravityAdapter(BaseHostAdapter):
         """
         if not isinstance(request, AgentRequest):
             raise TypeError("request must be an AgentRequest instance")
-        risk = evaluate_command_risk(request.prompt, request.workspace_dir)
+        risk = _evaluate_request_risk(request)
         if risk not in {"safe_local", "controlled_external"}:
             raise AgentNotSupportedError(
                 f"Operation classified as '{risk}' cannot receive out-of-band approval (Fail-Closed)."
@@ -1119,10 +1183,16 @@ class AntigravityAdapter(BaseHostAdapter):
                             error_msg = ev.get("message") or ev.get("error") or str(ev)
                         elif isinstance(ev.get("result"), dict):
                             res_obj = ev["result"]
-                            if res_obj.get("status") == "SUCCESS" and isinstance(res_obj.get("response"), str):
+                            result_status = str(res_obj.get("status") or "").strip().upper()
+                            if result_status == "SUCCESS" and res_obj.get("structured_output") is not None:
+                                messages.append(json.dumps(res_obj["structured_output"], ensure_ascii=False))
+                            elif result_status == "SUCCESS" and isinstance(res_obj.get("response"), str):
                                 messages.append(res_obj["response"])
-                            elif res_obj.get("status") == "ERROR":
-                                error_msg = res_obj.get("error") or "Antigravity CLI returned error status"
+                            elif result_status and result_status != "SUCCESS":
+                                error_msg = (
+                                    res_obj.get("error")
+                                    or f"Antigravity CLI returned non-success status: {result_status}"
+                                )
                 except Exception:
                     # Non-JSON stdout line
                     m_conv = re.search(r'"conversation_id"\s*:\s*"([^"]+)"', line)

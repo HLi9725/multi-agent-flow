@@ -51,6 +51,12 @@ def test_checkpoint_store_atomic_save_and_load(tmp_path):
         builder_session_id="sess_b_1",
         reviewer_session_id="sess_r_1",
         evidence_ids=("evi_b_1",),
+        execution_options={
+            "reviewer_adapter_id": "antigravity",
+            "qa_adapter_id": "codex_cli",
+            "test_commands": ["python -m pytest tests -q"],
+            "reviewer_timeout_seconds": 17,
+        },
     )
 
     store.save_checkpoint(ckpt)
@@ -61,6 +67,8 @@ def test_checkpoint_store_atomic_save_and_load(tmp_path):
     assert loaded.project_id == "proj_alpha"
     assert loaded.state == RunnerState.REVIEWING.value
     assert loaded.evidence_ids == ("evi_b_1",)
+    assert loaded.execution_options["reviewer_timeout_seconds"] == 17
+    assert loaded.execution_options["test_commands"] == ("python -m pytest tests -q",)
 
 
 def test_checkpoint_store_path_traversal_and_multi_project_isolation(tmp_path):
@@ -118,6 +126,24 @@ def test_runner_concurrency_lock(tmp_path):
     assert f2 is None
 
     store.release_runner_lock((h1, f1))
+
+
+def test_runner_lock_uses_checkpoint_data_root_not_process_context(tmp_path):
+    explicit_data_root = tmp_path / "project-data"
+    store = RunnerCheckpointStore(
+        data_root=str(explicit_data_root),
+        project_root=str(tmp_path / "project"),
+        project_id="isolated",
+    )
+
+    lock_tuple = store.acquire_runner_lock("T0061")
+    try:
+        assert lock_tuple[0] is not None
+        assert lock_tuple[1] is not None
+        assert os.path.commonpath([str(explicit_data_root), lock_tuple[1]]) == str(explicit_data_root)
+        assert lock_tuple[1].endswith(".lock")
+    finally:
+        store.release_runner_lock(lock_tuple)
 
 
 def test_runner_cancel_safely_cancels_hosts_and_preserves_worktree(tmp_path):
@@ -351,6 +377,14 @@ def test_runner_resume_breakpoint_and_integrity_verification(tmp_path, monkeypat
         worktree_path=str(repo_dir),
         worktree_branch="feature/t0099",
         evidence_ids=(evi_id,),
+        execution_options={
+            "builder_adapter_id": "codex_cli",
+            "reviewer_adapter_id": "antigravity",
+            "qa_adapter_id": "codex_cli",
+            "test_commands": ["python -m pytest test_app.py -q"],
+            "reviewer_timeout_seconds": 17,
+            "qa_timeout_seconds": 19,
+        },
     )
     checkpoint_store.save_checkpoint(ckpt)
 
@@ -358,6 +392,7 @@ def test_runner_resume_breakpoint_and_integrity_verification(tmp_path, monkeypat
     reviewer_called = False
     review_requests = {}
     qa_requests = {}
+    observed_timeouts = {}
 
     def mock_detect_caps(self):
         return HostCapabilities(
@@ -388,6 +423,7 @@ def test_runner_resume_breakpoint_and_integrity_verification(tmp_path, monkeypat
         return AgentHandle(session_id=req.session_id, host_id="antigravity", status="completed", is_real_host=True, adapter_instance_id="inst_a", invocation_token="tok_r")
 
     def mock_reviewer_wait(self, handle, timeout_seconds=None):
+        observed_timeouts["reviewer"] = timeout_seconds
         out_json = {
             "task_id": "T0099",
             "baseline_commit": baseline_sha,
@@ -401,6 +437,7 @@ def test_runner_resume_breakpoint_and_integrity_verification(tmp_path, monkeypat
         return AgentResult(session_id=handle.session_id, status=AgentStatus.SUCCESS, output=json.dumps(out_json), partial_results=({"invocation_id": "inv_r"},), is_real_host=True)
 
     def mock_qa_wait(self, handle, timeout_seconds=None):
+        observed_timeouts["qa"] = timeout_seconds
         req = qa_requests[handle.session_id]
         output = {
             "task_id": "T0099",
@@ -414,7 +451,7 @@ def test_runner_resume_breakpoint_and_integrity_verification(tmp_path, monkeypat
                 {"criterion_id": "AC-01", "status": "PASS", "evidence": "test_app.py::test_app"},
             ],
             "test_commands": [
-                {"command": "python -m pytest -q", "exit_code": 0, "summary": "1 passed"},
+                {"command": "python -m pytest test_app.py -q", "exit_code": 0, "summary": "1 passed"},
             ],
             "negative_scenarios": [
                 {"name": "resume idempotency", "status": "PASS", "evidence": "checkpoint recovery test"},
@@ -451,6 +488,7 @@ def test_runner_resume_breakpoint_and_integrity_verification(tmp_path, monkeypat
     assert res.success is True
     assert builder_called is False  # 断点在 Reviewer，Builder 不被重复调用
     assert reviewer_called is True
+    assert observed_timeouts == {"reviewer": 17.0, "qa": 19.0}
 
     # 2. 篡改 Candidate Commit 必须 Fail-Closed
     bad_ckpt = RunnerCheckpoint(

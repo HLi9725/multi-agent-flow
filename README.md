@@ -122,16 +122,32 @@ Agent 将自动执行 7 步标准初始化：
 Runner 的 Reviewer 会收到固定候选差异、变更文件、公开符号引用和适用影响面提示，不能只凭已有测试为绿放行。QA 必须返回结构化的逐项覆盖矩阵、至少一个独立反向场景、所有受控命令结果和未覆盖风险；Runner 随后会在同一候选提交上独立复跑命令，EvidenceGate 再从磁盘 Evidence 重算报告与命令哈希。任何缺项、身份/SHA 不匹配、未覆盖风险或命令失败都会自动打回。
 
 ```powershell
-# 一个命令
-python scripts/run_task.py start --task-id T0003 --test-command "python -m pytest tests -q"
+# 双宿主默认链：Codex Builder -> Antigravity Reviewer -> Codex QA
+# --approve 只能在用户已明确授权本次非破坏性工作区操作后使用
+python scripts/run_task.py start --task-id T0003 --approve `
+  --test-command "python -m pytest tests -q"
 
 # 后端、前端等多项门禁：重复传入 --test-command
-python scripts/run_task.py start --task-id T0003 `
+python scripts/run_task.py start --task-id T0003 --approve `
   --test-command "python -m pytest tests -q" `
   --test-command "npm run build"
+
+# Antigravity 单宿主、三个独立角色会话
+python scripts/run_task.py start --task-id T0003 --approve `
+  --builder-adapter antigravity `
+  --reviewer-adapter antigravity `
+  --qa-adapter antigravity `
+  --timeout-seconds 900 `
+  --test-command "python -m pytest tests -q"
 ```
 
-`status` 是纯只读查询；`resume` 用于审批或故障消除后的断点恢复。Runner 成功只停在【已完成】/`PENDING_USER_ACCEPTANCE`，不会替用户验收、合并、Push 或创建 Tag。
+`status` 是纯只读查询；`resume` 用于审批或故障消除后的断点恢复。Checkpoint 会保存 Adapter、测试命令、超时与循环预算，恢复时默认沿用；只有显式传入同名参数才会覆盖。`start --approve` / `resume --approve` 仅记录本次 Runner 的外层显式授权，不等于 `--dangerously-skip-permissions`，也不能授权删除、费用、Push、合并或发布操作。
+
+Antigravity Prompt 通过官方 stdin `stream-json` 协议传输，不进入 Windows 命令行参数，因此完整 Reviewer diff 不受约 32 KiB 的 `CreateProcess` 命令行上限影响。运行期间 stderr 会持续输出 `[YY-FLOW]` JSONL 事件，明确显示 `BUILDER -> REVIEWER -> QA -> PENDING_USER_ACCEPTANCE`；最终 stdout 仍是单一结果 JSON，便于脚本解析。
+
+如果 Antigravity GUI 已登录但 `agy` 无头 CLI 仍提示 OAuth，需先在运行 Runner 的同一 Windows 用户/终端上下文完成 CLI 登录。Runner 不会绕过该认证，也不会把登录失败伪装成 Reviewer 或 QA 成功。
+
+Runner 成功只停在【已完成】/`PENDING_USER_ACCEPTANCE`，不会替用户验收、合并、Push 或创建 Tag。
 
 ---
 

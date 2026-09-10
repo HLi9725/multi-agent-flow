@@ -387,6 +387,25 @@ def create_default_registry(context_id: str = "prod_runner") -> AdapterRegistry:
     return reg
 
 
+def _execution_options_from_spec(spec: TaskExecutionSpec) -> Dict[str, Any]:
+    """Persist effective runtime choices so resume cannot silently change hosts or gates."""
+    return {
+        "builder_adapter_id": spec.builder_adapter_id,
+        "reviewer_adapter_id": spec.reviewer_adapter_id,
+        "qa_adapter_id": spec.qa_adapter_id,
+        "workspace_mode": spec.workspace_mode,
+        "worktree_root": spec.worktree_root,
+        "test_commands": list(spec.test_commands),
+        "builder_timeout_seconds": spec.builder_timeout_seconds,
+        "reviewer_timeout_seconds": spec.reviewer_timeout_seconds,
+        "qa_timeout_seconds": spec.qa_timeout_seconds,
+        "max_review_cycles": spec.max_review_cycles,
+        "max_qa_cycles": spec.max_qa_cycles,
+        "max_total_attempts": spec.max_total_attempts,
+        "total_wall_clock_timeout_seconds": spec.total_wall_clock_timeout_seconds,
+    }
+
+
 class ProductionRunnerError(Exception):
     pass
 
@@ -405,14 +424,57 @@ class ProductionRunner:
         evidence_gate: Optional[EvidenceGate] = None,
         checkpoint_store: Optional[RunnerCheckpointStore] = None,
         worktree_manager: Optional[WorktreeManager] = None,
+        progress_callback: Optional[Callable[[Mapping[str, Any]], None]] = None,
     ):
         self.registry = registry or create_default_registry()
         self.evidence_store = evidence_store
         self.evidence_gate = evidence_gate
         self.checkpoint_store = checkpoint_store or RunnerCheckpointStore()
         self.worktree_manager = worktree_manager
+        self.progress_callback = progress_callback
         self._active_handles: Dict[str, AgentHandle] = {}
         self._lock = threading.Lock()
+
+    def _emit_progress(
+        self,
+        *,
+        task_id: str,
+        state: str,
+        role: str,
+        event: str,
+        message: str,
+        candidate_commit: Optional[str] = None,
+        cycle: Optional[int] = None,
+    ) -> None:
+        """Publish a bounded, non-secret stage event without affecting execution."""
+        if self.progress_callback is None:
+            return
+        payload: Dict[str, Any] = {
+            "event": event,
+            "task_id": task_id,
+            "state": state,
+            "role": role,
+            "message": message,
+            "timestamp": time.time(),
+        }
+        if candidate_commit:
+            payload["candidate_commit"] = candidate_commit
+        if cycle is not None:
+            payload["cycle"] = cycle
+        try:
+            self.progress_callback(payload)
+        except Exception:
+            # Telemetry is informative only and must never become a release gate.
+            pass
+
+    @staticmethod
+    def _record_pre_granted_approval(adapter: Any, request: AgentRequest, approved: bool) -> None:
+        """Record one exact outer-host approval when the CLI user explicitly granted it."""
+        if not approved:
+            return
+        recorder = getattr(adapter, "record_out_of_band_approval", None)
+        if callable(recorder):
+            recorder(request)
 
     def _is_cancellation_requested(self, task_id: str) -> bool:
         try:
@@ -503,8 +565,10 @@ class ProductionRunner:
             return False, "Unable to locate transition_task.py (Fail-Closed)."
 
         config_candidates = (
+            os.path.join(authority_root, ".yy-flow", "user_data", "workflow.config.yaml"),
             os.path.join(authority_root, "user_data", "workflow.config.yaml"),
             os.path.join(authority_root, "config", "workflow.config.yaml"),
+            paths.resolve_runtime_config(cwd=authority_root),
         )
         config_path = next((p for p in config_candidates if os.path.isfile(p)), None)
         if config_path is None:
@@ -1180,8 +1244,16 @@ class ProductionRunner:
             total_attempts=0,
             worktree_path=worktree_dir,
             worktree_branch=worktree_branch,
+            execution_options=_execution_options_from_spec(spec),
         )
         self.checkpoint_store.save_checkpoint(checkpoint)
+        self._emit_progress(
+            task_id=task_id,
+            state=RunnerState.WORKTREE_READY.value,
+            role="RUNNER",
+            event="worktree_ready",
+            message=f"Workspace ready on {worktree_branch}",
+        )
 
         builder_adapter = self.registry.get(spec.builder_adapter_id)
         reviewer_adapter = self.registry.get(spec.reviewer_adapter_id)
@@ -1275,6 +1347,7 @@ class ProductionRunner:
                     worktree_branch=worktree_branch,
                     builder_session_id=sess_builder,
                     evidence_ids=tuple(evidence_ids),
+                    execution_options=_execution_options_from_spec(spec),
                     defects_history=tuple(defects_history),
                 )
                 self.checkpoint_store.save_checkpoint(checkpoint)
@@ -1304,15 +1377,31 @@ class ProductionRunner:
                     workspace_dir=worktree_dir,
                     timeout_seconds=float(spec.builder_timeout_seconds),
                     extra_context={
+                        "sandbox": True,
                         "sandbox_mode": "workspace-write",
+                        "permission_boundary": "workspace_write",
+                        "operation_intent": "Implement workspace-local changes and create one candidate git commit",
                         "worktree_dir": worktree_dir,
                         "project_id": spec.project_id,
                         "pre_granted_approval": pre_granted_approval,
                         "approve_for_me": pre_granted_approval,
                     },
                 )
+                self._emit_progress(
+                    task_id=task_id,
+                    state=RunnerState.BUILDING.value,
+                    role="BUILDER",
+                    event="stage_started",
+                    message=f"Dispatching Builder via {spec.builder_adapter_id}",
+                    cycle=candidate_generation,
+                )
 
                 try:
+                    self._record_pre_granted_approval(
+                        builder_adapter,
+                        builder_request,
+                        pre_granted_approval,
+                    )
                     builder_handle = builder_adapter.dispatch_agent(builder_request)
                     with self._lock:
                         self._active_handles[task_id] = builder_handle
@@ -1350,6 +1439,7 @@ class ProductionRunner:
                         worktree_branch=worktree_branch,
                         builder_session_id=sess_builder,
                         evidence_ids=tuple(evidence_ids),
+                        execution_options=_execution_options_from_spec(spec),
                         defects_history=tuple(defects_history),
                         approval_reason=str(se),
                         last_error="Permission approval required",
@@ -1440,6 +1530,15 @@ class ProductionRunner:
                         task_id=task_id,
                         message="Builder produced no new commits on top of baseline commit (Candidate == Baseline). Fail-Closed.",
                     )
+                self._emit_progress(
+                    task_id=task_id,
+                    state=RunnerState.BUILDING.value,
+                    role="BUILDER",
+                    event="stage_completed",
+                    message="Builder produced a clean candidate commit",
+                    candidate_commit=candidate_commit,
+                    cycle=candidate_generation,
+                )
 
                 builder_evidence_id = f"evi_builder_{task_id.lower()}_{int(time.time()*1000)}"
                 builder_caps = builder_adapter.detect_capabilities()
@@ -1548,6 +1647,7 @@ class ProductionRunner:
                     builder_session_id=sess_builder if "sess_builder" in locals() else None,
                     reviewer_session_id=sess_reviewer,
                     evidence_ids=tuple(evidence_ids),
+                    execution_options=_execution_options_from_spec(spec),
                     defects_history=tuple(defects_history),
                 )
                 self.checkpoint_store.save_checkpoint(checkpoint)
@@ -1600,19 +1700,35 @@ class ProductionRunner:
                     workspace_dir=worktree_dir,
                     timeout_seconds=float(spec.reviewer_timeout_seconds),
                     extra_context={
-                        "sandbox": "read-only",
+                        "sandbox": True,
+                        "permission_boundary": "workspace_read",
+                        "operation_intent": (
+                            f"git diff --no-ext-diff --unified=40 {spec.baseline_commit} "
+                            f"{candidate_commit} --"
+                        ),
+                        "json_schema": REVIEWER_JSON_SCHEMA,
                         "worktree_dir": worktree_dir,
                         "project_id": spec.project_id,
                         "review_request_id": review_request_id,
                         "pre_granted_approval": pre_granted_approval,
                     },
                 )
+                self._emit_progress(
+                    task_id=task_id,
+                    state=RunnerState.REVIEWING.value,
+                    role="REVIEWER",
+                    event="stage_started",
+                    message=f"Dispatching independent Reviewer via {spec.reviewer_adapter_id}",
+                    candidate_commit=candidate_commit,
+                    cycle=review_cycle,
+                )
 
                 try:
-                    if pre_granted_approval:
-                        approval_recorder = getattr(reviewer_adapter, "record_out_of_band_approval", None)
-                        if callable(approval_recorder):
-                            approval_recorder(reviewer_request)
+                    self._record_pre_granted_approval(
+                        reviewer_adapter,
+                        reviewer_request,
+                        pre_granted_approval,
+                    )
                     reviewer_handle = reviewer_adapter.dispatch_agent(reviewer_request)
                     with self._lock:
                         self._active_handles[task_id] = reviewer_handle
@@ -1650,6 +1766,7 @@ class ProductionRunner:
                         worktree_branch=worktree_branch,
                         reviewer_session_id=sess_reviewer,
                         evidence_ids=tuple(evidence_ids),
+                        execution_options=_execution_options_from_spec(spec),
                         defects_history=tuple(defects_history),
                         approval_reason=str(se),
                         last_error="Permission approval required",
@@ -1720,6 +1837,15 @@ class ProductionRunner:
                     session_id=sess_reviewer,
                     invocation_id=inv_reviewer,
                     review_request_id=review_request_id,
+                )
+                self._emit_progress(
+                    task_id=task_id,
+                    state=RunnerState.REVIEWING.value,
+                    role="REVIEWER",
+                    event="stage_completed",
+                    message=f"Reviewer decision: {review_output.decision}",
+                    candidate_commit=candidate_commit,
+                    cycle=review_cycle,
                 )
 
                 reviewer_evidence_id = f"evi_reviewer_{task_id.lower()}_{int(time.time()*1000)}"
@@ -1873,6 +1999,7 @@ class ProductionRunner:
                 reviewer_session_id=sess_reviewer if "sess_reviewer" in locals() else None,
                 qa_session_id=sess_qa,
                 evidence_ids=tuple(evidence_ids),
+                execution_options=_execution_options_from_spec(spec),
                 defects_history=tuple(defects_history),
             )
             self.checkpoint_store.save_checkpoint(checkpoint)
@@ -1941,7 +2068,10 @@ class ProductionRunner:
                 workspace_dir=worktree_dir,
                 timeout_seconds=float(spec.qa_timeout_seconds),
                 extra_context={
-                    "sandbox": "read-only",
+                    "sandbox": True,
+                    "permission_boundary": "workspace_read",
+                    "operation_intent": "\n".join(test_commands) or "git status",
+                    "json_schema": QA_JSON_SCHEMA,
                     "worktree_dir": worktree_dir,
                     "project_id": spec.project_id,
                     "qa_request_id": qa_request_id,
@@ -1949,8 +2079,22 @@ class ProductionRunner:
                     "pre_granted_approval": pre_granted_approval,
                 },
             )
+            self._emit_progress(
+                task_id=task_id,
+                state=RunnerState.QA_TESTING.value,
+                role="QA",
+                event="stage_started",
+                message=f"Dispatching independent QA via {spec.qa_adapter_id}",
+                candidate_commit=candidate_commit,
+                cycle=qa_cycle,
+            )
 
             try:
+                self._record_pre_granted_approval(
+                    qa_adapter,
+                    qa_request,
+                    pre_granted_approval,
+                )
                 qa_handle = qa_adapter.dispatch_agent(qa_request)
                 with self._lock:
                     self._active_handles[task_id] = qa_handle
@@ -1988,6 +2132,7 @@ class ProductionRunner:
                     worktree_branch=worktree_branch,
                     qa_session_id=sess_qa,
                     evidence_ids=tuple(evidence_ids),
+                    execution_options=_execution_options_from_spec(spec),
                     defects_history=tuple(defects_history),
                     approval_reason=str(se),
                     last_error="Permission approval required",
@@ -2088,6 +2233,15 @@ class ProductionRunner:
             test_exit_codes = tuple(item["exit_code"] for item in command_results)
             commands_passed = bool(test_exit_codes) and all(code == 0 for code in test_exit_codes)
             qa_passed = qa_output.decision == "PASS" and commands_passed
+            self._emit_progress(
+                task_id=task_id,
+                state=RunnerState.QA_TESTING.value,
+                role="QA",
+                event="stage_completed",
+                message=f"QA decision: {'PASS' if qa_passed else 'FAIL'}",
+                candidate_commit=candidate_commit,
+                cycle=qa_cycle,
+            )
 
             # 严格核验 QA 前后源码不可变性（P1 门禁：HEAD、diff、cached diff、status）
             immutability_ok, immutability_err = self._verify_qa_immutability(worktree_dir, candidate_commit)
@@ -2274,6 +2428,7 @@ class ProductionRunner:
                 worktree_path=worktree_dir,
                 worktree_branch=worktree_branch,
                 evidence_ids=tuple(evidence_ids),
+                execution_options=_execution_options_from_spec(spec),
                 confirmation_request_id=confirmation_req_id,
                 defects_history=tuple(defects_history),
             )
@@ -2300,6 +2455,15 @@ class ProductionRunner:
                     evidence_ids=tuple(evidence_ids),
                     message=f"Failed to execute legal state transition to '已完成': {err_trans}",
                 )
+
+            self._emit_progress(
+                task_id=task_id,
+                state=RunnerState.PENDING_USER_ACCEPTANCE.value,
+                role="RUNNER",
+                event="pending_user_acceptance",
+                message="EvidenceGate passed; board is 已完成 and waiting for explicit user acceptance",
+                candidate_commit=candidate_commit,
+            )
 
             return RunnerResult(
                 success=True,
@@ -2337,6 +2501,7 @@ class ProductionRunner:
                 "confirmation_request_id": ckpt.confirmation_request_id,
                 "last_error": ckpt.last_error,
                 "approval_reason": ckpt.approval_reason,
+                "execution_options": dict(ckpt.execution_options),
             }
         return {
             "task_id": task_id,
@@ -2352,6 +2517,7 @@ class ProductionRunner:
         authority_root: Optional[str] = None,
         interactive_approval_cb: Optional[Callable[[str, Dict[str, Any]], bool]] = None,
         pre_granted_approval: bool = False,
+        overrides: Optional[Dict[str, Any]] = None,
     ) -> RunnerResult:
         """从 Checkpoint 恢复执行 (支持断点恢复、完整复核 HEAD、Evidence 与权威状态)"""
         _validate_task_id(task_id)
@@ -2364,7 +2530,14 @@ class ProductionRunner:
                 message=f"Cannot resume: No checkpoint found for task {task_id}.",
             )
 
-        spec = load_task_execution_spec(project_root=project_root, task_id=task_id, authority_root=authority_root)
+        effective_overrides = dict(ckpt.execution_options)
+        effective_overrides.update(overrides or {})
+        spec = load_task_execution_spec(
+            project_root=project_root,
+            task_id=task_id,
+            authority_root=authority_root,
+            overrides=effective_overrides,
+        )
 
         # 1. 严格乐观并发校验权威看板状态
         if not verify_optimistic_concurrency(spec):
@@ -2541,6 +2714,7 @@ class ProductionRunner:
                 reviewer_session_id=ckpt.reviewer_session_id,
                 qa_session_id=ckpt.qa_session_id,
                 evidence_ids=ckpt.evidence_ids,
+                execution_options=ckpt.execution_options,
                 confirmation_request_id=ckpt.confirmation_request_id,
                 defects_history=ckpt.defects_history,
                 last_error="Cancelled by user command.",

@@ -315,12 +315,14 @@ def test_production_runner_full_pass_pipeline(mock_git_repo, tmp_path, monkeypat
     evidence_store = EvidenceStore(root_dir=str(data_root / "evidence"))
     evidence_gate = EvidenceGate(store=evidence_store, project_root=str(repo_dir))
     checkpoint_store = RunnerCheckpointStore(data_root=str(data_root), project_root=str(repo_dir), project_id="test_proj")
+    progress_events = []
 
     runner = ProductionRunner(
         registry=registry,
         evidence_store=evidence_store,
         evidence_gate=evidence_gate,
         checkpoint_store=checkpoint_store,
+        progress_callback=progress_events.append,
     )
 
     spec = TaskExecutionSpec(
@@ -345,6 +347,13 @@ def test_production_runner_full_pass_pipeline(mock_git_repo, tmp_path, monkeypat
     assert result.state == RunnerState.PENDING_USER_ACCEPTANCE.value
     assert result.candidate_commit is not None
     assert len(result.evidence_ids) >= 3
+    stage_roles = [
+        event["role"]
+        for event in progress_events
+        if event["event"] == "stage_started"
+    ]
+    assert stage_roles == ["BUILDER", "REVIEWER", "QA"]
+    assert progress_events[-1]["event"] == "pending_user_acceptance"
     board = json.loads((repo_dir / "user_data" / "board.json").read_text(encoding="utf-8"))
     assert board[0]["status"] == "已完成"
     process = board[0]["process"]

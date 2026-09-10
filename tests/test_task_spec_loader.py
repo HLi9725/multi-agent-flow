@@ -154,6 +154,27 @@ def test_load_valid_task_execution_spec(mock_project_environment):
     assert "开发计划" not in spec.acceptance_criteria
 
 
+def test_project_local_yy_flow_config_is_used_for_load_and_revalidation(mock_project_environment):
+    yy_data = mock_project_environment / ".yy-flow" / "user_data"
+    yy_data.mkdir(parents=True)
+    source_config = mock_project_environment / "config" / "workflow.config.yaml"
+    source_config.replace(yy_data / "workflow.config.yaml")
+    source_board = mock_project_environment / "user_data" / "board.json"
+    source_board.replace(yy_data / "board.json")
+    installed_config = yy_data / "workflow.config.yaml"
+    config_data = yaml.safe_load(installed_config.read_text(encoding="utf-8"))
+    config_data["board"]["board_file"] = "user_data/board.json"
+    installed_config.write_text(yaml.safe_dump(config_data), encoding="utf-8")
+
+    spec = load_task_execution_spec(
+        project_root=str(mock_project_environment),
+        task_id="T0001",
+        authority_root=str(mock_project_environment),
+    )
+    assert spec.task_id == "T0001"
+    assert verify_optimistic_concurrency(spec) is True
+
+
 def test_a_class_task_without_explicit_acceptance_criteria_fails_closed(mock_project_environment):
     with pytest.raises(TaskSpecIncompleteError, match="no explicit, executable acceptance criteria"):
         load_task_execution_spec(

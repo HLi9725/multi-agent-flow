@@ -146,7 +146,10 @@ class RunnerCheckpointStore:
         Fail-Closed: 若锁已被占用，返回 (None, None)。
         """
         clean_id = _validate_task_id(task_id)
-        locks_dir = paths.locks_dir()
+        # Bind locks to the same explicit data root as checkpoints.  Resolving
+        # from the process CWD/skill location can put a shared-installation lock
+        # in another project's namespace.
+        locks_dir = os.path.join(self.data_root, "user_data", "locks")
         os.makedirs(locks_dir, exist_ok=True)
         lock_file = os.path.join(locks_dir, f".lock_runner_{self.project_id}_{clean_id}.lock")
         try:

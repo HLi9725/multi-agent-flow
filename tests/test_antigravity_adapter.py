@@ -54,6 +54,8 @@ from scripts._lib.core.evidence_gate import (
 )
 from scripts._lib.hosts.antigravity_adapter import (
     AntigravityAdapter,
+    _build_stream_input,
+    _evaluate_request_risk,
     _find_default_antigravity_executable,
     create_antigravity_manifest,
 )
@@ -143,10 +145,59 @@ def test_antigravity_adapter_role_based_routing_and_sandbox():
     assert cmd_dev[cmd_dev.index("--mode") + 1] == "accept-edits"
     assert "--sandbox" in cmd_dev
     assert "--dangerously-skip-permissions" not in cmd_dev
-    # Verify option flags precede --print
-    assert cmd_dev.index("--output-format") < cmd_dev.index("--print")
-    assert cmd_dev[-2] == "--print"
-    assert cmd_dev[-1] == "Implement feature"
+    # Prompts use stdin stream-json so large Windows prompts never enter argv.
+    assert cmd_dev[cmd_dev.index("--input-format") + 1] == "stream-json"
+    assert cmd_dev[cmd_dev.index("--output-format") + 1] == "stream-json"
+    assert cmd_dev[cmd_dev.index("--print-timeout") + 1] == "3600s"
+    assert "--print" not in cmd_dev
+    assert "Implement feature" not in cmd_dev
+
+
+def test_antigravity_prompt_uses_stdin_with_timeout_and_schema():
+    adapter = AntigravityAdapter(is_real_host=False)
+    schema = {
+        "type": "object",
+        "required": ["decision"],
+        "properties": {"decision": {"type": "string", "enum": ["PASS", "REJECT"]}},
+    }
+    request = AgentRequest(
+        session_id="sess_stdin_transport",
+        prompt="x" * 80_000,
+        role="REVIEWER",
+        workspace_dir=os.path.abspath("."),
+        timeout_seconds=12.1,
+        extra_context={"json_schema": schema},
+    )
+
+    command = adapter.build_antigravity_exec_command(request)
+    assert request.prompt not in command
+    assert command[command.index("--print-timeout") + 1] == "13s"
+    assert json.loads(command[command.index("--json-schema") + 1]) == schema
+    payload = json.loads(_build_stream_input(request.prompt))
+    assert payload == {"event": "user", "message": {"content": request.prompt}}
+
+
+def test_antigravity_request_risk_separates_operation_from_embedded_source_text():
+    request = AgentRequest(
+        session_id="sess_review_diff_words",
+        prompt="Review patch text mentioning delete, drop table, and git push as examples.",
+        role="REVIEWER",
+        workspace_dir=os.path.abspath("."),
+        extra_context={
+            "operation_intent": "git diff --no-ext-diff HEAD~1 HEAD --",
+            "permission_boundary": "workspace_read",
+        },
+    )
+    assert _evaluate_request_risk(request) == "safe_local"
+
+    destructive = AgentRequest(
+        session_id="sess_real_destructive_intent",
+        prompt="benign words",
+        role="DEV",
+        workspace_dir=os.path.abspath("."),
+        extra_context={"operation_intent": "git reset --hard HEAD"},
+    )
+    assert _evaluate_request_risk(destructive) == "destructive"
 
 
 def test_antigravity_adapter_parsing_real_stream_json():
@@ -166,6 +217,41 @@ def test_antigravity_adapter_parsing_real_stream_json():
     assert len(events) == 3
     assert err is None
     assert "Architecture plan created." in text
+
+
+def test_antigravity_adapter_parses_structured_output_result():
+    adapter = AntigravityAdapter(is_real_host=False)
+    sample = (
+        '{"event":"step_update","step_update":{"conversation_id":"conv-structured","step_index":2}}\n'
+        '{"event":"result","result":{"conversation_id":"conv-structured","status":"SUCCESS",'
+        '"structured_output":{"decision":"PASS","defects":[]}}}\n'
+    )
+    text, _, err, conv_id, inv_id, _ = adapter._parse_antigravity_output(sample, "")
+    assert err is None
+    assert conv_id == "conv-structured"
+    assert inv_id == "conv-structured:step_2"
+    assert json.loads(text) == {"decision": "PASS", "defects": []}
+
+
+@pytest.mark.parametrize("result_status", ["CANCELED", "INTERRUPTED", "INVALID", "WAITING", "RUNNING"])
+def test_antigravity_adapter_rejects_non_success_result_status(result_status):
+    adapter = AntigravityAdapter(is_real_host=False)
+    sample = json.dumps(
+        {
+            "event": "result",
+            "step_id": "step_1",
+            "result": {
+                "status": result_status,
+                "conversation_id": "conv-non-success",
+            },
+        }
+    )
+
+    _text, _events, error, conv_id, inv_id, _usage = adapter._parse_antigravity_output(sample, "")
+
+    assert error == f"Antigravity CLI returned non-success status: {result_status}"
+    assert conv_id == "conv-non-success"
+    assert inv_id == "conv-non-success:step_1"
 
 
 def test_antigravity_adapter_distinct_session_invocations_no_collision():
@@ -195,7 +281,7 @@ def test_antigravity_adapter_exit_zero_missing_canonical_identity_fails_closed(m
     class MockExitZeroNoIdentityProcess:
         pid = 88888
         returncode = 0
-        def communicate(self, timeout=None):
+        def communicate(self, input=None, timeout=None):
             return "Generic stdout without conversation.started\n", ""
         def poll(self):
             return 0
@@ -356,7 +442,7 @@ def test_antigravity_adapter_timeout_and_cancel_lifecycle(monkeypatch):
         returncode = None
         def poll(self):
             return None
-        def communicate(self, timeout=None):
+        def communicate(self, input=None, timeout=None):
             raise subprocess.TimeoutExpired(cmd=["agy"], timeout=timeout)
         def terminate(self):
             terminated_pids.append(self.pid)
@@ -474,7 +560,7 @@ def test_antigravity_adapter_thread_only_no_step_fails_closed(monkeypatch):
     class MockThreadOnlyProcess:
         pid = 44444
         returncode = 0
-        def communicate(self, timeout=None):
+        def communicate(self, input=None, timeout=None):
             return '{"type":"conversation.started","id":"conv-thread-only"}\n', ""
         def poll(self):
             return 0
@@ -518,7 +604,7 @@ def test_antigravity_evidence_gate_real_judgment(tmp_path, monkeypatch):
     class MockAgyProcess:
         pid = 33333
         returncode = 0
-        def communicate(self, timeout=None):
+        def communicate(self, input=None, timeout=None):
             return sample_stdout, ""
         def poll(self):
             return 0
@@ -925,6 +1011,7 @@ def test_antigravity_adapter_popen_sets_cwd_for_project_isolation(monkeypatch):
         permission_boundary="workspace_read"
     )
     captured_kwargs = {}
+    captured_communicate = {}
 
     class MockCapturedPopen:
         pid = 77777
@@ -933,7 +1020,9 @@ def test_antigravity_adapter_popen_sets_cwd_for_project_isolation(monkeypatch):
             captured_kwargs.update(kwargs)
         def poll(self):
             return 0
-        def communicate(self, timeout=None):
+        def communicate(self, input=None, timeout=None):
+            captured_communicate["input"] = input
+            captured_communicate["timeout"] = timeout
             return '{"type":"conversation.started","id":"conv-iso"}\n{"step_id":"step_1","type":"output"}\n', ""
 
     monkeypatch.setattr(subprocess, "Popen", MockCapturedPopen)
@@ -946,6 +1035,10 @@ def test_antigravity_adapter_popen_sets_cwd_for_project_isolation(monkeypatch):
     )
     handle = adapter.dispatch_agent(req)
     assert captured_kwargs.get("cwd") == target_ws
+    result = adapter.wait_for_result(handle, timeout_seconds=9)
+    assert result.status == AgentStatus.SUCCESS
+    assert json.loads(captured_communicate["input"])["message"]["content"] == "git status"
+    assert captured_communicate["timeout"] == 9
 
 
 def test_antigravity_adapter_dual_root_and_cross_project_isolation(tmp_path):
