@@ -354,6 +354,14 @@ def test_production_runner_full_pass_pipeline(mock_git_repo, tmp_path, monkeypat
     ]
     assert stage_roles == ["BUILDER", "REVIEWER", "QA"]
     assert progress_events[-1]["event"] == "pending_user_acceptance"
+    qa_request = next(iter(qa_requests.values()))
+    assert "Do not invoke tools, commands" in qa_request.prompt
+    assert "Runner-produced test evidence" in qa_request.prompt
+    assert '"exit_code": 0' in qa_request.prompt
+    assert "Execute the required" not in qa_request.prompt
+    assert qa_request.extra_context["operation_intent"] == (
+        "read-only semantic assessment of inline Runner test evidence"
+    )
     board = json.loads((repo_dir / "user_data" / "board.json").read_text(encoding="utf-8"))
     assert board[0]["status"] == "已完成"
     process = board[0]["process"]

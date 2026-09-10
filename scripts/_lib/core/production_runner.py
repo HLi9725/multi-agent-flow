@@ -2024,6 +2024,22 @@ class ProductionRunner:
                     message=f"Worktree HEAD ({head_before_qa}) does not match candidate commit ({candidate_commit}) before QA! Fail-Closed.",
                 )
 
+            try:
+                qa_diff_bundle = self._build_reviewer_diff_bundle(
+                    worktree_dir,
+                    spec.baseline_commit,
+                    candidate_commit,
+                )
+            except Exception as exc:
+                return RunnerResult(
+                    success=False,
+                    state=RunnerState.NEEDS_USER_INPUT.value,
+                    task_id=task_id,
+                    candidate_commit=candidate_commit,
+                    evidence_ids=tuple(evidence_ids),
+                    message=f"Unable to create bounded QA candidate payload: {exc}",
+                )
+
             test_commands = spec.test_commands or (spec.test_command or "python -m pytest -q",)
             validated_commands = []
             for test_cmd in test_commands:
@@ -2038,6 +2054,40 @@ class ProductionRunner:
                     )
                 validated_commands.append((test_cmd, cmd_args))
 
+            # The Runner, not the headless QA agent, owns command execution. This
+            # avoids duplicate test runs and prevents Antigravity CLI from trying
+            # to open an interactive permission prompt in stream-json mode. QA
+            # receives bounded, masked executable evidence and remains read-only.
+            command_results = []
+            qa_command_evidence = []
+            for command, command_args in validated_commands:
+                try:
+                    test_proc = subprocess.run(
+                        command_args,
+                        cwd=worktree_dir,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=spec.qa_timeout_seconds,
+                    )
+                    exit_code = test_proc.returncode
+                    output_material = (test_proc.stdout or "") + "\n" + (test_proc.stderr or "")
+                except Exception as exc:
+                    exit_code = 1
+                    output_material = f"Runner command exception: {type(exc).__name__}: {exc}"
+                masked_output = self.evidence_store._mask_text(output_material)
+                command_results.append({
+                    "command": command,
+                    "exit_code": exit_code,
+                    "output_hash": hashlib.sha256(output_material.encode("utf-8", errors="replace")).hexdigest(),
+                })
+                qa_command_evidence.append({
+                    "command": command,
+                    "exit_code": exit_code,
+                    "output_excerpt": masked_output[-4000:],
+                })
+
             qa_request_id = f"qa_req_{uuid.uuid4().hex}"
             criteria_payload = [item.to_dict() for item in spec.acceptance_criteria_items]
             qa_prompt = (
@@ -2049,11 +2099,17 @@ class ProductionRunner:
                 f"Baseline Commit: {spec.baseline_commit}\n"
                 f"Candidate Commit: {candidate_commit}\n"
                 f"Reviewer PASS summary: {review_output.summary if 'review_output' in locals() else 'validated reviewer evidence'}\n\n"
-                "Inspect the candidate read-only. Trace changed behavior through every API, background worker, "
-                "database, authorization, contract/SDK, and frontend boundary that applies. Execute the required "
-                "commands below and independently test at least one negative/adversarial scenario. If any criterion "
-                "or risk is not verifiable, return FAIL; never infer PASS from a green regression suite alone.\n\n"
-                f"Required commands:\n{json.dumps(list(test_commands), ensure_ascii=False, indent=2)}\n\n"
+                f"Immutable candidate diff:\n{qa_diff_bundle}\n\n"
+                "Perform a semantic QA assessment from the immutable candidate context and the Runner-produced "
+                "test evidence below. Do not invoke tools, commands, browsers, file-system access, subagents, or "
+                "permission prompts. Trace changed behavior through every API, background worker, database, "
+                "authorization, contract/SDK, and frontend boundary that applies. Verify at least one negative or "
+                "adversarial scenario represented by the acceptance criteria, review context, or test evidence. "
+                "If any criterion or risk is not verifiable, return FAIL; never infer PASS from a green regression "
+                "suite alone. In test_commands, copy each Runner command and its recorded exit_code exactly once; "
+                "do not claim to have executed it yourself.\n\n"
+                f"Runner-produced test evidence:\n"
+                f"{json.dumps(qa_command_evidence, ensure_ascii=False, indent=2)}\n\n"
                 "Return ONLY a JSON object matching this schema:\n"
                 f"{json.dumps(QA_JSON_SCHEMA, ensure_ascii=False, sort_keys=True)}\n"
                 f"Identity bindings: task_id={task_id}, baseline_commit={spec.baseline_commit}, "
@@ -2070,7 +2126,7 @@ class ProductionRunner:
                 extra_context={
                     "sandbox": True,
                     "permission_boundary": "workspace_read",
-                    "operation_intent": "\n".join(test_commands) or "git status",
+                    "operation_intent": "read-only semantic assessment of inline Runner test evidence",
                     "json_schema": QA_JSON_SCHEMA,
                     "worktree_dir": worktree_dir,
                     "project_id": spec.project_id,
@@ -2205,30 +2261,6 @@ class ProductionRunner:
                 expected_criterion_ids=[item.criterion_id for item in spec.acceptance_criteria_items],
                 expected_test_commands=test_commands,
             )
-
-            # Runner independently reruns every controlled command. Agent claims never replace executable evidence.
-            command_results = []
-            for command, command_args in validated_commands:
-                try:
-                    test_proc = subprocess.run(
-                        command_args,
-                        cwd=worktree_dir,
-                        capture_output=True,
-                        text=True,
-                        encoding="utf-8",
-                        errors="replace",
-                        timeout=spec.qa_timeout_seconds,
-                    )
-                    exit_code = test_proc.returncode
-                    output_material = (test_proc.stdout or "") + "\n" + (test_proc.stderr or "")
-                except Exception as exc:
-                    exit_code = 1
-                    output_material = f"Runner command exception: {type(exc).__name__}: {exc}"
-                command_results.append({
-                    "command": command,
-                    "exit_code": exit_code,
-                    "output_hash": hashlib.sha256(output_material.encode("utf-8", errors="replace")).hexdigest(),
-                })
 
             test_exit_codes = tuple(item["exit_code"] for item in command_results)
             commands_passed = bool(test_exit_codes) and all(code == 0 for code in test_exit_codes)
