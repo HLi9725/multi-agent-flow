@@ -23,8 +23,11 @@ from scripts._lib.core.agent_schema import (
 )
 from scripts._lib.core.evidence_store import EvidenceStore
 from scripts._lib.core.production_runner import (
+    QA_PROTOCOL_DEFECT_SUFFIXES,
+    REVIEWER_PROTOCOL_DEFECT_SUFFIXES,
     ProductionRunner,
     _extract_real_invocation_id,
+    _has_protocol_defect,
     _validate_qa_test_command,
 )
 from scripts._lib.core.runner_checkpoint_store import RunnerCheckpointStore
@@ -32,6 +35,18 @@ from scripts._lib.core.runner_schema import RunnerState, TaskExecutionSpec
 from scripts._lib.core.task_spec_loader import load_task_execution_spec
 from scripts._lib.hosts.antigravity_adapter import AntigravityAdapter, create_antigravity_manifest
 from scripts._lib.hosts.codex_cli_adapter import CodexCliAdapter, create_codex_cli_manifest
+
+
+def test_protocol_defects_are_distinct_from_business_defects():
+    reviewer_schema = [{"defect_id": "DEF-T0012-SCHEMA-VIOLATION"}]
+    reviewer_business = [{"defect_id": "DEF-T0012-ATOMICITY"}]
+    qa_schema = [{"defect_id": "DEF-T0012-QA-SCHEMA-VIOLATION"}]
+    qa_business = [{"defect_id": "DEF-T0012-QA-CONCURRENCY"}]
+
+    assert _has_protocol_defect(reviewer_schema, REVIEWER_PROTOCOL_DEFECT_SUFFIXES)
+    assert not _has_protocol_defect(reviewer_business, REVIEWER_PROTOCOL_DEFECT_SUFFIXES)
+    assert _has_protocol_defect(qa_schema, QA_PROTOCOL_DEFECT_SUFFIXES)
+    assert not _has_protocol_defect(qa_business, QA_PROTOCOL_DEFECT_SUFFIXES)
 
 
 @pytest.fixture

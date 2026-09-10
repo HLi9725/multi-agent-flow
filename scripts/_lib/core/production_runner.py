@@ -107,6 +107,28 @@ FORBIDDEN_DANGEROUS_COMMANDS = {
     "nc", "netcat", "bash", "sh", "powershell", "powershell.exe", "cmd", "cmd.exe",
 }
 
+REVIEWER_PROTOCOL_DEFECT_SUFFIXES = (
+    "SCHEMA-VIOLATION",
+    "IDENTITY-MISMATCH",
+    "INVALID-PASS",
+)
+
+QA_PROTOCOL_DEFECT_SUFFIXES = (
+    "QA-SCHEMA-VIOLATION",
+    "QA-IDENTITY-MISMATCH",
+    "QA-COMMAND-GAP",
+    "QA-INVALID-PASS",
+    "QA-INVALID-FAIL",
+)
+
+
+def _has_protocol_defect(defects: Sequence[Mapping[str, Any]], suffixes: Sequence[str]) -> bool:
+    """Return true only for host/schema failures that cannot be fixed in business code."""
+    return any(
+        str(item.get("defect_id", "")).endswith(tuple(suffixes))
+        for item in defects
+    )
+
 
 def _extract_capabilities_extra(caps: Any) -> Dict[str, Any]:
     if not caps:
@@ -1296,6 +1318,7 @@ class ProductionRunner:
         total_attempts = checkpoint.total_attempts
         evidence_ids: List[str] = list(checkpoint.evidence_ids)
         defects_history: List[Dict[str, Any]] = list(checkpoint.defects_history)
+        qa_test_cache: Dict[Tuple[str, Tuple[str, ...]], Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]] = {}
         start_role = checkpoint.current_role if existing_checkpoint else "BUILDER"
         skip_builder = (start_role in ("REVIEWER", "QA") and candidate_commit is not None)
         skip_reviewer = (start_role == "QA" and candidate_commit is not None)
@@ -1918,8 +1941,39 @@ class ProductionRunner:
                             )
                         current_board_status = "测试中"
                 else:
-                    # 状态机回退: 审查中 -> 已退回 -> 进行中 (REVIEWER & DEV)
                     review_exhausted = review_cycle >= spec.max_review_cycles
+                    reviewer_protocol_failure = _has_protocol_defect(
+                        review_output.defects,
+                        REVIEWER_PROTOCOL_DEFECT_SUFFIXES,
+                    )
+                    if reviewer_protocol_failure:
+                        defects_history.append({
+                            "cycle": review_cycle,
+                            "role": "REVIEWER_PROTOCOL",
+                            "defects": list(review_output.defects),
+                            "summary": review_output.summary,
+                        })
+                        if review_exhausted:
+                            return RunnerResult(
+                                success=False,
+                                state=RunnerState.NEEDS_USER_INPUT.value,
+                                task_id=task_id,
+                                candidate_commit=candidate_commit,
+                                candidate_generation=candidate_generation,
+                                evidence_ids=tuple(evidence_ids),
+                                message=(
+                                    "Reviewer protocol output remained invalid and exceeded "
+                                    f"max review cycles ({spec.max_review_cycles}). Business code was not returned to Builder."
+                                ),
+                                diagnostics={"defects": defects_history},
+                            )
+                        # The candidate is unchanged. Retry only the independent
+                        # Reviewer; a host/schema failure is not a code defect.
+                        skip_builder = True
+                        skip_reviewer = False
+                        continue
+
+                    # Real review defects go through the legal rejection loop.
                     if current_board_status == "审查中":
                         ok_return, err_return = self._do_state_transition(
                             spec.authority_root, task_id, "REVIEWER", "审查中", "已退回", "李开发",
@@ -1960,6 +2014,8 @@ class ProductionRunner:
                             message=f"Reviewer rejected candidate and exceeded max review cycles ({spec.max_review_cycles}). Paused at NEEDS_USER_INPUT.",
                             diagnostics={"defects": defects_history},
                         )
+                    skip_builder = False
+                    skip_reviewer = False
                     continue
             else:
                 skip_reviewer = False
@@ -2058,35 +2114,45 @@ class ProductionRunner:
             # avoids duplicate test runs and prevents Antigravity CLI from trying
             # to open an interactive permission prompt in stream-json mode. QA
             # receives bounded, masked executable evidence and remains read-only.
-            command_results = []
-            qa_command_evidence = []
-            for command, command_args in validated_commands:
-                try:
-                    test_proc = subprocess.run(
-                        command_args,
-                        cwd=worktree_dir,
-                        capture_output=True,
-                        text=True,
-                        encoding="utf-8",
-                        errors="replace",
-                        timeout=spec.qa_timeout_seconds,
-                    )
-                    exit_code = test_proc.returncode
-                    output_material = (test_proc.stdout or "") + "\n" + (test_proc.stderr or "")
-                except Exception as exc:
-                    exit_code = 1
-                    output_material = f"Runner command exception: {type(exc).__name__}: {exc}"
-                masked_output = self.evidence_store._mask_text(output_material)
-                command_results.append({
-                    "command": command,
-                    "exit_code": exit_code,
-                    "output_hash": hashlib.sha256(output_material.encode("utf-8", errors="replace")).hexdigest(),
-                })
-                qa_command_evidence.append({
-                    "command": command,
-                    "exit_code": exit_code,
-                    "output_excerpt": masked_output[-4000:],
-                })
+            qa_cache_key = (candidate_commit, tuple(test_commands))
+            cached_qa_evidence = qa_test_cache.get(qa_cache_key)
+            if cached_qa_evidence is not None:
+                command_results = [dict(item) for item in cached_qa_evidence[0]]
+                qa_command_evidence = [dict(item) for item in cached_qa_evidence[1]]
+            else:
+                command_results = []
+                qa_command_evidence = []
+                for command, command_args in validated_commands:
+                    try:
+                        test_proc = subprocess.run(
+                            command_args,
+                            cwd=worktree_dir,
+                            capture_output=True,
+                            text=True,
+                            encoding="utf-8",
+                            errors="replace",
+                            timeout=spec.qa_timeout_seconds,
+                        )
+                        exit_code = test_proc.returncode
+                        output_material = (test_proc.stdout or "") + "\n" + (test_proc.stderr or "")
+                    except Exception as exc:
+                        exit_code = 1
+                        output_material = f"Runner command exception: {type(exc).__name__}: {exc}"
+                    masked_output = self.evidence_store._mask_text(output_material)
+                    command_results.append({
+                        "command": command,
+                        "exit_code": exit_code,
+                        "output_hash": hashlib.sha256(output_material.encode("utf-8", errors="replace")).hexdigest(),
+                    })
+                    qa_command_evidence.append({
+                        "command": command,
+                        "exit_code": exit_code,
+                        "output_excerpt": masked_output[-4000:],
+                    })
+                qa_test_cache[qa_cache_key] = (
+                    [dict(item) for item in command_results],
+                    [dict(item) for item in qa_command_evidence],
+                )
 
             qa_request_id = f"qa_req_{uuid.uuid4().hex}"
             criteria_payload = [item.to_dict() for item in spec.acceptance_criteria_items]
@@ -2399,6 +2465,37 @@ class ProductionRunner:
                         "description": f"Runner-controlled QA commands failed with exit codes {list(test_exit_codes)}.",
                     })
                 qa_exhausted = qa_cycle >= spec.max_qa_cycles
+                qa_protocol_failure = commands_passed and _has_protocol_defect(
+                    qa_defects,
+                    QA_PROTOCOL_DEFECT_SUFFIXES,
+                )
+                if qa_protocol_failure:
+                    defects_history.append({
+                        "cycle": qa_cycle,
+                        "role": "QA_PROTOCOL",
+                        "defects": qa_defects,
+                        "summary": qa_output.summary,
+                    })
+                    if qa_exhausted:
+                        return RunnerResult(
+                            success=False,
+                            state=RunnerState.NEEDS_USER_INPUT.value,
+                            task_id=task_id,
+                            candidate_commit=candidate_commit,
+                            candidate_generation=candidate_generation,
+                            evidence_ids=tuple(evidence_ids),
+                            message=(
+                                "QA protocol output remained invalid and exceeded "
+                                f"max QA cycles ({spec.max_qa_cycles}). Business code was not returned to Builder."
+                            ),
+                            diagnostics={"defects": defects_history},
+                        )
+                    # Keep the board in 测试中 and retry only QA. The Runner test
+                    # evidence and candidate remain fixed and are not rerun.
+                    skip_builder = True
+                    skip_reviewer = True
+                    continue
+
                 if current_board_status == "测试中":
                     ok_return, err_return = self._do_state_transition(
                         spec.authority_root, task_id, "QA", "测试中", "已退回", "李开发",
@@ -2440,6 +2537,8 @@ class ProductionRunner:
                         message=f"QA semantic or command gate failed and exceeded max QA cycles ({spec.max_qa_cycles}). Paused at NEEDS_USER_INPUT.",
                         diagnostics={"defects": defects_history},
                     )
+                skip_builder = False
+                skip_reviewer = False
                 continue
 
             # ==========================================
