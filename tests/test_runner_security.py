@@ -6,6 +6,7 @@ Runner 缺陷回环、JSON Schema 对抗校验、候选提交校验、权限暂�
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -26,6 +27,7 @@ from scripts._lib.core.production_runner import (
     QA_PROTOCOL_DEFECT_SUFFIXES,
     REVIEWER_PROTOCOL_DEFECT_SUFFIXES,
     ProductionRunner,
+    _build_qa_subprocess_env,
     _extract_real_invocation_id,
     _has_protocol_defect,
     _validate_qa_test_command,
@@ -47,6 +49,42 @@ def test_protocol_defects_are_distinct_from_business_defects():
     assert not _has_protocol_defect(reviewer_business, REVIEWER_PROTOCOL_DEFECT_SUFFIXES)
     assert _has_protocol_defect(qa_schema, QA_PROTOCOL_DEFECT_SUFFIXES)
     assert not _has_protocol_defect(qa_business, QA_PROTOCOL_DEFECT_SUFFIXES)
+
+
+def test_qa_subprocess_environment_removes_host_credentials(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "secret-value")
+    monkeypatch.setenv("HTTPS_PROXY", "http://credential@example.invalid")
+    monkeypatch.setenv("SAFE_TEST_SETTING", "kept")
+
+    clean_env = _build_qa_subprocess_env()
+
+    assert "OPENAI_API_KEY" not in clean_env
+    assert "HTTPS_PROXY" not in clean_env
+    assert clean_env["SAFE_TEST_SETTING"] == "kept"
+    assert clean_env["CI"] == "1"
+    assert clean_env["NPM_CONFIG_AUDIT"] == "false"
+
+
+@pytest.mark.skipif(shutil.which("npm") is None, reason="npm is not installed on this host")
+def test_installed_npm_resolves_to_an_absolute_executable(tmp_path):
+    worktree_dir = str(tmp_path / "worktree")
+    os.makedirs(worktree_dir, exist_ok=True)
+
+    ok, error, args = _validate_qa_test_command("npm test", worktree_dir)
+
+    assert ok is True, error
+    assert os.path.isabs(args[0])
+    assert os.path.basename(args[0]).lower() in {"npm", "npm.cmd", "npm.exe"}
+    assert args[1:] == ["test"]
+    probe = subprocess.run(
+        [args[0], "--version"],
+        cwd=worktree_dir,
+        env=_build_qa_subprocess_env(),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert probe.returncode == 0, probe.stderr
 
 
 @pytest.fixture
@@ -379,7 +417,7 @@ def test_agent_result_status_and_identity_validation():
     assert _extract_real_invocation_id(valid_res, handle) == "inv_valid_real_456"
 
 
-def test_qa_test_command_security_and_path_boundary_validation(tmp_path):
+def test_qa_test_command_security_and_path_boundary_validation(tmp_path, monkeypatch):
     """
     P2 对抗测试：
     QA 测试命令缺少受控命令族与路径边界校验。
@@ -411,11 +449,50 @@ def test_qa_test_command_security_and_path_boundary_validation(tmp_path):
     # 5. 合法受控命令通过
     ok, err, args = _validate_qa_test_command("python -m pytest tests/ -q", worktree_dir)
     assert ok is True
-    assert args == ["python", "-m", "pytest", "tests/", "-q"]
+    assert args == [os.path.realpath(sys.executable), "-m", "pytest", "tests/", "-q"]
 
+    trusted_tools = tmp_path / "trusted-tools"
+    trusted_tools.mkdir()
+    npm_executable = trusted_tools / ("npm.cmd" if sys.platform == "win32" else "npm")
+    npm_executable.write_text("", encoding="utf-8")
+    monkeypatch.setattr(
+        "scripts._lib.core.production_runner.shutil.which",
+        lambda command: str(npm_executable) if command == "npm" else None,
+    )
     ok, err, args = _validate_qa_test_command("npm run build", worktree_dir)
     assert ok is True
-    assert args == ["npm", "run", "build"]
+    assert args == [os.path.realpath(npm_executable), "run", "build"]
+
+    ok, err, _ = _validate_qa_test_command("tools/npm run build", worktree_dir)
+    assert ok is False
+    assert "bare allowlisted command" in err
+
+    monkeypatch.setattr("scripts._lib.core.production_runner.shutil.which", lambda command: None)
+    ok, err, _ = _validate_qa_test_command("npm test", worktree_dir)
+    assert ok is False
+    assert err.startswith("[INFRA_TOOL_MISSING]")
+
+    workspace_npm = tmp_path / "worktree" / ("npm.cmd" if sys.platform == "win32" else "npm")
+    workspace_npm.write_text("", encoding="utf-8")
+    monkeypatch.setattr(
+        "scripts._lib.core.production_runner.shutil.which",
+        lambda command: str(workspace_npm),
+    )
+    ok, err, _ = _validate_qa_test_command("npm test", worktree_dir)
+    assert ok is False
+    assert "resolves inside the candidate workspace" in err
+
+    monkeypatch.setattr(
+        "scripts._lib.core.production_runner.shutil.which",
+        lambda command: str(npm_executable) if command in {"npm", "npx"} else None,
+    )
+    ok, err, _ = _validate_qa_test_command("npm test --prefix=../outside", worktree_dir)
+    assert ok is False
+    assert "escapes worktree boundary" in err
+
+    ok, err, _ = _validate_qa_test_command("npx jest", worktree_dir)
+    assert ok is False
+    assert "--no-install" in err
 
     # Windows quoted absolute interpreter is accepted only when it is the
     # currently trusted Python executable.

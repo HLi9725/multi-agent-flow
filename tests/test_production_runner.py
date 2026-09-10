@@ -104,6 +104,30 @@ def test_finalize_builder_candidate_rejects_empty_output(tmp_path):
         runner._finalize_builder_candidate(str(repo_dir), baseline)
 
 
+def test_finalize_builder_repair_requires_a_new_candidate(tmp_path):
+    repo_dir = tmp_path / "repair-builder-repo"
+    repo_dir.mkdir()
+    subprocess.run(["git", "init"], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "TestDev"], cwd=repo_dir, check=True)
+    subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo_dir, check=True)
+    (repo_dir / "value.py").write_text("VALUE = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo_dir, check=True)
+    subprocess.run(["git", "commit", "-m", "baseline"], cwd=repo_dir, check=True, capture_output=True)
+    baseline = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo_dir, text=True).strip()
+    (repo_dir / "value.py").write_text("VALUE = 2\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo_dir, check=True)
+    subprocess.run(["git", "commit", "-m", "candidate"], cwd=repo_dir, check=True, capture_output=True)
+    candidate = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo_dir, text=True).strip()
+
+    runner = object.__new__(ProductionRunner)
+    with pytest.raises(RuntimeError, match="repair cycle produced no new candidate"):
+        runner._finalize_builder_candidate(
+            str(repo_dir),
+            baseline,
+            previous_candidate_commit=candidate,
+        )
+
+
 def test_reviewer_diff_bundle_is_inline_bounded_and_nonempty(tmp_path):
     repo_dir = tmp_path / "review-repo"
     repo_dir.mkdir()
@@ -361,6 +385,11 @@ def test_production_runner_full_pass_pipeline(mock_git_repo, tmp_path, monkeypat
     assert "Execute the required" not in qa_request.prompt
     assert qa_request.extra_context["operation_intent"] == (
         "read-only semantic assessment of inline Runner test evidence"
+    )
+    assert any(event["event"] == "qa_command_started" for event in progress_events)
+    assert any(
+        event["event"] == "qa_command_completed" and "exited 0" in event["message"]
+        for event in progress_events
     )
     board = json.loads((repo_dir / "user_data" / "board.json").read_text(encoding="utf-8"))
     assert board[0]["status"] == "已完成"

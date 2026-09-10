@@ -21,7 +21,7 @@ version: 1.0.0
 | **`/yy-flow kanban`** | **看板 Web 服务就绪**：启动内置可视化看板 HTTP 服务并输出访问链接（默认 32886 端口） | 运行 `start_kanban_server.py`，支持多视图切换与 PR/Issue 徽标渲染 |
 | **`/yy-flow sync-pr`** | **PR 状态监听与合流自动解阻**：扫描【已阻塞】任务卡，检测 GitHub PR Merged 自动推进至【已完成】并唤起 PM 验收 | 运行 `sync_pr_status.py` / `heartbeat.py --sync-pr` |
 | **`/yy-flow auto`** | **纯模拟状态链**：零写入演示 A–G 类型任务的状态流转，不调用真实 Host、不改变看板 | 运行 `auto_task.py --simulate` |
-| **`/yy-flow run`** | **真实自动编排（2F-PROD 通用 Runner）**：读取带逐项验收标准的任务，串行调度 Codex Builder → Antigravity Reviewer → Codex QA；Reviewer 必须审查影响面，QA 必须提交逐项覆盖、反向场景和命令证据，Runner 独立复跑全部受控命令，EvidenceGate 复核语义证据后停在等待用户验收 | 用户明确授权后运行 `python scripts/run_task.py start --task-id <id> --approve`；可重复传入 `--test-command`。Antigravity Prompt 通过 stdin `stream-json` 传输，角色进度以 stderr `[YY-FLOW]` JSONL 事件输出；`resume` 默认继承 Checkpoint 中的 Adapter、测试和超时配置 |
+| **`/yy-flow run`** | **真实自动编排（2F-PROD 通用 Runner）**：读取带逐项验收标准的任务，串行调度 Codex Builder → Antigravity Reviewer → Codex QA；Reviewer 必须审查影响面，Runner 针对每个候选 SHA 单次执行受控命令并把脱敏证据交给只读 QA，QA 必须提交逐项覆盖与反向场景，EvidenceGate 复核后停在等待用户验收 | 用户明确授权后运行 `python scripts/run_task.py start --task-id <id> --approve`；可重复传入 `--test-command`。Antigravity Prompt 通过 stdin `stream-json` 传输，角色进度以 stderr `[YY-FLOW]` JSONL 事件输出；`resume` 默认继承 Checkpoint 中的 Adapter、测试和超时配置。协议错误只重试原角色，工具缺失等基础设施故障停在原阶段，不得退回 Builder |
 
 > 💡 **业务流转与协同全走自然语言**：任务拆解建卡、阶段开工（`check_stage_gate.py --action start`）、阶段结项（`check_stage_gate.py --action close`）、认领、提审、测试与打回等日常研发生命周期，直接使用自然语言与 Agent 对话沟通，由对应专家在后台自主调度底层脚本。
 

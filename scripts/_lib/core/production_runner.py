@@ -10,6 +10,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import threading
@@ -121,6 +122,20 @@ QA_PROTOCOL_DEFECT_SUFFIXES = (
     "QA-INVALID-FAIL",
 )
 
+SENSITIVE_QA_ENV_NAME_PARTS = (
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "PASSWD",
+    "CREDENTIAL",
+    "AUTH",
+    "COOKIE",
+    "API_KEY",
+    "ACCESS_KEY",
+    "PRIVATE_KEY",
+    "PROXY",
+)
+
 
 def _has_protocol_defect(defects: Sequence[Mapping[str, Any]], suffixes: Sequence[str]) -> bool:
     """Return true only for host/schema failures that cannot be fixed in business code."""
@@ -128,6 +143,25 @@ def _has_protocol_defect(defects: Sequence[Mapping[str, Any]], suffixes: Sequenc
         str(item.get("defect_id", "")).endswith(tuple(suffixes))
         for item in defects
     )
+
+
+def _build_qa_subprocess_env() -> Dict[str, str]:
+    """Create a deterministic test environment without inherited host credentials."""
+    clean_env = {
+        key: value
+        for key, value in os.environ.items()
+        if not any(part in key.upper() for part in SENSITIVE_QA_ENV_NAME_PARTS)
+    }
+    clean_env.update({
+        "CI": "1",
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "NO_UPDATE_NOTIFIER": "1",
+        "NPM_CONFIG_AUDIT": "false",
+        "NPM_CONFIG_FUND": "false",
+        "NPM_CONFIG_UPDATE_NOTIFIER": "false",
+    })
+    return clean_env
 
 
 def _extract_capabilities_extra(caps: Any) -> Dict[str, Any]:
@@ -192,6 +226,9 @@ def _validate_qa_test_command(test_cmd: str, worktree_dir: str) -> Tuple[bool, O
     raw_bin = args[0]
     base_bin = os.path.basename(raw_bin).lower()
 
+    if not os.path.isabs(raw_bin) and os.path.dirname(raw_bin):
+        return False, "QA test executable must be an absolute trusted interpreter or a bare allowlisted command", []
+
     if os.path.isabs(raw_bin):
         is_allowed_bin = bool(
             sys.executable
@@ -225,15 +262,42 @@ def _validate_qa_test_command(test_cmd: str, worktree_dir: str) -> Tuple[bool, O
         else:
             return False, "npm QA commands are limited to 'npm test', 'npm run test', or 'npm run build'", []
     elif base_bin in {"npx", "npx.cmd", "npx.exe"}:
-        if len(args) < 2 or args[1].lower() not in {"jest", "vitest", "mocha"}:
-            return False, "npx QA commands are limited to jest, vitest, or mocha", []
-        runner_args = args[2:]
+        if len(args) < 3 or args[1].lower() != "--no-install" or args[2].lower() not in {"jest", "vitest", "mocha"}:
+            return False, "npx QA commands require '--no-install' and are limited to jest, vitest, or mocha", []
+        runner_args = args[3:]
     elif base_bin in {"cargo", "cargo.exe", "go", "go.exe"}:
         if args[1:2] != ["test"]:
             return False, f"{base_bin} QA commands must use the 'test' subcommand", []
         runner_args = args[2:]
     else:
         return False, f"Unsupported QA command shape for '{base_bin}'", []
+
+    # Resolve the executable before dispatch. On Windows, CreateProcess does not
+    # reliably expand a bare `npm` to npm.cmd when shell=False. Python/pytest are
+    # pinned to the interpreter that launched the Runner; other allowlisted
+    # tools must resolve outside the candidate workspace to prevent PATH shadowing.
+    if base_bin in python_bins:
+        if not sys.executable:
+            return False, "[INFRA_TOOL_MISSING] Runner Python executable is unavailable", []
+        resolved_args = [os.path.realpath(sys.executable), *args[1:]]
+    elif base_bin in {"pytest", "pytest.exe"}:
+        if not sys.executable:
+            return False, "[INFRA_TOOL_MISSING] Runner Python executable is unavailable", []
+        resolved_args = [os.path.realpath(sys.executable), "-m", "pytest", *args[1:]]
+    else:
+        resolved_bin = shutil.which(raw_bin)
+        if not resolved_bin:
+            return False, f"[INFRA_TOOL_MISSING] QA test executable '{raw_bin}' was not found on PATH", []
+        resolved_bin = os.path.realpath(resolved_bin)
+        norm_worktree = os.path.normcase(os.path.realpath(worktree_dir))
+        norm_resolved_bin = os.path.normcase(resolved_bin)
+        try:
+            resolved_inside_worktree = os.path.commonpath([norm_worktree, norm_resolved_bin]) == norm_worktree
+        except ValueError:
+            resolved_inside_worktree = False
+        if resolved_inside_worktree:
+            return False, f"QA test executable '{resolved_bin}' resolves inside the candidate workspace", []
+        resolved_args = [resolved_bin, *args[1:]]
 
     forbidden_runner_flags = {
         "-p", "--pyargs", "-c", "--config-file", "--rootdir", "--confcutdir",
@@ -249,26 +313,27 @@ def _validate_qa_test_command(test_cmd: str, worktree_dir: str) -> Tuple[bool, O
 
     norm_worktree = os.path.normcase(os.path.realpath(worktree_dir))
     for arg in runner_args:
-        if arg.startswith("-"):
+        path_value = arg.split("=", 1)[1] if arg.startswith("-") and "=" in arg else arg
+        if arg.startswith("-") and path_value == arg:
             continue
         looks_like_path = (
-            os.path.isabs(arg)
-            or "/" in arg
-            or "\\" in arg
-            or arg.endswith((".py", ".js", ".ts", ".java", ".go", ".rs"))
-            or os.path.exists(os.path.join(worktree_dir, arg))
+            os.path.isabs(path_value)
+            or "/" in path_value
+            or "\\" in path_value
+            or path_value.endswith((".py", ".js", ".ts", ".java", ".go", ".rs"))
+            or os.path.exists(os.path.join(worktree_dir, path_value))
         )
         if not looks_like_path:
             continue
-        full_arg_path = os.path.normcase(os.path.realpath(os.path.join(worktree_dir, arg)))
+        full_arg_path = os.path.normcase(os.path.realpath(os.path.join(worktree_dir, path_value)))
         try:
             inside = os.path.commonpath([norm_worktree, full_arg_path]) == norm_worktree
         except ValueError:
             inside = False
         if not inside:
-            return False, f"Argument path '{arg}' escapes worktree boundary '{worktree_dir}'", []
+            return False, f"Argument path '{path_value}' escapes worktree boundary '{worktree_dir}'", []
 
-    return True, None, args
+    return True, None, resolved_args
 
 
 def _validate_reviewer_schema_builtin(data: Any) -> Tuple[bool, Optional[str]]:
@@ -726,7 +791,12 @@ class ProductionRunner:
             )
         return bundle
 
-    def _finalize_builder_candidate(self, worktree_dir: str, baseline_commit: str) -> str:
+    def _finalize_builder_candidate(
+        self,
+        worktree_dir: str,
+        baseline_commit: str,
+        previous_candidate_commit: Optional[str] = None,
+    ) -> str:
         """将真实 Builder 已完成但未提交的隔离工作区变更固化为候选提交。
 
         仅当真实 Builder 已成功返回、HEAD 仍等于基线且工作区确有变更时
@@ -745,6 +815,10 @@ class ProductionRunner:
             if status:
                 raise RuntimeError(
                     "Builder created a candidate commit but left additional uncommitted changes (Fail-Closed)."
+                )
+            if previous_candidate_commit and head.lower() == previous_candidate_commit.lower():
+                raise RuntimeError(
+                    "Builder repair cycle produced no new candidate commit (Fail-Closed)."
                 )
             return head
 
@@ -1526,9 +1600,11 @@ class ProductionRunner:
                     )
 
                 try:
+                    previous_candidate_commit = candidate_commit
                     candidate_commit = self._finalize_builder_candidate(
                         worktree_dir,
                         spec.baseline_commit,
+                        previous_candidate_commit=previous_candidate_commit,
                     )
                 except Exception as e:
                     return RunnerResult(
@@ -2101,6 +2177,27 @@ class ProductionRunner:
             for test_cmd in test_commands:
                 valid_cmd, cmd_err, cmd_args = _validate_qa_test_command(test_cmd, worktree_dir)
                 if not valid_cmd:
+                    if cmd_err and cmd_err.startswith("[INFRA_TOOL_MISSING]"):
+                        paused_checkpoint = replace(
+                            checkpoint,
+                            state=RunnerState.NEEDS_USER_INPUT.value,
+                            current_role="QA",
+                            execution_options=_execution_options_from_spec(spec),
+                            last_error=cmd_err,
+                        )
+                        self.checkpoint_store.save_checkpoint(paused_checkpoint)
+                        return RunnerResult(
+                            success=False,
+                            state=RunnerState.NEEDS_USER_INPUT.value,
+                            task_id=task_id,
+                            candidate_commit=candidate_commit,
+                            candidate_generation=candidate_generation,
+                            evidence_ids=tuple(evidence_ids),
+                            message=(
+                                f"QA infrastructure prerequisite is unavailable for '{test_cmd}': {cmd_err}. "
+                                "The task remains at QA; business code was not returned to Builder."
+                            ),
+                        )
                     return RunnerResult(
                         success=False,
                         state=RunnerState.FAILED.value,
@@ -2119,14 +2216,32 @@ class ProductionRunner:
             if cached_qa_evidence is not None:
                 command_results = [dict(item) for item in cached_qa_evidence[0]]
                 qa_command_evidence = [dict(item) for item in cached_qa_evidence[1]]
+                self._emit_progress(
+                    task_id=task_id,
+                    state=RunnerState.QA_TESTING.value,
+                    role="RUNNER",
+                    event="qa_command_cache_hit",
+                    message=f"Reusing controlled test evidence for candidate {candidate_commit}",
+                    candidate_commit=candidate_commit,
+                )
             else:
                 command_results = []
                 qa_command_evidence = []
+                infrastructure_failures = []
                 for command, command_args in validated_commands:
+                    self._emit_progress(
+                        task_id=task_id,
+                        state=RunnerState.QA_TESTING.value,
+                        role="RUNNER",
+                        event="qa_command_started",
+                        message=f"Running controlled QA command: {command}",
+                        candidate_commit=candidate_commit,
+                    )
                     try:
                         test_proc = subprocess.run(
                             command_args,
                             cwd=worktree_dir,
+                            env=_build_qa_subprocess_env(),
                             capture_output=True,
                             text=True,
                             encoding="utf-8",
@@ -2135,9 +2250,22 @@ class ProductionRunner:
                         )
                         exit_code = test_proc.returncode
                         output_material = (test_proc.stdout or "") + "\n" + (test_proc.stderr or "")
-                    except Exception as exc:
+                    except subprocess.TimeoutExpired as exc:
+                        exit_code = 124
+                        timeout_stdout = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+                        timeout_stderr = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+                        output_material = (
+                            f"Runner command timed out after {spec.qa_timeout_seconds}s\n"
+                            f"{timeout_stdout}\n{timeout_stderr}"
+                        )
+                    except (FileNotFoundError, PermissionError, OSError) as exc:
                         exit_code = 1
                         output_material = f"Runner command exception: {type(exc).__name__}: {exc}"
+                        infrastructure_failures.append({
+                            "command": command,
+                            "error_type": type(exc).__name__,
+                            "message": str(exc),
+                        })
                     masked_output = self.evidence_store._mask_text(output_material)
                     command_results.append({
                         "command": command,
@@ -2149,6 +2277,40 @@ class ProductionRunner:
                         "exit_code": exit_code,
                         "output_excerpt": masked_output[-4000:],
                     })
+                    self._emit_progress(
+                        task_id=task_id,
+                        state=RunnerState.QA_TESTING.value,
+                        role="RUNNER",
+                        event="qa_command_completed",
+                        message=f"Controlled QA command exited {exit_code}: {command}",
+                        candidate_commit=candidate_commit,
+                    )
+                if infrastructure_failures:
+                    infra_summary = "; ".join(
+                        f"{item['command']}: {item['error_type']}: {item['message']}"
+                        for item in infrastructure_failures
+                    )
+                    paused_checkpoint = replace(
+                        checkpoint,
+                        state=RunnerState.NEEDS_USER_INPUT.value,
+                        current_role="QA",
+                        execution_options=_execution_options_from_spec(spec),
+                        last_error=infra_summary,
+                    )
+                    self.checkpoint_store.save_checkpoint(paused_checkpoint)
+                    return RunnerResult(
+                        success=False,
+                        state=RunnerState.NEEDS_USER_INPUT.value,
+                        task_id=task_id,
+                        candidate_commit=candidate_commit,
+                        candidate_generation=candidate_generation,
+                        evidence_ids=tuple(evidence_ids),
+                        message=(
+                            "QA command infrastructure failed before semantic QA dispatch: "
+                            f"{infra_summary}. The task remains at QA; business code was not returned to Builder."
+                        ),
+                        diagnostics={"infrastructure_failures": infrastructure_failures},
+                    )
                 qa_test_cache[qa_cache_key] = (
                     [dict(item) for item in command_results],
                     [dict(item) for item in qa_command_evidence],

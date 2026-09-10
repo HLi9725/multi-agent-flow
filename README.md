@@ -119,7 +119,7 @@ Agent 将自动执行 7 步标准初始化：
 
 正式 A 类任务不能只写“功能正常”或“全量测试通过”。任务卡必须包含明确的 `验收标准:` 段落，每一项应能对应具体入口、正向结果和异常/反向场景；缺少时 Runner 会停止，不会让 Agent 自行猜测。
 
-Runner 的 Reviewer 会收到固定候选差异、变更文件、公开符号引用和适用影响面提示，不能只凭已有测试为绿放行。QA 必须返回结构化的逐项覆盖矩阵、至少一个独立反向场景、所有受控命令结果和未覆盖风险；Runner 随后会在同一候选提交上独立复跑命令，EvidenceGate 再从磁盘 Evidence 重算报告与命令哈希。任何缺项、身份/SHA 不匹配、未覆盖风险或命令失败都会自动打回。
+Runner 的 Reviewer 会收到固定候选差异、变更文件、公开符号引用和适用影响面提示，不能只凭已有测试为绿放行。Runner 针对每个候选 SHA 单次执行全部受控命令，再把脱敏、限长的真实结果交给只读 QA；QA 不重复调用命令，必须返回结构化逐项覆盖矩阵、至少一个反向场景和未覆盖风险。EvidenceGate 从磁盘 Evidence 重算报告与命令哈希。真实测试或业务缺陷才退回 Builder；Reviewer/QA 协议错误只重试原角色，工具缺失或无法启动等基础设施故障停在原 QA 阶段等待恢复。
 
 ```powershell
 # 双宿主默认链：Codex Builder -> Antigravity Reviewer -> Codex QA
@@ -142,6 +142,8 @@ python scripts/run_task.py start --task-id T0003 --approve `
 ```
 
 `status` 是纯只读查询；`resume` 用于审批或故障消除后的断点恢复。Checkpoint 会保存 Adapter、测试命令、超时与循环预算，恢复时默认沿用；只有显式传入同名参数才会覆盖。`start --approve` / `resume --approve` 仅记录本次 Runner 的外层显式授权，不等于 `--dangerously-skip-permissions`，也不能授权删除、费用、Push、合并或发布操作。
+
+在 Windows 上，Runner 会将裸 `npm`/`npx` 确定性解析为 PATH 中工作区外的真实 `.cmd/.exe`，并把 `python`/`pytest` 固定到启动 Runner 的可信解释器。测试子进程不会继承 Token、密码、认证头或代理凭据；找不到工具时返回 `NEEDS_USER_INPUT`，不会伪装成代码测试失败或触发无效 Builder 修复。
 
 Antigravity Prompt 通过官方 stdin `stream-json` 协议传输，不进入 Windows 命令行参数，因此完整 Reviewer diff 不受约 32 KiB 的 `CreateProcess` 命令行上限影响。运行期间 stderr 会持续输出 `[YY-FLOW]` JSONL 事件，明确显示 `BUILDER -> REVIEWER -> QA -> PENDING_USER_ACCEPTANCE`；最终 stdout 仍是单一结果 JSON，便于脚本解析。
 
