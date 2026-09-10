@@ -1410,9 +1410,30 @@ class ProductionRunner:
         skip_builder = (start_role in ("REVIEWER", "QA") and candidate_commit is not None)
         skip_reviewer = (start_role == "QA" and candidate_commit is not None)
 
+        if existing_checkpoint is not None and start_role == "BUILDER" and current_board_status == "已退回":
+            reclaimed, reclaim_error = self._do_state_transition(
+                spec.authority_root, task_id, "DEV", "已退回", "进行中", "李开发",
+                "Production Runner 恢复原任务并重新认领验收退回修复", spec.task_type,
+            )
+            if not reclaimed:
+                return RunnerResult(
+                    success=False, state=RunnerState.FAILED.value, task_id=task_id,
+                    candidate_commit=candidate_commit,
+                    message=f"Failed to reclaim returned task before Builder resume: {reclaim_error}",
+                )
+            current_board_status = "进行中"
+
         while True:
             total_attempts += 1
             if total_attempts > spec.max_total_attempts:
+                pause_message = f"Task exceeded max total attempts ({spec.max_total_attempts}). Paused at NEEDS_USER_INPUT."
+                checkpoint = replace(
+                    checkpoint, state=RunnerState.NEEDS_USER_INPUT.value,
+                    current_role=start_role, total_attempts=total_attempts,
+                    evidence_ids=tuple(evidence_ids), defects_history=tuple(defects_history),
+                    last_error=pause_message, updated_at=time.time(),
+                )
+                self.checkpoint_store.save_checkpoint(checkpoint)
                 return RunnerResult(
                     success=False,
                     state=RunnerState.NEEDS_USER_INPUT.value,
@@ -1420,11 +1441,19 @@ class ProductionRunner:
                     candidate_commit=candidate_commit,
                     candidate_generation=candidate_generation,
                     evidence_ids=tuple(evidence_ids),
-                    message=f"Task exceeded max total attempts ({spec.max_total_attempts}). Paused at NEEDS_USER_INPUT.",
+                    message=pause_message,
                     diagnostics={"total_attempts": total_attempts, "defects": defects_history},
                 )
 
             if time.time() - start_wall_clock > spec.total_wall_clock_timeout_seconds:
+                pause_message = f"Task exceeded wall clock timeout ({spec.total_wall_clock_timeout_seconds}s). Paused at NEEDS_USER_INPUT."
+                checkpoint = replace(
+                    checkpoint, state=RunnerState.NEEDS_USER_INPUT.value,
+                    current_role=start_role, total_attempts=total_attempts,
+                    evidence_ids=tuple(evidence_ids), defects_history=tuple(defects_history),
+                    last_error=pause_message, updated_at=time.time(),
+                )
+                self.checkpoint_store.save_checkpoint(checkpoint)
                 return RunnerResult(
                     success=False,
                     state=RunnerState.NEEDS_USER_INPUT.value,
@@ -1432,7 +1461,7 @@ class ProductionRunner:
                     candidate_commit=candidate_commit,
                     candidate_generation=candidate_generation,
                     evidence_ids=tuple(evidence_ids),
-                    message=f"Task exceeded wall clock timeout ({spec.total_wall_clock_timeout_seconds}s). Paused at NEEDS_USER_INPUT.",
+                    message=pause_message,
                     diagnostics={"elapsed": time.time() - start_wall_clock},
                 )
 
@@ -1642,6 +1671,11 @@ class ProductionRunner:
                         task_id=task_id,
                         message="Builder produced no new commits on top of baseline commit (Candidate == Baseline). Fail-Closed.",
                     )
+                # Retry budgets apply to one immutable candidate. A Builder
+                # repair creates a new candidate and starts fresh verification.
+                if candidate_commit != previous_candidate_commit:
+                    review_cycle = 0
+                    qa_cycle = 0
                 self._emit_progress(
                     task_id=task_id,
                     state=RunnerState.BUILDING.value,
@@ -1727,6 +1761,23 @@ class ProductionRunner:
             # STAGE 2: ANTIGRAVITY REVIEWER
             # ==========================================
             if not skip_reviewer:
+                if review_cycle >= spec.max_review_cycles:
+                    pause_message = (
+                        f"Reviewer retry budget already exhausted ({review_cycle}/"
+                        f"{spec.max_review_cycles}); create a new candidate or explicitly raise the limit."
+                    )
+                    checkpoint = replace(
+                        checkpoint, state=RunnerState.NEEDS_USER_INPUT.value,
+                        current_role="REVIEWER", last_error=pause_message,
+                        updated_at=time.time(),
+                    )
+                    self.checkpoint_store.save_checkpoint(checkpoint)
+                    return RunnerResult(
+                        False, RunnerState.NEEDS_USER_INPUT.value, task_id,
+                        candidate_commit=candidate_commit,
+                        candidate_generation=candidate_generation,
+                        evidence_ids=tuple(evidence_ids), message=pause_message,
+                    )
                 if not verify_optimistic_concurrency(
                     spec,
                     enforce_status=False,
@@ -2129,6 +2180,23 @@ class ProductionRunner:
             # ==========================================
             # STAGE 3: CODEX QA
             # ==========================================
+            if qa_cycle >= spec.max_qa_cycles:
+                pause_message = (
+                    f"QA retry budget already exhausted ({qa_cycle}/{spec.max_qa_cycles}); "
+                    "create a new candidate or explicitly raise the limit."
+                )
+                checkpoint = replace(
+                    checkpoint, state=RunnerState.NEEDS_USER_INPUT.value,
+                    current_role="QA", last_error=pause_message,
+                    updated_at=time.time(),
+                )
+                self.checkpoint_store.save_checkpoint(checkpoint)
+                return RunnerResult(
+                    False, RunnerState.NEEDS_USER_INPUT.value, task_id,
+                    candidate_commit=candidate_commit,
+                    candidate_generation=candidate_generation,
+                    evidence_ids=tuple(evidence_ids), message=pause_message,
+                )
             if not verify_optimistic_concurrency(
                 spec,
                 enforce_status=False,
@@ -2202,10 +2270,20 @@ class ProductionRunner:
                     message=f"Unable to create bounded QA candidate payload: {exc}",
                 )
 
-            test_commands = spec.test_commands or (spec.test_command or "python -m pytest -q",)
+            configured_test_commands = spec.test_commands or (spec.test_command or "python -m pytest -q",)
+            format_gate_command = f"git diff --check {spec.baseline_commit}..{candidate_commit} --"
+            # Mandatory trusted gate: callers cannot remove it with a custom
+            # --test-command list.
+            test_commands = tuple(configured_test_commands) + (format_gate_command,)
             validated_commands = []
             for test_cmd in test_commands:
-                valid_cmd, cmd_err, cmd_args = _validate_qa_test_command(test_cmd, worktree_dir)
+                if test_cmd == format_gate_command:
+                    valid_cmd, cmd_err, cmd_args = True, None, [
+                        "git", "diff", "--check",
+                        f"{spec.baseline_commit}..{candidate_commit}", "--",
+                    ]
+                else:
+                    valid_cmd, cmd_err, cmd_args = _validate_qa_test_command(test_cmd, worktree_dir)
                 if not valid_cmd:
                     if cmd_err and cmd_err.startswith("[INFRA_TOOL_MISSING]"):
                         paused_checkpoint = replace(
@@ -2365,7 +2443,12 @@ class ProductionRunner:
                 "adversarial scenario represented by the acceptance criteria, review context, or test evidence. "
                 "If any criterion or risk is not verifiable, return FAIL; never infer PASS from a green regression "
                 "suite alone. In test_commands, copy each Runner command and its recorded exit_code exactly once; "
-                "do not claim to have executed it yourself.\n\n"
+                "do not claim to have executed it yourself. For concurrency, atomicity, isolation, or multi-worker "
+                "claims, require evidence from independent physical database connections/processes, an explicit "
+                "synchronization point, and an observed single-winner operation count. Multiple threads, sessions, "
+                "or clients backed by SQLite StaticPool/a shared DBAPI connection do not prove independent-worker "
+                "safety; report that gap as FAIL and an uncovered risk. Reject dead compatibility implementations "
+                "or production globals that the requirement says must be removed, even if active routes bypass them.\n\n"
                 f"Runner-produced test evidence:\n"
                 f"{json.dumps(qa_command_evidence, ensure_ascii=False, indent=2)}\n\n"
                 "Return ONLY a JSON object matching this schema:\n"
@@ -2390,6 +2473,7 @@ class ProductionRunner:
                     "project_id": spec.project_id,
                     "qa_request_id": qa_request_id,
                     "acceptance_criteria_hash": spec.acceptance_criteria_hash,
+                    "required_test_commands": test_commands,
                     "pre_granted_approval": pre_granted_approval,
                 },
             )
@@ -2753,7 +2837,7 @@ class ProductionRunner:
             # ==========================================
             # STAGE 4: USER ACCEPTANCE & COMPLETION
             # ==========================================
-            confirmation_req_id = f"conf_req_{task_id.lower()}_{int(time.time()*1000)}"
+            confirmation_req_id = f"conf_req_{task_id.lower()}_{uuid.uuid4().hex}"
 
             checkpoint = RunnerCheckpoint(
                 task_id=task_id,
@@ -2772,8 +2856,6 @@ class ProductionRunner:
                 confirmation_request_id=confirmation_req_id,
                 defects_history=tuple(defects_history),
             )
-            self.checkpoint_store.save_checkpoint(checkpoint)
-
             # 通过合法状态机 transition_task.py 将任务流转至 已完成 (DEF-T0061-3)
             ok_trans, err_trans = self._do_state_transition(
                 spec.authority_root,
@@ -2795,6 +2877,9 @@ class ProductionRunner:
                     evidence_ids=tuple(evidence_ids),
                     message=f"Failed to execute legal state transition to '已完成': {err_trans}",
                 )
+            # Do not advertise an acceptance request until the authoritative
+            # board has actually reached 已完成.
+            self.checkpoint_store.save_checkpoint(checkpoint)
 
             self._emit_progress(
                 task_id=task_id,
@@ -2888,7 +2973,36 @@ class ProductionRunner:
                 message="Optimistic concurrency verification failed: task is in terminal status or modified in authoritative board.",
             )
 
-        if ckpt.state in (RunnerState.CANCELLED.value, RunnerState.PENDING_USER_ACCEPTANCE.value):
+        # Reconcile legacy/manual acceptance rejection. The board is authority;
+        # a returned card must resume the original task at Builder, not strand a
+        # stale PENDING checkpoint or create a replacement task.
+        if ckpt.state == RunnerState.PENDING_USER_ACCEPTANCE.value and spec.status_at_read == "已退回":
+            defects = list(ckpt.defects_history)
+            defects.append({
+                "cycle": ckpt.candidate_generation,
+                "role": "USER_ACCEPTANCE",
+                "defects": [{
+                    "defect_id": f"DEF-{task_id}-USER-ACCEPTANCE",
+                    "severity": "P1",
+                    "description": "Authoritative board returned the pending candidate during user acceptance.",
+                }],
+                "summary": "Reconciled an externally returned acceptance with the Runner checkpoint.",
+            })
+            ckpt = replace(
+                ckpt,
+                state=RunnerState.NEEDS_USER_INPUT.value,
+                current_role="BUILDER",
+                defects_history=tuple(defects),
+                last_error="User acceptance returned the candidate for repair.",
+                updated_at=time.time(),
+            )
+            self.checkpoint_store.save_checkpoint(ckpt)
+
+        if ckpt.state in (
+            RunnerState.CANCELLED.value,
+            RunnerState.PENDING_USER_ACCEPTANCE.value,
+            RunnerState.ACCEPTED.value,
+        ):
             return RunnerResult(
                 success=False,
                 state=ckpt.state,
@@ -2985,6 +3099,100 @@ class ProductionRunner:
         finally:
             self.checkpoint_store.release_runner_lock((lock_handle, lock_file))
 
+    def accept(
+        self,
+        project_root: str,
+        task_id: str,
+        confirmation_request_id: str,
+        authority_root: Optional[str] = None,
+    ) -> RunnerResult:
+        """Explicitly accept the exact pending candidate and synchronize board/checkpoint."""
+        _validate_task_id(task_id)
+        ckpt = self.checkpoint_store.load_checkpoint(task_id)
+        if not ckpt or ckpt.state != RunnerState.PENDING_USER_ACCEPTANCE.value:
+            return RunnerResult(False, ckpt.state if ckpt else RunnerState.FAILED.value, task_id,
+                                message="Task has no pending user acceptance checkpoint.")
+        if not confirmation_request_id or confirmation_request_id != ckpt.confirmation_request_id:
+            return RunnerResult(False, ckpt.state, task_id, candidate_commit=ckpt.candidate_commit,
+                                message="Confirmation request ID mismatch (Fail-Closed).")
+        worktree = os.path.realpath(ckpt.worktree_path or project_root)
+        try:
+            head = self._get_git_commit(worktree)
+            status = subprocess.check_output(
+                ["git", "status", "--porcelain"], cwd=worktree,
+                encoding="utf-8", errors="replace",
+            ).strip()
+        except Exception as exc:
+            return RunnerResult(False, RunnerState.FAILED.value, task_id,
+                                message=f"Unable to verify acceptance candidate: {exc}")
+        if head != ckpt.candidate_commit or status:
+            return RunnerResult(False, ckpt.state, task_id, candidate_commit=ckpt.candidate_commit,
+                                message="Acceptance requires the exact candidate HEAD and a clean worktree.")
+        authority = os.path.realpath(authority_root or project_root)
+        ok, error = self._do_state_transition(
+            authority, task_id, "PM", "已完成", "已验收", "严经理",
+            f"用户显式验收通过候选提交 {ckpt.candidate_commit}", "A",
+        )
+        if not ok:
+            return RunnerResult(False, ckpt.state, task_id, candidate_commit=ckpt.candidate_commit,
+                                message=f"Failed to transition board to 已验收: {error}")
+        accepted = replace(ckpt, state=RunnerState.ACCEPTED.value, current_role="PM",
+                           last_error=None, updated_at=time.time())
+        self.checkpoint_store.save_checkpoint(accepted)
+        return RunnerResult(True, RunnerState.ACCEPTED.value, task_id,
+                            candidate_commit=ckpt.candidate_commit,
+                            candidate_generation=ckpt.candidate_generation,
+                            evidence_ids=ckpt.evidence_ids,
+                            message="User acceptance recorded; board and checkpoint are synchronized at 已验收.")
+
+    def reject(
+        self,
+        project_root: str,
+        task_id: str,
+        confirmation_request_id: str,
+        reason: str,
+        authority_root: Optional[str] = None,
+    ) -> RunnerResult:
+        """Return the original task for Builder repair without creating a new card."""
+        _validate_task_id(task_id)
+        ckpt = self.checkpoint_store.load_checkpoint(task_id)
+        if not ckpt or ckpt.state != RunnerState.PENDING_USER_ACCEPTANCE.value:
+            return RunnerResult(False, ckpt.state if ckpt else RunnerState.FAILED.value, task_id,
+                                message="Task has no pending user acceptance checkpoint.")
+        if not confirmation_request_id or confirmation_request_id != ckpt.confirmation_request_id:
+            return RunnerResult(False, ckpt.state, task_id, candidate_commit=ckpt.candidate_commit,
+                                message="Confirmation request ID mismatch (Fail-Closed).")
+        reason = reason.strip()
+        if not reason:
+            return RunnerResult(False, ckpt.state, task_id, candidate_commit=ckpt.candidate_commit,
+                                message="Acceptance rejection requires a non-empty reason.")
+        authority = os.path.realpath(authority_root or project_root)
+        ok, error = self._do_state_transition(
+            authority, task_id, "PM", "已完成", "已退回", "李开发",
+            f"用户验收退回原任务：{reason}", "A",
+        )
+        if not ok:
+            return RunnerResult(False, ckpt.state, task_id, candidate_commit=ckpt.candidate_commit,
+                                message=f"Failed to return board task to 已退回: {error}")
+        history = list(ckpt.defects_history)
+        history.append({
+            "cycle": ckpt.candidate_generation,
+            "role": "USER_ACCEPTANCE",
+            "defects": [{"defect_id": f"DEF-{task_id}-USER-ACCEPTANCE", "severity": "P1",
+                         "description": reason}],
+            "summary": reason,
+        })
+        returned = replace(
+            ckpt, state=RunnerState.NEEDS_USER_INPUT.value, current_role="BUILDER",
+            defects_history=tuple(history), last_error=reason, updated_at=time.time(),
+        )
+        self.checkpoint_store.save_checkpoint(returned)
+        return RunnerResult(True, RunnerState.NEEDS_USER_INPUT.value, task_id,
+                            candidate_commit=ckpt.candidate_commit,
+                            candidate_generation=ckpt.candidate_generation,
+                            evidence_ids=ckpt.evidence_ids,
+                            message="Acceptance rejected; original task is 已退回 and ready for resume.")
+
     def cancel(self, project_root: str, task_id: str, authority_root: Optional[str] = None) -> RunnerResult:
         """安全取消任务：向所有正在运行的 Host 发送 cancel 请求，不删除 Worktree，不清除 Evidence"""
         _validate_task_id(task_id)
@@ -2997,7 +3205,7 @@ class ProductionRunner:
                 task_id=task_id,
                 message=f"Cannot cancel: No checkpoint found for task {task_id}.",
             )
-        if ckpt.state in (RunnerState.CANCELLED.value, RunnerState.PENDING_USER_ACCEPTANCE.value):
+        if ckpt.state in (RunnerState.CANCELLED.value, RunnerState.PENDING_USER_ACCEPTANCE.value, RunnerState.ACCEPTED.value):
             return RunnerResult(
                 success=False,
                 state=ckpt.state,

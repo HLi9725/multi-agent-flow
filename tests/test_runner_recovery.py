@@ -33,6 +33,47 @@ from scripts._lib.hosts.antigravity_adapter import AntigravityAdapter, create_an
 from scripts._lib.hosts.codex_cli_adapter import CodexCliAdapter, create_codex_cli_manifest
 
 
+def test_acceptance_commands_bind_confirmation_and_return_original_task(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    (repo / "app.txt").write_text("candidate\n", encoding="utf-8")
+    subprocess.run(["git", "add", "app.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "candidate"], cwd=repo, check=True, capture_output=True)
+    candidate = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    store = RunnerCheckpointStore(data_root=str(tmp_path / "data"), project_root=str(repo), project_id="demo")
+    checkpoint = RunnerCheckpoint(
+        task_id="T0012", project_id="demo", state=RunnerState.PENDING_USER_ACCEPTANCE.value,
+        current_role="QA", candidate_commit=candidate, worktree_path=str(repo),
+        confirmation_request_id="conf-secret", evidence_ids=("evi-qa",),
+    )
+    store.save_checkpoint(checkpoint)
+    runner = ProductionRunner(checkpoint_store=store)
+    transitions = []
+    monkeypatch.setattr(runner, "_do_state_transition", lambda *args, **kwargs: (transitions.append(args) or (True, None)))
+
+    mismatch = runner.reject(str(repo), "T0012", "wrong", "defect")
+    assert mismatch.success is False
+    assert not transitions
+
+    rejected = runner.reject(str(repo), "T0012", "conf-secret", "acceptance defect")
+    assert rejected.success is True
+    assert rejected.state == RunnerState.NEEDS_USER_INPUT.value
+    saved = store.load_checkpoint("T0012")
+    assert saved.current_role == "BUILDER"
+    assert saved.defects_history[-1]["role"] == "USER_ACCEPTANCE"
+    assert transitions[-1][3:5] == ("已完成", "已退回")
+
+    store.save_checkpoint(checkpoint)
+    accepted = runner.accept(str(repo), "T0012", "conf-secret")
+    assert accepted.success is True
+    assert accepted.state == RunnerState.ACCEPTED.value
+    assert store.load_checkpoint("T0012").state == RunnerState.ACCEPTED.value
+    assert transitions[-1][3:5] == ("已完成", "已验收")
+
+
 def test_checkpoint_store_atomic_save_and_load(tmp_path):
     store = RunnerCheckpointStore(data_root=str(tmp_path), project_id="proj_alpha")
 
@@ -451,7 +492,8 @@ def test_runner_resume_breakpoint_and_integrity_verification(tmp_path, monkeypat
                 {"criterion_id": "AC-01", "status": "PASS", "evidence": "test_app.py::test_app"},
             ],
             "test_commands": [
-                {"command": "python -m pytest test_app.py -q", "exit_code": 0, "summary": "1 passed"},
+                {"command": command, "exit_code": 0, "summary": "passed"}
+                for command in req.extra_context["required_test_commands"]
             ],
             "negative_scenarios": [
                 {"name": "resume idempotency", "status": "PASS", "evidence": "checkpoint recovery test"},

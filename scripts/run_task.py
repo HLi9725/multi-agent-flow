@@ -3,7 +3,7 @@
 """
 scripts/run_task.py
 2F-PROD 通用自动编排 Runner CLI 入口。
-支持: start / status / resume / cancel
+支持: start / status / resume / accept / reject / cancel
 """
 import argparse
 import json
@@ -120,6 +120,26 @@ def cmd_cancel(args):
     return 0 if result.success else 1
 
 
+def cmd_accept(args):
+    project_root = os.path.realpath(args.project_root or os.getcwd())
+    authority_root = os.path.realpath(args.authority_root) if args.authority_root else None
+    result = _runner_for(project_root, authority_root).accept(
+        project_root, args.task_id, args.confirmation_request_id, authority_root,
+    )
+    print(json.dumps(result.to_dict(), indent=2, ensure_ascii=False))
+    return 0 if result.success else 1
+
+
+def cmd_reject(args):
+    project_root = os.path.realpath(args.project_root or os.getcwd())
+    authority_root = os.path.realpath(args.authority_root) if args.authority_root else None
+    result = _runner_for(project_root, authority_root).reject(
+        project_root, args.task_id, args.confirmation_request_id, args.reason, authority_root,
+    )
+    print(json.dumps(result.to_dict(), indent=2, ensure_ascii=False))
+    return 0 if result.success else 1
+
+
 def main():
     parser = argparse.ArgumentParser(description="Multi-Agent Flow Universal Production Runner")
     subparsers = parser.add_subparsers(dest="subcommand", required=True)
@@ -183,6 +203,19 @@ def main():
         help="Override persisted workspace mode (checkpoint worktree is still authoritative)",
     )
     p_resume.set_defaults(func=cmd_resume)
+
+    for name, help_text, func in (
+        ("accept", "Accept the exact pending candidate", cmd_accept),
+        ("reject", "Return the exact pending candidate to the original task", cmd_reject),
+    ):
+        p_decision = subparsers.add_parser(name, help=help_text)
+        p_decision.add_argument("--task-id", required=True, help="Task ID")
+        p_decision.add_argument("--project-root", default=".", help="Project root directory")
+        p_decision.add_argument("--authority-root", default=None, help="Authoritative board root directory")
+        p_decision.add_argument("--confirmation-request-id", required=True, help="Exact pending confirmation request ID")
+        if name == "reject":
+            p_decision.add_argument("--reason", required=True, help="Concrete user acceptance rejection reason")
+        p_decision.set_defaults(func=func)
 
     # cancel
     p_cancel = subparsers.add_parser("cancel", help="Cancel task execution safely")

@@ -265,11 +265,10 @@ def test_production_runner_full_pass_pipeline(mock_git_repo, tmp_path, monkeypat
                     "status": "PASS",
                     "evidence": "test_app.py::test_app",
                 }],
-                "test_commands": [{
-                    "command": "python -m pytest -q",
-                    "exit_code": 0,
-                    "summary": "1 passed",
-                }],
+                "test_commands": [
+                    {"command": command, "exit_code": 0, "summary": "passed"}
+                    for command in qa_req.extra_context["required_test_commands"]
+                ],
                 "negative_scenarios": [{
                     "name": "unexpected false result",
                     "status": "PASS",
@@ -382,6 +381,11 @@ def test_production_runner_full_pass_pipeline(mock_git_repo, tmp_path, monkeypat
     assert "Do not invoke tools, commands" in qa_request.prompt
     assert "Runner-produced test evidence" in qa_request.prompt
     assert '"exit_code": 0' in qa_request.prompt
+    assert any(
+        command.startswith("git diff --check ")
+        for command in qa_request.extra_context["required_test_commands"]
+    )
+    assert "SQLite StaticPool" in qa_request.prompt
     assert "Execute the required" not in qa_request.prompt
     assert qa_request.extra_context["operation_intent"] == (
         "read-only semantic assessment of inline Runner test evidence"
