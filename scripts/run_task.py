@@ -77,7 +77,8 @@ def cmd_start(args):
         return 1
 
     runner = _runner_for(project_root, authority_root, spec.project_id)
-    result = runner.start(spec, pre_granted_approval=getattr(args, "approve", False))
+    result = runner.start(spec, pre_granted_approval=getattr(args, "approve", False),
+                          restart_cancelled=getattr(args, "restart_cancelled", False))
 
     print(json.dumps(result.to_dict(), indent=2, ensure_ascii=False))
     return 0 if result.success else 1
@@ -170,6 +171,7 @@ def main():
         help="Record explicit outer-host approval for this run's non-destructive workspace operations",
     )
     p_start.set_defaults(func=cmd_start)
+    p_start.add_argument("--restart-cancelled", action="store_true", help="Archive a cancelled run and start a new run of the same task")
 
     # status
     p_status = subparsers.add_parser("status", help="Query task execution status (read-only)")

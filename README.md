@@ -155,6 +155,12 @@ Host 权限拒绝属于显式暂停条件：Runner 会原子保存 `APPROVAL_REQ
 
 Runner 成功只停在【已完成】/`PENDING_USER_ACCEPTANCE`，不会替用户验收、合并、Push 或创建 Tag。
 
+恢复兼容性与边界：已有 Checkpoint 必须使用 `resume`，普通 `start` 不覆盖历史记录。只有明确重启已取消任务时使用 `start --restart-cancelled`（其余参数同首次启动）；旧记录先归档，新运行拒绝旧运行的迟到写入。恢复读取及迁移受运行锁保护，取消和 Checkpoint 保存使用独立短写锁。
+
+权限暂停会保存脱敏、限长的 `approval_diagnostics`（宿主返回的会话、调用、工具事件），单独累计 `approval_attempts`，不消耗本次被拒绝调用的修复/审查/QA 重试预算；不回写修正旧版历史计数。宿主未提供具体授权目标时仍须用户处理，不能据此猜测或添加通配授权。历史 Evidence 不代表当前整改通过。
+
+已有 Runner Checkpoint 的任务，通过 `transition_task.py` 推进开发、审查、测试或验收时，也必须提交该 Checkpoint 中的对应 Evidence 并通过重放校验；应由 Runner 调用，不要手工推进。未使用 Runner 的既有单角色流程保持原契约，这项保护不等于给所有传统工作流新增正式 A 类准出资格。
+
 执行 `accept` 时会再次核对精确候选 HEAD、工作区不可变性、`git diff --check`，并从磁盘重放同一 SHA 且按时序独立的 Builder → Reviewer PASS → QA PASS Evidence；QA 的验收哈希、受控命令退出码、未覆盖风险和缺陷计数任一不满足均拒绝验收。显式 `accept` 会生成并验证 `USER_CONFIRMATION` Evidence，`confirmation_request_id` 本身不等于验收凭据。
 
 ---

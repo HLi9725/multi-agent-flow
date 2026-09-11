@@ -570,7 +570,8 @@ def test_checkpoint_snapshot_round_trip_and_cancel_is_durable(tmp_path):
         store.save_checkpoint(replace(loaded, state=RunnerState.BUILDING.value))
 
 
-def test_accept_replays_same_sha_evidence_and_records_user_confirmation(tmp_path, monkeypatch):
+@pytest.mark.parametrize('corruption', [None, 'empty_commands', 'foreign_task', 'missing_capability'])
+def test_accept_replays_same_sha_evidence_and_records_user_confirmation(tmp_path, monkeypatch, corruption):
     repo = tmp_path / "accept-repo"
     repo.mkdir()
     subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
@@ -586,7 +587,8 @@ def test_accept_replays_same_sha_evidence_and_records_user_confirmation(tmp_path
     candidate = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
 
     data = tmp_path / "data"
-    evidence = EvidenceStore(root_dir=str(data / "evidence"))
+    (repo / '.git' / 'info' / 'exclude').write_text('user_data/\n', encoding='utf-8')
+    evidence = EvidenceStore(root_dir=str(repo / 'user_data' / 'runner_evidence'))
     created = time.time()
     evidence_ids = []
     for index, (role, source, target) in enumerate((
@@ -595,17 +597,38 @@ def test_accept_replays_same_sha_evidence_and_records_user_confirmation(tmp_path
         ("QA", "TESTING", "PENDING_USER_ACCEPTANCE"),
     )):
         evidence_id = f"evi_{role.lower()}_accept"
-        extra = {}
+        extra = production_runner_module._extract_capabilities_extra(HostCapabilities(is_real_host=True))
         if role == "QA":
-            extra = {
-                "qa_decision": "PASS", "acceptance_criteria_hash": "c" * 64,
-                "test_exit_codes": [0], "uncovered_risk_count": 0, "defect_count": 0,
+            commands = ['python -m pytest', f'git diff --check {baseline}..{candidate} --']
+            results = [{'command': cmd, 'exit_code': 0, 'output_hash': 'd' * 64} for cmd in commands]
+            report = {
+                'task_id': 'T0778', 'baseline_commit': baseline, 'candidate_commit': candidate,
+                'session_id': 'session_qa', 'qa_request_id': 'qa_req_accept',
+                'decision': 'PASS', 'acceptance_criteria_hash': 'c' * 64,
+                'acceptance_coverage': [{'criterion_id': 'AC-01', 'status': 'PASS'}],
+                'negative_scenarios': [{'name': 'invalid input', 'status': 'PASS'}],
+                'uncovered_risks': [], 'defects': [],
+                'test_commands': [{'command': cmd} for cmd in commands],
             }
+            digest = lambda value: hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+            extra.update({
+                "qa_decision": "PASS", "acceptance_criteria_hash": "c" * 64,
+                "test_exit_codes": [0, 0], "uncovered_risk_count": 0, "defect_count": 0,
+                'qa_request_id': 'qa_req_accept', 'qa_report': report, 'qa_report_hash': digest(report),
+                'required_test_commands': commands, 'required_test_command_count': 2,
+                'runner_test_results': results, 'test_command_hash': digest(commands),
+                'test_output_hash': digest(results), 'covered_criterion_ids': ['AC-01'],
+                'negative_scenario_count': 1,
+            })
+            if corruption == 'empty_commands':
+                extra['test_exit_codes'] = []
+        if corruption == 'missing_capability':
+            extra.pop('capability_is_real_host')
         evidence.append(EvidenceRecord(
             evidence_id=evidence_id, evidence_type=EvidenceType.TASK_TRANSITION,
             baseline_commit=baseline, result_commit=candidate, artifacts=(),
             metadata=EvidenceMetadata(
-                project_id="demo", task_id="T0778", actor_role=role,
+                project_id="demo", task_id="T9999" if corruption == 'foreign_task' else "T0778", actor_role=role,
                 host_id=f"host_{role.lower()}", adapter=f"adapter_{role.lower()}",
                 host_session_id=f"session_{role.lower()}", host_invocation_id=f"inv_{role.lower()}",
                 is_real_host=True, workspace_mode="workspace_read" if role != "BUILDER" else "workspace_write",
@@ -632,10 +655,26 @@ def test_accept_replays_same_sha_evidence_and_records_user_confirmation(tmp_path
     ))
     runner = ProductionRunner(checkpoint_store=store, evidence_store=evidence)
     monkeypatch.setattr(production_runner_module, "load_task_execution_spec", lambda **kwargs: spec)
-    monkeypatch.setattr(runner, "_do_state_transition", lambda *args, **kwargs: (True, None))
+    from scripts._lib.core.runner_transition_gate import validate_managed_transition
+    def checked_transition(*args, **kwargs):
+        current = store.load_checkpoint('T0778')
+        validate_managed_transition(str(data), 'T0778', args[3], args[4], current.evidence_ids[-1])
+        return True, None
+    monkeypatch.setattr(runner, "_do_state_transition", checked_transition)
+    if corruption is None:
+        for source, target, proof in zip(
+            ('进行中', '审查中', '测试中'), ('审查中', '测试中', '已完成'), evidence_ids
+        ):
+            current = store.load_checkpoint('T0778')
+            store.save_checkpoint(replace(current, execution_options={'test_commands': ['python -m pytest']}))
+            validate_managed_transition(str(data), 'T0778', source, target, proof)
 
     result = runner.accept(str(repo), "T0778", "conf-accept", str(repo))
 
+    if corruption:
+        assert result.success is False
+        assert store.load_checkpoint('T0778').state == RunnerState.PENDING_USER_ACCEPTANCE.value
+        return
     assert result.success is True
     assert result.state == RunnerState.ACCEPTED.value
     assert len(result.evidence_ids) == 4

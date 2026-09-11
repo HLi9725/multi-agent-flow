@@ -412,6 +412,9 @@ class RunnerCheckpoint:
     execution_options: Mapping[str, Any] = field(default_factory=dict)
     execution_spec_snapshot: Mapping[str, Any] = field(default_factory=dict)
     active_elapsed_seconds: float = 0.0
+    run_id: str = ""
+    approval_attempts: int = 0
+    approval_diagnostics: Mapping[str, Any] = field(default_factory=dict)
     confirmation_request_id: Optional[str] = None
     defects_history: Tuple[Dict[str, Any], ...] = field(default_factory=tuple)
     approval_reason: Optional[str] = None
@@ -424,6 +427,7 @@ class RunnerCheckpoint:
         object.__setattr__(self, "defects_history", tuple(self.defects_history))
         object.__setattr__(self, "execution_options", _freeze_runner_value(dict(self.execution_options)))
         object.__setattr__(self, "execution_spec_snapshot", _freeze_runner_value(dict(self.execution_spec_snapshot)))
+        object.__setattr__(self, "approval_diagnostics", _freeze_runner_value(dict(self.approval_diagnostics)))
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -448,6 +452,9 @@ class RunnerCheckpoint:
             "execution_options": dict(self.execution_options),
             "execution_spec_snapshot": dict(self.execution_spec_snapshot),
             "active_elapsed_seconds": self.active_elapsed_seconds,
+            "run_id": self.run_id,
+            "approval_attempts": self.approval_attempts,
+            "approval_diagnostics": dict(self.approval_diagnostics),
             "confirmation_request_id": self.confirmation_request_id,
             "defects_history": [dict(d) for d in self.defects_history],
             "approval_reason": self.approval_reason,
@@ -480,6 +487,9 @@ class RunnerCheckpoint:
             execution_options=dict(data.get("execution_options", {})),
             execution_spec_snapshot=dict(data.get("execution_spec_snapshot", {})),
             active_elapsed_seconds=float(data.get("active_elapsed_seconds", 0.0)),
+            run_id=str(data.get("run_id", "")),
+            approval_attempts=int(data.get("approval_attempts", 0)),
+            approval_diagnostics=dict(data.get("approval_diagnostics", {})),
             confirmation_request_id=data.get("confirmation_request_id"),
             defects_history=tuple(data.get("defects_history", [])),
             approval_reason=data.get("approval_reason"),

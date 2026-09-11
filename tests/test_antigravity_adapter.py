@@ -1066,8 +1066,11 @@ def test_antigravity_adapter_surfaces_runtime_permission_denial(monkeypatch):
 
     monkeypatch.setattr(subprocess, "Popen", PermissionDeniedPopen)
     handle = adapter.dispatch_agent(request)
-    with pytest.raises(AgentPermissionRequiredError, match="requires explicit user approval"):
+    with pytest.raises(AgentPermissionRequiredError, match="requires explicit user approval") as denied:
         adapter.wait_for_result(handle, timeout_seconds=5)
+    assert denied.value.diagnostics['exit_code'] == 1
+    assert denied.value.diagnostics['tool_events']
+    assert 'permission_denied' in denied.value.diagnostics['host_message']
 
 
 def test_antigravity_adapter_out_of_band_approval_is_exact_and_bounded():

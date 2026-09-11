@@ -205,6 +205,7 @@ def _transition_task_pipeline_impl(
     create_only: bool = False,
     force: bool = False,
     no_dup_check: bool = False,
+    runner_evidence_id: Optional[str] = None,
 ) -> bool:
     resolved_task_id = task_id or "AUTO"
     extra_log = {"task_id": resolved_task_id}
@@ -356,6 +357,14 @@ def _transition_task_pipeline_impl(
         # 4. 任务存在性检查（只读，前置）：确定目标记录与是否需要自动建单
         resolved_record_id = record_id or task_id
         existing = adapter_get(resolved_record_id) if resolved_record_id else None
+
+        try:
+            from _lib.core.runner_transition_gate import validate_managed_transition
+            validate_managed_transition(paths.resolve_data_root(), task_id, from_status,
+                                        to_status, runner_evidence_id)
+        except Exception as exc:
+            logger.error('Runner evidence gate rejected transition: %s', exc, extra=extra_log)
+            return False
 
         # 5. 强制运行防护门控 (并发上限与 HOTFIX 特权透传，未通过则直接抛错中断！)
         is_valid = validate(
@@ -561,6 +570,7 @@ def main():
     parser.add_argument("--create", action="store_true", help="显式建单模式：创建任务卡【待开始】并分配处理人，不执行流转")
     parser.add_argument("--force", action="store_true", help="重复任务校验命中时强制创建（用户已确认重复创建）")
     parser.add_argument("--no-dup-check", action="store_true", help="跳过重复任务校验")
+    parser.add_argument("--runner-evidence-id", default=None, help="Persisted proof for a Runner-managed transition")
 
     args = parser.parse_args()
 
@@ -588,6 +598,7 @@ def main():
         create_only=args.create,
         force=args.force,
         no_dup_check=args.no_dup_check,
+        runner_evidence_id=args.runner_evidence_id,
     )
 
     if not ok:

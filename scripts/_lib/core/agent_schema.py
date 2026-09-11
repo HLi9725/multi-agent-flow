@@ -151,6 +151,10 @@ class AgentNotSupportedError(AgentError):
 class AgentPermissionRequiredError(AgentNotSupportedError):
     """The host denied an operation that requires explicit user approval."""
 
+    def __init__(self, message: str, *, diagnostics=None):
+        super().__init__(message)
+        self.diagnostics = dict(diagnostics or {})
+
 
 class AgentUnsafeHostConfigError(AgentNotSupportedError):
     """The host configuration contains a permission bypass or wildcard."""

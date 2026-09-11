@@ -11,6 +11,7 @@ import re
 import sys
 import tempfile
 import time
+import uuid
 from typing import Any, Dict, Optional, Tuple
 
 _SCRIPTS_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -73,12 +74,32 @@ class RunnerCheckpointStore:
         return os.path.join(self.checkpoint_dir, f"{clean_id}.json")
 
     def save_checkpoint(self, checkpoint: RunnerCheckpoint) -> None:
+        self._ensure_dir()
+        with file_lock.acquire_lock(self.get_checkpoint_path(checkpoint.task_id) + '.write.lock', blocking=True, timeout=10):
+            self._save_locked(checkpoint)
+
+    def initialize_checkpoint(self, checkpoint: RunnerCheckpoint, *, restart_cancelled=False) -> None:
+        """Create once, or explicitly archive a cancelled run before replacing it."""
+        self._ensure_dir()
+        with file_lock.acquire_lock(self.get_checkpoint_path(checkpoint.task_id) + '.write.lock', blocking=True, timeout=10):
+            old = self.load_checkpoint(checkpoint.task_id)
+            if old:
+                if not restart_cancelled or old.state != 'CANCELLED':
+                    raise CheckpointStoreError('Checkpoint already exists; use resume, not start.')
+                archive = self.get_checkpoint_path(checkpoint.task_id) + '.archive_' + uuid.uuid4().hex
+                with open(archive, 'xb') as handle:
+                    handle.write(json.dumps(old.to_dict(), ensure_ascii=False).encode('utf-8'))
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            self._save_locked(checkpoint, initializing=True)
+
+    def _save_locked(self, checkpoint: RunnerCheckpoint, initializing=False) -> None:
         """
         原子写入 Checkpoint 文件（Create-or-Replace with fsync）
         """
         self._ensure_dir()
         target_path = self.get_checkpoint_path(checkpoint.task_id)
-        temp_path = target_path + f".tmp_{os.getpid()}_{int(time.time()*1000)}"
+        temp_path = target_path + '.tmp_' + uuid.uuid4().hex
 
         data = checkpoint.to_dict()
         payload = json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
@@ -87,7 +108,9 @@ class RunnerCheckpointStore:
             if os.path.isfile(target_path):
                 with open(target_path, "r", encoding="utf-8") as existing_file:
                     existing = json.load(existing_file)
-                if existing.get("state") == "CANCELLED" and checkpoint.state != "CANCELLED":
+                if not initializing and existing.get('run_id', '') != checkpoint.run_id:
+                    raise CheckpointStoreError('Stale run cannot overwrite a newer run.')
+                if not initializing and existing.get("state") == "CANCELLED" and checkpoint.state != "CANCELLED":
                     raise CheckpointStoreError(
                         f"Refusing to overwrite durable cancellation for {checkpoint.task_id}."
                     )
@@ -98,7 +121,7 @@ class RunnerCheckpointStore:
             if os.path.isfile(target_path):
                 with open(target_path, "r", encoding="utf-8") as existing_file:
                     latest = json.load(existing_file)
-                if latest.get("state") == "CANCELLED" and checkpoint.state != "CANCELLED":
+                if not initializing and latest.get("state") == "CANCELLED" and checkpoint.state != "CANCELLED":
                     raise CheckpointStoreError(
                         f"Refusing to overwrite durable cancellation for {checkpoint.task_id}."
                     )

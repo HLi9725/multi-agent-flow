@@ -703,6 +703,22 @@ class ProductionRunner:
             )
         return self._synchronize_failed_result_checkpoint(result)
 
+    def _permission_checkpoint(self, checkpoint, error):
+        """Persist bounded host diagnostics without treating permission retries as repairs."""
+        diagnostic = {}
+        for key, value in getattr(error, 'diagnostics', {}).items():
+            # Flatten complex tool payloads to bounded strings for safe serialization.
+            diagnostic[key] = self._sanitize_diagnostic(value, 12000 if key == 'tool_events' else 4000)
+        for key in tuple(diagnostic):
+            diagnostic[key] = re.sub(r'--dangerously-skip-permissions', '[blocked bypass suggestion]', diagnostic[key])
+        return replace(checkpoint,
+            total_attempts=max(0, checkpoint.total_attempts - 1),
+            approval_attempts=checkpoint.approval_attempts + 1,
+            approval_diagnostics=diagnostic,
+            review_cycle=max(0, checkpoint.review_cycle - (checkpoint.current_role == 'REVIEWER')),
+            qa_cycle=max(0, checkpoint.qa_cycle - (checkpoint.current_role == 'QA')),
+        )
+
     def _is_cancellation_requested(self, task_id: str) -> bool:
         try:
             data = self.checkpoint_store.query_status(task_id)
@@ -821,6 +837,9 @@ class ProductionRunner:
         if to_status in ("已完成", "已验收"):
             import datetime
             cmd.extend(["--end-time", datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
+        proof_checkpoint = self.checkpoint_store.load_checkpoint(task_id)
+        if proof_checkpoint and proof_checkpoint.evidence_ids:
+            cmd.extend(['--runner-evidence-id', proof_checkpoint.evidence_ids[-1]])
         proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", env=env)
         if proc.returncode != 0:
             return False, proc.stderr or proc.stdout
@@ -1334,6 +1353,7 @@ class ProductionRunner:
         spec: TaskExecutionSpec,
         interactive_approval_cb: Optional[Callable[[str, Dict[str, Any]], bool]] = None,
         pre_granted_approval: bool = False,
+        restart_cancelled: bool = False,
     ) -> RunnerResult:
         """启动新任务的自动编排"""
         _validate_task_id(spec.task_id)
@@ -1355,9 +1375,16 @@ class ProductionRunner:
             )
 
         try:
+            previous = self.checkpoint_store.load_checkpoint(spec.task_id)
+            if previous and not (restart_cancelled and previous.state == RunnerState.CANCELLED.value):
+                return RunnerResult(False, previous.state, spec.task_id,
+                                    candidate_commit=previous.candidate_commit,
+                                    evidence_ids=previous.evidence_ids,
+                                    message="Checkpoint already exists; use resume. Cancelled runs require start --restart-cancelled.")
             return self._execute_with_checkpoint_guard(
                 spec,
                 lock_tuple=(lock_handle, lock_file),
+                restart_cancelled=restart_cancelled,
                 interactive_approval_cb=interactive_approval_cb,
                 existing_checkpoint=None,
                 pre_granted_approval=pre_granted_approval,
@@ -1372,6 +1399,7 @@ class ProductionRunner:
         interactive_approval_cb: Optional[Callable[[str, Dict[str, Any]], bool]] = None,
         existing_checkpoint: Optional[RunnerCheckpoint] = None,
         pre_granted_approval: bool = False,
+        restart_cancelled: bool = False,
     ) -> RunnerResult:
         start_wall_clock = time.time()
         project_root = spec.project_root
@@ -1457,8 +1485,12 @@ class ProductionRunner:
             worktree_branch=worktree_branch,
             execution_options=_execution_options_from_spec(spec),
             execution_spec_snapshot=_execution_spec_snapshot(spec),
+            run_id=uuid.uuid4().hex,
         )
-        self.checkpoint_store.save_checkpoint(checkpoint)
+        if existing_checkpoint is None:
+            self.checkpoint_store.initialize_checkpoint(checkpoint, restart_cancelled=restart_cancelled)
+        else:
+            self.checkpoint_store.save_checkpoint(checkpoint)
         self._emit_progress(
             task_id=task_id,
             state=RunnerState.WORKTREE_READY.value,
@@ -1593,6 +1625,9 @@ class ProductionRunner:
                     evidence_ids=tuple(evidence_ids),
                     execution_options=_execution_options_from_spec(spec),
                     execution_spec_snapshot=checkpoint.execution_spec_snapshot,
+                    run_id=checkpoint.run_id,
+                    approval_attempts=checkpoint.approval_attempts,
+                    approval_diagnostics=checkpoint.approval_diagnostics,
                     active_elapsed_seconds=checkpoint.active_elapsed_seconds,
                     defects_history=tuple(defects_history),
                 )
@@ -1701,6 +1736,7 @@ class ProductionRunner:
                         last_error="Permission approval required",
                         updated_at=time.time(),
                     )
+                    checkpoint = self._permission_checkpoint(checkpoint, se)
                     self.checkpoint_store.save_checkpoint(checkpoint)
                     return RunnerResult(
                         success=False,
@@ -1710,7 +1746,7 @@ class ProductionRunner:
                         candidate_generation=candidate_generation,
                         evidence_ids=tuple(evidence_ids),
                         message=f"Execution paused at APPROVAL_REQUIRED: {self._sanitize_diagnostic(se)}",
-                        diagnostics={"approval_reason": self._sanitize_diagnostic(se)},
+                        diagnostics={"approval_reason": self._sanitize_diagnostic(se), **dict(checkpoint.approval_diagnostics)},
                     )
                 except Exception as e:
                     with self._lock:
@@ -1829,7 +1865,7 @@ class ProductionRunner:
                 # Retry budgets apply to one immutable candidate. A Builder
                 # repair creates a new candidate and starts fresh verification.
                 if candidate_commit != previous_candidate_commit:
-                    candidate_generation = builder_attempt
+                    candidate_generation += 1
                     review_cycle = 0
                     qa_cycle = 0
                 self._emit_progress(
@@ -1897,6 +1933,9 @@ class ProductionRunner:
                         message=f"Builder EvidenceGate validation failed: {gate_error}",
                     )
                 evidence_ids.append(builder_evidence_id)
+                checkpoint = replace(checkpoint, candidate_commit=candidate_commit,
+                    candidate_generation=candidate_generation, evidence_ids=tuple(evidence_ids))
+                self.checkpoint_store.save_checkpoint(checkpoint)
 
                 # 状态机推进: 进行中 -> 审查中 (DEV)
                 if current_board_status == "进行中":
@@ -1968,6 +2007,9 @@ class ProductionRunner:
                     evidence_ids=tuple(evidence_ids),
                     execution_options=_execution_options_from_spec(spec),
                     execution_spec_snapshot=checkpoint.execution_spec_snapshot,
+                    run_id=checkpoint.run_id,
+                    approval_attempts=checkpoint.approval_attempts,
+                    approval_diagnostics=checkpoint.approval_diagnostics,
                     active_elapsed_seconds=checkpoint.active_elapsed_seconds,
                     defects_history=tuple(defects_history),
                 )
@@ -2091,6 +2133,7 @@ class ProductionRunner:
                         last_error="Permission approval required",
                         updated_at=time.time(),
                     )
+                    checkpoint = self._permission_checkpoint(checkpoint, se)
                     self.checkpoint_store.save_checkpoint(checkpoint)
                     return RunnerResult(
                         success=False,
@@ -2100,7 +2143,7 @@ class ProductionRunner:
                         candidate_generation=candidate_generation,
                         evidence_ids=tuple(evidence_ids),
                         message=f"Execution paused at APPROVAL_REQUIRED: {se}",
-                        diagnostics={"approval_reason": str(se)},
+                        diagnostics={"approval_reason": self._sanitize_diagnostic(se), **dict(checkpoint.approval_diagnostics)},
                     )
                 except Exception as e:
                     with self._lock:
@@ -2240,6 +2283,8 @@ class ProductionRunner:
                         message=f"Reviewer EvidenceGate validation failed: {gate_error}",
                     )
                 evidence_ids.append(reviewer_evidence_id)
+                checkpoint = replace(checkpoint, evidence_ids=tuple(evidence_ids))
+                self.checkpoint_store.save_checkpoint(checkpoint)
 
                 if review_output.decision == "PASS":
                     # 状态机推进: 审查中 -> 测试中 (REVIEWER)
@@ -2405,6 +2450,9 @@ class ProductionRunner:
                 evidence_ids=tuple(evidence_ids),
                 execution_options=_execution_options_from_spec(spec),
                 execution_spec_snapshot=checkpoint.execution_spec_snapshot,
+                run_id=checkpoint.run_id,
+                approval_attempts=checkpoint.approval_attempts,
+                approval_diagnostics=checkpoint.approval_diagnostics,
                 active_elapsed_seconds=checkpoint.active_elapsed_seconds,
                 defects_history=tuple(defects_history),
             )
@@ -2737,6 +2785,7 @@ class ProductionRunner:
                     last_error="Permission approval required",
                     updated_at=time.time(),
                 )
+                checkpoint = self._permission_checkpoint(checkpoint, se)
                 self.checkpoint_store.save_checkpoint(checkpoint)
                 return RunnerResult(
                     success=False,
@@ -2746,7 +2795,7 @@ class ProductionRunner:
                     candidate_generation=candidate_generation,
                     evidence_ids=tuple(evidence_ids),
                     message=f"Execution paused at APPROVAL_REQUIRED: {se}",
-                    diagnostics={"approval_reason": str(se)},
+                    diagnostics={"approval_reason": self._sanitize_diagnostic(se), **dict(checkpoint.approval_diagnostics)},
                 )
             except Exception as e:
                 with self._lock:
@@ -3073,6 +3122,9 @@ class ProductionRunner:
                 evidence_ids=tuple(evidence_ids),
                 execution_options=_execution_options_from_spec(spec),
                 execution_spec_snapshot=checkpoint.execution_spec_snapshot,
+                run_id=checkpoint.run_id,
+                approval_attempts=checkpoint.approval_attempts,
+                approval_diagnostics=checkpoint.approval_diagnostics,
                 active_elapsed_seconds=checkpoint.active_elapsed_seconds + (time.time() - start_wall_clock),
                 confirmation_request_id=confirmation_req_id,
                 defects_history=tuple(defects_history),
@@ -3166,6 +3218,11 @@ class ProductionRunner:
                 "execution_options": dict(ckpt.execution_options),
                 "execution_spec_snapshot": dict(ckpt.execution_spec_snapshot),
                 "active_elapsed_seconds": ckpt.active_elapsed_seconds,
+                "run_id": ckpt.run_id,
+                "approval_attempts": ckpt.approval_attempts,
+                "approval_diagnostics": dict(ckpt.approval_diagnostics),
+                "total_attempts": ckpt.total_attempts,
+                "evidence_scope": "Historical evidence; not proof that the current repair passed.",
             }
         return {
             "task_id": task_id,
@@ -3175,6 +3232,24 @@ class ProductionRunner:
         }
 
     def resume(
+        self, project_root: str, task_id: str, authority_root=None,
+        interactive_approval_cb=None, pre_granted_approval=False,
+        overrides=None, rejection_reason=None,
+    ) -> RunnerResult:
+        """Lock before reading or migrating any durable recovery state."""
+        _validate_task_id(task_id)
+        lock = self.checkpoint_store.acquire_runner_lock(task_id)
+        if lock[0] is None:
+            return RunnerResult(False, RunnerState.NEEDS_USER_INPUT.value, task_id,
+                                message="Task is already locked by another running process.")
+        try:
+            return self._resume_locked(project_root, task_id, authority_root,
+                interactive_approval_cb, pre_granted_approval, overrides, rejection_reason,
+                lock_tuple=lock)
+        finally:
+            self.checkpoint_store.release_runner_lock(lock)
+
+    def _resume_locked(
         self,
         project_root: str,
         task_id: str,
@@ -3183,6 +3258,7 @@ class ProductionRunner:
         pre_granted_approval: bool = False,
         overrides: Optional[Dict[str, Any]] = None,
         rejection_reason: Optional[str] = None,
+        lock_tuple=None,
     ) -> RunnerResult:
         """从 Checkpoint 恢复执行 (支持断点恢复、完整复核 HEAD、Evidence 与权威状态)"""
         _validate_task_id(task_id)
@@ -3287,6 +3363,14 @@ class ProductionRunner:
             self.checkpoint_store.save_checkpoint(ckpt)
 
         if ckpt.state == RunnerState.REJECTION_PENDING.value:
+            if spec.status_at_read == '已完成':
+                ok, error = self._do_state_transition(spec.authority_root, task_id, 'PM',
+                    '已完成', '已退回', spec.owner or '李开发',
+                    ckpt.last_error or 'Recover interrupted user rejection', spec.task_type)
+                if not ok:
+                    return RunnerResult(False, ckpt.state, task_id,
+                                        message=f'Rejection recovery failed: {self._sanitize_diagnostic(error)}')
+                spec = replace(spec, status_at_read='已退回')
             if spec.status_at_read == "已退回":
                 reason = ckpt.last_error or "User acceptance rejection recovered after interruption."
                 history = list(ckpt.defects_history)
@@ -3394,6 +3478,13 @@ class ProductionRunner:
         )
 
         if ckpt.state == RunnerState.COMPLETION_PENDING.value:
+            if spec.status_at_read == '测试中':
+                ok, error = self._do_state_transition(spec.authority_root, task_id, 'QA',
+                    '测试中', '已完成', '严经理', 'Recover interrupted QA completion', spec.task_type)
+                if not ok:
+                    return RunnerResult(False, ckpt.state, task_id,
+                                        message=f'Completion recovery failed: {self._sanitize_diagnostic(error)}')
+                spec = replace(spec, status_at_read='已完成')
             if spec.status_at_read == "已完成":
                 ckpt = replace(
                     ckpt,
@@ -3421,25 +3512,11 @@ class ProductionRunner:
                 message="Completion write-ahead intent could not be reconciled with the authoritative board.",
             )
 
-        lock_handle, lock_file = self.checkpoint_store.acquire_runner_lock(task_id)
-        if lock_handle is None:
-            return RunnerResult(
-                success=False,
-                state=RunnerState.FAILED.value,
-                task_id=task_id,
-                message=f"Task {task_id} is already locked by another running process.",
-            )
-
-        try:
-            return self._execute_with_checkpoint_guard(
-                spec,
-                lock_tuple=(lock_handle, lock_file),
-                interactive_approval_cb=interactive_approval_cb,
-                existing_checkpoint=ckpt,
-                pre_granted_approval=pre_granted_approval,
-            )
-        finally:
-            self.checkpoint_store.release_runner_lock((lock_handle, lock_file))
+        return self._execute_with_checkpoint_guard(
+            spec, lock_tuple=lock_tuple,
+            interactive_approval_cb=interactive_approval_cb,
+            existing_checkpoint=ckpt, pre_granted_approval=pre_granted_approval,
+        )
 
     def accept(
         self,
@@ -3531,6 +3608,8 @@ class ProductionRunner:
                 record for record in records
                 if record.baseline_commit == baseline and record.result_commit == candidate
                 and record.metadata.is_real_host
+                and record.metadata.task_id == task_id
+                and record.metadata.project_id == ckpt.project_id
             ]
             builder_records = [r for r in matching if r.metadata.actor_role == "BUILDER" and r.metadata.transition_to == "REVIEWING"]
             reviewer_records = [r for r in matching if r.metadata.actor_role == "REVIEWER" and r.metadata.transition_to == "TESTING"]
@@ -3541,6 +3620,14 @@ class ProductionRunner:
             builder_evi = max(builder_records, key=lambda r: r.metadata.created_at)
             reviewer_evi = max(reviewer_records, key=lambda r: r.metadata.created_at)
             qa_evi = max(qa_records, key=lambda r: r.metadata.created_at)
+            from .runner_transition_gate import replay_record
+            for record, actor, source, target in (
+                (builder_evi, 'BUILDER', 'BUILDING', 'REVIEWING'),
+                (reviewer_evi, 'REVIEWER', 'REVIEWING', 'TESTING'),
+                (qa_evi, 'QA', 'TESTING', 'PENDING_USER_ACCEPTANCE'),
+            ):
+                replay_record(self.evidence_store, record, ckpt, actor, source, target,
+                              commands=live_spec.test_commands or (live_spec.test_command or 'python -m pytest -q',))
             if not (builder_evi.metadata.created_at <= reviewer_evi.metadata.created_at <= qa_evi.metadata.created_at):
                 return RunnerResult(False, ckpt.state, task_id, candidate_commit=candidate,
                                     message="Acceptance EvidenceGate replay failed: evidence order is invalid.")

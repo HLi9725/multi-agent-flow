@@ -982,7 +982,14 @@ class AntigravityAdapter(BaseHostAdapter):
         ):
             raise AgentPermissionRequiredError(
                 "Antigravity host denied the requested operation and requires explicit user approval. "
-                f"Host detail: {(error_msg or final_output)[:500]}"
+                "Inspect the persisted permission diagnostics; do not change global permissions automatically.",
+                diagnostics={
+                    "host_session_id": detected_conv_id,
+                    "host_invocation_id": detected_inv_id,
+                    "exit_code": exit_code,
+                    "host_message": (error_msg or final_output or stderr_data)[:4000],
+                    "tool_events": [event for event in events if isinstance(event, Mapping)][-12:],
+                },
             )
 
         return result
