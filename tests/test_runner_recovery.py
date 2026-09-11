@@ -412,8 +412,8 @@ def test_runner_resume_breakpoint_and_integrity_verification(tmp_path, monkeypat
         current_role="BUILDER",
         candidate_commit=cand_sha,
         candidate_generation=1,
-        review_cycle=0,
-        qa_cycle=0,
+        review_cycle=8,
+        qa_cycle=13,
         total_attempts=0,
         worktree_path=str(repo_dir),
         worktree_branch="feature/t0099",
@@ -530,6 +530,9 @@ def test_runner_resume_breakpoint_and_integrity_verification(tmp_path, monkeypat
     assert res.success is True
     assert builder_called is False  # 断点在 Reviewer，Builder 不被重复调用
     assert reviewer_called is True
+    recovered = checkpoint_store.load_checkpoint("T0099")
+    assert recovered.review_cycle <= 1
+    assert recovered.qa_cycle <= 1
     assert observed_timeouts["reviewer"] == 17.0
     assert 0 < observed_timeouts["qa"] <= 19.0
 

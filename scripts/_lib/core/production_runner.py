@@ -1597,6 +1597,23 @@ class ProductionRunner:
         if existing_checkpoint is not None and candidate_commit:
             if current_board_status == "审查中":
                 start_role = "REVIEWER"
+                # Legacy checkpoints could persist the new candidate before
+                # persisting the per-candidate retry reset and phase change.
+                # This exact stale boundary is identifiable by BUILDER still
+                # being recorded while the authoritative board is 审查中.
+                if checkpoint.current_role == "BUILDER":
+                    review_cycle = 0
+                    qa_cycle = 0
+                    checkpoint = replace(
+                        checkpoint,
+                        state=RunnerState.REVIEWING.value,
+                        current_role="REVIEWER",
+                        review_cycle=0,
+                        qa_cycle=0,
+                        last_error=None,
+                        updated_at=time.time(),
+                    )
+                    self.checkpoint_store.save_checkpoint(checkpoint)
             elif current_board_status == "测试中":
                 start_role = "QA"
         skip_builder = (start_role in ("REVIEWER", "QA") and candidate_commit is not None)
@@ -1995,6 +2012,9 @@ class ProductionRunner:
                     checkpoint,
                     candidate_commit=candidate_commit,
                     candidate_generation=candidate_generation,
+                    review_cycle=review_cycle,
+                    qa_cycle=qa_cycle,
+                    total_attempts=total_attempts,
                     builder_session_id=sess_builder,
                     builder_invocation_id=inv_builder,
                     evidence_ids=tuple(evidence_ids),
@@ -2387,6 +2407,19 @@ class ProductionRunner:
                                 message=f"Failed to transition state to 测试中: {err_trans}"
                             )
                         current_board_status = "测试中"
+                        checkpoint = replace(
+                            checkpoint,
+                            state=RunnerState.QA_TESTING.value,
+                            current_role="QA",
+                            review_cycle=review_cycle,
+                            qa_cycle=qa_cycle,
+                            reviewer_session_id=sess_reviewer,
+                            reviewer_invocation_id=inv_reviewer,
+                            evidence_ids=tuple(evidence_ids),
+                            last_error=None,
+                            updated_at=time.time(),
+                        )
+                        self.checkpoint_store.save_checkpoint(checkpoint)
                 else:
                     review_exhausted = review_cycle >= spec.max_review_cycles
                     reviewer_protocol_failure = _has_protocol_defect(
