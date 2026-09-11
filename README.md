@@ -149,6 +149,8 @@ Antigravity Prompt 通过官方 stdin `stream-json` 协议传输，不进入 Win
 
 如果 Antigravity GUI 已登录但 `agy` 无头 CLI 仍提示 OAuth，需先在运行 Runner 的同一 Windows 用户/终端上下文完成 CLI 登录。Runner 不会绕过该认证，也不会把登录失败伪装成 Reviewer 或 QA 成功。
 
+Host 权限拒绝属于显式暂停条件：Runner 会原子保存 `APPROVAL_REQUIRED`，释放运行锁并要求用户在 Runner 外部处理授权；其他 Host 失败会持久化为 `NEEDS_USER_INPUT`，不会遗留假的 `BUILDING`、`REVIEWING` 或 `QA_TESTING`。Runner 和角色 Agent 均不得修改用户全局 Antigravity/agy/Codex 设置、创建绕权限诊断脚本，或使用 `command(*)`、`unsandboxed(*)`、`--dangerously-skip-permissions` 等通配/跳过规则。检测到这类危险全局配置时将 Fail-Closed 停止，且 `--approve` 不能绕过安全门禁。
+
 Runner 成功只停在【已完成】/`PENDING_USER_ACCEPTANCE`，不会替用户验收、合并、Push 或创建 Tag。
 
 ---

@@ -146,6 +146,11 @@ def test_pm_requires_serial_independent_agents():
     assert "禁止退化为单对话多角色扮演" in body
     assert "并行调度 DEV/QA/REVIEWER" not in body
     assert "正向验证和反向/异常场景" in body
+    assert "不得修改用户全局 Antigravity/agy/Codex 设置" in body
+    assert "不得创建绕过权限的诊断脚本" in body
+    assert "command(*)" in body
+    assert "unsandboxed(*)" in body
+    assert "--dangerously-skip-permissions" in body
 
 
 def test_reviewer_and_qa_exports_require_semantic_quality_evidence():

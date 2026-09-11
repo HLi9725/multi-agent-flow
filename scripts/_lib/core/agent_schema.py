@@ -148,5 +148,13 @@ class AgentNotSupportedError(AgentError):
     pass
 
 
+class AgentPermissionRequiredError(AgentNotSupportedError):
+    """The host denied an operation that requires explicit user approval."""
+
+
+class AgentUnsafeHostConfigError(AgentNotSupportedError):
+    """The host configuration contains a permission bypass or wildcard."""
+
+
 class AgentInvalidHandleError(AgentError):
     pass

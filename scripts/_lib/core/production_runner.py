@@ -40,7 +40,7 @@ from .adapter_registry import AdapterRegistry
 from .agent_schema import (
     AgentHandle,
     AgentInvalidHandleError,
-    AgentNotSupportedError,
+    AgentPermissionRequiredError,
     AgentRequest,
     AgentResult,
     AgentStatus,
@@ -603,6 +603,42 @@ class ProductionRunner:
         recorder = getattr(adapter, "record_out_of_band_approval", None)
         if callable(recorder):
             recorder(request)
+
+    def _synchronize_failed_result_checkpoint(self, result: RunnerResult) -> RunnerResult:
+        """Keep a failed/paused Runner result and its durable checkpoint consistent.
+
+        A host exception must never be reported to the caller while leaving the
+        durable state at BUILDING/REVIEWING/QA_TESTING.  This method is also the
+        final safety net for failure branches that return early.
+        """
+        if result.success:
+            return result
+        checkpoint = self.checkpoint_store.load_checkpoint(result.task_id)
+        if checkpoint is None or checkpoint.state == result.state:
+            return result
+        updated = replace(
+            checkpoint,
+            state=result.state,
+            last_error=result.message or checkpoint.last_error,
+            updated_at=time.time(),
+        )
+        self.checkpoint_store.save_checkpoint(updated)
+        return result
+
+    def _execute_with_checkpoint_guard(self, *args: Any, **kwargs: Any) -> RunnerResult:
+        """Run the state machine and durably reconcile every normal exception."""
+        spec = args[0] if args else kwargs.get("spec")
+        try:
+            result = self._execute_loop(*args, **kwargs)
+        except Exception as exc:
+            task_id = getattr(spec, "task_id", "UNKNOWN")
+            result = RunnerResult(
+                success=False,
+                state=RunnerState.NEEDS_USER_INPUT.value,
+                task_id=task_id,
+                message=f"Runner stopped after an unexpected execution error: {exc}",
+            )
+        return self._synchronize_failed_result_checkpoint(result)
 
     def _is_cancellation_requested(self, task_id: str) -> bool:
         try:
@@ -1257,7 +1293,7 @@ class ProductionRunner:
             )
 
         try:
-            return self._execute_loop(
+            return self._execute_with_checkpoint_guard(
                 spec,
                 lock_tuple=(lock_handle, lock_file),
                 interactive_approval_cb=interactive_approval_cb,
@@ -1508,6 +1544,13 @@ class ProductionRunner:
                         f"Acceptance Criteria:\n{spec.acceptance_criteria}\n"
                         f"Please implement the requirements in {worktree_dir}, write unit tests, verify your implementation, and make a git commit."
                     )
+                builder_prompt += (
+                    "\n\nSecurity boundary: modify only files inside the assigned worktree. Never modify global "
+                    "Antigravity/agy settings, permission policies, user profiles, or files under the host home "
+                    "directory. Never create diagnostic scripts that probe or bypass host permissions. The flags "
+                    "--dangerously-skip-permissions and any command(*)/unsandboxed(*) wildcard rules are forbidden. "
+                    "If a host permission blocks work, stop and report the exact denial; do not repair the host environment."
+                )
 
                 builder_request = AgentRequest(
                     session_id=sess_builder,
@@ -1524,6 +1567,7 @@ class ProductionRunner:
                         "project_id": spec.project_id,
                         "pre_granted_approval": pre_granted_approval,
                         "approve_for_me": pre_granted_approval,
+                        "enforce_host_config_safety": True,
                     },
                 )
                 self._emit_progress(
@@ -1561,12 +1605,11 @@ class ProductionRunner:
                         evidence_ids=tuple(evidence_ids),
                         message=str(ce),
                     )
-                except AgentNotSupportedError as se:
+                except AgentPermissionRequiredError as se:
                     with self._lock:
                         self._active_handles.pop(task_id, None)
-                    checkpoint = RunnerCheckpoint(
-                        task_id=task_id,
-                        project_id=spec.project_id,
+                    checkpoint = replace(
+                        checkpoint,
                         state=RunnerState.APPROVAL_REQUIRED.value,
                         current_role="BUILDER",
                         candidate_commit=candidate_commit,
@@ -1574,14 +1617,13 @@ class ProductionRunner:
                         review_cycle=review_cycle,
                         qa_cycle=qa_cycle,
                         total_attempts=total_attempts,
-                        worktree_path=worktree_dir,
-                        worktree_branch=worktree_branch,
                         builder_session_id=sess_builder,
                         evidence_ids=tuple(evidence_ids),
                         execution_options=_execution_options_from_spec(spec),
                         defects_history=tuple(defects_history),
                         approval_reason=str(se),
                         last_error="Permission approval required",
+                        updated_at=time.time(),
                     )
                     self.checkpoint_store.save_checkpoint(checkpoint)
                     return RunnerResult(
@@ -1597,13 +1639,20 @@ class ProductionRunner:
                 except Exception as e:
                     with self._lock:
                         self._active_handles.pop(task_id, None)
+                    pause_message = f"Builder host dispatch/wait failed: {e}"
+                    checkpoint = replace(
+                        checkpoint, state=RunnerState.NEEDS_USER_INPUT.value,
+                        current_role="BUILDER", last_error=pause_message,
+                        updated_at=time.time(),
+                    )
+                    self.checkpoint_store.save_checkpoint(checkpoint)
                     return RunnerResult(
                         success=False,
-                        state=RunnerState.FAILED.value,
+                        state=RunnerState.NEEDS_USER_INPUT.value,
                         task_id=task_id,
                         candidate_commit=candidate_commit,
                         candidate_generation=candidate_generation,
-                        message=f"Builder dispatch/wait failed: {e}",
+                        message=pause_message,
                         diagnostics={"error": str(e)},
                     )
                 finally:
@@ -1611,11 +1660,21 @@ class ProductionRunner:
                         self._active_handles.pop(task_id, None)
 
                 if builder_result.status != AgentStatus.SUCCESS:
+                    pause_message = (
+                        f"Builder execution failed with status: {builder_result.status.value}; "
+                        f"{builder_result.error_message or builder_result.output[:500]}"
+                    )
+                    checkpoint = replace(
+                        checkpoint, state=RunnerState.NEEDS_USER_INPUT.value,
+                        current_role="BUILDER", last_error=pause_message,
+                        updated_at=time.time(),
+                    )
+                    self.checkpoint_store.save_checkpoint(checkpoint)
                     return RunnerResult(
                         success=False,
-                        state=RunnerState.FAILED.value,
+                        state=RunnerState.NEEDS_USER_INPUT.value,
                         task_id=task_id,
-                        message=f"Builder execution failed with status: {builder_result.status.value}",
+                        message=pause_message,
                     )
                 if builder_result.session_id != builder_handle.session_id:
                     return RunnerResult(
@@ -1874,6 +1933,7 @@ class ProductionRunner:
                         "project_id": spec.project_id,
                         "review_request_id": review_request_id,
                         "pre_granted_approval": pre_granted_approval,
+                        "enforce_host_config_safety": True,
                     },
                 )
                 self._emit_progress(
@@ -1912,12 +1972,11 @@ class ProductionRunner:
                         evidence_ids=tuple(evidence_ids),
                         message=str(ce),
                     )
-                except AgentNotSupportedError as se:
+                except AgentPermissionRequiredError as se:
                     with self._lock:
                         self._active_handles.pop(task_id, None)
-                    checkpoint = RunnerCheckpoint(
-                        task_id=task_id,
-                        project_id=spec.project_id,
+                    checkpoint = replace(
+                        checkpoint,
                         state=RunnerState.APPROVAL_REQUIRED.value,
                         current_role="REVIEWER",
                         candidate_commit=candidate_commit,
@@ -1925,14 +1984,13 @@ class ProductionRunner:
                         review_cycle=review_cycle,
                         qa_cycle=qa_cycle,
                         total_attempts=total_attempts,
-                        worktree_path=worktree_dir,
-                        worktree_branch=worktree_branch,
                         reviewer_session_id=sess_reviewer,
                         evidence_ids=tuple(evidence_ids),
                         execution_options=_execution_options_from_spec(spec),
                         defects_history=tuple(defects_history),
                         approval_reason=str(se),
                         last_error="Permission approval required",
+                        updated_at=time.time(),
                     )
                     self.checkpoint_store.save_checkpoint(checkpoint)
                     return RunnerResult(
@@ -1948,13 +2006,20 @@ class ProductionRunner:
                 except Exception as e:
                     with self._lock:
                         self._active_handles.pop(task_id, None)
+                    pause_message = f"Reviewer host dispatch/wait failed: {e}"
+                    checkpoint = replace(
+                        checkpoint, state=RunnerState.NEEDS_USER_INPUT.value,
+                        current_role="REVIEWER", last_error=pause_message,
+                        updated_at=time.time(),
+                    )
+                    self.checkpoint_store.save_checkpoint(checkpoint)
                     return RunnerResult(
                         success=False,
-                        state=RunnerState.FAILED.value,
+                        state=RunnerState.NEEDS_USER_INPUT.value,
                         task_id=task_id,
                         candidate_commit=candidate_commit,
                         candidate_generation=candidate_generation,
-                        message=f"Reviewer dispatch/wait failed: {e}",
+                        message=pause_message,
                         diagnostics={"error": str(e)},
                     )
                 finally:
@@ -1962,11 +2027,21 @@ class ProductionRunner:
                         self._active_handles.pop(task_id, None)
 
                 if reviewer_result.status != AgentStatus.SUCCESS:
+                    pause_message = (
+                        f"Reviewer execution failed with status: {reviewer_result.status.value}; "
+                        f"{reviewer_result.error_message or reviewer_result.output[:500]}"
+                    )
+                    checkpoint = replace(
+                        checkpoint, state=RunnerState.NEEDS_USER_INPUT.value,
+                        current_role="REVIEWER", last_error=pause_message,
+                        updated_at=time.time(),
+                    )
+                    self.checkpoint_store.save_checkpoint(checkpoint)
                     return RunnerResult(
                         success=False,
-                        state=RunnerState.FAILED.value,
+                        state=RunnerState.NEEDS_USER_INPUT.value,
                         task_id=task_id,
-                        message=f"Reviewer execution failed with status: {reviewer_result.status.value}",
+                        message=pause_message,
                     )
                 if reviewer_result.session_id != reviewer_handle.session_id:
                     return RunnerResult(
@@ -2475,6 +2550,7 @@ class ProductionRunner:
                     "acceptance_criteria_hash": spec.acceptance_criteria_hash,
                     "required_test_commands": test_commands,
                     "pre_granted_approval": pre_granted_approval,
+                    "enforce_host_config_safety": True,
                 },
             )
             self._emit_progress(
@@ -2513,12 +2589,11 @@ class ProductionRunner:
                     evidence_ids=tuple(evidence_ids),
                     message=str(ce),
                 )
-            except AgentNotSupportedError as se:
+            except AgentPermissionRequiredError as se:
                 with self._lock:
                     self._active_handles.pop(task_id, None)
-                checkpoint = RunnerCheckpoint(
-                    task_id=task_id,
-                    project_id=spec.project_id,
+                checkpoint = replace(
+                    checkpoint,
                     state=RunnerState.APPROVAL_REQUIRED.value,
                     current_role="QA",
                     candidate_commit=candidate_commit,
@@ -2526,14 +2601,13 @@ class ProductionRunner:
                     review_cycle=review_cycle,
                     qa_cycle=qa_cycle,
                     total_attempts=total_attempts,
-                    worktree_path=worktree_dir,
-                    worktree_branch=worktree_branch,
                     qa_session_id=sess_qa,
                     evidence_ids=tuple(evidence_ids),
                     execution_options=_execution_options_from_spec(spec),
                     defects_history=tuple(defects_history),
                     approval_reason=str(se),
                     last_error="Permission approval required",
+                    updated_at=time.time(),
                 )
                 self.checkpoint_store.save_checkpoint(checkpoint)
                 return RunnerResult(
@@ -2549,11 +2623,18 @@ class ProductionRunner:
             except Exception as e:
                 with self._lock:
                     self._active_handles.pop(task_id, None)
+                pause_message = f"QA host dispatch/wait failed: {e}"
+                checkpoint = replace(
+                    checkpoint, state=RunnerState.NEEDS_USER_INPUT.value,
+                    current_role="QA", last_error=pause_message,
+                    updated_at=time.time(),
+                )
+                self.checkpoint_store.save_checkpoint(checkpoint)
                 return RunnerResult(
                     success=False,
-                    state=RunnerState.FAILED.value,
+                    state=RunnerState.NEEDS_USER_INPUT.value,
                     task_id=task_id,
-                    message=f"QA dispatch/wait failed: {e}",
+                    message=pause_message,
                     diagnostics={"error": str(e)},
                 )
             finally:
@@ -2561,11 +2642,21 @@ class ProductionRunner:
                     self._active_handles.pop(task_id, None)
 
             if qa_result.status != AgentStatus.SUCCESS:
+                pause_message = (
+                    f"QA execution failed with status: {qa_result.status.value}; "
+                    f"{qa_result.error_message or qa_result.output[:500]}"
+                )
+                checkpoint = replace(
+                    checkpoint, state=RunnerState.NEEDS_USER_INPUT.value,
+                    current_role="QA", last_error=pause_message,
+                    updated_at=time.time(),
+                )
+                self.checkpoint_store.save_checkpoint(checkpoint)
                 return RunnerResult(
                     success=False,
-                    state=RunnerState.FAILED.value,
+                    state=RunnerState.NEEDS_USER_INPUT.value,
                     task_id=task_id,
-                    message=f"QA execution failed with status: {qa_result.status.value}",
+                    message=pause_message,
                 )
             if qa_result.session_id != qa_handle.session_id:
                 return RunnerResult(
@@ -3093,7 +3184,7 @@ class ProductionRunner:
             )
 
         try:
-            return self._execute_loop(
+            return self._execute_with_checkpoint_guard(
                 spec,
                 lock_tuple=(lock_handle, lock_file),
                 interactive_approval_cb=interactive_approval_cb,

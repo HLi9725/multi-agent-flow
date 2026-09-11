@@ -25,6 +25,9 @@ version: 1.0.0
 
 > 💡 **业务流转与协同全走自然语言**：任务拆解建卡、阶段开工（`check_stage_gate.py --action start`）、阶段结项（`check_stage_gate.py --action close`）、认领、提审、测试与打回等日常研发生命周期，直接使用自然语言与 Agent 对话沟通，由对应专家在后台自主调度底层脚本。
 
+> [!CAUTION]
+> **Host 权限不得由 Agent 自行修改**：Runner/主协调者/子 Agent 不得改写用户全局 Antigravity/agy/Codex 设置，不得生成权限绕过诊断脚本，不得使用 `command(*)`、`unsandboxed(*)`、`--dangerously-skip-permissions` 或等价通配放行。权限拒绝时必须持久化停在 `APPROVAL_REQUIRED`；检测到危险全局配置时停在 `NEEDS_USER_INPUT`，由用户在 Runner 外部手工处理。
+
 ---
 
 > [!NOTE]

@@ -16,7 +16,7 @@ import yaml
 from scripts._lib.core.adapter_registry import AdapterRegistry
 from scripts._lib.core.agent_schema import (
     AgentHandle,
-    AgentNotSupportedError,
+    AgentPermissionRequiredError,
     AgentResult,
     AgentStatus,
     CapabilitySupport,
@@ -33,7 +33,7 @@ from scripts._lib.core.production_runner import (
     _validate_qa_test_command,
 )
 from scripts._lib.core.runner_checkpoint_store import RunnerCheckpointStore
-from scripts._lib.core.runner_schema import RunnerState, TaskExecutionSpec
+from scripts._lib.core.runner_schema import RunnerCheckpoint, RunnerResult, RunnerState, TaskExecutionSpec
 from scripts._lib.core.task_spec_loader import load_task_execution_spec
 from scripts._lib.hosts.antigravity_adapter import AntigravityAdapter, create_antigravity_manifest
 from scripts._lib.hosts.codex_cli_adapter import CodexCliAdapter, create_codex_cli_manifest
@@ -753,7 +753,7 @@ def test_permission_approval_required_pause_and_resume(mock_git_repo, tmp_path, 
         nonlocal call_count
         call_count += 1
         if call_count == 1:
-            raise AgentNotSupportedError("Operation requires explicit user permission approval for network access.")
+            raise AgentPermissionRequiredError("Operation requires explicit user permission approval for network access.")
         return AgentHandle(session_id=req.session_id, host_id="codex_cli", status="completed", is_real_host=True, adapter_instance_id="inst_c", invocation_token="tok_b")
 
     def mock_wait(self, handle, timeout_seconds=None):
@@ -794,7 +794,40 @@ def test_permission_approval_required_pause_and_resume(mock_git_repo, tmp_path, 
     assert res1.success is False
     assert res1.state == RunnerState.APPROVAL_REQUIRED.value
     assert "Operation requires explicit user permission approval" in res1.message
+    paused = checkpoint_store.load_checkpoint("T0033")
+    assert paused is not None
+    assert paused.state == RunnerState.APPROVAL_REQUIRED.value
+    assert paused.current_role == "BUILDER"
+    assert "explicit user permission approval" in (paused.approval_reason or "")
 
     # 2. 通过 resume 并授权后继续执行
     res2 = runner.resume(project_root=str(repo_dir), task_id="T0033", authority_root=str(repo_dir), pre_granted_approval=True)
     assert res2.state != RunnerState.APPROVAL_REQUIRED.value
+
+
+def test_runner_failure_result_cannot_leave_building_checkpoint(tmp_path):
+    store = RunnerCheckpointStore(
+        data_root=str(tmp_path / "checkpoint_data"),
+        project_root=str(tmp_path),
+        project_id="checkpoint_guard",
+    )
+    store.save_checkpoint(RunnerCheckpoint(
+        task_id="T0088",
+        project_id="checkpoint_guard",
+        state=RunnerState.BUILDING.value,
+        current_role="BUILDER",
+    ))
+    runner = ProductionRunner(checkpoint_store=store)
+
+    result = runner._synchronize_failed_result_checkpoint(RunnerResult(
+        success=False,
+        state=RunnerState.NEEDS_USER_INPUT.value,
+        task_id="T0088",
+        message="Host stopped before returning a valid result.",
+    ))
+
+    persisted = store.load_checkpoint("T0088")
+    assert result.state == RunnerState.NEEDS_USER_INPUT.value
+    assert persisted is not None
+    assert persisted.state == RunnerState.NEEDS_USER_INPUT.value
+    assert persisted.last_error == "Host stopped before returning a valid result."

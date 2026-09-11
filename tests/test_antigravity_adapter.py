@@ -12,6 +12,8 @@ from scripts._lib.core.agent_schema import (
     AgentHandle,
     AgentInvalidHandleError,
     AgentNotSupportedError,
+    AgentPermissionRequiredError,
+    AgentUnsafeHostConfigError,
     AgentRequest,
     AgentResult,
     AgentStatus,
@@ -59,6 +61,7 @@ from scripts._lib.hosts.antigravity_adapter import (
     _find_default_antigravity_executable,
     create_antigravity_manifest,
 )
+from scripts._lib.hosts import antigravity_adapter as antigravity_adapter_module
 
 
 def test_antigravity_manifest_structure_and_anti_forgery():
@@ -1006,6 +1009,65 @@ def test_antigravity_adapter_dispatch_zero_self_authorization():
     )
     handle_2 = adapter.dispatch_agent(req_safe_2)
     assert handle_2.session_id == "sess_safe_chk_02"
+
+
+def test_antigravity_adapter_rejects_global_wildcard_permissions_without_rewriting(tmp_path, monkeypatch):
+    config_path = tmp_path / "settings.json"
+    original = '{"permissions":{"allow":["command(*)","workspace_read(*)"]}}'
+    config_path.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(
+        antigravity_adapter_module,
+        "_antigravity_config_path",
+        lambda: str(config_path),
+    )
+
+    adapter = AntigravityAdapter(
+        is_real_host=True,
+        executable_path=sys.executable,
+        verification_level=VerificationLevel.CLI_VERIFIED,
+    )
+    request = AgentRequest(
+        session_id="sess_unsafe_global_config",
+        prompt="git status",
+        role="REVIEWER",
+        workspace_dir=os.path.abspath("."),
+        extra_context={"enforce_host_config_safety": True},
+    )
+
+    with pytest.raises(AgentUnsafeHostConfigError, match=r"command\(\*\)"):
+        adapter.dispatch_agent(request)
+    assert config_path.read_text(encoding="utf-8") == original
+
+
+def test_antigravity_adapter_surfaces_runtime_permission_denial(monkeypatch):
+    adapter = AntigravityAdapter(
+        is_real_host=True,
+        executable_path=sys.executable,
+        verification_level=VerificationLevel.CLI_VERIFIED,
+    )
+    workspace = os.path.abspath(".")
+    request = AgentRequest(
+        session_id="sess_runtime_permission_denial",
+        prompt="git status",
+        role="QA",
+        workspace_dir=workspace,
+    )
+    adapter.record_out_of_band_approval(request)
+
+    class PermissionDeniedPopen:
+        pid = 77888
+        returncode = 1
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def communicate(self, input=None, timeout=None):
+            return '{"type":"error","message":"permission_denied: command requires approval"}\n', ""
+
+    monkeypatch.setattr(subprocess, "Popen", PermissionDeniedPopen)
+    handle = adapter.dispatch_agent(request)
+    with pytest.raises(AgentPermissionRequiredError, match="requires explicit user approval"):
+        adapter.wait_for_result(handle, timeout_seconds=5)
 
 
 def test_antigravity_adapter_out_of_band_approval_is_exact_and_bounded():

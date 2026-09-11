@@ -18,6 +18,8 @@
    任何代码提交、分支推送或 PR 发起内部必须绑定明确的看板工单；外部 Commit Message 与 PR 正文严格保持通用纯净，严禁泄露内部任务编号与虚拟专家人名。
 6. **看板资产只增不减 (Append-Only Lifecycle)**：
    看板任务卡全生命周期只增不减，绝对禁止物理删除任务卡或直接修改底层 `board.json`；作废任务统一由 PM 严经理流转为【已取消】终态归档。
+7. **Host 权限由用户掌控 (No Agent Permission Repair)**：
+   Agent 不得改写全局 Host/CLI 权限配置、探测或绕过安全限制，严禁 `command(*)`、`unsandboxed(*)`、`--dangerously-skip-permissions` 及等价规则。权限拒绝必须原子保存 Checkpoint 并停止，禁止协调者自行修复环境后继续。
 
 ---
 

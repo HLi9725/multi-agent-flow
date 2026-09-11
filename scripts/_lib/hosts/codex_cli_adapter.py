@@ -19,6 +19,7 @@ from ..core.agent_schema import (
     AgentHandle,
     AgentInvalidHandleError,
     AgentNotSupportedError,
+    AgentPermissionRequiredError,
     AgentRequest,
     AgentResult,
     AgentStatus,
@@ -42,6 +43,15 @@ from ..core.adapter_manifest import (
 ALLOWED_SANDBOX_MODES: Set[str] = {"read-only", "workspace-write"}
 ALLOWED_APPROVAL_POLICIES: Set[str] = {"on-request", "never"}
 ALLOWED_WINDOWS_SANDBOX_IMPLEMENTATIONS: Set[str] = {"elevated", "unelevated"}
+
+
+def _is_host_permission_denial(*parts: Optional[str]) -> bool:
+    material = "\n".join(str(part) for part in parts if part).lower()
+    return any(marker in material for marker in (
+        "permission_denied", "permission denied", "permission was denied",
+        "auto-denied", "auto denied", "requires approval", "approval required",
+        "not permitted", "sandbox denied", "access is denied", "access denied",
+    ))
 
 
 def _find_default_codex_executable() -> Optional[str]:
@@ -459,6 +469,14 @@ class CodexCliAdapter(BaseHostAdapter):
             session_data["result"] = result
             self._session_history[handle.session_id] = session_data
             self._running_sessions.pop(handle.session_id, None)
+
+        if status == AgentStatus.FAILED and _is_host_permission_denial(
+            error_msg, final_output, stderr_data
+        ):
+            raise AgentPermissionRequiredError(
+                "Codex host denied the requested operation and requires explicit user approval. "
+                f"Host detail: {(error_msg or final_output)[:500]}"
+            )
 
         return result
 

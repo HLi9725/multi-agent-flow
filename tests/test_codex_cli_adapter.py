@@ -12,6 +12,7 @@ from scripts._lib.core.agent_schema import (
     AgentHandle,
     AgentInvalidHandleError,
     AgentNotSupportedError,
+    AgentPermissionRequiredError,
     AgentRequest,
     AgentResult,
     AgentStatus,
@@ -439,6 +440,28 @@ def test_codex_cli_adapter_error_events_and_git_repo_check(tmp_path):
     )
     with pytest.raises(AgentNotSupportedError, match="not inside a trusted Git repository"):
         adapter.dispatch_agent(req_non_git)
+
+
+def test_codex_cli_adapter_surfaces_runtime_permission_denial(monkeypatch):
+    adapter = CodexCliAdapter(is_real_host=True, executable_path=sys.executable)
+
+    class PermissionDeniedProcess:
+        pid = 22334
+        returncode = 1
+
+        def communicate(self, timeout=None):
+            return '{"type":"error","message":"permission_denied: sandbox requires approval"}\n', ""
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: PermissionDeniedProcess())
+    request = AgentRequest(
+        session_id="sess_codex_permission_denied",
+        prompt="git status",
+        role="QA",
+        workspace_dir=os.path.abspath("."),
+    )
+    handle = adapter.dispatch_agent(request)
+    with pytest.raises(AgentPermissionRequiredError, match="requires explicit user approval"):
+        adapter.wait_for_result(handle)
 
 
 def test_codex_cli_evidence_gate_real_judgment(tmp_path, monkeypatch):

@@ -20,10 +20,12 @@ from ..core.agent_schema import (
     AgentHandle,
     AgentInvalidHandleError,
     AgentNotSupportedError,
+    AgentPermissionRequiredError,
     AgentRequest,
     AgentResult,
     AgentStatus,
     AgentTimeoutError,
+    AgentUnsafeHostConfigError,
     CapabilitySupport,
     ConfirmationRequest,
     ConfirmationResult,
@@ -42,6 +44,60 @@ from ..core.adapter_manifest import (
 # Whitelist of permissible execution modes and sandbox policies
 ALLOWED_EXECUTION_MODES: Set[str] = {"accept-edits", "plan"}
 ALLOWED_APPROVAL_POLICIES: Set[str] = {"request-review", "strict", "proceed-in-sandbox", "never", "on-request"}
+
+FORBIDDEN_HOST_PERMISSION_RULES: Set[str] = {
+    "command(*)",
+    "command(regex:.*)",
+    "unsandboxed(*)",
+    "unsandboxed(regex:.*)",
+}
+
+
+def _antigravity_config_path() -> str:
+    return os.path.realpath(os.path.expanduser("~/.gemini/antigravity-cli/settings.json"))
+
+
+def _validate_antigravity_host_config() -> None:
+    """Fail closed on global wildcard/bypass rules; never rewrite host config."""
+    config_path = _antigravity_config_path()
+    if not os.path.isfile(config_path):
+        return
+    try:
+        with open(config_path, "r", encoding="utf-8") as handle:
+            config = json.load(handle)
+    except Exception as exc:
+        raise AgentUnsafeHostConfigError(
+            f"Antigravity host config is unreadable or invalid JSON at '{config_path}': {exc}. "
+            "Runner will not repair global settings automatically."
+        ) from exc
+
+    serialized = json.dumps(config, ensure_ascii=False, sort_keys=True).lower()
+    permissions = config.get("permissions", {}) if isinstance(config, Mapping) else {}
+    allow_rules = permissions.get("allow", ()) if isinstance(permissions, Mapping) else ()
+    normalized_rules = {
+        re.sub(r"\s+", "", str(rule)).lower()
+        for rule in (allow_rules if isinstance(allow_rules, (list, tuple)) else ())
+    }
+    forbidden = sorted(normalized_rules.intersection(FORBIDDEN_HOST_PERMISSION_RULES))
+    bypass_tokens = [
+        token for token in ("dangerously-skip-permissions", "skip_permission_checks")
+        if token in serialized
+    ]
+    if forbidden or bypass_tokens:
+        details = ", ".join(forbidden + bypass_tokens)
+        raise AgentUnsafeHostConfigError(
+            f"Unsafe Antigravity global permission configuration detected at '{config_path}': {details}. "
+            "Remove the wildcard/bypass rules manually; --approve cannot override this safety gate."
+        )
+
+
+def _is_host_permission_denial(*parts: Optional[str]) -> bool:
+    material = "\n".join(str(part) for part in parts if part).lower()
+    return any(marker in material for marker in (
+        "permission_denied", "permission denied", "permission was denied",
+        "auto-denied", "auto denied", "requires approval", "approval required",
+        "not permitted", "sandbox denied", "access is denied", "access denied",
+    ))
 
 # Mapping from project roles to specialized Antigravity subagents
 ROLE_AGENT_MAP: Dict[str, str] = {
@@ -610,6 +666,11 @@ class AntigravityAdapter(BaseHostAdapter):
         if not request.session_id or not request.session_id.strip():
             raise ValueError("request.session_id cannot be empty")
 
+        if self._is_real_host and isinstance(request.extra_context, Mapping) and request.extra_context.get(
+            "enforce_host_config_safety"
+        ):
+            _validate_antigravity_host_config()
+
         # DEF-T0052-4: Dual-root and workspace validation
         self.validate_workspace_roots(request)
 
@@ -650,7 +711,7 @@ class AntigravityAdapter(BaseHostAdapter):
             permission_boundary=permission_boundary,
         )
         if not has_approval:
-            raise AgentNotSupportedError(
+            raise AgentPermissionRequiredError(
                 f"Operation classified as '{risk}' requires explicit user permission approval for command family "
                 f"'{command_family}' in project '{project_id}' before execution."
             )
@@ -899,6 +960,14 @@ class AntigravityAdapter(BaseHostAdapter):
             session_data["result"] = result
             self._session_history[handle.session_id] = session_data
             self._running_sessions.pop(handle.session_id, None)
+
+        if status == AgentStatus.FAILED and _is_host_permission_denial(
+            error_msg, final_output, stderr_data
+        ):
+            raise AgentPermissionRequiredError(
+                "Antigravity host denied the requested operation and requires explicit user approval. "
+                f"Host detail: {(error_msg or final_output)[:500]}"
+            )
 
         return result
 
