@@ -165,6 +165,49 @@ def _compose_requirement_text(
     description = description.strip()
     remarks = remarks.strip()
     acceptance_marker = re.compile(r"(?:【\s*验收标准\s*】\s*[:：]?|验收标准\s*[:：])")
+
+    def immutable_contract_prefix(source: str) -> str:
+        """Return the requirement/criteria prefix, excluding appended workflow notes.
+
+        Board adapters append transition comments to ``remarks`` separated by a
+        blank line.  Those comments are operational history, not a contract
+        mutation.  Preserve the source text byte-for-byte up to the end of the
+        acceptance section so existing checkpoint hashes remain compatible.
+        """
+        source = source.strip()
+        if not source:
+            return ""
+        lines = source.splitlines()
+        result = []
+        in_acceptance = False
+        acceptance_has_content = False
+        blank_after_acceptance = False
+        for line in lines:
+            stripped = line.strip()
+            if re.match(r"^\s*\[T\d+-N\d+\]", line):
+                break
+            if not in_acceptance:
+                result.append(line)
+                marker = acceptance_marker.search(line)
+                if marker:
+                    in_acceptance = True
+                    acceptance_has_content = bool(line[marker.end():].strip())
+                continue
+            if not stripped:
+                if acceptance_has_content:
+                    blank_after_acceptance = True
+                result.append(line)
+                continue
+            if _is_acceptance_section_boundary(stripped):
+                break
+            is_list_item = bool(re.match(r"^(?:[-*+]\s+|\d+[.)、]\s*)", stripped))
+            if blank_after_acceptance and not is_list_item:
+                break
+            result.append(line)
+            acceptance_has_content = True
+            blank_after_acceptance = False
+        return "\n".join(result).rstrip()
+
     requirement_lines = []
     for line in process.splitlines():
         # append_process_node writes a multi-line audit block.  Everything from
@@ -173,13 +216,15 @@ def _compose_requirement_text(
             break
         requirement_lines.append(line)
     process_without_history = "\n".join(requirement_lines).strip()
-    if remarks and acceptance_marker.search(remarks):
-        return "\n\n".join(part for part in (description, remarks) if part)
     if description and acceptance_marker.search(description):
-        return description
+        return immutable_contract_prefix(description)
     if process_without_history and acceptance_marker.search(process_without_history):
-        return "\n\n".join(part for part in (description, process_without_history) if part)
-    return description or remarks or process_without_history or task_name.strip()
+        contract = immutable_contract_prefix(process_without_history)
+        return "\n\n".join(part for part in (description, contract) if part)
+    if remarks and acceptance_marker.search(remarks):
+        contract = immutable_contract_prefix(remarks)
+        return "\n\n".join(part for part in (description, contract) if part)
+    return immutable_contract_prefix(description or remarks or process_without_history) or task_name.strip()
 
 
 def _extract_acceptance_criteria(

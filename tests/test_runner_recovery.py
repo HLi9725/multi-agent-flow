@@ -403,12 +403,13 @@ def test_runner_resume_breakpoint_and_integrity_verification(tmp_path, monkeypat
     )
     evidence_store.append(rec)
 
-    # 1. 保存从 REVIEWER 阶段恢复的 Checkpoint
+    # 1. 模拟 Builder 已提交且看板已进入审查中，但旧 Runner 在持久化
+    # Reviewer 阶段前暂停；恢复必须以权威看板阶段为准，不得重复 Builder。
     ckpt = RunnerCheckpoint(
         task_id="T0099",
         project_id="test_repo",
-        state=RunnerState.REVIEWING.value,
-        current_role="REVIEWER",
+        state=RunnerState.NEEDS_USER_INPUT.value,
+        current_role="BUILDER",
         candidate_commit=cand_sha,
         candidate_generation=1,
         review_cycle=0,
@@ -568,6 +569,40 @@ def test_checkpoint_snapshot_round_trip_and_cancel_is_durable(tmp_path):
     store.save_checkpoint(replace(loaded, state=RunnerState.CANCELLED.value))
     with pytest.raises(CheckpointStoreError, match="durable cancellation"):
         store.save_checkpoint(replace(loaded, state=RunnerState.BUILDING.value))
+
+
+def test_legacy_contract_snapshot_migrates_once_without_weakening_v2_guard(tmp_path):
+    spec = TaskExecutionSpec(
+        project_id="demo",
+        project_root=str(tmp_path),
+        authority_root=str(tmp_path),
+        task_id="T0111",
+        task_name="稳定契约",
+        requirement_text="需求正文",
+        acceptance_criteria="验收标准: 可观测结果",
+        acceptance_criteria_hash="a" * 64,
+        task_version="1",
+        status_at_read="审查中",
+        requirement_hash="b" * 64,
+        owner="李开发",
+    )
+    legacy = production_runner_module._execution_spec_snapshot(spec)
+    legacy.pop("contract_hash_version")
+    legacy["requirement_hash"] = "c" * 64
+
+    migrated = production_runner_module._upgrade_legacy_contract_snapshot(legacy, spec)
+    assert migrated["contract_hash_version"] == 2
+    assert migrated["requirement_hash"] == "b" * 64
+
+    changed = replace(spec, requirement_hash="d" * 64)
+    assert "requirement_hash" in " ".join(
+        production_runner_module._snapshot_mismatches(migrated, changed)
+    )
+
+    wrong_acceptance = dict(legacy, acceptance_criteria_hash="e" * 64)
+    assert production_runner_module._upgrade_legacy_contract_snapshot(
+        wrong_acceptance, spec
+    ) == wrong_acceptance
 
 
 @pytest.mark.parametrize('corruption', [None, 'empty_commands', 'foreign_task', 'missing_capability'])

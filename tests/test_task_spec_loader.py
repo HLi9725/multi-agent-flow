@@ -211,6 +211,7 @@ def test_stable_requirement_fields_take_precedence_over_transition_log(mock_proj
 
     # Appending workflow history must not invalidate a stable requirement snapshot.
     data[4]["process"] += "\n[T0005-N02] 进行中 -> 审查中 | 候选已提交"
+    data[4]["remarks"] += "\n\n候选提交 abc123 已生成，转交周审查"
     data[4]["status"] = "审查中"
     data[4]["updated_at"] = "1787890001"
     with open(board_file, "w", encoding="utf-8") as f:
@@ -225,6 +226,49 @@ def test_stable_requirement_fields_take_precedence_over_transition_log(mock_proj
 
     # Changing only the requirement body while retaining the same criteria is a conflict.
     data[4]["remarks"] = data[4]["remarks"].replace("支持批量导出审计结果", "支持跨租户批量导出审计结果")
+    with open(board_file, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    assert verify_optimistic_concurrency(
+        spec,
+        adapter,
+        enforce_status=False,
+        enforce_version=False,
+    ) is False
+
+
+def test_plain_transition_remarks_after_acceptance_do_not_mutate_contract(mock_project_environment):
+    board_file = str(mock_project_environment / "user_data" / "board.json")
+    adapter = OfflineBoardAdapter(board_file=board_file)
+    spec = load_task_execution_spec(
+        project_root=str(mock_project_environment),
+        task_id="T0005",
+        authority_root=str(mock_project_environment),
+    )
+
+    with open(board_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    data[4]["remarks"] += (
+        "\n\nProduction Runner 启动并由 Builder 合法领取任务"
+        "\n\nCodex Builder 完成开发，候选提交: abc123"
+    )
+    data[4]["process"] += (
+        "\n[T0005-N02] 进行中 -> 审查中 | 候选已提交"
+    )
+    data[4]["status"] = "审查中"
+    with open(board_file, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+
+    assert verify_optimistic_concurrency(
+        spec,
+        adapter,
+        enforce_status=False,
+        enforce_version=False,
+    ) is True
+
+    data[4]["remarks"] = data[4]["remarks"].replace(
+        "支持批量导出审计结果", "支持跨租户批量导出审计结果"
+    )
+    data[4]["process"] = ""
     with open(board_file, "w", encoding="utf-8") as f:
         json.dump(data, f)
     assert verify_optimistic_concurrency(

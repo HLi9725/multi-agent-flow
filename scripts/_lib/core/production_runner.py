@@ -538,6 +538,7 @@ def _execution_options_from_spec(spec: TaskExecutionSpec) -> Dict[str, Any]:
 def _execution_spec_snapshot(spec: TaskExecutionSpec) -> Dict[str, Any]:
     """Freeze the business contract and original Git baseline for every resume/accept."""
     return {
+        "contract_hash_version": 2,
         "project_id": spec.project_id,
         "project_root": os.path.realpath(spec.project_root),
         "authority_root": os.path.realpath(spec.authority_root),
@@ -551,6 +552,44 @@ def _execution_spec_snapshot(spec: TaskExecutionSpec) -> Dict[str, Any]:
         "baseline_commit": spec.baseline_commit,
         "baseline_branch": spec.baseline_branch,
     }
+
+
+def _upgrade_legacy_contract_snapshot(
+    snapshot: Mapping[str, Any], spec: TaskExecutionSpec
+) -> Dict[str, Any]:
+    """One-time migration from mutable-history hashes to canonical contract hashes.
+
+    Version-1 checkpoints could hash transition comments appended to ``remarks``.
+    Upgrade only when task identity and acceptance criteria are unchanged.  Once
+    marked version 2, ordinary requirement drift remains fail-closed.
+    """
+    upgraded = dict(snapshot)
+    try:
+        version = int(upgraded.get("contract_hash_version") or 1)
+    except (TypeError, ValueError):
+        version = 1
+    if version >= 2:
+        return upgraded
+
+    current = _execution_spec_snapshot(spec)
+    identity_fields = (
+        "project_id", "project_root", "authority_root", "task_id", "task_name",
+        "task_type", "owner",
+    )
+    if any(
+        upgraded.get(name) not in (None, "")
+        and upgraded.get(name) != current.get(name)
+        for name in identity_fields
+    ):
+        return upgraded
+    expected_criteria = upgraded.get("acceptance_criteria_hash")
+    if not expected_criteria or expected_criteria != spec.acceptance_criteria_hash:
+        return upgraded
+
+    upgraded["requirement_hash"] = spec.requirement_hash
+    upgraded["acceptance_criteria_hash"] = spec.acceptance_criteria_hash
+    upgraded["contract_hash_version"] = 2
+    return upgraded
 
 
 def _snapshot_mismatches(snapshot: Mapping[str, Any], spec: TaskExecutionSpec) -> List[str]:
@@ -1552,6 +1591,14 @@ class ProductionRunner:
         defects_history: List[Dict[str, Any]] = list(checkpoint.defects_history)
         qa_test_cache: Dict[Tuple[str, Tuple[str, ...]], Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]] = {}
         start_role = checkpoint.current_role if existing_checkpoint else "BUILDER"
+        # The authoritative board phase wins over a stale checkpoint role.  A
+        # crash or a contract guard immediately after a successful transition
+        # must not dispatch Builder again for an already committed candidate.
+        if existing_checkpoint is not None and candidate_commit:
+            if current_board_status == "审查中":
+                start_role = "REVIEWER"
+            elif current_board_status == "测试中":
+                start_role = "QA"
         skip_builder = (start_role in ("REVIEWER", "QA") and candidate_commit is not None)
         skip_reviewer = (start_role == "QA" and candidate_commit is not None)
 
@@ -1944,8 +1991,18 @@ class ProductionRunner:
                         message=f"Builder EvidenceGate validation failed: {gate_error}",
                     )
                 evidence_ids.append(builder_evidence_id)
-                checkpoint = replace(checkpoint, candidate_commit=candidate_commit,
-                    candidate_generation=candidate_generation, evidence_ids=tuple(evidence_ids))
+                checkpoint = replace(
+                    checkpoint,
+                    candidate_commit=candidate_commit,
+                    candidate_generation=candidate_generation,
+                    builder_session_id=sess_builder,
+                    builder_invocation_id=inv_builder,
+                    evidence_ids=tuple(evidence_ids),
+                    approval_reason=None,
+                    approval_diagnostics={},
+                    last_error=None,
+                    updated_at=time.time(),
+                )
                 self.checkpoint_store.save_checkpoint(checkpoint)
 
                 # 状态机推进: 进行中 -> 审查中 (DEV)
@@ -1960,6 +2017,13 @@ class ProductionRunner:
                             message=f"Failed to transition state to 审查中: {err_trans}"
                         )
                     current_board_status = "审查中"
+                    checkpoint = replace(
+                        checkpoint,
+                        state=RunnerState.REVIEWING.value,
+                        current_role="REVIEWER",
+                        updated_at=time.time(),
+                    )
+                    self.checkpoint_store.save_checkpoint(checkpoint)
             else:
                 skip_builder = False
 
@@ -1989,13 +2053,26 @@ class ProductionRunner:
                     enforce_status=False,
                     enforce_version=False,
                 ):
+                    pause_message = "Task requirements or acceptance criteria changed before Reviewer dispatch."
+                    checkpoint = replace(
+                        checkpoint,
+                        state=RunnerState.NEEDS_USER_INPUT.value,
+                        current_role="REVIEWER",
+                        candidate_commit=candidate_commit,
+                        candidate_generation=candidate_generation,
+                        evidence_ids=tuple(evidence_ids),
+                        last_error=pause_message,
+                        updated_at=time.time(),
+                    )
+                    self.checkpoint_store.save_checkpoint(checkpoint)
                     return RunnerResult(
                         success=False,
                         state=RunnerState.NEEDS_USER_INPUT.value,
                         task_id=task_id,
                         candidate_commit=candidate_commit,
+                        candidate_generation=candidate_generation,
                         evidence_ids=tuple(evidence_ids),
-                        message="Task requirements or acceptance criteria changed before Reviewer dispatch.",
+                        message=pause_message,
                     )
                 review_cycle += 1
                 sess_reviewer = f"sess_reviewer_runner_{task_id.lower()}_{int(time.time()*1000)}"
@@ -2432,13 +2509,26 @@ class ProductionRunner:
                 enforce_status=False,
                 enforce_version=False,
             ):
+                pause_message = "Task requirements or acceptance criteria changed before QA dispatch."
+                checkpoint = replace(
+                    checkpoint,
+                    state=RunnerState.NEEDS_USER_INPUT.value,
+                    current_role="QA",
+                    candidate_commit=candidate_commit,
+                    candidate_generation=candidate_generation,
+                    evidence_ids=tuple(evidence_ids),
+                    last_error=pause_message,
+                    updated_at=time.time(),
+                )
+                self.checkpoint_store.save_checkpoint(checkpoint)
                 return RunnerResult(
                     success=False,
                     state=RunnerState.NEEDS_USER_INPUT.value,
                     task_id=task_id,
                     candidate_commit=candidate_commit,
+                    candidate_generation=candidate_generation,
                     evidence_ids=tuple(evidence_ids),
-                    message="Task requirements or acceptance criteria changed before QA dispatch.",
+                    message=pause_message,
                 )
             qa_cycle += 1
             sess_qa = f"sess_qa_runner_{task_id.lower()}_{int(time.time()*1000)}"
@@ -2912,13 +3002,26 @@ class ProductionRunner:
                 enforce_status=False,
                 enforce_version=False,
             ):
+                pause_message = "Task requirements or acceptance criteria changed during QA execution."
+                checkpoint = replace(
+                    checkpoint,
+                    state=RunnerState.NEEDS_USER_INPUT.value,
+                    current_role="QA",
+                    candidate_commit=candidate_commit,
+                    candidate_generation=candidate_generation,
+                    evidence_ids=tuple(evidence_ids),
+                    last_error=pause_message,
+                    updated_at=time.time(),
+                )
+                self.checkpoint_store.save_checkpoint(checkpoint)
                 return RunnerResult(
                     success=False,
                     state=RunnerState.NEEDS_USER_INPUT.value,
                     task_id=task_id,
                     candidate_commit=candidate_commit,
+                    candidate_generation=candidate_generation,
                     evidence_ids=tuple(evidence_ids),
-                    message="Task requirements or acceptance criteria changed during QA execution.",
+                    message=pause_message,
                 )
 
             qa_evidence_id = f"evi_qa_{task_id.lower()}_{int(time.time()*1000)}"
@@ -3309,6 +3412,16 @@ class ProductionRunner:
             snapshot = _execution_spec_snapshot(
                 replace(spec, baseline_commit=legacy_baseline or spec.baseline_commit)
             )
+            ckpt = replace(
+                ckpt,
+                execution_spec_snapshot=snapshot,
+                updated_at=time.time(),
+            )
+            self.checkpoint_store.save_checkpoint(ckpt)
+
+        upgraded_snapshot = _upgrade_legacy_contract_snapshot(snapshot, spec)
+        if upgraded_snapshot != snapshot:
+            snapshot = upgraded_snapshot
             ckpt = replace(
                 ckpt,
                 execution_spec_snapshot=snapshot,
