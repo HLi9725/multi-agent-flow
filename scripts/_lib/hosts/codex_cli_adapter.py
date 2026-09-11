@@ -197,7 +197,7 @@ class CodexCliAdapter(BaseHostAdapter):
                     f"Unauthorized or dangerous sandbox mode '{requested_sandbox}'. "
                     f"Allowed whitelist: {sorted(ALLOWED_SANDBOX_MODES)}"
                 )
-            if role == "REVIEWER" and requested_sandbox != "read-only":
+            if role in ("REVIEWER", "QA") and requested_sandbox != "read-only":
                 raise AgentNotSupportedError(
                     f"Role '{role}' is strictly read-only; cannot request writable sandbox '{requested_sandbox}'"
                 )
@@ -225,7 +225,7 @@ class CodexCliAdapter(BaseHostAdapter):
 
         if is_auto_approval:
             # DEF-T0050-7: REVIEWER cannot use --approve-for-me because it implies workspace-write
-            if role == "REVIEWER":
+            if role in ("REVIEWER", "QA"):
                 raise AgentNotSupportedError(
                     f"Role '{role}' is strictly read-only and cannot use '--approve-for-me' (which forces workspace-write)"
                 )
@@ -470,7 +470,7 @@ class CodexCliAdapter(BaseHostAdapter):
             self._session_history[handle.session_id] = session_data
             self._running_sessions.pop(handle.session_id, None)
 
-        if status == AgentStatus.FAILED and _is_host_permission_denial(
+        if _is_host_permission_denial(
             error_msg, final_output, stderr_data
         ):
             raise AgentPermissionRequiredError(

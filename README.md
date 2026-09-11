@@ -143,6 +143,8 @@ python scripts/run_task.py start --task-id T0003 --approve `
 
 `status` 是纯只读查询；`resume` 用于审批、退回修复或故障消除后的断点恢复。旧版已经手工把看板退回、但 Checkpoint 仍为 `PENDING_USER_ACCEPTANCE` 时，使用 `resume --reason "<完整验收缺陷>"` 对账并把缺陷注入 Builder。用户验收必须使用 Runner 返回的不可预测 `confirmation_request_id`：`run_task.py accept --task-id <id> --confirmation-request-id <id>` 或 `run_task.py reject --task-id <id> --confirmation-request-id <id> --reason "<缺陷>"`。`reject` 退回原任务，下次 `resume` 回到 Builder，不新建卡片。Checkpoint 会保存 Adapter、测试命令、超时与循环预算，新候选提交会重置该候选的 Reviewer/QA 轮次。
 
+Checkpoint 还冻结初始需求哈希、验收标准哈希、项目/Authority Root 和 Git 基线；恢复与验收会拒绝契约漂移。修复轮次必须在上一候选之上产生新 Commit（仅有工作区修改时由 Runner 受控固化）；没有新产物会停在 `NEEDS_USER_INPUT`，但保留旧候选、Evidence、会话标识和脱敏诊断。完成、验收、退回、取消均采用写前状态与重启对账，后到的 Host 输出不能覆盖已经持久化的取消。
+
 在 Windows 上，Runner 会将裸 `npm`/`npx` 确定性解析为 PATH 中工作区外的真实 `.cmd/.exe`，并把 `python`/`pytest` 固定到启动 Runner 的可信解释器。测试子进程不会继承 Token、密码、认证头或代理凭据；找不到工具时返回 `NEEDS_USER_INPUT`，不会伪装成代码测试失败或触发无效 Builder 修复。
 
 Antigravity Prompt 通过官方 stdin `stream-json` 协议传输，不进入 Windows 命令行参数，因此完整 Reviewer diff 不受约 32 KiB 的 `CreateProcess` 命令行上限影响。适配器会把最终 `structured_output` 与 Planner/进度消息隔离，并兼容过程文本后附带的裸 JSON；运行期间 stderr 会持续输出 `[YY-FLOW]` JSONL 事件，明确显示 `BUILDER -> REVIEWER -> QA -> PENDING_USER_ACCEPTANCE`。Reviewer/QA 协议重试达到上限时，Runner 会先原子保存 `NEEDS_USER_INPUT` Checkpoint，再返回最终结果，确保状态查询与恢复依据一致。
@@ -152,6 +154,8 @@ Antigravity Prompt 通过官方 stdin `stream-json` 协议传输，不进入 Win
 Host 权限拒绝属于显式暂停条件：Runner 会原子保存 `APPROVAL_REQUIRED`，释放运行锁并要求用户在 Runner 外部处理授权；其他 Host 失败会持久化为 `NEEDS_USER_INPUT`，不会遗留假的 `BUILDING`、`REVIEWING` 或 `QA_TESTING`。Runner 和角色 Agent 均不得修改用户全局 Antigravity/agy/Codex 设置、创建绕权限诊断脚本，或使用 `command(*)`、`unsandboxed(*)`、`--dangerously-skip-permissions` 等通配/跳过规则。检测到这类危险全局配置时将 Fail-Closed 停止，且 `--approve` 不能绕过安全门禁。
 
 Runner 成功只停在【已完成】/`PENDING_USER_ACCEPTANCE`，不会替用户验收、合并、Push 或创建 Tag。
+
+执行 `accept` 时会再次核对精确候选 HEAD、工作区不可变性、`git diff --check`，并从磁盘重放同一 SHA 且按时序独立的 Builder → Reviewer PASS → QA PASS Evidence；QA 的验收哈希、受控命令退出码、未覆盖风险和缺陷计数任一不满足均拒绝验收。显式 `accept` 会生成并验证 `USER_CONFIRMATION` Evidence，`confirmation_request_id` 本身不等于验收凭据。
 
 ---
 

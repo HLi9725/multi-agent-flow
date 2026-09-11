@@ -1293,3 +1293,26 @@ def test_antigravity_adapter_static_only_blocks_real_process_spawn():
     )
     with pytest.raises(AgentNotSupportedError, match="declared STATIC_ONLY"):
         adapter.dispatch_agent(req_bypass)
+
+
+def test_antigravity_qa_cannot_request_write_or_disable_sandbox(tmp_path):
+    adapter = AntigravityAdapter(
+        executable_path=sys.executable,
+        is_real_host=True,
+        verification_level=VerificationLevel.CLI_VERIFIED,
+    )
+    base = {
+        "session_id": "sess_qa_read_only",
+        "prompt": "review inline evidence",
+        "role": "QA",
+        "workspace_dir": str(tmp_path),
+        "timeout_seconds": 1,
+    }
+    with pytest.raises(AgentNotSupportedError, match="strictly read-only"):
+        adapter.build_antigravity_exec_command(AgentRequest(
+            **base, extra_context={"mode": "accept-edits"},
+        ))
+    with pytest.raises(AgentNotSupportedError, match="requires sandbox"):
+        adapter.build_antigravity_exec_command(AgentRequest(
+            **base, extra_context={"sandbox": False},
+        ))

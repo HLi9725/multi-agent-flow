@@ -720,8 +720,11 @@ def test_builder_no_commit_or_missing_invocation_fails_closed(mock_git_repo, tmp
 
     result = runner.start(spec)
     assert result.success is False
-    assert result.state == RunnerState.FAILED.value
-    assert "Builder produced no new commits" in result.message
+    assert result.state == RunnerState.NEEDS_USER_INPUT.value
+    assert "no new commits or working-tree changes" in result.message
+    persisted = runner.checkpoint_store.load_checkpoint("T0055")
+    assert persisted.state == RunnerState.NEEDS_USER_INPUT.value
+    assert persisted.current_role == "BUILDER"
 
 
 def test_permission_approval_required_pause_and_resume(mock_git_repo, tmp_path, monkeypatch):

@@ -11,11 +11,12 @@ event_triggers:
 - '开发完成提交审查: 撰写开发报告并推至【审查中】，移交 REVIEWER'
 - '缺陷打回修复: 读取 DEF-TXXX-N 备注，在原任务上置为【进行中】修复'
 orchestration_rules:
+- 【Production Runner 托管模式】当当前提示明确声明由 Production Runner 调度时，任务已由 Runner 建卡和领取；不得执行 --create、transition_task.py 或修改看板，只修改分配的 worktree、运行验证并生成新的候选 Commit，状态和 Evidence 由 Runner 独占管理
 - 编码前必须先执行 python3 scripts/transition_task.py --from-status 待开始 --to-status 进行中 --assignee
   DEV
 - 提交审查前使用 python3 scripts/generate_report.py --type dev 生成/更新开发报告
 - 绝对禁止新建孤儿修复任务，退回任务一律在原任务编号上修复
-- 【动工与完工硬门禁】凡涉及任何文件创建/修改/删除（L1/L2 级），动手前第一步必须执行 transition_task.py --create 建卡领单，严禁无卡改文件；交付完成后最后一步必须执行【完工硬门禁】流转推进状态（A 类推至审查中，B/C/D/G 类推至已完成并补填 end_time），否则视为未交付；任务卡必须经历待开始状态（L0 纯文本即时问答无卡直答免建卡）
+- 【独立角色模式动工与完工硬门禁】仅当未由 Production Runner 托管时，凡涉及文件变更必须先确认已有工单；没有工单才执行 --create，有工单只合法领取。交付后按任务类型流转；不得为已有任务重复建卡；L0 即时问答豁免动工与完工硬门禁
 allowed_transitions:
 - 待开始 -> 进行中 (自领取，需先改状态落库)
 - 进行中 -> 审查中 (提交代码审查)

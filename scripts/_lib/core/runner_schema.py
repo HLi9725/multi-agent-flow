@@ -31,6 +31,8 @@ class RunnerState(str, Enum):
     BUILDING = "BUILDING"
     REVIEWING = "REVIEWING"
     QA_TESTING = "QA_TESTING"
+    COMPLETION_PENDING = "COMPLETION_PENDING"
+    REJECTION_PENDING = "REJECTION_PENDING"
     PENDING_USER_ACCEPTANCE = "PENDING_USER_ACCEPTANCE"
     ACCEPTED = "ACCEPTED"
     NEEDS_USER_INPUT = "NEEDS_USER_INPUT"
@@ -408,6 +410,8 @@ class RunnerCheckpoint:
     qa_invocation_id: Optional[str] = None
     evidence_ids: Tuple[str, ...] = field(default_factory=tuple)
     execution_options: Mapping[str, Any] = field(default_factory=dict)
+    execution_spec_snapshot: Mapping[str, Any] = field(default_factory=dict)
+    active_elapsed_seconds: float = 0.0
     confirmation_request_id: Optional[str] = None
     defects_history: Tuple[Dict[str, Any], ...] = field(default_factory=tuple)
     approval_reason: Optional[str] = None
@@ -419,6 +423,7 @@ class RunnerCheckpoint:
         object.__setattr__(self, "evidence_ids", tuple(self.evidence_ids))
         object.__setattr__(self, "defects_history", tuple(self.defects_history))
         object.__setattr__(self, "execution_options", _freeze_runner_value(dict(self.execution_options)))
+        object.__setattr__(self, "execution_spec_snapshot", _freeze_runner_value(dict(self.execution_spec_snapshot)))
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -441,6 +446,8 @@ class RunnerCheckpoint:
             "qa_invocation_id": self.qa_invocation_id,
             "evidence_ids": list(self.evidence_ids),
             "execution_options": dict(self.execution_options),
+            "execution_spec_snapshot": dict(self.execution_spec_snapshot),
+            "active_elapsed_seconds": self.active_elapsed_seconds,
             "confirmation_request_id": self.confirmation_request_id,
             "defects_history": [dict(d) for d in self.defects_history],
             "approval_reason": self.approval_reason,
@@ -471,6 +478,8 @@ class RunnerCheckpoint:
             qa_invocation_id=data.get("qa_invocation_id"),
             evidence_ids=tuple(data.get("evidence_ids", [])),
             execution_options=dict(data.get("execution_options", {})),
+            execution_spec_snapshot=dict(data.get("execution_spec_snapshot", {})),
+            active_elapsed_seconds=float(data.get("active_elapsed_seconds", 0.0)),
             confirmation_request_id=data.get("confirmation_request_id"),
             defects_history=tuple(data.get("defects_history", [])),
             approval_reason=data.get("approval_reason"),

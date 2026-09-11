@@ -4,11 +4,13 @@ tests/test_runner_recovery.py
 Runner 状态恢复、原子 Checkpoint、防路径逃逸、并发锁与 Host 取消/断点测试。
 """
 import json
+import hashlib
 import os
 import subprocess
 import tempfile
 import threading
 import time
+from dataclasses import replace
 import pytest
 import yaml
 
@@ -27,6 +29,7 @@ from scripts._lib.core.evidence_schema import (
 )
 from scripts._lib.core.evidence_store import EvidenceStore
 from scripts._lib.core.production_runner import ProductionRunner, RunnerCancelledError
+import scripts._lib.core.production_runner as production_runner_module
 from scripts._lib.core.runner_checkpoint_store import CheckpointStoreError, RunnerCheckpointStore
 from scripts._lib.core.runner_schema import RunnerCheckpoint, RunnerState, TaskExecutionSpec
 from scripts._lib.hosts.antigravity_adapter import AntigravityAdapter, create_antigravity_manifest
@@ -59,19 +62,15 @@ def test_acceptance_commands_bind_confirmation_and_return_original_task(tmp_path
     assert not transitions
 
     rejected = runner.reject(str(repo), "T0012", "conf-secret", "acceptance defect")
-    assert rejected.success is True
-    assert rejected.state == RunnerState.NEEDS_USER_INPUT.value
-    saved = store.load_checkpoint("T0012")
-    assert saved.current_role == "BUILDER"
-    assert saved.defects_history[-1]["role"] == "USER_ACCEPTANCE"
-    assert transitions[-1][3:5] == ("已完成", "已退回")
+    assert rejected.success is False
+    assert "revalidate" in rejected.message.lower()
+    assert not transitions
 
     store.save_checkpoint(checkpoint)
     accepted = runner.accept(str(repo), "T0012", "conf-secret")
-    assert accepted.success is True
-    assert accepted.state == RunnerState.ACCEPTED.value
-    assert store.load_checkpoint("T0012").state == RunnerState.ACCEPTED.value
-    assert transitions[-1][3:5] == ("已完成", "已验收")
+    assert accepted.success is False
+    assert "validation failed closed" in accepted.message.lower()
+    assert store.load_checkpoint("T0012").state == RunnerState.PENDING_USER_ACCEPTANCE.value
 
 
 def test_checkpoint_store_atomic_save_and_load(tmp_path):
@@ -530,7 +529,8 @@ def test_runner_resume_breakpoint_and_integrity_verification(tmp_path, monkeypat
     assert res.success is True
     assert builder_called is False  # 断点在 Reviewer，Builder 不被重复调用
     assert reviewer_called is True
-    assert observed_timeouts == {"reviewer": 17.0, "qa": 19.0}
+    assert observed_timeouts["reviewer"] == 17.0
+    assert 0 < observed_timeouts["qa"] <= 19.0
 
     # 2. 篡改 Candidate Commit 必须 Fail-Closed
     bad_ckpt = RunnerCheckpoint(
@@ -546,3 +546,97 @@ def test_runner_resume_breakpoint_and_integrity_verification(tmp_path, monkeypat
     res_bad = runner.resume(project_root=str(repo_dir), task_id="T0099", authority_root=str(repo_dir))
     assert res_bad.success is False
     assert "does not exist in worktree Git history" in res_bad.message
+
+
+def test_checkpoint_snapshot_round_trip_and_cancel_is_durable(tmp_path):
+    store = RunnerCheckpointStore(
+        data_root=str(tmp_path / "data"), project_root=str(tmp_path), project_id="demo"
+    )
+    original = RunnerCheckpoint(
+        task_id="T0777", project_id="demo", state=RunnerState.BUILDING.value,
+        current_role="BUILDER", candidate_commit="a" * 40,
+        execution_spec_snapshot={"requirement_hash": "r", "baseline_commit": "b" * 40},
+        active_elapsed_seconds=12.5,
+    )
+    store.save_checkpoint(original)
+    loaded = store.load_checkpoint("T0777")
+    assert dict(loaded.execution_spec_snapshot) == {
+        "requirement_hash": "r", "baseline_commit": "b" * 40,
+    }
+    assert loaded.active_elapsed_seconds == 12.5
+
+    store.save_checkpoint(replace(loaded, state=RunnerState.CANCELLED.value))
+    with pytest.raises(CheckpointStoreError, match="durable cancellation"):
+        store.save_checkpoint(replace(loaded, state=RunnerState.BUILDING.value))
+
+
+def test_accept_replays_same_sha_evidence_and_records_user_confirmation(tmp_path, monkeypatch):
+    repo = tmp_path / "accept-repo"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    (repo / "app.txt").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+    baseline = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    (repo / "app.txt").write_text("candidate\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "candidate"], cwd=repo, check=True, capture_output=True)
+    candidate = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+
+    data = tmp_path / "data"
+    evidence = EvidenceStore(root_dir=str(data / "evidence"))
+    created = time.time()
+    evidence_ids = []
+    for index, (role, source, target) in enumerate((
+        ("BUILDER", "BUILDING", "REVIEWING"),
+        ("REVIEWER", "REVIEWING", "TESTING"),
+        ("QA", "TESTING", "PENDING_USER_ACCEPTANCE"),
+    )):
+        evidence_id = f"evi_{role.lower()}_accept"
+        extra = {}
+        if role == "QA":
+            extra = {
+                "qa_decision": "PASS", "acceptance_criteria_hash": "c" * 64,
+                "test_exit_codes": [0], "uncovered_risk_count": 0, "defect_count": 0,
+            }
+        evidence.append(EvidenceRecord(
+            evidence_id=evidence_id, evidence_type=EvidenceType.TASK_TRANSITION,
+            baseline_commit=baseline, result_commit=candidate, artifacts=(),
+            metadata=EvidenceMetadata(
+                project_id="demo", task_id="T0778", actor_role=role,
+                host_id=f"host_{role.lower()}", adapter=f"adapter_{role.lower()}",
+                host_session_id=f"session_{role.lower()}", host_invocation_id=f"inv_{role.lower()}",
+                is_real_host=True, workspace_mode="workspace_read" if role != "BUILDER" else "workspace_write",
+                transition_from=source, transition_to=target, created_at=created + index,
+                extra=extra,
+            ),
+        ))
+        evidence_ids.append(evidence_id)
+
+    spec = TaskExecutionSpec(
+        project_id="demo", project_root=str(repo), authority_root=str(repo),
+        task_id="T0778", task_name="accept", requirement_text="requirement",
+        acceptance_criteria="criteria", acceptance_criteria_hash="c" * 64,
+        task_version="1", status_at_read="已完成", requirement_hash="r" * 64,
+        baseline_commit=baseline, workspace_mode="inherit", test_commands=("python -m pytest",),
+    )
+    store = RunnerCheckpointStore(data_root=str(data), project_root=str(repo), project_id="demo")
+    store.save_checkpoint(RunnerCheckpoint(
+        task_id="T0778", project_id="demo", state=RunnerState.PENDING_USER_ACCEPTANCE.value,
+        current_role="QA", candidate_commit=candidate, candidate_generation=1,
+        worktree_path=str(repo), evidence_ids=tuple(evidence_ids),
+        confirmation_request_id="conf-accept",
+        execution_spec_snapshot=production_runner_module._execution_spec_snapshot(spec),
+    ))
+    runner = ProductionRunner(checkpoint_store=store, evidence_store=evidence)
+    monkeypatch.setattr(production_runner_module, "load_task_execution_spec", lambda **kwargs: spec)
+    monkeypatch.setattr(runner, "_do_state_transition", lambda *args, **kwargs: (True, None))
+
+    result = runner.accept(str(repo), "T0778", "conf-accept", str(repo))
+
+    assert result.success is True
+    assert result.state == RunnerState.ACCEPTED.value
+    assert len(result.evidence_ids) == 4
+    assert evidence.read(result.evidence_ids[-1]).evidence_type == EvidenceType.USER_CONFIRMATION

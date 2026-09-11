@@ -47,6 +47,7 @@ from .agent_schema import (
     AgentTimeoutError,
     CapabilitySupport,
     ConfirmationRequest,
+    ConfirmationResult,
     HostCapabilities,
 )
 from .evidence_gate import EvidenceGate, EvidenceValidationContext
@@ -534,6 +535,40 @@ def _execution_options_from_spec(spec: TaskExecutionSpec) -> Dict[str, Any]:
     }
 
 
+def _execution_spec_snapshot(spec: TaskExecutionSpec) -> Dict[str, Any]:
+    """Freeze the business contract and original Git baseline for every resume/accept."""
+    return {
+        "project_id": spec.project_id,
+        "project_root": os.path.realpath(spec.project_root),
+        "authority_root": os.path.realpath(spec.authority_root),
+        "task_id": spec.task_id,
+        "task_name": spec.task_name,
+        "task_type": spec.task_type,
+        "owner": spec.owner,
+        "requirement_hash": spec.requirement_hash,
+        "acceptance_criteria_hash": spec.acceptance_criteria_hash,
+        "task_version_at_start": spec.task_version,
+        "baseline_commit": spec.baseline_commit,
+        "baseline_branch": spec.baseline_branch,
+    }
+
+
+def _snapshot_mismatches(snapshot: Mapping[str, Any], spec: TaskExecutionSpec) -> List[str]:
+    """Return immutable task-contract drift; workflow status/handler changes are expected."""
+    if not snapshot:
+        return []
+    current = _execution_spec_snapshot(spec)
+    immutable_fields = (
+        "project_id", "project_root", "authority_root", "task_id", "task_name",
+        "task_type", "owner", "requirement_hash", "acceptance_criteria_hash",
+    )
+    return [
+        f"{name}: expected {snapshot.get(name)!r}, got {current.get(name)!r}"
+        for name in immutable_fields
+        if snapshot.get(name) not in (None, "") and snapshot.get(name) != current.get(name)
+    ]
+
+
 class ProductionRunnerError(Exception):
     pass
 
@@ -561,6 +596,7 @@ class ProductionRunner:
         self.worktree_manager = worktree_manager
         self.progress_callback = progress_callback
         self._active_handles: Dict[str, AgentHandle] = {}
+        self._run_timing: Dict[str, Tuple[float, float]] = {}
         self._lock = threading.Lock()
 
     def _emit_progress(
@@ -614,16 +650,43 @@ class ProductionRunner:
         if result.success:
             return result
         checkpoint = self.checkpoint_store.load_checkpoint(result.task_id)
-        if checkpoint is None or checkpoint.state == result.state:
+        if checkpoint is not None and checkpoint.state == RunnerState.CANCELLED.value:
+            return RunnerResult(
+                success=True,
+                state=RunnerState.CANCELLED.value,
+                task_id=result.task_id,
+                candidate_commit=checkpoint.candidate_commit,
+                candidate_generation=checkpoint.candidate_generation,
+                evidence_ids=checkpoint.evidence_ids,
+                message="Task cancellation is durable; later stage output was discarded.",
+            )
+        if checkpoint is None:
             return result
+        started_at, elapsed_base = self._run_timing.get(result.task_id, (time.time(), checkpoint.active_elapsed_seconds))
+        elapsed = max(checkpoint.active_elapsed_seconds, elapsed_base + max(0.0, time.time() - started_at))
         updated = replace(
             checkpoint,
             state=result.state,
+            active_elapsed_seconds=elapsed,
             last_error=result.message or checkpoint.last_error,
             updated_at=time.time(),
         )
         self.checkpoint_store.save_checkpoint(updated)
         return result
+
+    def _sanitize_diagnostic(self, value: Any, limit: int = 4000) -> str:
+        text = str(value or "")
+        try:
+            if self.evidence_store is not None:
+                text = self.evidence_store._mask_text(text)
+        except Exception:
+            text = "***MASKED***"
+        text = re.sub(
+            r"(?i)(authorization|cookie|password|secret|api[_-]?key|access[_-]?token)\s*[:=]\s*\S+",
+            r"\1=***MASKED***",
+            text,
+        )
+        return text[-limit:]
 
     def _execute_with_checkpoint_guard(self, *args: Any, **kwargs: Any) -> RunnerResult:
         """Run the state machine and durably reconcile every normal exception."""
@@ -888,20 +951,23 @@ class ProductionRunner:
             errors="replace",
         ).strip()
 
-        if head.lower() != baseline_commit.lower():
+        expected_start = previous_candidate_commit or baseline_commit
+        if head.lower() != expected_start.lower():
             if status:
                 raise RuntimeError(
                     "Builder created a candidate commit but left additional uncommitted changes (Fail-Closed)."
                 )
-            if previous_candidate_commit and head.lower() == previous_candidate_commit.lower():
-                raise RuntimeError(
-                    "Builder repair cycle produced no new candidate commit (Fail-Closed)."
-                )
+            ancestry = subprocess.run(
+                ["git", "merge-base", "--is-ancestor", expected_start, head],
+                cwd=worktree_dir, capture_output=True,
+            )
+            if ancestry.returncode != 0:
+                raise RuntimeError("Builder candidate is not descended from the expected prior candidate (Fail-Closed).")
             return head
 
         if not status:
             raise RuntimeError(
-                "Builder produced no new commits or working-tree changes (Fail-Closed)."
+                "Builder repair cycle produced no new candidate: no new commits or working-tree changes (Fail-Closed)."
             )
 
         add_proc = subprocess.run(
@@ -927,7 +993,7 @@ class ProductionRunner:
             raise RuntimeError(f"Failed to commit Builder changes: {commit_proc.stderr or commit_proc.stdout}")
 
         candidate = self._get_git_commit(worktree_dir)
-        if candidate.lower() == baseline_commit.lower():
+        if candidate.lower() == expected_start.lower():
             raise RuntimeError("Controlled Builder commit did not advance HEAD (Fail-Closed).")
 
         remaining = subprocess.check_output(
@@ -958,7 +1024,7 @@ class ProductionRunner:
 
         try:
             diff_out = subprocess.check_output(
-                ["git", "diff", expected_candidate, "--", ".", ":!user_data", ":!.yy-flow"],
+                ["git", "diff", expected_candidate, "--", ".", ":(exclude,glob)user_data/board.json*", ":(exclude,glob)user_data/locks/**", ":(exclude,glob)user_data/logs/**", ":(exclude,glob).yy-flow/user_data/board.json*", ":(exclude,glob).yy-flow/user_data/locks/**", ":(exclude,glob).yy-flow/user_data/logs/**"],
                 cwd=worktree_dir,
                 stderr=subprocess.DEVNULL,
                 encoding="utf-8",
@@ -971,7 +1037,7 @@ class ProductionRunner:
 
         try:
             cached_diff = subprocess.check_output(
-                ["git", "diff", "--cached", "--", ".", ":!user_data", ":!.yy-flow"],
+                ["git", "diff", "--cached", "--", ".", ":(exclude,glob)user_data/board.json*", ":(exclude,glob)user_data/locks/**", ":(exclude,glob)user_data/logs/**", ":(exclude,glob).yy-flow/user_data/board.json*", ":(exclude,glob).yy-flow/user_data/locks/**", ":(exclude,glob).yy-flow/user_data/logs/**"],
                 cwd=worktree_dir,
                 stderr=subprocess.DEVNULL,
                 encoding="utf-8",
@@ -982,10 +1048,6 @@ class ProductionRunner:
         except Exception as e:
             return False, f"Failed to check git cached diff in QA worktree: {e}"
 
-        ALLOWED_ROOT_PREFIXES = (
-            "user_data",
-            ".yy-flow",
-        )
         ALLOWED_CACHE_COMPONENTS = {
             ".pytest_cache",
             "__pycache__",
@@ -1012,12 +1074,12 @@ class ProductionRunner:
                     file_rel = file_rel[1:-1]
                 normalized_rel = file_rel.replace("\\", "/").rstrip("/")
                 path_parts = tuple(part for part in normalized_rel.split("/") if part)
-                is_safe_root = any(
-                    normalized_rel == prefix or normalized_rel.startswith(prefix + "/")
-                    for prefix in ALLOWED_ROOT_PREFIXES
-                )
+                is_runner_control = bool(re.match(
+                    r"^(?:\.yy-flow/)?user_data/(?:board\.json|logs/|locks/)",
+                    normalized_rel,
+                ))
                 is_safe_cache = (
-                    is_safe_root
+                    is_runner_control
                     or any(part in ALLOWED_CACHE_COMPONENTS for part in path_parts)
                     or normalized_rel.endswith(".pyc")
                 )
@@ -1314,6 +1376,10 @@ class ProductionRunner:
         start_wall_clock = time.time()
         project_root = spec.project_root
         task_id = spec.task_id
+        self._run_timing[task_id] = (
+            start_wall_clock,
+            existing_checkpoint.active_elapsed_seconds if existing_checkpoint else 0.0,
+        )
         current_board_status = spec.status_at_read
 
         # Fresh starts only accept the initial states. The actual claim is delayed
@@ -1390,6 +1456,7 @@ class ProductionRunner:
             worktree_path=worktree_dir,
             worktree_branch=worktree_branch,
             execution_options=_execution_options_from_spec(spec),
+            execution_spec_snapshot=_execution_spec_snapshot(spec),
         )
         self.checkpoint_store.save_checkpoint(checkpoint)
         self._emit_progress(
@@ -1481,12 +1548,14 @@ class ProductionRunner:
                     diagnostics={"total_attempts": total_attempts, "defects": defects_history},
                 )
 
-            if time.time() - start_wall_clock > spec.total_wall_clock_timeout_seconds:
+            active_elapsed = checkpoint.active_elapsed_seconds + (time.time() - start_wall_clock)
+            if active_elapsed > spec.total_wall_clock_timeout_seconds:
                 pause_message = f"Task exceeded wall clock timeout ({spec.total_wall_clock_timeout_seconds}s). Paused at NEEDS_USER_INPUT."
                 checkpoint = replace(
                     checkpoint, state=RunnerState.NEEDS_USER_INPUT.value,
                     current_role=start_role, total_attempts=total_attempts,
                     evidence_ids=tuple(evidence_ids), defects_history=tuple(defects_history),
+                    active_elapsed_seconds=active_elapsed,
                     last_error=pause_message, updated_at=time.time(),
                 )
                 self.checkpoint_store.save_checkpoint(checkpoint)
@@ -1498,7 +1567,7 @@ class ProductionRunner:
                     candidate_generation=candidate_generation,
                     evidence_ids=tuple(evidence_ids),
                     message=pause_message,
-                    diagnostics={"elapsed": time.time() - start_wall_clock},
+                    diagnostics={"elapsed": active_elapsed},
                 )
 
             # ==========================================
@@ -1506,7 +1575,7 @@ class ProductionRunner:
             # ==========================================
             if not skip_builder:
                 sess_builder = f"sess_builder_runner_{task_id.lower()}_{int(time.time()*1000)}"
-                candidate_generation += 1
+                builder_attempt = candidate_generation + 1
 
                 checkpoint = RunnerCheckpoint(
                     task_id=task_id,
@@ -1523,6 +1592,8 @@ class ProductionRunner:
                     builder_session_id=sess_builder,
                     evidence_ids=tuple(evidence_ids),
                     execution_options=_execution_options_from_spec(spec),
+                    execution_spec_snapshot=checkpoint.execution_spec_snapshot,
+                    active_elapsed_seconds=checkpoint.active_elapsed_seconds,
                     defects_history=tuple(defects_history),
                 )
                 self.checkpoint_store.save_checkpoint(checkpoint)
@@ -1546,10 +1617,15 @@ class ProductionRunner:
                     )
                 builder_prompt += (
                     "\n\nSecurity boundary: modify only files inside the assigned worktree. Never modify global "
-                    "Antigravity/agy settings, permission policies, user profiles, or files under the host home "
-                    "directory. Never create diagnostic scripts that probe or bypass host permissions. The flags "
+                    "Antigravity/agy settings, permission policies, user profiles, or files outside the assigned "
+                    "worktree. The worktree may itself be under the user profile and remains writable. Never create "
+                    "diagnostic scripts that probe or bypass host permissions. The flags "
                     "--dangerously-skip-permissions and any command(*)/unsandboxed(*) wildcard rules are forbidden. "
                     "If a host permission blocks work, stop and report the exact denial; do not repair the host environment."
+                    "\n\nProduction Runner managed mode: this task already exists and is claimed. Do not create tasks, "
+                    "do not call transition_task.py, and do not modify the board or yy-flow control data. Work only "
+                    "inside the assigned worktree, run relevant checks, and create a new Git commit or leave verifiable "
+                    "working-tree changes for the Runner to commit. A repair cycle must advance the prior candidate."
                 )
 
                 builder_request = AgentRequest(
@@ -1576,7 +1652,7 @@ class ProductionRunner:
                     role="BUILDER",
                     event="stage_started",
                     message=f"Dispatching Builder via {spec.builder_adapter_id}",
-                    cycle=candidate_generation,
+                    cycle=builder_attempt,
                 )
 
                 try:
@@ -1621,7 +1697,7 @@ class ProductionRunner:
                         evidence_ids=tuple(evidence_ids),
                         execution_options=_execution_options_from_spec(spec),
                         defects_history=tuple(defects_history),
-                        approval_reason=str(se),
+                        approval_reason=self._sanitize_diagnostic(se),
                         last_error="Permission approval required",
                         updated_at=time.time(),
                     )
@@ -1633,13 +1709,13 @@ class ProductionRunner:
                         candidate_commit=candidate_commit,
                         candidate_generation=candidate_generation,
                         evidence_ids=tuple(evidence_ids),
-                        message=f"Execution paused at APPROVAL_REQUIRED: {se}",
-                        diagnostics={"approval_reason": str(se)},
+                        message=f"Execution paused at APPROVAL_REQUIRED: {self._sanitize_diagnostic(se)}",
+                        diagnostics={"approval_reason": self._sanitize_diagnostic(se)},
                     )
                 except Exception as e:
                     with self._lock:
                         self._active_handles.pop(task_id, None)
-                    pause_message = f"Builder host dispatch/wait failed: {e}"
+                    pause_message = f"Builder host dispatch/wait failed: {self._sanitize_diagnostic(e)}"
                     checkpoint = replace(
                         checkpoint, state=RunnerState.NEEDS_USER_INPUT.value,
                         current_role="BUILDER", last_error=pause_message,
@@ -1653,7 +1729,7 @@ class ProductionRunner:
                         candidate_commit=candidate_commit,
                         candidate_generation=candidate_generation,
                         message=pause_message,
-                        diagnostics={"error": str(e)},
+                        diagnostics={"error": self._sanitize_diagnostic(e)},
                     )
                 finally:
                     with self._lock:
@@ -1662,7 +1738,7 @@ class ProductionRunner:
                 if builder_result.status != AgentStatus.SUCCESS:
                     pause_message = (
                         f"Builder execution failed with status: {builder_result.status.value}; "
-                        f"{builder_result.error_message or builder_result.output[:500]}"
+                        f"{self._sanitize_diagnostic(builder_result.error_message or builder_result.output, 500)}"
                     )
                     checkpoint = replace(
                         checkpoint, state=RunnerState.NEEDS_USER_INPUT.value,
@@ -1708,11 +1784,31 @@ class ProductionRunner:
                         previous_candidate_commit=previous_candidate_commit,
                     )
                 except Exception as e:
+                    detail = self._sanitize_diagnostic(
+                        f"{e}\nHost output: {builder_result.output}", 4000
+                    )
+                    checkpoint = replace(
+                        checkpoint,
+                        state=RunnerState.NEEDS_USER_INPUT.value,
+                        current_role="BUILDER",
+                        candidate_commit=candidate_commit,
+                        candidate_generation=candidate_generation,
+                        builder_invocation_id=inv_builder,
+                        evidence_ids=tuple(evidence_ids),
+                        defects_history=tuple(defects_history),
+                        last_error=detail,
+                        updated_at=time.time(),
+                    )
+                    self.checkpoint_store.save_checkpoint(checkpoint)
                     return RunnerResult(
                         success=False,
-                        state=RunnerState.FAILED.value,
+                        state=RunnerState.NEEDS_USER_INPUT.value,
                         task_id=task_id,
-                        message=f"Failed to finalize candidate commit from Builder worktree: {e}",
+                        candidate_commit=candidate_commit,
+                        candidate_generation=candidate_generation,
+                        evidence_ids=tuple(evidence_ids),
+                        message=f"Failed to finalize candidate commit from Builder worktree: {self._sanitize_diagnostic(e)}",
+                        diagnostics={"builder_output": self._sanitize_diagnostic(builder_result.output)},
                     )
 
                 if not re.match(r"^[0-9a-f]{40}$", candidate_commit):
@@ -1733,6 +1829,7 @@ class ProductionRunner:
                 # Retry budgets apply to one immutable candidate. A Builder
                 # repair creates a new candidate and starts fresh verification.
                 if candidate_commit != previous_candidate_commit:
+                    candidate_generation = builder_attempt
                     review_cycle = 0
                     qa_cycle = 0
                 self._emit_progress(
@@ -1742,7 +1839,7 @@ class ProductionRunner:
                     event="stage_completed",
                     message="Builder produced a clean candidate commit",
                     candidate_commit=candidate_commit,
-                    cycle=candidate_generation,
+                    cycle=builder_attempt,
                 )
 
                 builder_evidence_id = f"evi_builder_{task_id.lower()}_{int(time.time()*1000)}"
@@ -1870,6 +1967,8 @@ class ProductionRunner:
                     reviewer_session_id=sess_reviewer,
                     evidence_ids=tuple(evidence_ids),
                     execution_options=_execution_options_from_spec(spec),
+                    execution_spec_snapshot=checkpoint.execution_spec_snapshot,
+                    active_elapsed_seconds=checkpoint.active_elapsed_seconds,
                     defects_history=tuple(defects_history),
                 )
                 self.checkpoint_store.save_checkpoint(checkpoint)
@@ -2305,6 +2404,8 @@ class ProductionRunner:
                 qa_session_id=sess_qa,
                 evidence_ids=tuple(evidence_ids),
                 execution_options=_execution_options_from_spec(spec),
+                execution_spec_snapshot=checkpoint.execution_spec_snapshot,
+                active_elapsed_seconds=checkpoint.active_elapsed_seconds,
                 defects_history=tuple(defects_history),
             )
             self.checkpoint_store.save_checkpoint(checkpoint)
@@ -2329,6 +2430,20 @@ class ProductionRunner:
                     message=f"Worktree HEAD ({head_before_qa}) does not match candidate commit ({candidate_commit}) before QA! Fail-Closed.",
                 )
 
+            pre_immutability_ok, pre_immutability_error = self._verify_qa_immutability(
+                worktree_dir, candidate_commit
+            )
+            if not pre_immutability_ok:
+                return RunnerResult(
+                    success=False,
+                    state=RunnerState.NEEDS_USER_INPUT.value,
+                    task_id=task_id,
+                    candidate_commit=candidate_commit,
+                    candidate_generation=candidate_generation,
+                    evidence_ids=tuple(evidence_ids),
+                    message=f"QA precondition failed before executing tests: {pre_immutability_error}",
+                )
+
             try:
                 qa_diff_bundle = self._build_reviewer_diff_bundle(
                     worktree_dir,
@@ -2350,6 +2465,7 @@ class ProductionRunner:
             # Mandatory trusted gate: callers cannot remove it with a custom
             # --test-command list.
             test_commands = tuple(configured_test_commands) + (format_gate_command,)
+            qa_stage_deadline = time.monotonic() + float(spec.qa_timeout_seconds)
             validated_commands = []
             for test_cmd in test_commands:
                 if test_cmd == format_gate_command:
@@ -2421,6 +2537,9 @@ class ProductionRunner:
                         candidate_commit=candidate_commit,
                     )
                     try:
+                        remaining_qa_seconds = qa_stage_deadline - time.monotonic()
+                        if remaining_qa_seconds <= 0:
+                            raise subprocess.TimeoutExpired(command_args, spec.qa_timeout_seconds)
                         test_proc = subprocess.run(
                             command_args,
                             cwd=worktree_dir,
@@ -2429,7 +2548,7 @@ class ProductionRunner:
                             text=True,
                             encoding="utf-8",
                             errors="replace",
-                            timeout=spec.qa_timeout_seconds,
+                            timeout=remaining_qa_seconds,
                         )
                         exit_code = test_proc.returncode
                         output_material = (test_proc.stdout or "") + "\n" + (test_proc.stderr or "")
@@ -2438,7 +2557,7 @@ class ProductionRunner:
                         timeout_stdout = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
                         timeout_stderr = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
                         output_material = (
-                            f"Runner command timed out after {spec.qa_timeout_seconds}s\n"
+                            f"Runner QA stage exhausted its cumulative {spec.qa_timeout_seconds}s budget\n"
                             f"{timeout_stdout}\n{timeout_stderr}"
                         )
                     except (FileNotFoundError, PermissionError, OSError) as exc:
@@ -2500,6 +2619,15 @@ class ProductionRunner:
                 )
 
             qa_request_id = f"qa_req_{uuid.uuid4().hex}"
+            qa_remaining_seconds = qa_stage_deadline - time.monotonic()
+            if qa_remaining_seconds <= 0:
+                return RunnerResult(
+                    False, RunnerState.NEEDS_USER_INPUT.value, task_id,
+                    candidate_commit=candidate_commit,
+                    candidate_generation=candidate_generation,
+                    evidence_ids=tuple(evidence_ids),
+                    message=f"QA commands exhausted the cumulative {spec.qa_timeout_seconds}s QA-stage budget before semantic QA.",
+                )
             criteria_payload = [item.to_dict() for item in spec.acceptance_criteria_items]
             qa_prompt = (
                 f"You are the independent QA gate for Task {task_id}.\n"
@@ -2538,7 +2666,7 @@ class ProductionRunner:
                 prompt=qa_prompt,
                 role="QA",
                 workspace_dir=worktree_dir,
-                timeout_seconds=float(spec.qa_timeout_seconds),
+                timeout_seconds=float(qa_remaining_seconds),
                 extra_context={
                     "sandbox": True,
                     "permission_boundary": "workspace_read",
@@ -2576,7 +2704,7 @@ class ProductionRunner:
                 qa_result = self._wait_for_result_cancellable(
                     qa_adapter,
                     qa_handle,
-                    timeout_seconds=float(spec.qa_timeout_seconds),
+                    timeout_seconds=float(qa_remaining_seconds),
                     task_id=task_id,
                 )
             except RunnerCancelledError as ce:
@@ -2933,7 +3061,7 @@ class ProductionRunner:
             checkpoint = RunnerCheckpoint(
                 task_id=task_id,
                 project_id=spec.project_id,
-                state=RunnerState.PENDING_USER_ACCEPTANCE.value,
+                state=RunnerState.COMPLETION_PENDING.value,
                 current_role="QA",
                 candidate_commit=candidate_commit,
                 candidate_generation=candidate_generation,
@@ -2944,9 +3072,14 @@ class ProductionRunner:
                 worktree_branch=worktree_branch,
                 evidence_ids=tuple(evidence_ids),
                 execution_options=_execution_options_from_spec(spec),
+                execution_spec_snapshot=checkpoint.execution_spec_snapshot,
+                active_elapsed_seconds=checkpoint.active_elapsed_seconds + (time.time() - start_wall_clock),
                 confirmation_request_id=confirmation_req_id,
                 defects_history=tuple(defects_history),
             )
+            # Write-ahead intent closes the crash window between board and
+            # checkpoint updates. Resume can deterministically reconcile it.
+            self.checkpoint_store.save_checkpoint(checkpoint)
             # 通过合法状态机 transition_task.py 将任务流转至 已完成 (DEF-T0061-3)
             ok_trans, err_trans = self._do_state_transition(
                 spec.authority_root,
@@ -2959,6 +3092,13 @@ class ProductionRunner:
                 task_type=spec.task_type,
             )
             if not ok_trans:
+                checkpoint = replace(
+                    checkpoint,
+                    state=RunnerState.NEEDS_USER_INPUT.value,
+                    last_error=f"Completion transition failed: {self._sanitize_diagnostic(err_trans)}",
+                    updated_at=time.time(),
+                )
+                self.checkpoint_store.save_checkpoint(checkpoint)
                 return RunnerResult(
                     success=False,
                     state=RunnerState.FAILED.value,
@@ -2970,6 +3110,12 @@ class ProductionRunner:
                 )
             # Do not advertise an acceptance request until the authoritative
             # board has actually reached 已完成.
+            checkpoint = replace(
+                checkpoint,
+                state=RunnerState.PENDING_USER_ACCEPTANCE.value,
+                last_error=None,
+                updated_at=time.time(),
+            )
             self.checkpoint_store.save_checkpoint(checkpoint)
 
             self._emit_progress(
@@ -3018,6 +3164,8 @@ class ProductionRunner:
                 "last_error": ckpt.last_error,
                 "approval_reason": ckpt.approval_reason,
                 "execution_options": dict(ckpt.execution_options),
+                "execution_spec_snapshot": dict(ckpt.execution_spec_snapshot),
+                "active_elapsed_seconds": ckpt.active_elapsed_seconds,
             }
         return {
             "task_id": task_id,
@@ -3056,6 +3204,51 @@ class ProductionRunner:
             overrides=effective_overrides,
         )
 
+        snapshot = dict(ckpt.execution_spec_snapshot)
+        if not snapshot:
+            # Backward-compatible one-time migration for checkpoints created by
+            # pre-snapshot Runner versions. Prefer the first immutable Evidence
+            # baseline over the mutable current branch HEAD.
+            legacy_baseline = None
+            if ckpt.evidence_ids:
+                if self.evidence_store is None:
+                    self.evidence_store = EvidenceStore(
+                        root_dir=os.path.join(project_root, "user_data", "runner_evidence")
+                    )
+                try:
+                    legacy_baseline = self.evidence_store.read(ckpt.evidence_ids[0]).baseline_commit
+                except Exception:
+                    legacy_baseline = None
+            snapshot = _execution_spec_snapshot(
+                replace(spec, baseline_commit=legacy_baseline or spec.baseline_commit)
+            )
+            ckpt = replace(
+                ckpt,
+                execution_spec_snapshot=snapshot,
+                updated_at=time.time(),
+            )
+            self.checkpoint_store.save_checkpoint(ckpt)
+
+        drift = _snapshot_mismatches(snapshot, spec)
+        if drift:
+            message = "Frozen task contract changed since start: " + "; ".join(drift)
+            ckpt = replace(
+                ckpt,
+                state=RunnerState.NEEDS_USER_INPUT.value,
+                last_error=message,
+                updated_at=time.time(),
+            )
+            self.checkpoint_store.save_checkpoint(ckpt)
+            return RunnerResult(
+                success=False,
+                state=RunnerState.NEEDS_USER_INPUT.value,
+                task_id=task_id,
+                candidate_commit=ckpt.candidate_commit,
+                candidate_generation=ckpt.candidate_generation,
+                evidence_ids=ckpt.evidence_ids,
+                message=message,
+            )
+
         # 1. 严格乐观并发校验权威看板状态
         if not verify_optimistic_concurrency(spec):
             return RunnerResult(
@@ -3092,6 +3285,39 @@ class ProductionRunner:
                 updated_at=time.time(),
             )
             self.checkpoint_store.save_checkpoint(ckpt)
+
+        if ckpt.state == RunnerState.REJECTION_PENDING.value:
+            if spec.status_at_read == "已退回":
+                reason = ckpt.last_error or "User acceptance rejection recovered after interruption."
+                history = list(ckpt.defects_history)
+                history.append({
+                    "cycle": ckpt.candidate_generation,
+                    "role": "USER_ACCEPTANCE",
+                    "defects": [{
+                        "defect_id": f"DEF-{task_id}-USER-ACCEPTANCE",
+                        "severity": "P1",
+                        "description": reason,
+                    }],
+                    "summary": reason,
+                })
+                ckpt = replace(
+                    ckpt,
+                    state=RunnerState.NEEDS_USER_INPUT.value,
+                    current_role="BUILDER",
+                    defects_history=tuple(history),
+                    updated_at=time.time(),
+                )
+                self.checkpoint_store.save_checkpoint(ckpt)
+            else:
+                return RunnerResult(
+                    False, RunnerState.NEEDS_USER_INPUT.value, task_id,
+                    candidate_commit=ckpt.candidate_commit,
+                    evidence_ids=ckpt.evidence_ids,
+                    message=(
+                        "Rejection write-ahead intent could not be reconciled with "
+                        f"authoritative board status {spec.status_at_read!r}."
+                    ),
+                )
 
         if ckpt.state in (
             RunnerState.CANCELLED.value,
@@ -3157,14 +3383,7 @@ class ProductionRunner:
                         message=f"Evidence record '{evi_id}' referenced in checkpoint not found in EvidenceStore.",
                     )
 
-        resumed_baseline = spec.baseline_commit
-        if ckpt.evidence_ids and self.evidence_store is not None:
-            try:
-                first_evi = self.evidence_store.read(ckpt.evidence_ids[0])
-                if first_evi.baseline_commit and re.match(r"^[0-9a-f]{40}$", first_evi.baseline_commit):
-                    resumed_baseline = first_evi.baseline_commit
-            except Exception:
-                pass
+        resumed_baseline = str(snapshot.get("baseline_commit") or spec.baseline_commit)
 
         spec = replace(
             spec,
@@ -3173,6 +3392,34 @@ class ProductionRunner:
             baseline_commit=resumed_baseline,
             workspace_mode="inherit",
         )
+
+        if ckpt.state == RunnerState.COMPLETION_PENDING.value:
+            if spec.status_at_read == "已完成":
+                ckpt = replace(
+                    ckpt,
+                    state=RunnerState.PENDING_USER_ACCEPTANCE.value,
+                    last_error=None,
+                    updated_at=time.time(),
+                )
+                self.checkpoint_store.save_checkpoint(ckpt)
+                return RunnerResult(
+                    True,
+                    RunnerState.PENDING_USER_ACCEPTANCE.value,
+                    task_id,
+                    candidate_commit=ckpt.candidate_commit,
+                    candidate_generation=ckpt.candidate_generation,
+                    evidence_ids=ckpt.evidence_ids,
+                    confirmation_request_id=ckpt.confirmation_request_id,
+                    message="Recovered completed board transition; awaiting explicit user acceptance.",
+                )
+            return RunnerResult(
+                False,
+                RunnerState.NEEDS_USER_INPUT.value,
+                task_id,
+                candidate_commit=ckpt.candidate_commit,
+                evidence_ids=ckpt.evidence_ids,
+                message="Completion write-ahead intent could not be reconciled with the authoritative board.",
+            )
 
         lock_handle, lock_file = self.checkpoint_store.acquire_runner_lock(task_id)
         if lock_handle is None:
@@ -3203,44 +3450,227 @@ class ProductionRunner:
     ) -> RunnerResult:
         """Explicitly accept the exact pending candidate and synchronize board/checkpoint."""
         _validate_task_id(task_id)
-        ckpt = self.checkpoint_store.load_checkpoint(task_id)
-        if not ckpt or ckpt.state != RunnerState.PENDING_USER_ACCEPTANCE.value:
-            return RunnerResult(False, ckpt.state if ckpt else RunnerState.FAILED.value, task_id,
-                                message="Task has no pending user acceptance checkpoint.")
-        if not confirmation_request_id or confirmation_request_id != ckpt.confirmation_request_id:
-            return RunnerResult(False, ckpt.state, task_id, candidate_commit=ckpt.candidate_commit,
-                                message="Confirmation request ID mismatch (Fail-Closed).")
-        worktree = os.path.realpath(ckpt.worktree_path or project_root)
-        try:
-            head = self._get_git_commit(worktree)
-            status = subprocess.check_output(
-                ["git", "status", "--porcelain"], cwd=worktree,
-                encoding="utf-8", errors="replace",
-            ).strip()
-        except Exception as exc:
+        lock_handle, lock_file = self.checkpoint_store.acquire_runner_lock(task_id)
+        if lock_handle is None:
             return RunnerResult(False, RunnerState.FAILED.value, task_id,
-                                message=f"Unable to verify acceptance candidate: {exc}")
-        if head != ckpt.candidate_commit or status:
-            return RunnerResult(False, ckpt.state, task_id, candidate_commit=ckpt.candidate_commit,
-                                message="Acceptance requires the exact candidate HEAD and a clean worktree.")
-        authority = os.path.realpath(authority_root or project_root)
-        ok, error = self._do_state_transition(
-            authority, task_id, "PM", "已完成", "已验收", "严经理",
-            f"用户显式验收通过候选提交 {ckpt.candidate_commit}", "A",
-        )
-        if not ok:
-            return RunnerResult(False, ckpt.state, task_id, candidate_commit=ckpt.candidate_commit,
-                                message=f"Failed to transition board to 已验收: {error}")
-        accepted = replace(ckpt, state=RunnerState.ACCEPTED.value, current_role="PM",
-                           last_error=None, updated_at=time.time())
-        self.checkpoint_store.save_checkpoint(accepted)
-        return RunnerResult(True, RunnerState.ACCEPTED.value, task_id,
-                            candidate_commit=ckpt.candidate_commit,
-                            candidate_generation=ckpt.candidate_generation,
-                            evidence_ids=ckpt.evidence_ids,
-                            message="User acceptance recorded; board and checkpoint are synchronized at 已验收.")
+                                message="Task is active in another Runner process; acceptance is locked.")
+        try:
+            ckpt = self.checkpoint_store.load_checkpoint(task_id)
+            if not ckpt or ckpt.state != RunnerState.PENDING_USER_ACCEPTANCE.value:
+                return RunnerResult(False, ckpt.state if ckpt else RunnerState.FAILED.value, task_id,
+                                    message="Task has no pending user acceptance checkpoint.")
+            if not confirmation_request_id or confirmation_request_id != ckpt.confirmation_request_id:
+                return RunnerResult(False, ckpt.state, task_id, candidate_commit=ckpt.candidate_commit,
+                                    message="Confirmation request ID mismatch (Fail-Closed).")
+
+            authority = os.path.realpath(authority_root or project_root)
+            live_spec = load_task_execution_spec(
+                project_root=project_root,
+                task_id=task_id,
+                authority_root=authority,
+                overrides=dict(ckpt.execution_options),
+            )
+            drift = _snapshot_mismatches(ckpt.execution_spec_snapshot, live_spec)
+            if not drift and live_spec.status_at_read == "已验收" and ckpt.evidence_ids:
+                if self.evidence_store is None:
+                    self.evidence_store = EvidenceStore(
+                        root_dir=os.path.join(project_root, "user_data", "runner_evidence")
+                    )
+                try:
+                    last_record = self.evidence_store.read(ckpt.evidence_ids[-1])
+                    confirmed = (
+                        last_record.evidence_type == EvidenceType.USER_CONFIRMATION
+                        and last_record.metadata.extra.get("confirmation_id") == confirmation_request_id
+                        and last_record.result_commit == ckpt.candidate_commit
+                    )
+                except Exception:
+                    confirmed = False
+                if confirmed:
+                    accepted = replace(
+                        ckpt, state=RunnerState.ACCEPTED.value, current_role="PM",
+                        last_error=None, updated_at=time.time(),
+                    )
+                    self.checkpoint_store.save_checkpoint(accepted)
+                    return RunnerResult(
+                        True, RunnerState.ACCEPTED.value, task_id,
+                        candidate_commit=ckpt.candidate_commit,
+                        candidate_generation=ckpt.candidate_generation,
+                        evidence_ids=ckpt.evidence_ids,
+                        message="Recovered acceptance after board/checkpoint interruption.",
+                    )
+            if drift or live_spec.status_at_read != "已完成":
+                detail = "; ".join(drift) if drift else f"board status={live_spec.status_at_read!r}"
+                return RunnerResult(False, ckpt.state, task_id, candidate_commit=ckpt.candidate_commit,
+                                    message=f"Acceptance contract revalidation failed: {detail}")
+
+            worktree = os.path.realpath(ckpt.worktree_path or project_root)
+            try:
+                head = self._get_git_commit(worktree)
+                clean, clean_error = self._verify_qa_immutability(worktree, str(ckpt.candidate_commit))
+                format_check = subprocess.run(
+                    ["git", "diff", "--check", f"{ckpt.execution_spec_snapshot.get('baseline_commit')}..{ckpt.candidate_commit}", "--"],
+                    cwd=worktree, capture_output=True, text=True,
+                    encoding="utf-8", errors="replace",
+                )
+            except Exception as exc:
+                return RunnerResult(False, RunnerState.FAILED.value, task_id,
+                                    message=f"Unable to verify acceptance candidate: {self._sanitize_diagnostic(exc)}")
+            if head != ckpt.candidate_commit or not clean or format_check.returncode != 0:
+                return RunnerResult(False, ckpt.state, task_id, candidate_commit=ckpt.candidate_commit,
+                                    message="Acceptance requires the exact candidate HEAD, an immutable worktree, and git diff --check PASS. "
+                                            f"{clean_error or ''}")
+
+            if self.evidence_store is None:
+                self.evidence_store = EvidenceStore(
+                    root_dir=os.path.join(project_root, "user_data", "runner_evidence")
+                )
+            records = [self.evidence_store.read(evidence_id) for evidence_id in ckpt.evidence_ids]
+            candidate = ckpt.candidate_commit
+            baseline = ckpt.execution_spec_snapshot.get("baseline_commit")
+            matching = [
+                record for record in records
+                if record.baseline_commit == baseline and record.result_commit == candidate
+                and record.metadata.is_real_host
+            ]
+            builder_records = [r for r in matching if r.metadata.actor_role == "BUILDER" and r.metadata.transition_to == "REVIEWING"]
+            reviewer_records = [r for r in matching if r.metadata.actor_role == "REVIEWER" and r.metadata.transition_to == "TESTING"]
+            qa_records = [r for r in matching if r.metadata.actor_role == "QA" and r.metadata.transition_to == "PENDING_USER_ACCEPTANCE"]
+            if not builder_records or not reviewer_records or not qa_records:
+                return RunnerResult(False, ckpt.state, task_id, candidate_commit=candidate,
+                                    message="Acceptance EvidenceGate replay failed: missing same-SHA Builder, Reviewer PASS, or QA PASS evidence.")
+            builder_evi = max(builder_records, key=lambda r: r.metadata.created_at)
+            reviewer_evi = max(reviewer_records, key=lambda r: r.metadata.created_at)
+            qa_evi = max(qa_records, key=lambda r: r.metadata.created_at)
+            if not (builder_evi.metadata.created_at <= reviewer_evi.metadata.created_at <= qa_evi.metadata.created_at):
+                return RunnerResult(False, ckpt.state, task_id, candidate_commit=candidate,
+                                    message="Acceptance EvidenceGate replay failed: evidence order is invalid.")
+            sessions = {
+                builder_evi.metadata.host_session_id,
+                reviewer_evi.metadata.host_session_id,
+                qa_evi.metadata.host_session_id,
+            }
+            qa_extra = qa_evi.metadata.extra
+            if (
+                len(sessions) != 3
+                or qa_extra.get("qa_decision") != "PASS"
+                or qa_extra.get("acceptance_criteria_hash") != live_spec.acceptance_criteria_hash
+                or any(code != 0 for code in tuple(qa_extra.get("test_exit_codes") or ()))
+                or int(qa_extra.get("uncovered_risk_count", 1)) != 0
+                or int(qa_extra.get("defect_count", 1)) != 0
+            ):
+                return RunnerResult(False, ckpt.state, task_id, candidate_commit=candidate,
+                                    message="Acceptance EvidenceGate replay failed: independent identity or QA semantic proof is invalid.")
+
+            user_evidence_id = f"evi_user_{task_id.lower()}_{int(time.time()*1000)}"
+            confirmed_at = time.time()
+            user_caps = HostCapabilities(is_real_host=True)
+            confirmation_extra = _extract_capabilities_extra(user_caps)
+            confirmation_extra.update({
+                "confirmation_id": confirmation_request_id,
+                "user_source": "explicit_user",
+                "confirmed_at": confirmed_at,
+            })
+            confirmation_meta = EvidenceMetadata(
+                project_id=ckpt.project_id, task_id=task_id, actor_role="PM",
+                host_id="explicit_user_cli", adapter="run_task_cli",
+                host_session_id=confirmation_request_id,
+                host_invocation_id=f"accept-{uuid.uuid4().hex}", is_real_host=True,
+                workspace_mode="user_confirmation", transition_from="PENDING_USER_ACCEPTANCE",
+                transition_to="ACCEPTED", created_at=confirmed_at,
+                extra=confirmation_extra,
+            )
+            self.evidence_store.append(EvidenceRecord(
+                evidence_id=user_evidence_id, evidence_type=EvidenceType.USER_CONFIRMATION,
+                baseline_commit=str(baseline), result_commit=str(candidate), artifacts=(), metadata=confirmation_meta,
+            ))
+            if self.evidence_gate is None:
+                self.evidence_gate = EvidenceGate(store=self.evidence_store, project_root=project_root)
+            confirmation_handle = AgentHandle(
+                session_id=confirmation_request_id,
+                host_id="explicit_user_cli",
+                status="completed",
+                is_real_host=True,
+                adapter_instance_id="run_task_cli",
+                invocation_token="explicit-user-confirmation",
+            )
+            self.evidence_gate.validate_evidence(
+                user_evidence_id,
+                EvidenceValidationContext(
+                    project_id=ckpt.project_id,
+                    task_id=task_id,
+                    actor_role="PM",
+                    transition_from="PENDING_USER_ACCEPTANCE",
+                    transition_to="ACCEPTED",
+                    baseline_commit=str(baseline),
+                    result_commit=str(candidate),
+                    expected_invocation_id=confirmation_meta.host_invocation_id,
+                    expected_adapter="run_task_cli",
+                    expected_workspace_mode="user_confirmation",
+                    expected_evidence_type=EvidenceType.USER_CONFIRMATION,
+                    host_handle=confirmation_handle,
+                    expected_capabilities=user_caps,
+                    confirmation_result=ConfirmationResult(
+                        request_id=confirmation_request_id,
+                        selected_option="accept",
+                        is_confirmed=True,
+                        is_real_host=True,
+                    ),
+                ),
+            )
+            accepted_ids = tuple(ckpt.evidence_ids) + (user_evidence_id,)
+            # Persist the explicit confirmation before changing the board. If the
+            # process dies after the transition, a later audit can still prove
+            # exactly which confirmation authorized it.
+            ckpt = replace(ckpt, evidence_ids=accepted_ids, updated_at=time.time())
+            self.checkpoint_store.save_checkpoint(ckpt)
+
+            ok, error = self._do_state_transition(
+                authority, task_id, "PM", "已完成", "已验收", "严经理",
+                f"用户显式验收通过候选提交 {candidate}", live_spec.task_type,
+            )
+            if not ok:
+                return RunnerResult(False, ckpt.state, task_id, candidate_commit=candidate,
+                                    message=f"Failed to transition board to 已验收: {self._sanitize_diagnostic(error)}")
+
+            accepted = replace(ckpt, state=RunnerState.ACCEPTED.value, current_role="PM",
+                               evidence_ids=accepted_ids, last_error=None, updated_at=time.time())
+            self.checkpoint_store.save_checkpoint(accepted)
+            return RunnerResult(True, RunnerState.ACCEPTED.value, task_id,
+                                candidate_commit=candidate,
+                                candidate_generation=ckpt.candidate_generation,
+                                evidence_ids=accepted_ids,
+                                message="User acceptance recorded after same-SHA EvidenceGate replay; board and checkpoint are synchronized at 已验收.")
+        except Exception as exc:
+            current = self.checkpoint_store.load_checkpoint(task_id)
+            return RunnerResult(False, current.state if current else RunnerState.FAILED.value, task_id,
+                                candidate_commit=current.candidate_commit if current else None,
+                                evidence_ids=current.evidence_ids if current else (),
+                                message=f"Acceptance validation failed closed: {self._sanitize_diagnostic(exc)}")
+        finally:
+            self.checkpoint_store.release_runner_lock((lock_handle, lock_file))
 
     def reject(
+        self,
+        project_root: str,
+        task_id: str,
+        confirmation_request_id: str,
+        reason: str,
+        authority_root: Optional[str] = None,
+    ) -> RunnerResult:
+        """Serialize user rejection against start/resume/accept for the same task."""
+        _validate_task_id(task_id)
+        lock_handle, lock_file = self.checkpoint_store.acquire_runner_lock(task_id)
+        if lock_handle is None:
+            return RunnerResult(False, RunnerState.FAILED.value, task_id,
+                                message="Task is active in another Runner process; rejection is locked.")
+        try:
+            return self._reject_unlocked(
+                project_root, task_id, confirmation_request_id, reason, authority_root
+            )
+        finally:
+            self.checkpoint_store.release_runner_lock((lock_handle, lock_file))
+
+    def _reject_unlocked(
         self,
         project_root: str,
         task_id: str,
@@ -3262,11 +3692,40 @@ class ProductionRunner:
             return RunnerResult(False, ckpt.state, task_id, candidate_commit=ckpt.candidate_commit,
                                 message="Acceptance rejection requires a non-empty reason.")
         authority = os.path.realpath(authority_root or project_root)
+        try:
+            live_spec = load_task_execution_spec(
+                project_root=project_root,
+                task_id=task_id,
+                authority_root=authority,
+                overrides=dict(ckpt.execution_options),
+            )
+        except Exception as exc:
+            return RunnerResult(False, ckpt.state, task_id, candidate_commit=ckpt.candidate_commit,
+                                message=f"Unable to revalidate rejection contract: {self._sanitize_diagnostic(exc)}")
+        drift = _snapshot_mismatches(ckpt.execution_spec_snapshot, live_spec)
+        if drift or live_spec.status_at_read != "已完成":
+            detail = "; ".join(drift) if drift else f"board status={live_spec.status_at_read!r}"
+            return RunnerResult(False, ckpt.state, task_id, candidate_commit=ckpt.candidate_commit,
+                                message=f"Rejection contract revalidation failed: {detail}")
+        pending_rejection = replace(
+            ckpt,
+            state=RunnerState.REJECTION_PENDING.value,
+            current_role="PM",
+            last_error=reason,
+            updated_at=time.time(),
+        )
+        self.checkpoint_store.save_checkpoint(pending_rejection)
         ok, error = self._do_state_transition(
             authority, task_id, "PM", "已完成", "已退回", "李开发",
-            f"用户验收退回原任务：{reason}", "A",
+            f"用户验收退回原任务：{reason}", live_spec.task_type,
         )
         if not ok:
+            self.checkpoint_store.save_checkpoint(replace(
+                pending_rejection,
+                state=RunnerState.PENDING_USER_ACCEPTANCE.value,
+                last_error=self._sanitize_diagnostic(error),
+                updated_at=time.time(),
+            ))
             return RunnerResult(False, ckpt.state, task_id, candidate_commit=ckpt.candidate_commit,
                                 message=f"Failed to return board task to 已退回: {error}")
         history = list(ckpt.defects_history)
@@ -3341,26 +3800,11 @@ class ProductionRunner:
 
         # 2. 更新 Checkpoint 状态为 CANCELLED
         if ckpt:
-            updated = RunnerCheckpoint(
-                task_id=task_id,
-                project_id=ckpt.project_id,
+            updated = replace(
+                ckpt,
                 state=RunnerState.CANCELLED.value,
-                current_role=ckpt.current_role,
-                candidate_commit=ckpt.candidate_commit,
-                candidate_generation=ckpt.candidate_generation,
-                review_cycle=ckpt.review_cycle,
-                qa_cycle=ckpt.qa_cycle,
-                total_attempts=ckpt.total_attempts,
-                worktree_path=ckpt.worktree_path,
-                worktree_branch=ckpt.worktree_branch,
-                builder_session_id=ckpt.builder_session_id,
-                reviewer_session_id=ckpt.reviewer_session_id,
-                qa_session_id=ckpt.qa_session_id,
-                evidence_ids=ckpt.evidence_ids,
-                execution_options=ckpt.execution_options,
-                confirmation_request_id=ckpt.confirmation_request_id,
-                defects_history=ckpt.defects_history,
                 last_error="Cancelled by user command.",
+                updated_at=time.time(),
             )
             self.checkpoint_store.save_checkpoint(updated)
 

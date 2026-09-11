@@ -74,9 +74,25 @@ def _validate_antigravity_host_config() -> None:
     serialized = json.dumps(config, ensure_ascii=False, sort_keys=True).lower()
     permissions = config.get("permissions", {}) if isinstance(config, Mapping) else {}
     allow_rules = permissions.get("allow", ()) if isinstance(permissions, Mapping) else ()
+    all_string_values: List[str] = []
+
+    def collect_strings(value: Any) -> None:
+        if isinstance(value, str):
+            all_string_values.append(value)
+        elif isinstance(value, Mapping):
+            for nested in value.values():
+                collect_strings(nested)
+        elif isinstance(value, (list, tuple)):
+            for nested in value:
+                collect_strings(nested)
+
+    collect_strings(config)
     normalized_rules = {
         re.sub(r"\s+", "", str(rule)).lower()
-        for rule in (allow_rules if isinstance(allow_rules, (list, tuple)) else ())
+        for rule in (
+            list(allow_rules if isinstance(allow_rules, (list, tuple)) else ())
+            + all_string_values
+        )
     }
     forbidden = sorted(normalized_rules.intersection(FORBIDDEN_HOST_PERMISSION_RULES))
     bypass_tokens = [
@@ -598,7 +614,7 @@ class AntigravityAdapter(BaseHostAdapter):
                 raise AgentNotSupportedError(
                     f"Unauthorized execution mode '{requested_mode}'. Allowed whitelist: {sorted(ALLOWED_EXECUTION_MODES)}"
                 )
-            if role == "REVIEWER" and requested_mode != "plan":
+            if role in ("REVIEWER", "QA") and requested_mode != "plan":
                 raise AgentNotSupportedError(
                     f"Role '{role}' is strictly read-only; cannot request writable execution mode '{requested_mode}'"
                 )
@@ -633,6 +649,8 @@ class AntigravityAdapter(BaseHostAdapter):
         use_sandbox = self._default_sandbox_mode
         if isinstance(request.extra_context, Mapping) and "sandbox" in request.extra_context:
             use_sandbox = bool(request.extra_context["sandbox"])
+        if self._is_real_host and not use_sandbox:
+            raise AgentNotSupportedError("Real Antigravity host dispatch requires sandbox mode (Fail-Closed).")
         if use_sandbox:
             cmd.append("--sandbox")
 
@@ -666,9 +684,7 @@ class AntigravityAdapter(BaseHostAdapter):
         if not request.session_id or not request.session_id.strip():
             raise ValueError("request.session_id cannot be empty")
 
-        if self._is_real_host and isinstance(request.extra_context, Mapping) and request.extra_context.get(
-            "enforce_host_config_safety"
-        ):
+        if self._is_real_host:
             _validate_antigravity_host_config()
 
         # DEF-T0052-4: Dual-root and workspace validation
@@ -961,7 +977,7 @@ class AntigravityAdapter(BaseHostAdapter):
             self._session_history[handle.session_id] = session_data
             self._running_sessions.pop(handle.session_id, None)
 
-        if status == AgentStatus.FAILED and _is_host_permission_denial(
+        if _is_host_permission_denial(
             error_msg, final_output, stderr_data
         ):
             raise AgentPermissionRequiredError(

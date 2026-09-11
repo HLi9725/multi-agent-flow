@@ -127,6 +127,15 @@ def test_finalize_builder_repair_requires_a_new_candidate(tmp_path):
             previous_candidate_commit=candidate,
         )
 
+    (repo_dir / "value.py").write_text("VALUE = 3\n", encoding="utf-8")
+    repaired = runner._finalize_builder_candidate(
+        str(repo_dir), baseline, previous_candidate_commit=candidate
+    )
+    assert repaired != candidate
+    assert subprocess.check_output(
+        ["git", "status", "--porcelain"], cwd=repo_dir, text=True
+    ).strip() == ""
+
 
 def test_reviewer_diff_bundle_is_inline_bounded_and_nonempty(tmp_path):
     repo_dir = tmp_path / "review-repo"

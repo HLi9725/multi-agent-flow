@@ -679,3 +679,22 @@ def test_codex_cli_real_executable_detection_and_help():
         assert "--sandbox" in proc_help.stdout
         assert "--json" in proc_help.stdout
         assert "--approve-for-me" in proc_help.stdout
+
+
+def test_codex_qa_cannot_request_write_or_auto_approval(tmp_path):
+    adapter = CodexCliAdapter(executable_path=sys.executable, is_real_host=True)
+    base = {
+        "session_id": "sess_qa_read_only",
+        "prompt": "review evidence",
+        "role": "QA",
+        "workspace_dir": str(tmp_path),
+        "timeout_seconds": 1,
+    }
+    with pytest.raises(AgentNotSupportedError, match="strictly read-only"):
+        adapter.build_codex_exec_command(AgentRequest(
+            **base, extra_context={"sandbox_mode": "workspace-write"},
+        ))
+    with pytest.raises(AgentNotSupportedError, match="strictly read-only"):
+        adapter.build_codex_exec_command(AgentRequest(
+            **base, extra_context={"approve_for_me": True},
+        ))

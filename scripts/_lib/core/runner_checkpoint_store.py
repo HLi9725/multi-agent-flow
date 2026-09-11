@@ -84,10 +84,24 @@ class RunnerCheckpointStore:
         payload = json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
 
         try:
+            if os.path.isfile(target_path):
+                with open(target_path, "r", encoding="utf-8") as existing_file:
+                    existing = json.load(existing_file)
+                if existing.get("state") == "CANCELLED" and checkpoint.state != "CANCELLED":
+                    raise CheckpointStoreError(
+                        f"Refusing to overwrite durable cancellation for {checkpoint.task_id}."
+                    )
             with open(temp_path, "wb") as f:
                 f.write(payload)
                 f.flush()
                 os.fsync(f.fileno())
+            if os.path.isfile(target_path):
+                with open(target_path, "r", encoding="utf-8") as existing_file:
+                    latest = json.load(existing_file)
+                if latest.get("state") == "CANCELLED" and checkpoint.state != "CANCELLED":
+                    raise CheckpointStoreError(
+                        f"Refusing to overwrite durable cancellation for {checkpoint.task_id}."
+                    )
             os.replace(temp_path, target_path)
         except Exception as e:
             if os.path.exists(temp_path):
