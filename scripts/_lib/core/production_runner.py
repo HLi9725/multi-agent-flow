@@ -675,7 +675,7 @@ class ProductionRunner:
         return result
 
     def _sanitize_diagnostic(self, value: Any, limit: int = 4000) -> str:
-        text = str(value or "")
+        text = "" if value is None else str(value)
         try:
             if self.evidence_store is not None:
                 text = self.evidence_store._mask_text(text)
@@ -707,10 +707,20 @@ class ProductionRunner:
         """Persist bounded host diagnostics without treating permission retries as repairs."""
         diagnostic = {}
         for key, value in getattr(error, 'diagnostics', {}).items():
-            # Flatten complex tool payloads to bounded strings for safe serialization.
-            diagnostic[key] = self._sanitize_diagnostic(value, 12000 if key == 'tool_events' else 4000)
+            if key == 'host_exit_code' and isinstance(value, int):
+                diagnostic[key] = value
+            elif key == 'denied_actions' and isinstance(value, (list, tuple)):
+                diagnostic[key] = tuple({
+                    'action': self._sanitize_diagnostic(item.get('action'), 200),
+                    'display_name': self._sanitize_diagnostic(item.get('display_name'), 200),
+                } for item in value if isinstance(item, Mapping))
+            else:
+                # Full tool streams stay bounded; the actionable denial fields
+                # above remain structured and queryable.
+                diagnostic[key] = self._sanitize_diagnostic(value, 12000 if key == 'tool_events' else 4000)
         for key in tuple(diagnostic):
-            diagnostic[key] = re.sub(r'--dangerously-skip-permissions', '[blocked bypass suggestion]', diagnostic[key])
+            if isinstance(diagnostic[key], str):
+                diagnostic[key] = re.sub(r'--dangerously-skip-permissions', '[blocked bypass suggestion]', diagnostic[key])
         return replace(checkpoint,
             total_attempts=max(0, checkpoint.total_attempts - 1),
             approval_attempts=checkpoint.approval_attempts + 1,
@@ -1639,7 +1649,7 @@ class ProductionRunner:
                         f"Task {task_id}: Previous attempt was rejected by {last_defect.get('role', 'REVIEWER')}.\n"
                         f"Defects: {json.dumps(last_defect.get('defects', []), ensure_ascii=False)}\n"
                         f"Summary: {last_defect.get('summary', '')}\n"
-                        f"Please fix the defects in {worktree_dir}, verify your changes, and make a git commit."
+                        f"Please fix the defects in {worktree_dir} using file read/write tools only."
                     )
                 else:
                     custom_prompts = getattr(spec, "custom_prompts", {}) or {}
@@ -1648,7 +1658,7 @@ class ProductionRunner:
                         or f"Task {task_id}: {spec.task_name}\n"
                         f"Requirements:\n{spec.requirement_text}\n"
                         f"Acceptance Criteria:\n{spec.acceptance_criteria}\n"
-                        f"Please implement the requirements in {worktree_dir}, write unit tests, verify your implementation, and make a git commit."
+                        f"Please implement the requirements in {worktree_dir} and write the required tests using file read/write tools only."
                     )
                 builder_prompt += (
                     "\n\nSecurity boundary: modify only files inside the assigned worktree. Never modify global "
@@ -1659,8 +1669,9 @@ class ProductionRunner:
                     "If a host permission blocks work, stop and report the exact denial; do not repair the host environment."
                     "\n\nProduction Runner managed mode: this task already exists and is claimed. Do not create tasks, "
                     "do not call transition_task.py, and do not modify the board or yy-flow control data. Work only "
-                    "inside the assigned worktree, run relevant checks, and create a new Git commit or leave verifiable "
-                    "working-tree changes for the Runner to commit. A repair cycle must advance the prior candidate."
+                    "inside the assigned worktree. Do not invoke run_command, a shell, Git, test commands, package "
+                    "managers, or subprocesses. Leave verifiable working-tree changes only; the Runner exclusively "
+                    "runs Git checks, executes tests, and creates the candidate commit. A repair cycle must change files."
                 )
 
                 builder_request = AgentRequest(
@@ -1673,7 +1684,7 @@ class ProductionRunner:
                         "sandbox": True,
                         "sandbox_mode": "workspace-write",
                         "permission_boundary": "workspace_write",
-                        "operation_intent": "Implement workspace-local changes and create one candidate git commit",
+                        "operation_intent": "Edit workspace-local files only; Runner owns Git, tests, and commit",
                         "worktree_dir": worktree_dir,
                         "project_id": spec.project_id,
                         "pre_granted_approval": pre_granted_approval,

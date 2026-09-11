@@ -11,7 +11,7 @@ event_triggers:
 - '开发完成提交审查: 撰写开发报告并推至【审查中】，移交 REVIEWER'
 - '缺陷打回修复: 读取 DEF-TXXX-N 备注，在原任务上置为【进行中】修复'
 orchestration_rules:
-- 【Production Runner 托管模式】当当前提示明确声明由 Production Runner 调度时，任务已由 Runner 建卡和领取；不得执行 --create、transition_task.py 或修改看板，只修改分配的 worktree、运行验证并生成新的候选 Commit，状态和 Evidence 由 Runner 独占管理
+- 【Production Runner 托管模式】当当前提示明确声明由 Production Runner 调度时，任务已由 Runner 建卡和领取；只用文件读取/写入工具修改分配的 worktree，不得调用 run_command、Shell、Git、测试命令或包管理器；Git 检查、受控测试和候选 Commit 均由 Runner 独占执行，状态和 Evidence 也由 Runner 独占管理
 - 编码前必须先执行 python3 scripts/transition_task.py --from-status 待开始 --to-status 进行中 --assignee
   DEV
 - 提交审查前使用 python3 scripts/generate_report.py --type dev 生成/更新开发报告

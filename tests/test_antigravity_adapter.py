@@ -155,6 +155,15 @@ def test_antigravity_adapter_role_based_routing_and_sandbox():
     assert "--print" not in cmd_dev
     assert "Implement feature" not in cmd_dev
 
+    req_builder = AgentRequest(
+        session_id="sess_ag_builder_01",
+        prompt="Implement managed change without commands",
+        role="BUILDER",
+        workspace_dir=os.path.abspath("."),
+    )
+    cmd_builder = adapter.build_antigravity_exec_command(req_builder)
+    assert cmd_builder[cmd_builder.index("--agent") + 1] == "flow-runner-builder"
+
 
 def test_antigravity_prompt_uses_stdin_with_timeout_and_schema():
     adapter = AntigravityAdapter(is_real_host=False)
@@ -1068,9 +1077,50 @@ def test_antigravity_adapter_surfaces_runtime_permission_denial(monkeypatch):
     handle = adapter.dispatch_agent(request)
     with pytest.raises(AgentPermissionRequiredError, match="requires explicit user approval") as denied:
         adapter.wait_for_result(handle, timeout_seconds=5)
-    assert denied.value.diagnostics['exit_code'] == 1
+    assert denied.value.diagnostics['host_exit_code'] == 1
     assert denied.value.diagnostics['tool_events']
     assert 'permission_denied' in denied.value.diagnostics['host_message']
+
+
+def test_antigravity_adapter_treats_success_with_denied_actions_as_permission_failure(monkeypatch):
+    adapter = AntigravityAdapter(
+        is_real_host=True, executable_path=sys.executable,
+        verification_level=VerificationLevel.CLI_VERIFIED,
+    )
+    request = AgentRequest(
+        session_id="sess_denied_success", prompt="edit files only", role="BUILDER",
+        workspace_dir=os.path.abspath("."),
+    )
+    adapter.record_out_of_band_approval(request)
+
+    class DeniedButSuccessfulPopen:
+        pid = 77889
+        returncode = 0
+        def __init__(self, *args, **kwargs):
+            pass
+        def communicate(self, input=None, timeout=None):
+            events = [
+                {"event": "init", "conversation_id": "conv-denied"},
+                {"event": "step_update", "step_update": {
+                    "conversation_id": "conv-denied", "step_index": 2,
+                    "tool_info": {"parameters": {"CommandLine": "git status"}},
+                }},
+                {"event": "result", "result": {
+                    "conversation_id": "conv-denied", "status": "SUCCESS", "response": "",
+                    "denied_actions": [{"action": "escalate_admin", "display_name": "Bash"}],
+                }},
+            ]
+            return "\n".join(json.dumps(item) for item in events), ""
+
+    monkeypatch.setattr(subprocess, "Popen", DeniedButSuccessfulPopen)
+    handle = adapter.dispatch_agent(request)
+    with pytest.raises(AgentPermissionRequiredError) as denied:
+        adapter.wait_for_result(handle, timeout_seconds=5)
+    assert denied.value.diagnostics["host_exit_code"] == 0
+    assert denied.value.diagnostics["denied_command"] == "git status"
+    assert denied.value.diagnostics["denied_actions"] == [
+        {"action": "escalate_admin", "display_name": "Bash"}
+    ]
 
 
 def test_antigravity_adapter_out_of_band_approval_is_exact_and_bounded():

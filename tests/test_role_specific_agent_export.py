@@ -13,7 +13,7 @@ SCRIPTS = os.path.join(ROOT, "scripts")
 if SCRIPTS not in sys.path:
     sys.path.insert(0, SCRIPTS)
 
-from verify_and_export_agents import ROLES_MAP, serialize_subagent  # noqa: E402
+from verify_and_export_agents import ROLES_MAP, serialize_subagent, serialize_runner_builder  # noqa: E402
 from _lib.core.validate_transition import validate  # noqa: E402
 
 
@@ -104,6 +104,17 @@ def test_antigravity_permissions_are_role_specific():
         assert "write_to_file" not in frontmatter["tools"]
         assert "replace_file_content" not in frontmatter["tools"]
         assert "run_command" in frontmatter["tools"]
+
+
+def test_antigravity_runner_builder_has_file_tools_but_no_terminal():
+    content = serialize_runner_builder("antigravity", ANTIGRAVITY_SPEC)
+    _, frontmatter, body = content.split("---", 2)
+    parsed = yaml.safe_load(frontmatter)
+    assert parsed["name"] == "flow-runner-builder"
+    assert parsed["enable_write_tools"] is True
+    assert "run_command" not in parsed["tools"]
+    assert "write_to_file" in parsed["tools"]
+    assert "Git 检查、测试及候选 Commit 由 Runner 受控执行" in body
 
 
 @pytest.mark.parametrize("platform", MARKDOWN_PLATFORMS)

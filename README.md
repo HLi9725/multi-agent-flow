@@ -153,6 +153,8 @@ Antigravity Prompt 通过官方 stdin `stream-json` 协议传输，不进入 Win
 
 Host 权限拒绝属于显式暂停条件：Runner 会原子保存 `APPROVAL_REQUIRED`，释放运行锁并要求用户在 Runner 外部处理授权；其他 Host 失败会持久化为 `NEEDS_USER_INPUT`，不会遗留假的 `BUILDING`、`REVIEWING` 或 `QA_TESTING`。Runner 和角色 Agent 均不得修改用户全局 Antigravity/agy/Codex 设置、创建绕权限诊断脚本，或使用 `command(*)`、`unsandboxed(*)`、`--dangerously-skip-permissions` 等通配/跳过规则。检测到这类危险全局配置时将 Fail-Closed 停止，且 `--approve` 不能绕过安全门禁。
 
+Antigravity 的 Production Runner 使用额外的 `flow-runner-builder` 执行配置（不是第九个业务角色）：Builder 只获得项目内文件读写工具，不获得 `run_command`。Git 状态核对、测试命令和候选 Commit 由 Runner 自身确定性执行；这避免 Windows 无头沙箱把普通终端命令升级为无法交互批准的 `escalate_admin("")`。独立使用 `flow-dev` 时仍保留原有 CLI 能力，不受此配置影响。
+
 Runner 成功只停在【已完成】/`PENDING_USER_ACCEPTANCE`，不会替用户验收、合并、Push 或创建 Tag。
 
 恢复兼容性与边界：已有 Checkpoint 必须使用 `resume`，普通 `start` 不覆盖历史记录。只有明确重启已取消任务时使用 `start --restart-cancelled`（其余参数同首次启动）；旧记录先归档，新运行拒绝旧运行的迟到写入。恢复读取及迁移受运行锁保护，取消和 Checkpoint 保存使用独立短写锁。

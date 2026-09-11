@@ -43,6 +43,31 @@ DEFAULT_TOOLS = ["run_command", "replace_file_content", "write_to_file", "view_f
 WRITE_TOOL_NAMES = {
     "edit", "write", "replace_file_content", "write_to_file",
 }
+RUNNER_BUILDER_ID = "flow-runner-builder"
+
+
+def serialize_runner_builder(platform_key, subagent_spec):
+    """Antigravity-only managed Builder profile with no terminal capability."""
+    tools = [tool for tool in PLATFORM_TOOLS.get(platform_key, DEFAULT_TOOLS)
+             if tool.lower() != "run_command"]
+    body = """# Production Runner 托管 Builder
+
+这是 flow-dev 的 Runner 专用执行配置，不是第九个业务角色。
+
+- 只读取和修改分配工作区内的业务源码与测试文件。
+- 不得调用 run_command、Shell、Git、测试命令、包管理器或子进程。
+- 不得建卡、修改看板、生成 Evidence 或执行 Reviewer/QA/用户验收。
+- 完成文件修改后直接返回修改摘要；Git 检查、测试及候选 Commit 由 Runner 受控执行。
+- 若文件工具被拒绝，立即返回阻断，不得修改全局权限或尝试绕过。
+"""
+    fm = yaml.dump({
+        "name": RUNNER_BUILDER_ID,
+        "description": "yy-flow Production Runner 专用无终端 Builder",
+        "tools": tools,
+        "enable_write_tools": True,
+        "subagent": True,
+    }, allow_unicode=True, sort_keys=False)
+    return f"---\n{fm}---\n\n{body}"
 
 
 def _as_bullets(value):
@@ -439,6 +464,20 @@ def export_platform_assets(platforms_config, active_platforms, global_mode=False
             ok, err = verify_exported_agent(out_abs_path, fmt)
             if not ok:
                 verify_failures.append(f"[{p_key}] {out_rel_path}: {err}")
+
+        # The managed Builder is an execution profile, not a ninth business
+        # role. It exists only on Antigravity surfaces because their headless
+        # sandbox may elevate every terminal command before it can run.
+        if p_key in ("antigravity", "antigravity_cli"):
+            runner_rel = pattern.format(agent_id=RUNNER_BUILDER_ID)
+            runner_abs = os.path.expanduser(runner_rel) if global_mode else os.path.join(TARGET_PROJECT_DIR, runner_rel)
+            os.makedirs(os.path.dirname(runner_abs), exist_ok=True)
+            with open(runner_abs, "w", encoding="utf-8") as fp:
+                fp.write(serialize_runner_builder(p_key, subagent_spec or {}))
+            total_exported += 1
+            ok, err = verify_exported_agent(runner_abs, fmt)
+            if not ok:
+                verify_failures.append(f"[{p_key}] {runner_rel}: {err}")
 
         print(f"[SUCCESS]  [{p_name}] 成功导出专家子代理 ({exported_count}/8) -> 模式: `{pattern}`")
 

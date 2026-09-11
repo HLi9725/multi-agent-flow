@@ -115,10 +115,29 @@ def _is_host_permission_denial(*parts: Optional[str]) -> bool:
         "not permitted", "sandbox denied", "access is denied", "access denied",
     ))
 
+
+def _extract_denied_actions(events: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    """Extract the CLI 1.1.27+ authoritative denied_actions payload."""
+    denied: List[Dict[str, str]] = []
+    for event in events:
+        result = event.get("result") if isinstance(event, Mapping) else None
+        actions = result.get("denied_actions") if isinstance(result, Mapping) else None
+        if not isinstance(actions, list):
+            continue
+        for action in actions:
+            if isinstance(action, Mapping) and action.get("action"):
+                denied.append({
+                    "action": str(action["action"]),
+                    "display_name": str(action.get("display_name") or ""),
+                })
+    return denied
+
 # Mapping from project roles to specialized Antigravity subagents
 ROLE_AGENT_MAP: Dict[str, str] = {
     "DEV": "flow-dev",
-    "BUILDER": "flow-dev",
+    # Runner Builder must not inherit terminal tools. Git, tests, and candidate
+    # commits are performed by the deterministic Runner after file edits.
+    "BUILDER": "flow-runner-builder",
     "REVIEWER": "flow-reviewer",
     "QA": "flow-qa",
     "ARCHITECT": "flow-architect",
@@ -934,6 +953,18 @@ class AntigravityAdapter(BaseHostAdapter):
 
         exit_code = process.returncode
         output_text, events, error_msg, detected_conv_id, detected_inv_id, detected_usage = self._parse_antigravity_output(stdout_data, stderr_data)
+        denied_actions = _extract_denied_actions(events)
+        denied_command = None
+        for event in reversed(events):
+            update = event.get("step_update") if isinstance(event, Mapping) else None
+            info = update.get("tool_info") if isinstance(update, Mapping) else None
+            params = info.get("parameters") if isinstance(info, Mapping) else None
+            if isinstance(params, Mapping) and params.get("CommandLine"):
+                denied_command = str(params["CommandLine"])
+                break
+
+        if denied_actions and not error_msg:
+            error_msg = "Antigravity CLI reported denied_actions despite a successful process exit."
 
         # Fail-Closed on missing canonical identity
         if exit_code == 0 and not error_msg:
@@ -977,16 +1008,16 @@ class AntigravityAdapter(BaseHostAdapter):
             self._session_history[handle.session_id] = session_data
             self._running_sessions.pop(handle.session_id, None)
 
-        if _is_host_permission_denial(
-            error_msg, final_output, stderr_data
-        ):
+        if denied_actions or _is_host_permission_denial(error_msg, final_output, stderr_data):
             raise AgentPermissionRequiredError(
                 "Antigravity host denied the requested operation and requires explicit user approval. "
                 "Inspect the persisted permission diagnostics; do not change global permissions automatically.",
                 diagnostics={
                     "host_session_id": detected_conv_id,
                     "host_invocation_id": detected_inv_id,
-                    "exit_code": exit_code,
+                    "host_exit_code": exit_code,
+                    "denied_actions": denied_actions,
+                    "denied_command": denied_command,
                     "host_message": (error_msg or final_output or stderr_data)[:4000],
                     "tool_events": [event for event in events if isinstance(event, Mapping)][-12:],
                 },

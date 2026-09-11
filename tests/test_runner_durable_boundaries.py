@@ -102,6 +102,8 @@ def test_permission_diagnostics_survive_and_do_not_consume_repair_budget(tmp_pat
     checkpoint = make_checkpoint(total_attempts=17)
     error = AgentPermissionRequiredError('Permission denied', diagnostics={
         'host_session_id': 'conv-real', 'host_invocation_id': 'conv-real:step_2',
+        'host_exit_code': 0,
+        'denied_actions': [{'action': 'escalate_admin', 'display_name': 'Bash'}],
         'tool_events': [{'tool_name': 'run_command', 'command': 'git status'}],
         'host_message': 'password=private --dangerously-skip-permissions',
     })
@@ -109,6 +111,8 @@ def test_permission_diagnostics_survive_and_do_not_consume_repair_budget(tmp_pat
     store.save_checkpoint(paused)
     restored = store.load_checkpoint('T0770')
     assert restored.total_attempts == 16 and restored.approval_attempts == 1
+    assert restored.approval_diagnostics['host_exit_code'] == 0
+    assert restored.approval_diagnostics['denied_actions'][0]['action'] == 'escalate_admin'
     assert 'git status' in restored.approval_diagnostics['tool_events']
     assert 'private' not in restored.approval_diagnostics['host_message']
     assert '--dangerously-skip-permissions' not in restored.approval_diagnostics['host_message']
