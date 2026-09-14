@@ -998,6 +998,8 @@ class AntigravityAdapter(BaseHostAdapter):
         final_output = output_text if output_text else (stderr_data or "No output returned")
 
         meta_event = {
+            "output_empty": not bool(output_text.strip()),
+            "event_count": len(events),
             "conversation_id": detected_conv_id if status == AgentStatus.SUCCESS else None,
             "invocation_id": final_invocation_id,
             "usage": detected_usage,

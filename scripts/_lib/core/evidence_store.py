@@ -59,6 +59,24 @@ class EvidenceStore:
         if 'invocation_token' in v_lower:
             raise EvidenceSecurityError("invocation_token must be rejected")
 
+        # Preserve diagnostic lines around sensitive material. Consume an
+        # unterminated PEM block to EOF, rather than exposing its following lines.
+        text = re.sub(
+            r'-----BEGIN [^\r\n-]*PRIVATE KEY-----.*?(?:-----END [^\r\n-]*PRIVATE KEY-----|\Z)',
+            '***MASKED***', text, flags=re.DOTALL | re.IGNORECASE,
+        )
+        # JSON-style credentials can put the value on the next line. Mask the
+        # entire quoted assignment before splitting the diagnostic into lines.
+        text = re.sub(
+            r'''["'](?:password|secret|authorization|cookie|api[_-]key|\w*token|\w*credentials)["']\s*:\s*(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')''',
+            '***MASKED***', text, flags=re.DOTALL | re.IGNORECASE,
+        )
+        if '\n' in text or '\r' in text:
+            return ''.join(
+                self._mask_text(line.rstrip('\r\n')) + line[len(line.rstrip('\r\n')):]
+                for line in text.splitlines(keepends=True)
+            )
+
         # Match keys in strings (e.g. from command outputs)
         patterns = ['authorization:', 'bearer ', 'cookie:', 'api_key', 'api-key', 'secret=', 'password=', 'private key',
                     'access_token', 'refresh_token', 'id_token', 'session_token', 'github_token', 'ci_job_token',

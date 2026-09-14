@@ -187,6 +187,16 @@ def _extract_embedded_json_object(raw_output: str, required_fields: Sequence[str
     return candidates[0] if len(candidates) == 1 else None
 
 
+def _is_repairable_test_failure(command: str, exit_code: int, output: str) -> bool:
+    if exit_code in (0, 124):
+        return False
+    if re.search(r"(?i)ModuleNotFoundError|command not found|is not recognized as|No module named|ImportError while loading", output):
+        return False
+    if command.startswith("git diff --check "):
+        return bool(re.search(r"trailing whitespace|space before tab|new blank line at EOF|leftover conflict marker", output, re.I))
+    return bool(re.search(r"(?im)(?:^FAILED\s+\S+|\b[1-9]\d* failed\b|^not ok\s+\d+|^# fail [1-9])", output))
+
+
 def _build_qa_subprocess_env() -> Dict[str, str]:
     """Create a deterministic test environment without inherited host credentials."""
     clean_env = {
@@ -1876,10 +1886,58 @@ class ProductionRunner:
 
                 if defects_history:
                     last_defect = defects_history[-1]
+                    if last_defect.get("role") == "QA" and not last_defect.get("test_diagnostics"):
+                        # Legacy checkpoints retained only exit codes. Reproduce
+                        # the approved commands before asking a file-only Builder
+                        # to repair an otherwise unobservable failure.
+                        recovered_diagnostics = []
+                        uncertain_failure = False
+                        diagnostic_deadline = time.monotonic() + float(spec.qa_timeout_seconds)
+                        if self._get_git_commit(worktree_dir) != candidate_commit or subprocess.check_output(
+                            ["git", "status", "--porcelain=v1"], cwd=worktree_dir, text=True
+                        ).strip():
+                            raise ProductionRunnerError("Legacy diagnostics require a clean, unchanged candidate")
+                        for command in spec.test_commands or (spec.test_command or "python -m pytest -q",):
+                            valid, error, argv = _validate_qa_test_command(command, worktree_dir)
+                            if not valid:
+                                raise ProductionRunnerError(f"Cannot recover QA diagnostics: {error}")
+                            self._emit_progress(task_id=task_id, state=RunnerState.BUILDING.value,
+                                                role="RUNNER", event="repair_diagnostics_started",
+                                                message=f"Recovering legacy test diagnostics: {command}")
+                            proc = subprocess.run(argv, cwd=worktree_dir, env=_build_qa_subprocess_env(),
+                                                  capture_output=True, text=True, encoding="utf-8",
+                                                  errors="replace", timeout=max(0.001, diagnostic_deadline - time.monotonic()))
+                            output = self.evidence_store._mask_text((proc.stdout or "") + "\n" + (proc.stderr or ""))
+                            uncertain_failure |= proc.returncode != 0 and not _is_repairable_test_failure(
+                                command, proc.returncode, (proc.stdout or "") + "\n" + (proc.stderr or "")
+                            )
+                            recovered_diagnostics.append({"command": command, "exit_code": proc.returncode,
+                                                          "output_excerpt": output[-12000:],
+                                                          "output_truncated": len(output) > 12000})
+                        last_defect = {**last_defect, "test_diagnostics": recovered_diagnostics}
+                        defects_history[-1] = last_defect
+                        checkpoint = replace(checkpoint, defects_history=tuple(defects_history))
+                        self.checkpoint_store.save_checkpoint(checkpoint)
+                        if self._get_git_commit(worktree_dir) != candidate_commit or subprocess.check_output(
+                            ["git", "status", "--porcelain=v1"], cwd=worktree_dir, text=True
+                        ).strip():
+                            raise ProductionRunnerError("Candidate changed during legacy diagnostic commands")
+                        if uncertain_failure:
+                            # Do not mark this incomplete diagnosis as ready for
+                            # reuse on a subsequent resume.
+                            last_defect = {**last_defect, "test_diagnostics": [],
+                                           "unclassified_test_diagnostics": recovered_diagnostics}
+                            defects_history[-1] = last_defect
+                            self.checkpoint_store.save_checkpoint(replace(checkpoint, defects_history=tuple(defects_history)))
+                            raise ProductionRunnerError("Legacy test failure needs environment diagnosis; see persisted unclassified_test_diagnostics")
                     builder_prompt = (
                         f"Task {task_id}: Previous attempt was rejected by {last_defect.get('role', 'REVIEWER')}.\n"
                         f"Defects: {json.dumps(last_defect.get('defects', []), ensure_ascii=False)}\n"
                         f"Summary: {last_defect.get('summary', '')}\n"
+                        f"Requirements:\n{spec.requirement_text}\n"
+                        f"Acceptance Criteria:\n{spec.acceptance_criteria}\n"
+                        f"Baseline: {spec.baseline_commit}\nCandidate: {candidate_commit}\n"
+                        f"Runner test diagnostics: {json.dumps(last_defect.get('test_diagnostics', []), ensure_ascii=False)}\n"
                         f"Please fix the defects in {worktree_dir} using file read/write tools only."
                     )
                 else:
@@ -2087,7 +2145,13 @@ class ProductionRunner:
                         candidate_generation=candidate_generation,
                         evidence_ids=tuple(evidence_ids),
                         message=f"Failed to finalize candidate commit from Builder worktree: {self._sanitize_diagnostic(e)}",
-                        diagnostics={"builder_output": self._sanitize_diagnostic(builder_result.output)},
+                        diagnostics={
+                            "builder_output": self._sanitize_diagnostic(builder_result.output),
+                            "host_invocation_id": inv_builder,
+                            "host_event_count": len(builder_result.partial_results),
+                            "failure_kind": "BUILDER_NO_CANDIDATE",
+                            "note": "Host completion is not proof of file edits; inspect the bound host session. Empty text alone does not establish the cause.",
+                        },
                     )
 
                 if not re.match(r"^[0-9a-f]{40}$", candidate_commit):
@@ -2193,7 +2257,7 @@ class ProductionRunner:
                     builder_invocation_id=inv_builder,
                     evidence_ids=tuple(evidence_ids),
                     approval_reason=None,
-                    approval_diagnostics={},
+                    approval_diagnostics=checkpoint.approval_diagnostics,
                     last_error=None,
                     updated_at=time.time(),
                 )
@@ -2963,7 +3027,8 @@ class ProductionRunner:
                     qa_command_evidence.append({
                         "command": command,
                         "exit_code": exit_code,
-                        "output_excerpt": masked_output[-4000:],
+                        "output_excerpt": masked_output[-12000:],
+                        "output_truncated": len(masked_output) > 12000,
                     })
                     self._emit_progress(
                         task_id=task_id,
@@ -2973,7 +3038,24 @@ class ProductionRunner:
                         message=f"Controlled QA command exited {exit_code}: {command}",
                         candidate_commit=candidate_commit,
                     )
+                    # A nonzero child exit is not itself proof of a code defect.
+                    # Only a recognizable failed-test summary can trigger repair;
+                    # missing dependencies, timeout and unknown failures pause QA.
+                    if exit_code != 0 and not any(
+                        item.get("command") == command for item in infrastructure_failures
+                    ):
+                        if not _is_repairable_test_failure(command, exit_code, output_material):
+                            infrastructure_failures.append({
+                                "command": command,
+                                "error_type": "EXECUTION_FAILURE_UNCLASSIFIED",
+                                "message": masked_output[-12000:],
+                            })
                 if infrastructure_failures:
+                    clean, boundary_error = self._verify_qa_immutability(worktree_dir, candidate_commit)
+                    if not clean:
+                        return RunnerResult(False, RunnerState.FAILED.value, task_id,
+                                            candidate_commit=candidate_commit,
+                                            message=f"QA violated code immutability boundary: {boundary_error}")
                     infra_summary = "; ".join(
                         f"{item['command']}: {item['error_type']}: {item['message']}"
                         for item in infrastructure_failures
@@ -3026,6 +3108,8 @@ class ProductionRunner:
                 f"Reviewer PASS summary: {review_output.summary if 'review_output' in locals() else 'validated reviewer evidence'}\n\n"
                 f"Immutable candidate diff:\n{qa_diff_bundle}\n\n"
                 "Perform a semantic QA assessment from the immutable candidate context and the Runner-produced "
+                "test evidence. Distinguish static inspection of a test from observed execution: never claim a "
+                "named test passed unless Runner output proves it ran successfully. Missing evidence is not PASS. "
                 "test evidence below. You may use read/search tools solely for a Runner-designated complete diff "
                 "artifact or candidate files when the inline bundle says so. Do not invoke commands, browsers, "
                 "write tools, subagents, or permission prompts. Trace changed behavior through every API, background worker, database, "
@@ -3296,6 +3380,7 @@ class ProductionRunner:
                 "qa_report": qa_report,
                 "required_test_commands": list(test_commands),
                 "runner_test_results": command_results,
+                "test_diagnostics": qa_command_evidence,
             }
             qa_extra = _extract_capabilities_extra(qa_caps)
             qa_extra.update(qa_semantic_metadata)
@@ -3441,6 +3526,7 @@ class ProductionRunner:
                     "role": "QA",
                     "defects": qa_defects,
                     "summary": qa_output.summary,
+                    "test_diagnostics": qa_command_evidence,
                 })
                 if qa_exhausted:
                     return RunnerResult(
@@ -3462,7 +3548,7 @@ class ProductionRunner:
             # ==========================================
             confirmation_req_id = f"conf_req_{task_id.lower()}_{uuid.uuid4().hex}"
 
-            checkpoint = RunnerCheckpoint(
+            checkpoint = replace(checkpoint,
                 task_id=task_id,
                 project_id=spec.project_id,
                 state=RunnerState.COMPLETION_PENDING.value,
@@ -3575,7 +3661,8 @@ class ProductionRunner:
                 "active_elapsed_seconds": ckpt.active_elapsed_seconds,
                 "run_id": ckpt.run_id,
                 "approval_attempts": ckpt.approval_attempts,
-                "approval_diagnostics": dict(ckpt.approval_diagnostics),
+                "approval_diagnostics": dict(ckpt.approval_diagnostics) if ckpt.state == RunnerState.APPROVAL_REQUIRED.value else {},
+                "historical_approval_diagnostics": dict(ckpt.approval_diagnostics) if ckpt.state != RunnerState.APPROVAL_REQUIRED.value else {},
                 "total_attempts": ckpt.total_attempts,
                 "evidence_scope": "Historical evidence; not proof that the current repair passed.",
             }

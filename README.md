@@ -157,6 +157,8 @@ Antigravity 的 Production Runner 使用 `flow-runner-builder`、`flow-runner-re
 
 Runner 成功只停在【已完成】/`PENDING_USER_ACCEPTANCE`，不会替用户验收、合并、Push 或创建 Tag。
 
+QA 失败诊断：Runner 对输出逐行脱敏，并整体遮蔽多行私钥，保留安全错误上下文；Evidence 的 `test_diagnostics` 保存每条命令最后 12000 字符及截断标记。返工 Builder 同时收到原需求、验收标准、候选 SHA 和该诊断。能够识别的失败测试进入修复；依赖缺失、超时、未收集到测试及无法分类的执行错误暂停等待诊断。旧任务缺少日志时，恢复会在固定、干净候选上重跑原配置的受控测试以补齐诊断；这不是重放历史 PASS。空回复不能证明没有编辑，最终必须检查真实 Git 变更；无新候选时保留 Host 调用标识并明确停止。`status` 将非权限暂停状态下的旧权限信息显示为 `historical_approval_diagnostics`，避免误当作当前阻断。
+
 恢复兼容性与边界：已有 Checkpoint 必须使用 `resume`，普通 `start` 不覆盖历史记录。只有明确重启已取消任务时使用 `start --restart-cancelled`（其余参数同首次启动）；旧记录先归档，新运行拒绝旧运行的迟到写入。恢复跳过 Builder 或 Reviewer 前必须找到绑定同一候选与契约的有效前序 Evidence；看板状态本身不能作为跳阶段依据。旧契约快照只有在需求哈希和验收哈希均完全一致时才自动升级，无法证明只是流程日志差异时会停止并报告，不会用“验收标准相同”覆盖需求变化。
 
 权限暂停会保存脱敏、限长的 `approval_diagnostics`（宿主返回的会话、调用、工具事件），单独累计 `approval_attempts`，不消耗本次被拒绝调用的修复/审查/QA 重试预算；不回写修正旧版历史计数。宿主未提供具体授权目标时仍须用户处理，不能据此猜测或添加通配授权。历史 Evidence 不代表当前整改通过。

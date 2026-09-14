@@ -401,10 +401,15 @@ def test_production_runner_full_pass_pipeline(mock_git_repo, tmp_path, monkeypat
 
     result = runner.start(spec)
 
-    assert result.success is True
+    assert result.success is True, result.message
     assert result.state == RunnerState.PENDING_USER_ACCEPTANCE.value
     assert result.candidate_commit is not None
     assert len(result.evidence_ids) >= 3
+    qa_evidence = evidence_store.read(next(item for item in reversed(result.evidence_ids) if item.startswith("evi_qa_")))
+    diagnostics = qa_evidence.metadata.extra["test_diagnostics"]
+    assert diagnostics[0]["exit_code"] == 0
+    assert "passed" in diagnostics[0]["output_excerpt"]
+    assert "test from observed execution" in next(iter(qa_requests.values())).prompt
     stage_roles = [
         event["role"]
         for event in progress_events

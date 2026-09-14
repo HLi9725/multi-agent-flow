@@ -538,6 +538,12 @@ def test_qa_source_immutability_committed_changes_fails_closed(mock_git_repo, tm
     QA 修改源码后执行 git commit，前后 status 虽干净但 HEAD 改变，必须被 Fail-Closed 拦截。
     """
     repo_dir, baseline_sha = mock_git_repo
+    # Reach semantic QA through a real passing suite; no-tests-collected now
+    # correctly pauses before a QA agent can be dispatched.
+    (repo_dir / "test_smoke.py").write_text("def test_smoke(): assert True\n", encoding="utf-8")
+    subprocess.run(["git", "add", "test_smoke.py"], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "test: add QA prerequisite"], cwd=repo_dir, check=True, capture_output=True)
+    baseline_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo_dir, text=True).strip()
     data_root = tmp_path / "data_root"
     data_root.mkdir()
 
@@ -636,7 +642,7 @@ def test_qa_source_immutability_committed_changes_fails_closed(mock_git_repo, tm
 
     result = runner.start(spec)
     assert result.success is False
-    assert result.state == RunnerState.FAILED.value
+    assert result.state == RunnerState.FAILED.value, result.message
     assert "QA modified HEAD or committed code illegally" in result.message
 
 
