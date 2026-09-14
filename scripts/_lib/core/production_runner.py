@@ -725,7 +725,14 @@ class ProductionRunner:
             updated_at=time.time(),
         )
         self.checkpoint_store.save_checkpoint(updated)
-        return result
+        same_candidate = result.candidate_commit in (None, checkpoint.candidate_commit)
+        return replace(
+            result,
+            candidate_commit=result.candidate_commit or checkpoint.candidate_commit,
+            candidate_generation=(result.candidate_generation or checkpoint.candidate_generation)
+                if same_candidate else result.candidate_generation,
+            evidence_ids=result.evidence_ids or checkpoint.evidence_ids,
+        )
 
     def _sanitize_diagnostic(self, value: Any, limit: int = 4000) -> str:
         text = "" if value is None else str(value)
@@ -3349,15 +3356,19 @@ class ProductionRunner:
 
             qa_evidence_id = f"evi_qa_{task_id.lower()}_{int(time.time()*1000)}"
             qa_caps = qa_adapter.detect_capabilities()
-            qa_report = qa_output.to_dict()
+            # Hash and compare the exact representation append() persists,
+            # not the raw Host prose that may be redacted during storage.
+            qa_report = self.evidence_store.prepare_metadata(qa_output.to_dict())
+            stored_test_commands = self.evidence_store.prepare_metadata(list(test_commands))
+            stored_command_results = self.evidence_store.prepare_metadata(command_results)
             qa_report_hash = hashlib.sha256(
                 json.dumps(qa_report, ensure_ascii=False, sort_keys=True).encode("utf-8")
             ).hexdigest()
             test_command_hash = hashlib.sha256(
-                json.dumps(list(test_commands), ensure_ascii=False, sort_keys=True).encode("utf-8")
+                json.dumps(stored_test_commands, ensure_ascii=False, sort_keys=True).encode("utf-8")
             ).hexdigest()
             test_output_hash = hashlib.sha256(
-                json.dumps(command_results, ensure_ascii=False, sort_keys=True).encode("utf-8")
+                json.dumps(stored_command_results, ensure_ascii=False, sort_keys=True).encode("utf-8")
             ).hexdigest()
             covered_criterion_ids = tuple(
                 item["criterion_id"] for item in qa_output.acceptance_coverage if item.get("status") == "PASS"
@@ -3378,10 +3389,11 @@ class ProductionRunner:
                 "test_output_hash": test_output_hash,
                 "test_exit_codes": test_exit_codes,
                 "qa_report": qa_report,
-                "required_test_commands": list(test_commands),
-                "runner_test_results": command_results,
+                "required_test_commands": stored_test_commands,
+                "runner_test_results": stored_command_results,
                 "test_diagnostics": qa_command_evidence,
             }
+            qa_semantic_metadata = self.evidence_store.prepare_metadata(qa_semantic_metadata)
             qa_extra = _extract_capabilities_extra(qa_caps)
             qa_extra.update(qa_semantic_metadata)
             qa_meta = EvidenceMetadata(
@@ -3437,6 +3449,9 @@ class ProductionRunner:
                     task_id=task_id,
                     candidate_commit=candidate_commit,
                     message=f"QA EvidenceGate validation failed: {gate_error}",
+                    candidate_generation=candidate_generation,
+                    evidence_ids=tuple(evidence_ids),
+                    diagnostics={"rejected_evidence_id": qa_evidence_id, "failure_kind": "QA_EVIDENCE_VALIDATION"},
                 )
             evidence_ids.append(qa_evidence_id)
 

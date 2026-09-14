@@ -110,6 +110,15 @@ class EvidenceStore:
             return self._mask_text(data)
         return data
 
+    def prepare_metadata(self, data: Any) -> Any:
+        """Return the exact JSON-compatible, redacted metadata used on disk.
+
+        Producers must use this before computing hashes or expected metadata.
+        The gate still compares persisted values exactly; it never masks away
+        differences during validation.
+        """
+        return self._mask_secrets(_to_dict(data))
+
     def append(self, record: EvidenceRecord) -> str:
         path = self._safe_path(record.evidence_id)
 
@@ -117,7 +126,7 @@ class EvidenceStore:
         data.pop("content_hash", None)
 
         if "metadata" in data and "extra" in data["metadata"]:
-            data["metadata"]["extra"] = self._mask_secrets(data["metadata"]["extra"])
+            data["metadata"]["extra"] = self.prepare_metadata(data["metadata"]["extra"])
 
         raw_bytes = canonical_json(data)
         content_hash = hashlib.sha256(raw_bytes).hexdigest()

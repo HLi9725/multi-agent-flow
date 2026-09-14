@@ -825,6 +825,9 @@ def test_runner_failure_result_cannot_leave_building_checkpoint(tmp_path):
         project_id="checkpoint_guard",
         state=RunnerState.BUILDING.value,
         current_role="BUILDER",
+        candidate_commit="a" * 40,
+        candidate_generation=12,
+        evidence_ids=("evi_builder_preserved",),
     ))
     runner = ProductionRunner(checkpoint_store=store)
 
@@ -840,3 +843,6 @@ def test_runner_failure_result_cannot_leave_building_checkpoint(tmp_path):
     assert persisted is not None
     assert persisted.state == RunnerState.NEEDS_USER_INPUT.value
     assert persisted.last_error == "Host stopped before returning a valid result."
+    assert result.candidate_commit == "a" * 40
+    assert result.candidate_generation == 12
+    assert result.evidence_ids == ("evi_builder_preserved",)

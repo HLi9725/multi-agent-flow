@@ -299,7 +299,7 @@ def test_production_runner_full_pass_pipeline(mock_git_repo, tmp_path, monkeypat
                 "acceptance_coverage": [{
                     "criterion_id": "AC-01",
                     "status": "PASS",
-                    "evidence": "test_app.py::test_app",
+                    "evidence": "test_app.py::test_access_token verified persistence",
                 }],
                 "test_commands": [
                     {"command": command, "exit_code": 0, "summary": "passed"}
@@ -308,7 +308,7 @@ def test_production_runner_full_pass_pipeline(mock_git_repo, tmp_path, monkeypat
                 "negative_scenarios": [{
                     "name": "unexpected false result",
                     "status": "PASS",
-                    "evidence": "test_app.py::test_app",
+                    "evidence": "test_app.py::test_refresh_token concurrent single winner",
                 }],
                 "uncovered_risks": [],
                 "defects": [],
@@ -434,6 +434,8 @@ def test_production_runner_full_pass_pipeline(mock_git_repo, tmp_path, monkeypat
     diagnostics = qa_evidence.metadata.extra["test_diagnostics"]
     assert diagnostics[0]["exit_code"] == 0
     assert "passed" in diagnostics[0]["output_excerpt"]
+    assert qa_evidence.metadata.extra["qa_report"]["acceptance_coverage"][0]["evidence"] == "***MASKED***"
+    assert qa_evidence.metadata.extra["qa_report"]["negative_scenarios"][0]["evidence"] == "***MASKED***"
     assert "test from observed execution" in next(iter(qa_requests.values())).prompt
     stage_roles = [
         event["role"]

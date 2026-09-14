@@ -27,6 +27,20 @@ def store(tmp_path):
 def caps():
     return HostCapabilities(is_real_host=True)
 
+
+def test_prepared_metadata_is_idempotent_and_gate_does_not_echo_secrets(store, tmp_path):
+    raw = {"decision": "PASS", "evidence": "test_access_token proved single winner", "summary": "safe"}
+    prepared = store.prepare_metadata(raw)
+    assert prepared["evidence"] == "***MASKED***"
+    assert prepared["decision"] == "PASS"
+    assert store.prepare_metadata(prepared) == prepared
+    assert raw["evidence"] != prepared["evidence"]
+    gate = EvidenceGate(store, str(tmp_path))
+    with pytest.raises(EvidenceGateError) as error:
+        gate._check_match("metadata_qa_report", prepared, {**raw, "summary": "sensitive-example-value"})
+    assert "metadata_qa_report" in str(error.value)
+    assert "sensitive-example-value" not in str(error.value)
+
 @pytest.fixture
 def dummy_metadata(caps):
     extra = {"safe": "value"}

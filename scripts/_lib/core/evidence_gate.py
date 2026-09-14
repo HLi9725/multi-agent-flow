@@ -57,7 +57,9 @@ class EvidenceGate:
         if actual is None or expected is None:
             raise EvidenceGateError(f"Evidence rejected: {field_name} is missing in context or evidence (None is not allowed).")
         if _plain_evidence_value(actual) != _plain_evidence_value(expected):
-            raise EvidenceGateError(f"Evidence rejected: Context mismatch for {field_name}. Expected {expected}, got {actual}")
+            # Expected values may contain pre-redaction secrets. Do not echo
+            # either payload into CLI output, checkpoints or host prompts.
+            raise EvidenceGateError(f"Evidence rejected: Context mismatch for {field_name}.")
 
     def validate_evidence(self, evidence_id: str, ctx: EvidenceValidationContext) -> bool:
         record = self.store.read(evidence_id)
