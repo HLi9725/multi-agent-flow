@@ -1817,9 +1817,8 @@ class ProductionRunner:
             current_board_status = "进行中"
 
         while True:
-            total_attempts += 1
-            if total_attempts > spec.max_total_attempts:
-                pause_message = f"Task exceeded max total attempts ({spec.max_total_attempts}). Paused at NEEDS_USER_INPUT."
+            if total_attempts >= spec.max_total_attempts:
+                pause_message = f"Task exhausted max total attempts ({spec.max_total_attempts}); used {total_attempts}. Explicitly increase --max-total-attempts to continue. Paused at NEEDS_USER_INPUT."
                 checkpoint = replace(
                     checkpoint, state=RunnerState.NEEDS_USER_INPUT.value,
                     current_role=start_role, total_attempts=total_attempts,
@@ -1835,9 +1834,10 @@ class ProductionRunner:
                     candidate_generation=candidate_generation,
                     evidence_ids=tuple(evidence_ids),
                     message=pause_message,
-                    diagnostics={"total_attempts": total_attempts, "defects": defects_history},
+                    diagnostics={"total_attempts": total_attempts, "max_total_attempts": spec.max_total_attempts, "remaining_attempts": 0, "defects": defects_history},
                 )
 
+            total_attempts += 1
             active_elapsed = checkpoint.active_elapsed_seconds + (time.time() - start_wall_clock)
             if active_elapsed > spec.total_wall_clock_timeout_seconds:
                 pause_message = f"Task exceeded wall clock timeout ({spec.total_wall_clock_timeout_seconds}s). Paused at NEEDS_USER_INPUT."

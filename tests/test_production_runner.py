@@ -232,7 +232,8 @@ def test_runner_wait_enforces_outer_deadline():
     assert adapter.cancelled is True
 
 
-def test_production_runner_full_pass_pipeline(mock_git_repo, tmp_path, monkeypatch):
+@pytest.mark.parametrize("recover_budget", [False, True])
+def test_production_runner_full_pass_pipeline(mock_git_repo, tmp_path, monkeypatch, recover_budget):
     repo_dir, baseline_sha = mock_git_repo
     data_root = tmp_path / "data_root"
     data_root.mkdir()
@@ -372,7 +373,7 @@ def test_production_runner_full_pass_pipeline(mock_git_repo, tmp_path, monkeypat
 
     evidence_store = EvidenceStore(root_dir=str(data_root / "evidence"))
     evidence_gate = EvidenceGate(store=evidence_store, project_root=str(repo_dir))
-    checkpoint_store = RunnerCheckpointStore(data_root=str(data_root), project_root=str(repo_dir), project_id="test_proj")
+    checkpoint_store = RunnerCheckpointStore(data_root=str(data_root), project_root=str(repo_dir), project_id="repo")
     progress_events = []
 
     runner = ProductionRunner(
@@ -384,7 +385,7 @@ def test_production_runner_full_pass_pipeline(mock_git_repo, tmp_path, monkeypat
     )
 
     spec = TaskExecutionSpec(
-        project_id="test_proj",
+        project_id="repo",
         project_root=str(repo_dir),
         authority_root=str(repo_dir),
         task_id="T0088",
@@ -397,9 +398,33 @@ def test_production_runner_full_pass_pipeline(mock_git_repo, tmp_path, monkeypat
         baseline_commit=baseline_sha,
         workspace_mode="inherit",
         test_command="python -m pytest -q",
+        max_total_attempts=0 if recover_budget else 6,
     )
 
     result = runner.start(spec)
+
+    if recover_budget:
+        assert result.state == RunnerState.NEEDS_USER_INPUT.value
+        assert result.diagnostics["total_attempts"] == 0
+        assert not session_workspaces
+        for _ in range(2):
+            result = runner.resume(str(repo_dir), "T0088", authority_root=str(repo_dir))
+            assert result.state == RunnerState.NEEDS_USER_INPUT.value, result.message
+            assert checkpoint_store.load_checkpoint("T0088").total_attempts == 0
+            assert not session_workspaces
+        from dataclasses import replace
+        checkpoint = checkpoint_store.load_checkpoint("T0088")
+        checkpoint_store.save_checkpoint(replace(checkpoint, total_attempts=21,
+            execution_options={**checkpoint.execution_options, "max_total_attempts": 20}))
+        for _ in range(2):
+            result = runner.resume(str(repo_dir), "T0088", authority_root=str(repo_dir))
+            assert result.state == RunnerState.NEEDS_USER_INPUT.value, result.message
+            assert checkpoint_store.load_checkpoint("T0088").total_attempts == 21
+            assert not session_workspaces
+        result = runner.resume(str(repo_dir), "T0088", authority_root=str(repo_dir), overrides={"max_total_attempts": 25})
+        assert result.success, result.message
+        assert checkpoint_store.load_checkpoint("T0088").execution_options["max_total_attempts"] == 25
+        assert checkpoint_store.load_checkpoint("T0088").total_attempts == 22
 
     assert result.success is True, result.message
     assert result.state == RunnerState.PENDING_USER_ACCEPTANCE.value

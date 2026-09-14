@@ -143,6 +143,8 @@ python scripts/run_task.py start --task-id T0003 --approve `
 
 `status` 是纯只读查询；`resume` 用于审批、退回修复或故障消除后的断点恢复。旧版已经手工把看板退回、但 Checkpoint 仍为 `PENDING_USER_ACCEPTANCE` 时，使用 `resume --reason "<完整验收缺陷>"` 对账并把缺陷注入 Builder。用户验收必须使用 Runner 返回的不可预测 `confirmation_request_id`：`run_task.py accept --task-id <id> --confirmation-request-id <id>` 或 `run_task.py reject --task-id <id> --confirmation-request-id <id> --reason "<缺陷>"`。`reject` 退回原任务，下次 `resume` 回到 Builder，不新建卡片。Checkpoint 会保存 Adapter、测试命令、超时与循环预算，新候选提交会重置该候选的 Reviewer/QA 轮次。
 
+总尝试预算耗尽后，重复 `resume` 不增加历史次数，也不会派发角色。用户可明确授权 `resume --max-total-attempts 25`：25 是累计上限，不是额外次数；例如已用 21 次则剩 4 次。此正整数参数也适用于 `start`；恢复时省略则继承已有预算。它不清零历史计数，不改变 Reviewer/QA 单独预算、累计耗时上限或质量门禁，不应无限提高预算掩盖持续失败。
+
 Checkpoint 还冻结初始需求哈希、验收标准哈希、项目/Authority Root 和 Git 基线；恢复与验收会拒绝契约漂移。修复轮次必须在上一候选之上产生新 Commit（仅有工作区修改时由 Runner 受控固化）；没有新产物会停在 `NEEDS_USER_INPUT`，但保留旧候选、Evidence、会话标识和脱敏诊断。完成、验收、退回、取消均采用写前状态与重启对账，后到的 Host 输出不能覆盖已经持久化的取消。
 
 在 Windows 上，Runner 会将裸 `npm`/`npx` 确定性解析为 PATH 中工作区外的真实 `.cmd/.exe`，并把 `python`/`pytest` 固定到启动 Runner 的可信解释器。测试子进程不会继承 Token、密码、认证头或代理凭据；找不到工具时返回 `NEEDS_USER_INPUT`，不会伪装成代码测试失败或触发无效 Builder 修复。

@@ -40,8 +40,17 @@ def _runner_for(project_root, authority_root, project_id=None):
     return ProductionRunner(checkpoint_store=store, progress_callback=_emit_progress)
 
 
+def _positive_int(value):
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
 def _overrides_from_args(args):
     overrides = {}
+    if getattr(args, "max_total_attempts", None) is not None:
+        overrides["max_total_attempts"] = args.max_total_attempts
     if getattr(args, "builder_adapter", None):
         overrides["builder_adapter_id"] = args.builder_adapter
     if getattr(args, "reviewer_adapter", None):
@@ -159,6 +168,7 @@ def main():
     p_start.add_argument("--reviewer-adapter", default="antigravity", help="Reviewer adapter ID")
     p_start.add_argument("--qa-adapter", default="codex_cli", help="QA adapter ID")
     p_start.add_argument("--max-review-cycles", type=int, default=3, help="Max review rejection loop cycles")
+    p_start.add_argument("--max-total-attempts", type=_positive_int, default=None, help="Total cumulative attempt limit (not additional attempts)")
     p_start.add_argument("--max-qa-cycles", type=int, default=3, help="Max QA failure loop cycles")
     p_start.add_argument("--timeout-seconds", type=int, default=300, help="Timeout per host dispatch")
     p_start.add_argument(
@@ -199,6 +209,7 @@ def main():
     p_resume.add_argument("--reviewer-adapter", default=None, help="Override persisted Reviewer adapter ID")
     p_resume.add_argument("--qa-adapter", default=None, help="Override persisted QA adapter ID")
     p_resume.add_argument("--max-review-cycles", type=int, default=None, help="Override persisted review cycle limit")
+    p_resume.add_argument("--max-total-attempts", type=_positive_int, default=None, help="Explicitly override cumulative attempt limit; preserves historical counts")
     p_resume.add_argument("--max-qa-cycles", type=int, default=None, help="Override persisted QA cycle limit")
     p_resume.add_argument("--timeout-seconds", type=int, default=None, help="Override persisted per-host timeout")
     p_resume.add_argument(

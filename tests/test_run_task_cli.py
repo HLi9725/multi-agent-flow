@@ -10,7 +10,7 @@ def test_resume_overrides_are_optional_and_complete():
         builder_adapter="antigravity", reviewer_adapter="antigravity",
         qa_adapter="antigravity", max_review_cycles=4, max_qa_cycles=5,
         timeout_seconds=901, test_commands=["python -m pytest tests -q", "npm run build"],
-        workspace_mode="branch",
+        workspace_mode="branch", max_total_attempts=25,
     )
     assert _overrides_from_args(args) == {
         "builder_adapter_id": "antigravity", "reviewer_adapter_id": "antigravity",
@@ -19,7 +19,27 @@ def test_resume_overrides_are_optional_and_complete():
         "qa_timeout_seconds": 901,
         "test_commands": ("python -m pytest tests -q", "npm run build"),
         "workspace_mode": "branch",
+        "max_total_attempts": 25,
     }
+
+
+def test_attempt_budget_cli_parsing(monkeypatch):
+    import pytest
+    from scripts import run_task
+    for command in ("start", "resume"):
+        seen = []
+        monkeypatch.setattr(run_task, "cmd_" + command, lambda args: seen.append(_overrides_from_args(args)) or 0)
+        for values, expected in (([], None), (["--max-total-attempts", "25"], 25)):
+            monkeypatch.setattr("sys.argv", ["run_task.py", command, "--task-id", "T1", *values])
+            with pytest.raises(SystemExit) as result:
+                run_task.main()
+            assert result.value.code == 0
+            assert seen[-1].get("max_total_attempts") == expected
+        for invalid in ("0", "-1", "1.5", "bad"):
+            monkeypatch.setattr("sys.argv", ["run_task.py", command, "--task-id", "T1", "--max-total-attempts", invalid])
+            with pytest.raises(SystemExit) as result:
+                run_task.main()
+            assert result.value.code == 2
 
 
 def test_explicit_authority_root_owns_checkpoint_store(tmp_path):
