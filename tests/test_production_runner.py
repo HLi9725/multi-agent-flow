@@ -421,9 +421,33 @@ def test_production_runner_full_pass_pipeline(mock_git_repo, tmp_path, monkeypat
             assert result.state == RunnerState.NEEDS_USER_INPUT.value, result.message
             assert checkpoint_store.load_checkpoint("T0088").total_attempts == 21
             assert not session_workspaces
-        result = runner.resume(str(repo_dir), "T0088", authority_root=str(repo_dir), overrides={"max_total_attempts": 25})
+        checkpoint = checkpoint_store.load_checkpoint("T0088")
+        checkpoint_store.save_checkpoint(replace(
+            checkpoint,
+            total_attempts=21,
+            active_elapsed_seconds=2600.0,
+            execution_options={
+                **checkpoint.execution_options,
+                "max_total_attempts": 25,
+                "total_wall_clock_timeout_seconds": 1800,
+            },
+        ))
+        for _ in range(2):
+            result = runner.resume(str(repo_dir), "T0088", authority_root=str(repo_dir))
+            assert result.state == RunnerState.NEEDS_USER_INPUT.value, result.message
+            paused = checkpoint_store.load_checkpoint("T0088")
+            assert paused.total_attempts == 21
+            assert paused.active_elapsed_seconds >= 2600.0
+            assert result.diagnostics["total_wall_clock_timeout_seconds"] == 1800
+            assert result.diagnostics["remaining_wall_clock_seconds"] == 0.0
+            assert not session_workspaces
+        result = runner.resume(
+            str(repo_dir), "T0088", authority_root=str(repo_dir),
+            overrides={"max_total_attempts": 25, "total_wall_clock_timeout_seconds": 4500},
+        )
         assert result.success, result.message
         assert checkpoint_store.load_checkpoint("T0088").execution_options["max_total_attempts"] == 25
+        assert checkpoint_store.load_checkpoint("T0088").execution_options["total_wall_clock_timeout_seconds"] == 4500
         assert checkpoint_store.load_checkpoint("T0088").total_attempts == 22
 
     assert result.success is True, result.message

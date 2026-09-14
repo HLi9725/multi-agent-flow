@@ -1830,6 +1830,7 @@ class ProductionRunner:
                     checkpoint, state=RunnerState.NEEDS_USER_INPUT.value,
                     current_role=start_role, total_attempts=total_attempts,
                     evidence_ids=tuple(evidence_ids), defects_history=tuple(defects_history),
+                    execution_options=_execution_options_from_spec(spec),
                     last_error=pause_message, updated_at=time.time(),
                 )
                 self.checkpoint_store.save_checkpoint(checkpoint)
@@ -1844,15 +1845,15 @@ class ProductionRunner:
                     diagnostics={"total_attempts": total_attempts, "max_total_attempts": spec.max_total_attempts, "remaining_attempts": 0, "defects": defects_history},
                 )
 
-            total_attempts += 1
             active_elapsed = checkpoint.active_elapsed_seconds + (time.time() - start_wall_clock)
-            if active_elapsed > spec.total_wall_clock_timeout_seconds:
+            if active_elapsed >= spec.total_wall_clock_timeout_seconds:
                 pause_message = f"Task exceeded wall clock timeout ({spec.total_wall_clock_timeout_seconds}s). Paused at NEEDS_USER_INPUT."
                 checkpoint = replace(
                     checkpoint, state=RunnerState.NEEDS_USER_INPUT.value,
                     current_role=start_role, total_attempts=total_attempts,
                     evidence_ids=tuple(evidence_ids), defects_history=tuple(defects_history),
                     active_elapsed_seconds=active_elapsed,
+                    execution_options=_execution_options_from_spec(spec),
                     last_error=pause_message, updated_at=time.time(),
                 )
                 self.checkpoint_store.save_checkpoint(checkpoint)
@@ -1864,8 +1865,19 @@ class ProductionRunner:
                     candidate_generation=candidate_generation,
                     evidence_ids=tuple(evidence_ids),
                     message=pause_message,
-                    diagnostics={"elapsed": active_elapsed},
+                    diagnostics={
+                        "elapsed": active_elapsed,
+                        "active_elapsed_seconds": active_elapsed,
+                        "total_wall_clock_timeout_seconds": spec.total_wall_clock_timeout_seconds,
+                        "remaining_wall_clock_seconds": max(
+                            0.0, spec.total_wall_clock_timeout_seconds - active_elapsed
+                        ),
+                        "total_attempts": total_attempts,
+                        "max_total_attempts": spec.max_total_attempts,
+                    },
                 )
+
+            total_attempts += 1
 
             # ==========================================
             # STAGE 1: CODEX BUILDER
