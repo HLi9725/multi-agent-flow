@@ -19,6 +19,7 @@ if SCRIPTS not in sys.path:
 from scripts._lib.boards.offline_board_adapter import OfflineBoardAdapter
 from scripts._lib.core.runner_schema import TaskExecutionSpec
 from scripts._lib.core.task_spec_loader import (
+    _compose_requirement_text,
     load_task_execution_spec,
     verify_optimistic_concurrency,
     TaskSpecError,
@@ -26,6 +27,27 @@ from scripts._lib.core.task_spec_loader import (
     TaskSpecInvalidStatusError,
     TaskSpecIncompleteError,
 )
+
+
+def test_contract_preserves_constraints_after_acceptance_section():
+    process = (
+        "需求: 实现原子核销。\n验收标准:\n- 并发只能一个成功\n\n"
+        "补充约束:\n- 必须使用独立数据库连接\n"
+        "[T0001-N01] [2026-01-01] 状态由【待开始】更新至【进行中】"
+    )
+    contract = _compose_requirement_text("原子核销", "", "", process)
+    assert "必须使用独立数据库连接" in contract
+    assert "T0001-N01" not in contract
+
+
+def test_conflicting_explicit_contract_fields_fail_closed():
+    with pytest.raises(TaskSpecIncompleteError, match="Conflicting requirement contracts"):
+        _compose_requirement_text(
+            "冲突任务",
+            "需求: A\n验收标准: 返回 A",
+            "",
+            "需求: B\n验收标准: 返回 B",
+        )
 
 
 @pytest.fixture

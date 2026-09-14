@@ -26,10 +26,14 @@ def _emit_progress(event):
 
 
 def _runner_for(project_root, authority_root, project_id=None):
-    authority = os.path.realpath(authority_root or project_root)
+    authority = (
+        os.path.realpath(authority_root)
+        if authority_root
+        else os.path.realpath(paths.resolve_data_root(cwd=project_root))
+    )
     identity = project_id or os.path.basename(os.path.realpath(project_root))
     store = RunnerCheckpointStore(
-        data_root=paths.resolve_data_root(cwd=authority),
+        data_root=authority,
         project_root=os.path.realpath(project_root),
         project_id=identity,
     )

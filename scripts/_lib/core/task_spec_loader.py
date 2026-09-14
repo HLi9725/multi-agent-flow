@@ -155,58 +155,33 @@ def _compose_requirement_text(
     remarks: str,
     process: str,
 ) -> str:
-    """Prefer stable requirement fields; use process only for legacy boards.
+    """Build a contract without discarding post-acceptance constraints.
 
-    ``process`` is normally an append-only transition log.  Including it when
-    description/remarks already contain the requirement would change the
-    immutable task hash after every workflow transition and can also hide the
-    actual requirement behind operational history.
+    Structured process nodes are workflow history and are the only content we
+    remove deterministically.  We never cut at the first blank line after the
+    acceptance section because legitimate requirements commonly continue in a
+    later section.
     """
     description = description.strip()
     remarks = remarks.strip()
     acceptance_marker = re.compile(r"(?:【\s*验收标准\s*】\s*[:：]?|验收标准\s*[:：])")
 
-    def immutable_contract_prefix(source: str) -> str:
-        """Return the requirement/criteria prefix, excluding appended workflow notes.
+    def strip_recognized_workflow_suffix(source: str) -> str:
+        """Remove only known Runner audit paragraphs from legacy remarks."""
+        audit = re.compile(
+            r"^(?:\[T\d+-N\d+\]|Production Runner\b|Codex Builder\b|"
+            r"Antigravity Reviewer\b|Reviewer (?:PASS|REJECT)\b|QA (?:PASS|FAIL)\b|"
+            r"候选提交\s+[0-9a-fA-F]{6,40}\s+已生成)",
+            re.IGNORECASE,
+        )
+        kept = []
+        for paragraph in re.split(r"\n\s*\n", source.strip()):
+            if audit.match(paragraph.strip()):
+                break
+            kept.append(paragraph)
+        return "\n\n".join(kept).strip()
 
-        Board adapters append transition comments to ``remarks`` separated by a
-        blank line.  Those comments are operational history, not a contract
-        mutation.  Preserve the source text byte-for-byte up to the end of the
-        acceptance section so existing checkpoint hashes remain compatible.
-        """
-        source = source.strip()
-        if not source:
-            return ""
-        lines = source.splitlines()
-        result = []
-        in_acceptance = False
-        acceptance_has_content = False
-        blank_after_acceptance = False
-        for line in lines:
-            stripped = line.strip()
-            if re.match(r"^\s*\[T\d+-N\d+\]", line):
-                break
-            if not in_acceptance:
-                result.append(line)
-                marker = acceptance_marker.search(line)
-                if marker:
-                    in_acceptance = True
-                    acceptance_has_content = bool(line[marker.end():].strip())
-                continue
-            if not stripped:
-                if acceptance_has_content:
-                    blank_after_acceptance = True
-                result.append(line)
-                continue
-            if _is_acceptance_section_boundary(stripped):
-                break
-            is_list_item = bool(re.match(r"^(?:[-*+]\s+|\d+[.)、]\s*)", stripped))
-            if blank_after_acceptance and not is_list_item:
-                break
-            result.append(line)
-            acceptance_has_content = True
-            blank_after_acceptance = False
-        return "\n".join(result).rstrip()
+    remarks_contract = strip_recognized_workflow_suffix(remarks)
 
     requirement_lines = []
     for line in process.splitlines():
@@ -217,14 +192,18 @@ def _compose_requirement_text(
         requirement_lines.append(line)
     process_without_history = "\n".join(requirement_lines).strip()
     if description and acceptance_marker.search(description):
-        return immutable_contract_prefix(description)
+        if process_without_history and acceptance_marker.search(process_without_history):
+            if description.strip() != process_without_history.strip():
+                raise TaskSpecIncompleteError(
+                    "Conflicting requirement contracts found in description and process fields. "
+                    "Reconcile them explicitly before running Production Runner."
+                )
+        return description
     if process_without_history and acceptance_marker.search(process_without_history):
-        contract = immutable_contract_prefix(process_without_history)
-        return "\n\n".join(part for part in (description, contract) if part)
-    if remarks and acceptance_marker.search(remarks):
-        contract = immutable_contract_prefix(remarks)
-        return "\n\n".join(part for part in (description, contract) if part)
-    return immutable_contract_prefix(description or remarks or process_without_history) or task_name.strip()
+        return "\n\n".join(part for part in (description, process_without_history) if part)
+    if remarks_contract and acceptance_marker.search(remarks_contract):
+        return "\n\n".join(part for part in (description, remarks_contract) if part)
+    return description or remarks_contract or process_without_history or task_name.strip()
 
 
 def _extract_acceptance_criteria(

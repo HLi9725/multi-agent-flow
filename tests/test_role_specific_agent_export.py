@@ -13,7 +13,9 @@ SCRIPTS = os.path.join(ROOT, "scripts")
 if SCRIPTS not in sys.path:
     sys.path.insert(0, SCRIPTS)
 
-from verify_and_export_agents import ROLES_MAP, serialize_subagent, serialize_runner_builder  # noqa: E402
+from verify_and_export_agents import (  # noqa: E402
+    ROLES_MAP, serialize_subagent, serialize_runner_builder, serialize_runner_readonly_role,
+)
 from _lib.core.validate_transition import validate  # noqa: E402
 
 
@@ -115,6 +117,26 @@ def test_antigravity_runner_builder_has_file_tools_but_no_terminal():
     assert "run_command" not in parsed["tools"]
     assert "write_to_file" in parsed["tools"]
     assert "Git 检查、测试及候选 Commit 由 Runner 受控执行" in body
+
+
+@pytest.mark.parametrize("role_code,yaml_name,agent_id", [
+    ("REVIEWER", "04-reviewer.yaml", "flow-runner-reviewer"),
+    ("QA", "05-qa.yaml", "flow-runner-qa"),
+])
+def test_antigravity_runner_readonly_profiles_keep_duties_without_terminal(
+    role_code, yaml_name, agent_id
+):
+    with open(os.path.join(ROOT, "agents", yaml_name), "r", encoding="utf-8") as handle:
+        role_data = yaml.safe_load(handle)
+    content = serialize_runner_readonly_role("antigravity", role_code, role_data)
+    _, frontmatter, body = content.split("---", 2)
+    parsed = yaml.safe_load(frontmatter)
+    assert parsed["name"] == agent_id
+    assert parsed["enable_write_tools"] is False
+    assert "run_command" not in parsed["tools"]
+    assert "python3 scripts/check_secrets.py" not in body
+    assert "不得修改任何文件" in body
+    assert role_data["responsibilities"][0] in body
 
 
 @pytest.mark.parametrize("platform", MARKDOWN_PLATFORMS)

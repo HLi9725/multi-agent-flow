@@ -412,8 +412,8 @@ def test_runner_resume_breakpoint_and_integrity_verification(tmp_path, monkeypat
         current_role="BUILDER",
         candidate_commit=cand_sha,
         candidate_generation=1,
-        review_cycle=8,
-        qa_cycle=13,
+        review_cycle=0,
+        qa_cycle=0,
         total_attempts=0,
         worktree_path=str(repo_dir),
         worktree_branch="feature/t0099",
@@ -591,11 +591,11 @@ def test_legacy_contract_snapshot_migrates_once_without_weakening_v2_guard(tmp_p
     )
     legacy = production_runner_module._execution_spec_snapshot(spec)
     legacy.pop("contract_hash_version")
-    legacy["requirement_hash"] = "c" * 64
-
     migrated = production_runner_module._upgrade_legacy_contract_snapshot(legacy, spec)
     assert migrated["contract_hash_version"] == 2
     assert migrated["requirement_hash"] == "b" * 64
+    ambiguous = dict(legacy, requirement_hash="c" * 64)
+    assert production_runner_module._upgrade_legacy_contract_snapshot(ambiguous, spec) == ambiguous
 
     changed = replace(spec, requirement_hash="d" * 64)
     assert "requirement_hash" in " ".join(

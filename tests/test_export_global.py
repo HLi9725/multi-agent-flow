@@ -13,6 +13,7 @@ import subprocess
 import sys
 
 import pytest
+import yaml
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPTS = os.path.join(REPO_ROOT, "scripts")
@@ -57,9 +58,12 @@ class TestGlobalExport:
         # 用户级 subagent 导出（Claude Code 支持 user_pattern）
         agents_dir = fake_home / ".gemini/config" / "agents"
         exported = list(agents_dir.glob("flow-*.md"))
-        assert len(exported) == 9
+        assert len(exported) == 11
         runner_builder = (agents_dir / "flow-runner-builder.md").read_text(encoding="utf-8")
         assert "run_command" not in runner_builder.split("---", 2)[1]
+        for managed_name in ("flow-runner-reviewer.md", "flow-runner-qa.md"):
+            managed = (agents_dir / managed_name).read_text(encoding="utf-8")
+            assert "run_command" not in yaml.safe_load(managed.split("---", 2)[1])["tools"]
         dev = (agents_dir / "flow-dev.md").read_text(encoding="utf-8")
         assert "核心业务逻辑实现" in dev
 

@@ -9,6 +9,7 @@ import os
 import subprocess
 import threading
 import time
+from pathlib import Path
 import pytest
 import yaml
 
@@ -158,8 +159,33 @@ def test_reviewer_diff_bundle_is_inline_bounded_and_nonempty(tmp_path):
     assert "DIFF STAT:" in bundle
     assert "-VALUE = 1" in bundle
     assert "+VALUE = 2" in bundle
-    with pytest.raises(Exception, match="exceeds safe inline limit"):
-        runner._build_reviewer_diff_bundle(str(repo_dir), baseline, candidate, max_chars=10)
+    large = runner._build_reviewer_diff_bundle(str(repo_dir), baseline, candidate, max_chars=10)
+    assert "not silently truncated" in large
+    artifact = large.split("complete_artifact=", 1)[1].splitlines()[0]
+    assert Path(artifact).read_text(encoding="utf-8") == bundle
+
+
+def test_runner_security_scan_is_candidate_bound_and_fail_closed(tmp_path):
+    repo_dir = tmp_path / "security-repo"
+    repo_dir.mkdir()
+    subprocess.run(["git", "init"], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "TestDev"], cwd=repo_dir, check=True)
+    subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo_dir, check=True)
+    (repo_dir / "app.py").write_text("TOKEN = None\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo_dir, check=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=repo_dir, check=True, capture_output=True)
+    baseline = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo_dir, text=True).strip()
+    (repo_dir / "app.py").write_text("TOKEN = 'ghp_" + "a" * 36 + "'\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo_dir, check=True)
+    subprocess.run(["git", "commit", "-m", "candidate"], cwd=repo_dir, check=True, capture_output=True)
+    candidate = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo_dir, text=True).strip()
+
+    runner = object.__new__(ProductionRunner)
+    runner.evidence_store = None
+    result = runner._run_reviewer_security_scan(str(repo_dir), baseline, candidate)
+    assert result["candidate_commit"] == candidate
+    assert result["exit_code"] == 1
+    assert result["passed"] is False
 
 
 def test_runner_wait_enforces_outer_deadline():
@@ -387,7 +413,7 @@ def test_production_runner_full_pass_pipeline(mock_git_repo, tmp_path, monkeypat
     assert stage_roles == ["BUILDER", "REVIEWER", "QA"]
     assert progress_events[-1]["event"] == "pending_user_acceptance"
     qa_request = next(iter(qa_requests.values()))
-    assert "Do not invoke tools, commands" in qa_request.prompt
+    assert "Do not invoke commands" in qa_request.prompt
     assert "Runner-produced test evidence" in qa_request.prompt
     assert '"exit_code": 0' in qa_request.prompt
     assert any(

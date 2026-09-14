@@ -135,15 +135,19 @@ def _extract_denied_actions(events: List[Dict[str, Any]]) -> List[Dict[str, str]
 # Mapping from project roles to specialized Antigravity subagents
 ROLE_AGENT_MAP: Dict[str, str] = {
     "DEV": "flow-dev",
-    # Runner Builder must not inherit terminal tools. Git, tests, and candidate
-    # commits are performed by the deterministic Runner after file edits.
-    "BUILDER": "flow-runner-builder",
+    "BUILDER": "flow-dev",
     "REVIEWER": "flow-reviewer",
     "QA": "flow-qa",
     "ARCHITECT": "flow-architect",
     "PM": "flow-pm",
     "DOCS": "flow-docs",
     "DEVOPS": "flow-devops",
+}
+
+RUNNER_MANAGED_AGENT_MAP: Dict[str, str] = {
+    "BUILDER": "flow-runner-builder",
+    "REVIEWER": "flow-runner-reviewer",
+    "QA": "flow-runner-qa",
 }
 
 # 5-Tier Permission Categories
@@ -649,10 +653,22 @@ class AntigravityAdapter(BaseHostAdapter):
         verification_probe_authorized = (
             getattr(self._verification_probe_ctx, "session_id", None) == request.session_id.strip()
         )
+        runner_managed = bool(
+            isinstance(request.extra_context, Mapping)
+            and request.extra_context.get("production_runner_managed") is True
+        )
+        if runner_managed and role not in RUNNER_MANAGED_AGENT_MAP:
+            raise AgentNotSupportedError(
+                f"Role '{role}' has no Production Runner managed Antigravity profile."
+            )
         agent_name = (
             "self"
             if verification_probe_authorized
-            else ROLE_AGENT_MAP.get(role, "flow-dev" if role in ("DEV", "BUILDER") else "self")
+            else (
+                RUNNER_MANAGED_AGENT_MAP[role]
+                if runner_managed
+                else ROLE_AGENT_MAP.get(role, "flow-dev" if role in ("DEV", "BUILDER") else "self")
+            )
         )
 
         cmd = [self._executable_path or "agy"]

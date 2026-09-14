@@ -557,11 +557,11 @@ def _execution_spec_snapshot(spec: TaskExecutionSpec) -> Dict[str, Any]:
 def _upgrade_legacy_contract_snapshot(
     snapshot: Mapping[str, Any], spec: TaskExecutionSpec
 ) -> Dict[str, Any]:
-    """One-time migration from mutable-history hashes to canonical contract hashes.
+    """Mark a legacy snapshot current only when its contract already matches.
 
-    Version-1 checkpoints could hash transition comments appended to ``remarks``.
-    Upgrade only when task identity and acceptance criteria are unchanged.  Once
-    marked version 2, ordinary requirement drift remains fail-closed.
+    Acceptance equality alone cannot prove that requirement-body changes were
+    merely workflow history.  Ambiguous legacy drift therefore remains
+    fail-closed and is surfaced by ``_snapshot_mismatches``.
     """
     upgraded = dict(snapshot)
     try:
@@ -582,13 +582,17 @@ def _upgrade_legacy_contract_snapshot(
         for name in identity_fields
     ):
         return upgraded
+    if upgraded.get("requirement_hash") != spec.requirement_hash:
+        return upgraded
     expected_criteria = upgraded.get("acceptance_criteria_hash")
     if not expected_criteria or expected_criteria != spec.acceptance_criteria_hash:
         return upgraded
 
-    upgraded["requirement_hash"] = spec.requirement_hash
-    upgraded["acceptance_criteria_hash"] = spec.acceptance_criteria_hash
     upgraded["contract_hash_version"] = 2
+    upgraded["migration"] = {
+        "from_version": version,
+        "reason": "legacy snapshot hashes exactly matched the canonical contract",
+    }
     return upgraded
 
 
@@ -795,6 +799,18 @@ class ProductionRunner:
                 done.set()
 
         timeout_seconds = max(0.001, float(timeout_seconds))
+        role = (
+            "REVIEWER" if "reviewer" in handle.session_id.lower()
+            else "QA" if "qa" in handle.session_id.lower()
+            else "BUILDER"
+        )
+        state = {
+            "REVIEWER": RunnerState.REVIEWING.value,
+            "QA": RunnerState.QA_TESTING.value,
+            "BUILDER": RunnerState.BUILDING.value,
+        }[role]
+        started_wait = time.monotonic()
+        next_progress = started_wait + 15.0
         deadline = time.monotonic() + timeout_seconds
         waiter = threading.Thread(target=_wait, name=f"yy-flow-wait-{task_id}", daemon=True)
         waiter.start()
@@ -804,6 +820,20 @@ class ProductionRunner:
                     adapter.cancel_agent(handle)
                 finally:
                     raise RunnerCancelledError(f"Task {task_id} was cancelled by user command.")
+            now = time.monotonic()
+            if now >= next_progress:
+                elapsed = int(now - started_wait)
+                self._emit_progress(
+                    task_id=task_id,
+                    state=state,
+                    role=role,
+                    event="stage_waiting",
+                    message=(
+                        f"Waiting for {role} host session {handle.session_id}; "
+                        f"elapsed={elapsed}s; no completion event received yet"
+                    ),
+                )
+                next_progress = now + 15.0
             if time.monotonic() >= deadline:
                 try:
                     adapter.cancel_agent(handle)
@@ -904,6 +934,42 @@ class ProductionRunner:
             errors="replace",
         ).strip()
 
+    def _find_bound_evidence(
+        self,
+        checkpoint: RunnerCheckpoint,
+        role: str,
+        candidate_commit: str,
+        transition_to: str,
+        spec: TaskExecutionSpec,
+    ) -> Optional[str]:
+        """Find durable, integrity-checked Evidence for one exact candidate."""
+        if self.evidence_store is None:
+            return None
+        for evidence_id in reversed(checkpoint.evidence_ids):
+            try:
+                record = self.evidence_store.read(evidence_id)
+            except Exception:
+                continue
+            meta = record.metadata
+            if (
+                meta.project_id == spec.project_id
+                and meta.task_id == spec.task_id
+                and meta.actor_role == role
+                and meta.transition_to == transition_to
+                and meta.is_real_host
+                and record.baseline_commit == spec.baseline_commit
+                and record.result_commit == candidate_commit
+            ):
+                extra = dict(meta.extra)
+                stored_contract = extra.get("contract_hash")
+                stored_acceptance = extra.get("acceptance_criteria_hash")
+                if stored_contract not in (None, spec.requirement_hash):
+                    continue
+                if stored_acceptance not in (None, spec.acceptance_criteria_hash):
+                    continue
+                return evidence_id
+        return None
+
     def _build_reviewer_diff_bundle(
         self,
         worktree_dir: str,
@@ -994,10 +1060,84 @@ class ProductionRunner:
         if not patch.strip():
             raise ProductionRunnerError("Reviewer bundle contains no candidate diff (Fail-Closed).")
         if len(bundle) > max_chars:
-            raise ProductionRunnerError(
-                f"Reviewer bundle exceeds safe inline limit ({len(bundle)} > {max_chars}); user input required."
+            artifact_dir = os.path.realpath(os.path.join(worktree_dir, ".yy-flow", "runner_artifacts"))
+            if os.path.commonpath([os.path.realpath(worktree_dir), artifact_dir]) != os.path.realpath(worktree_dir):
+                raise ProductionRunnerError("Reviewer artifact path escaped the worktree (Fail-Closed).")
+            os.makedirs(artifact_dir, exist_ok=True)
+            artifact_path = os.path.join(artifact_dir, f"review-{candidate_commit.lower()}.diff")
+            encoded = bundle.encode("utf-8")
+            tmp_path = artifact_path + f".{uuid.uuid4().hex}.tmp"
+            with open(tmp_path, "xb") as handle:
+                handle.write(encoded)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, artifact_path)
+            return (
+                "LARGE DIFF NOTICE: the complete immutable bundle was not silently truncated.\n"
+                f"characters={len(bundle)} sha256={hashlib.sha256(encoded).hexdigest()}\n"
+                f"complete_artifact={artifact_path}\n"
+                "Use only read/search tools to inspect that artifact and the listed candidate files.\n\n"
+                f"DIFF STAT:\n{stat or '(no stat)'}\n\n{impact}"
             )
         return bundle
+
+    def _run_reviewer_security_scan(
+        self,
+        worktree_dir: str,
+        baseline_commit: str,
+        candidate_commit: str,
+        timeout_seconds: float = 120.0,
+    ) -> Dict[str, Any]:
+        """Run the Skill-owned scanner against the immutable candidate.
+
+        Reviewer agents never execute a shell in managed mode.  Exit 0 is a
+        clean scan, exit 1 is a real candidate finding that the Reviewer must
+        reject, and every other outcome is infrastructure failure.
+        """
+        scanner = os.path.realpath(
+            os.path.join(os.path.dirname(__file__), "..", "..", "check_secrets.py")
+        )
+        if not os.path.isfile(scanner):
+            raise ProductionRunnerError(
+                f"Skill-owned security scanner is missing: {scanner} (Fail-Closed)."
+            )
+        command = [
+            sys.executable,
+            scanner,
+            "--project-root", worktree_dir,
+            "--baseline", baseline_commit,
+            "--candidate", candidate_commit,
+        ]
+        started = time.monotonic()
+        try:
+            proc = subprocess.run(
+                command,
+                cwd=worktree_dir,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=max(1.0, float(timeout_seconds)),
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ProductionRunnerError(f"Security scanner could not execute: {exc}") from exc
+        output = (proc.stdout or "") + (proc.stderr or "")
+        if proc.returncode not in (0, 1):
+            raise ProductionRunnerError(
+                f"Security scanner infrastructure failed with exit {proc.returncode}: "
+                f"{self._sanitize_diagnostic(output, 2000)}"
+            )
+        return {
+            "command": "check_secrets.py --project-root <workspace> --baseline <sha> --candidate <sha>",
+            "scanner_path": scanner,
+            "baseline_commit": baseline_commit,
+            "candidate_commit": candidate_commit,
+            "exit_code": proc.returncode,
+            "passed": proc.returncode == 0,
+            "output_hash": hashlib.sha256(output.encode("utf-8", errors="replace")).hexdigest(),
+            "output_excerpt": self._sanitize_diagnostic(output, 4000),
+            "duration_seconds": round(time.monotonic() - started, 3),
+        }
 
     def _finalize_builder_candidate(
         self,
@@ -1143,7 +1283,7 @@ class ProductionRunner:
                 normalized_rel = file_rel.replace("\\", "/").rstrip("/")
                 path_parts = tuple(part for part in normalized_rel.split("/") if part)
                 is_runner_control = bool(re.match(
-                    r"^(?:\.yy-flow/)?user_data/(?:board\.json|logs/|locks/)",
+                    r"^(?:\.yy-flow/)?(?:user_data/(?:board\.json|logs/|locks/)|runner_artifacts/)",
                     normalized_rel,
                 ))
                 is_safe_cache = (
@@ -1593,28 +1733,62 @@ class ProductionRunner:
         start_role = checkpoint.current_role if existing_checkpoint else "BUILDER"
         # The authoritative board phase wins over a stale checkpoint role.  A
         # crash or a contract guard immediately after a successful transition
-        # must not dispatch Builder again for an already committed candidate.
+        # must not dispatch Builder again for an already committed candidate,
+        # but board state alone is never sufficient proof to skip a role.
         if existing_checkpoint is not None and candidate_commit:
             if current_board_status == "审查中":
+                builder_evidence = self._find_bound_evidence(
+                    checkpoint, "BUILDER", candidate_commit, "REVIEWING", spec
+                )
+                if not builder_evidence:
+                    pause_message = (
+                        "Board is 审查中 but no valid Builder Evidence is bound to the current candidate; "
+                        "recovery stopped without skipping Builder."
+                    )
+                    checkpoint = replace(
+                        checkpoint, state=RunnerState.NEEDS_USER_INPUT.value,
+                        last_error=pause_message, updated_at=time.time(),
+                    )
+                    self.checkpoint_store.save_checkpoint(checkpoint)
+                    return RunnerResult(
+                        False, RunnerState.NEEDS_USER_INPUT.value, task_id,
+                        candidate_commit=candidate_commit,
+                        candidate_generation=candidate_generation,
+                        evidence_ids=tuple(evidence_ids), message=pause_message,
+                    )
                 start_role = "REVIEWER"
-                # Legacy checkpoints could persist the new candidate before
-                # persisting the per-candidate retry reset and phase change.
-                # This exact stale boundary is identifiable by BUILDER still
-                # being recorded while the authoritative board is 审查中.
                 if checkpoint.current_role == "BUILDER":
-                    review_cycle = 0
-                    qa_cycle = 0
                     checkpoint = replace(
                         checkpoint,
                         state=RunnerState.REVIEWING.value,
                         current_role="REVIEWER",
-                        review_cycle=0,
-                        qa_cycle=0,
                         last_error=None,
                         updated_at=time.time(),
                     )
                     self.checkpoint_store.save_checkpoint(checkpoint)
             elif current_board_status == "测试中":
+                builder_evidence = self._find_bound_evidence(
+                    checkpoint, "BUILDER", candidate_commit, "REVIEWING", spec
+                )
+                reviewer_evidence = self._find_bound_evidence(
+                    checkpoint, "REVIEWER", candidate_commit, "TESTING", spec
+                )
+                if not builder_evidence or not reviewer_evidence:
+                    pause_message = (
+                        "Board is 测试中 but candidate-bound Builder/Reviewer PASS Evidence is incomplete; "
+                        "recovery stopped without skipping Reviewer."
+                    )
+                    checkpoint = replace(
+                        checkpoint, state=RunnerState.NEEDS_USER_INPUT.value,
+                        last_error=pause_message, updated_at=time.time(),
+                    )
+                    self.checkpoint_store.save_checkpoint(checkpoint)
+                    return RunnerResult(
+                        False, RunnerState.NEEDS_USER_INPUT.value, task_id,
+                        candidate_commit=candidate_commit,
+                        candidate_generation=candidate_generation,
+                        evidence_ids=tuple(evidence_ids), message=pause_message,
+                    )
                 start_role = "QA"
         skip_builder = (start_role in ("REVIEWER", "QA") and candidate_commit is not None)
         skip_reviewer = (start_role == "QA" and candidate_commit is not None)
@@ -1683,9 +1857,8 @@ class ProductionRunner:
                 sess_builder = f"sess_builder_runner_{task_id.lower()}_{int(time.time()*1000)}"
                 builder_attempt = candidate_generation + 1
 
-                checkpoint = RunnerCheckpoint(
-                    task_id=task_id,
-                    project_id=spec.project_id,
+                checkpoint = replace(
+                    checkpoint,
                     state=RunnerState.BUILDING.value,
                     current_role="BUILDER",
                     candidate_commit=candidate_commit,
@@ -1693,17 +1866,11 @@ class ProductionRunner:
                     review_cycle=review_cycle,
                     qa_cycle=qa_cycle,
                     total_attempts=total_attempts,
-                    worktree_path=worktree_dir,
-                    worktree_branch=worktree_branch,
                     builder_session_id=sess_builder,
                     evidence_ids=tuple(evidence_ids),
                     execution_options=_execution_options_from_spec(spec),
-                    execution_spec_snapshot=checkpoint.execution_spec_snapshot,
-                    run_id=checkpoint.run_id,
-                    approval_attempts=checkpoint.approval_attempts,
-                    approval_diagnostics=checkpoint.approval_diagnostics,
-                    active_elapsed_seconds=checkpoint.active_elapsed_seconds,
                     defects_history=tuple(defects_history),
+                    updated_at=time.time(),
                 )
                 self.checkpoint_store.save_checkpoint(checkpoint)
 
@@ -1745,6 +1912,7 @@ class ProductionRunner:
                     workspace_dir=worktree_dir,
                     timeout_seconds=float(spec.builder_timeout_seconds),
                     extra_context={
+                        "production_runner_managed": True,
                         "sandbox": True,
                         "sandbox_mode": "workspace-write",
                         "permission_boundary": "workspace_write",
@@ -1968,7 +2136,13 @@ class ProductionRunner:
                     transition_from="BUILDING",
                     transition_to="REVIEWING",
                     created_at=time.time(),
-                    extra=_extract_capabilities_extra(builder_caps),
+                    extra={
+                        **_extract_capabilities_extra(builder_caps),
+                        "managed_profile": "flow-runner-builder",
+                        "contract_hash": spec.requirement_hash,
+                        "acceptance_criteria_hash": spec.acceptance_criteria_hash,
+                        "candidate_generation": candidate_generation,
+                    },
                 )
                 b_record = EvidenceRecord(
                     evidence_id=builder_evidence_id,
@@ -2098,9 +2272,8 @@ class ProductionRunner:
                 sess_reviewer = f"sess_reviewer_runner_{task_id.lower()}_{int(time.time()*1000)}"
                 review_request_id = f"rev_req_{uuid.uuid4().hex}"
 
-                checkpoint = RunnerCheckpoint(
-                    task_id=task_id,
-                    project_id=spec.project_id,
+                checkpoint = replace(
+                    checkpoint,
                     state=RunnerState.REVIEWING.value,
                     current_role="REVIEWER",
                     candidate_commit=candidate_commit,
@@ -2108,18 +2281,11 @@ class ProductionRunner:
                     review_cycle=review_cycle,
                     qa_cycle=qa_cycle,
                     total_attempts=total_attempts,
-                    worktree_path=worktree_dir,
-                    worktree_branch=worktree_branch,
-                    builder_session_id=sess_builder if "sess_builder" in locals() else None,
                     reviewer_session_id=sess_reviewer,
                     evidence_ids=tuple(evidence_ids),
                     execution_options=_execution_options_from_spec(spec),
-                    execution_spec_snapshot=checkpoint.execution_spec_snapshot,
-                    run_id=checkpoint.run_id,
-                    approval_attempts=checkpoint.approval_attempts,
-                    approval_diagnostics=checkpoint.approval_diagnostics,
-                    active_elapsed_seconds=checkpoint.active_elapsed_seconds,
                     defects_history=tuple(defects_history),
+                    updated_at=time.time(),
                 )
                 self.checkpoint_store.save_checkpoint(checkpoint)
 
@@ -2129,6 +2295,27 @@ class ProductionRunner:
                         spec.baseline_commit,
                         candidate_commit,
                     )
+                    self._emit_progress(
+                        task_id=task_id,
+                        state=RunnerState.REVIEWING.value,
+                        role="RUNNER",
+                        event="review_security_scan_started",
+                        message="Running Skill-owned security scan for the immutable candidate",
+                        candidate_commit=candidate_commit,
+                    )
+                    reviewer_security_scan = self._run_reviewer_security_scan(
+                        worktree_dir,
+                        spec.baseline_commit,
+                        candidate_commit,
+                    )
+                    self._emit_progress(
+                        task_id=task_id,
+                        state=RunnerState.REVIEWING.value,
+                        role="RUNNER",
+                        event="review_security_scan_completed",
+                        message=f"Security scan exited {reviewer_security_scan['exit_code']}",
+                        candidate_commit=candidate_commit,
+                    )
                 except Exception as exc:
                     return RunnerResult(
                         success=False,
@@ -2136,7 +2323,7 @@ class ProductionRunner:
                         task_id=task_id,
                         candidate_commit=candidate_commit,
                         evidence_ids=tuple(evidence_ids),
-                        message=f"Unable to create bounded Reviewer payload: {exc}",
+                        message=f"Unable to prepare trusted Reviewer evidence: {exc}",
                     )
 
                 reviewer_prompt = (
@@ -2146,8 +2333,11 @@ class ProductionRunner:
                     f"Acceptance Criteria: {spec.acceptance_criteria}\n"
                     f"Baseline Commit: {spec.baseline_commit}\n"
                     f"Candidate Commit: {candidate_commit}\n\n"
-                    "Review ONLY the immutable diff embedded below. Do not invoke tools, commands, "
-                    "browsers, file-system access, subagents, or permission prompts.\n\n"
+                    "Runner-owned immutable security scan evidence (exit 0 is PASS; exit 1 MUST be REJECT):\n"
+                    f"{json.dumps(reviewer_security_scan, ensure_ascii=False, indent=2)}\n\n"
+                    "Review ONLY the immutable evidence below. You may use read/search tools solely for a "
+                    "Runner-designated complete diff artifact or candidate files when the inline bundle says so. "
+                    "Do not invoke commands, browsers, write tools, subagents, or permission prompts.\n\n"
                     f"{reviewer_diff_bundle}\n\n"
                     f"You MUST return ONLY a JSON object strictly matching this schema:\n"
                     f"```json\n"
@@ -2171,12 +2361,10 @@ class ProductionRunner:
                     workspace_dir=worktree_dir,
                     timeout_seconds=float(spec.reviewer_timeout_seconds),
                     extra_context={
+                        "production_runner_managed": True,
                         "sandbox": True,
                         "permission_boundary": "workspace_read",
-                        "operation_intent": (
-                            f"git diff --no-ext-diff --unified=40 {spec.baseline_commit} "
-                            f"{candidate_commit} --"
-                        ),
+                        "operation_intent": "read-only review of Runner-prepared immutable evidence",
                         "json_schema": REVIEWER_JSON_SCHEMA,
                         "worktree_dir": worktree_dir,
                         "project_id": spec.project_id,
@@ -2326,6 +2514,25 @@ class ProductionRunner:
                     invocation_id=inv_reviewer,
                     review_request_id=review_request_id,
                 )
+                if not reviewer_security_scan["passed"] and review_output.decision == "PASS":
+                    review_output = ReviewerStructuredOutput(
+                        task_id=task_id,
+                        baseline_commit=spec.baseline_commit,
+                        candidate_commit=candidate_commit,
+                        session_id=sess_reviewer,
+                        host_invocation_id=inv_reviewer,
+                        review_request_id=review_request_id,
+                        decision="REJECT",
+                        defects=({
+                            "defect_id": f"DEF-{task_id}-SECRET-SCAN",
+                            "severity": "P1",
+                            "description": (
+                                "Runner-owned immutable candidate security scan failed; "
+                                "Reviewer PASS was overridden fail-closed."
+                            ),
+                        },),
+                        summary="Candidate failed the mandatory Runner-owned security scan.",
+                    )
                 self._emit_progress(
                     task_id=task_id,
                     state=RunnerState.REVIEWING.value,
@@ -2351,7 +2558,13 @@ class ProductionRunner:
                     transition_from="REVIEWING",
                     transition_to="TESTING" if review_output.decision == "PASS" else "BUILDING",
                     created_at=time.time(),
-                    extra=_extract_capabilities_extra(reviewer_caps),
+                    extra={
+                        **_extract_capabilities_extra(reviewer_caps),
+                        "managed_profile": "flow-runner-reviewer",
+                        "security_scan": reviewer_security_scan,
+                        "contract_hash": spec.requirement_hash,
+                        "acceptance_criteria_hash": spec.acceptance_criteria_hash,
+                    },
                 )
                 r_record = EvidenceRecord(
                     evidence_id=reviewer_evidence_id,
@@ -2566,9 +2779,8 @@ class ProductionRunner:
             qa_cycle += 1
             sess_qa = f"sess_qa_runner_{task_id.lower()}_{int(time.time()*1000)}"
 
-            checkpoint = RunnerCheckpoint(
-                task_id=task_id,
-                project_id=spec.project_id,
+            checkpoint = replace(
+                checkpoint,
                 state=RunnerState.QA_TESTING.value,
                 current_role="QA",
                 candidate_commit=candidate_commit,
@@ -2576,19 +2788,11 @@ class ProductionRunner:
                 review_cycle=review_cycle,
                 qa_cycle=qa_cycle,
                 total_attempts=total_attempts,
-                worktree_path=worktree_dir,
-                worktree_branch=worktree_branch,
-                builder_session_id=sess_builder if "sess_builder" in locals() else None,
-                reviewer_session_id=sess_reviewer if "sess_reviewer" in locals() else None,
                 qa_session_id=sess_qa,
                 evidence_ids=tuple(evidence_ids),
                 execution_options=_execution_options_from_spec(spec),
-                execution_spec_snapshot=checkpoint.execution_spec_snapshot,
-                run_id=checkpoint.run_id,
-                approval_attempts=checkpoint.approval_attempts,
-                approval_diagnostics=checkpoint.approval_diagnostics,
-                active_elapsed_seconds=checkpoint.active_elapsed_seconds,
                 defects_history=tuple(defects_history),
+                updated_at=time.time(),
             )
             self.checkpoint_store.save_checkpoint(checkpoint)
 
@@ -2822,8 +3026,9 @@ class ProductionRunner:
                 f"Reviewer PASS summary: {review_output.summary if 'review_output' in locals() else 'validated reviewer evidence'}\n\n"
                 f"Immutable candidate diff:\n{qa_diff_bundle}\n\n"
                 "Perform a semantic QA assessment from the immutable candidate context and the Runner-produced "
-                "test evidence below. Do not invoke tools, commands, browsers, file-system access, subagents, or "
-                "permission prompts. Trace changed behavior through every API, background worker, database, "
+                "test evidence below. You may use read/search tools solely for a Runner-designated complete diff "
+                "artifact or candidate files when the inline bundle says so. Do not invoke commands, browsers, "
+                "write tools, subagents, or permission prompts. Trace changed behavior through every API, background worker, database, "
                 "authorization, contract/SDK, and frontend boundary that applies. Verify at least one negative or "
                 "adversarial scenario represented by the acceptance criteria, review context, or test evidence. "
                 "If any criterion or risk is not verifiable, return FAIL; never infer PASS from a green regression "
@@ -2850,6 +3055,7 @@ class ProductionRunner:
                 workspace_dir=worktree_dir,
                 timeout_seconds=float(qa_remaining_seconds),
                 extra_context={
+                    "production_runner_managed": True,
                     "sandbox": True,
                     "permission_boundary": "workspace_read",
                     "operation_intent": "read-only semantic assessment of inline Runner test evidence",
@@ -3073,6 +3279,8 @@ class ProductionRunner:
                 item["criterion_id"] for item in qa_output.acceptance_coverage if item.get("status") == "PASS"
             )
             qa_semantic_metadata = {
+                "managed_profile": "flow-runner-qa",
+                "contract_hash": spec.requirement_hash,
                 "qa_decision": "PASS" if qa_passed else "FAIL",
                 "qa_request_id": qa_request_id,
                 "qa_report_hash": qa_report_hash,

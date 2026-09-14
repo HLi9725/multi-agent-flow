@@ -162,7 +162,26 @@ def test_antigravity_adapter_role_based_routing_and_sandbox():
         workspace_dir=os.path.abspath("."),
     )
     cmd_builder = adapter.build_antigravity_exec_command(req_builder)
+    assert cmd_builder[cmd_builder.index("--agent") + 1] == "flow-dev"
+
+    req_builder = AgentRequest(
+        session_id="sess_ag_managed_builder_01",
+        prompt="Implement managed change without commands",
+        role="BUILDER",
+        workspace_dir=os.path.abspath("."),
+        extra_context={"production_runner_managed": True},
+    )
+    cmd_builder = adapter.build_antigravity_exec_command(req_builder)
     assert cmd_builder[cmd_builder.index("--agent") + 1] == "flow-runner-builder"
+
+    for role, expected in (("REVIEWER", "flow-runner-reviewer"), ("QA", "flow-runner-qa")):
+        request = AgentRequest(
+            session_id=f"sess_ag_managed_{role.lower()}", prompt="managed",
+            role=role, workspace_dir=os.path.abspath("."),
+            extra_context={"production_runner_managed": True},
+        )
+        command = adapter.build_antigravity_exec_command(request)
+        assert command[command.index("--agent") + 1] == expected
 
 
 def test_antigravity_prompt_uses_stdin_with_timeout_and_schema():

@@ -5,6 +5,8 @@
 import os
 import sys
 import re
+import argparse
+import subprocess
 from typing import List, Tuple
 
 SECRET_PATTERNS = [
@@ -43,7 +45,78 @@ def scan_file(file_path: str) -> List[Tuple[int, str, str]]:
         print(f"[WARN] 无法读取文件 {file_path}: {e}")
     return findings
 
+
+def scan_text(text: str) -> List[Tuple[int, str, str]]:
+    """Scan immutable candidate content without checking out or editing it."""
+    findings = []
+    for line_num, line in enumerate(text.splitlines(), 1):
+        clean_line = line.strip()
+        if clean_line.startswith('#'):
+            continue
+        for pattern, desc in SECRET_PATTERNS:
+            match = pattern.search(line)
+            if match and not re.match(r'^\$\{[A-Za-z0-9_:-]+\}$', match.group(0).strip()):
+                findings.append((line_num, desc, clean_line))
+    return findings
+
+
+def scan_candidate(project_root: str, baseline: str, candidate: str) -> int:
+    """Scan added/modified text at an immutable Git candidate."""
+    sha_re = re.compile(r"^[0-9a-fA-F]{40}$")
+    if not sha_re.fullmatch(baseline or "") or not sha_re.fullmatch(candidate or ""):
+        print("[ERROR] baseline and candidate must be full 40-character Git SHAs")
+        return 2
+    project_root = os.path.realpath(os.path.abspath(project_root))
+    try:
+        names = subprocess.check_output(
+            ["git", "diff", "--name-only", "--diff-filter=ACMR", "-z", baseline, candidate, "--"],
+            cwd=project_root,
+        ).decode("utf-8", errors="surrogateescape").split("\0")
+    except (OSError, subprocess.CalledProcessError) as exc:
+        print(f"[ERROR] unable to enumerate candidate files: {exc}")
+        return 2
+
+    total_issues = 0
+    scanned = 0
+    for relative_path in (name for name in names if name):
+        if os.path.basename(relative_path) == "check_secrets.py":
+            continue
+        try:
+            blob = subprocess.check_output(
+                ["git", "show", f"{candidate}:{relative_path}"],
+                cwd=project_root,
+                stderr=subprocess.STDOUT,
+            )
+        except subprocess.CalledProcessError as exc:
+            print(f"[ERROR] unable to read candidate file {relative_path}: {exc}")
+            return 2
+        if b"\x00" in blob:
+            continue
+        scanned += 1
+        findings = scan_text(blob.decode("utf-8", errors="ignore"))
+        if findings:
+            print(f"[FAILED] candidate {candidate} contains a credential risk in [{relative_path}]:")
+            for line_num, desc, line_content in findings:
+                print(f"   - line {line_num} [{desc}]: {line_content[:60]}...")
+                total_issues += 1
+    if total_issues:
+        print(f"[FAILED] scanned_files={scanned} findings={total_issues} candidate={candidate}")
+        return 1
+    print(f"[SUCCESS] scanned_files={scanned} findings=0 candidate={candidate}")
+    return 0
+
 def main():
+    parser = argparse.ArgumentParser(description="Scan yy-flow sources or an immutable Git candidate")
+    parser.add_argument("--project-root")
+    parser.add_argument("--baseline")
+    parser.add_argument("--candidate")
+    args = parser.parse_args()
+    candidate_args = (args.project_root, args.baseline, args.candidate)
+    if any(candidate_args):
+        if not all(candidate_args):
+            parser.error("--project-root, --baseline and --candidate must be provided together")
+        sys.exit(scan_candidate(args.project_root, args.baseline, args.candidate))
+
     print("========================================================================")
     print("        [GUARD]   Multi-Agent Workflow · 敏感凭证与硬编码密钥安全扫描")
     print("========================================================================")

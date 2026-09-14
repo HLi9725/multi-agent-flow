@@ -119,7 +119,7 @@ Agent 将自动执行 7 步标准初始化：
 
 正式 A 类任务不能只写“功能正常”或“全量测试通过”。任务卡必须包含明确的 `验收标准:` 段落，每一项应能对应具体入口、正向结果和异常/反向场景；缺少时 Runner 会停止，不会让 Agent 自行猜测。
 
-Runner 的 Reviewer 会收到固定候选差异、变更文件、公开符号引用和适用影响面提示，不能只凭已有测试为绿放行。Runner 针对每个候选 SHA 单次执行全部受控命令，并无条件追加 `git diff --check <baseline>..<candidate> --` 格式门禁；再把脱敏、限长的真实结果交给只读 QA。QA 对并发/原子性结论必须核对物理连接隔离、同步点和单胜者计数；SQLite `StaticPool` 共享单连接的多线程不能作为独立 Worker 证据。EvidenceGate 从磁盘 Evidence 重算报告与命令哈希。真实测试或业务缺陷才退回 Builder；Reviewer/QA 协议错误只重试原角色，工具缺失或无法启动等基础设施故障停在原 QA 阶段等待恢复。
+Runner 的 Reviewer 会收到固定候选差异、变更文件、公开符号引用、适用影响面提示，以及由 Runner 从 Skill 正确路径执行的候选级安全扫描结果，不能只凭已有测试为绿放行。差异超过内联上限时会生成带 SHA-256 的完整只读工件并明确提示读取，不会静默截断。Runner 针对每个候选 SHA 单次执行全部受控测试命令，并无条件追加 `git diff --check <baseline>..<candidate> --` 格式门禁；再把脱敏、限长的真实结果交给只读 QA。QA 对并发/原子性结论必须核对物理连接隔离、同步点和单胜者计数；SQLite `StaticPool` 共享单连接的多线程不能作为独立 Worker 证据。EvidenceGate 从磁盘 Evidence 重算报告与命令哈希。真实测试或业务缺陷才退回 Builder；Reviewer/QA 协议错误只重试原角色，工具缺失或无法启动等基础设施故障停在原阶段等待恢复。
 
 ```powershell
 # 双宿主默认链：Codex Builder -> Antigravity Reviewer -> Codex QA
@@ -153,11 +153,11 @@ Antigravity Prompt 通过官方 stdin `stream-json` 协议传输，不进入 Win
 
 Host 权限拒绝属于显式暂停条件：Runner 会原子保存 `APPROVAL_REQUIRED`，释放运行锁并要求用户在 Runner 外部处理授权；其他 Host 失败会持久化为 `NEEDS_USER_INPUT`，不会遗留假的 `BUILDING`、`REVIEWING` 或 `QA_TESTING`。Runner 和角色 Agent 均不得修改用户全局 Antigravity/agy/Codex 设置、创建绕权限诊断脚本，或使用 `command(*)`、`unsandboxed(*)`、`--dangerously-skip-permissions` 等通配/跳过规则。检测到这类危险全局配置时将 Fail-Closed 停止，且 `--approve` 不能绕过安全门禁。
 
-Antigravity 的 Production Runner 使用额外的 `flow-runner-builder` 执行配置（不是第九个业务角色）：Builder 只获得项目内文件读写工具，不获得 `run_command`。Git 状态核对、测试命令和候选 Commit 由 Runner 自身确定性执行；这避免 Windows 无头沙箱把普通终端命令升级为无法交互批准的 `escalate_admin("")`。独立使用 `flow-dev` 时仍保留原有 CLI 能力，不受此配置影响。
+Antigravity 的 Production Runner 使用 `flow-runner-builder`、`flow-runner-reviewer`、`flow-runner-qa` 三份托管执行配置（不是新增业务角色）：Builder 只有项目内文件读写能力，Reviewer/QA 只有读取和搜索能力，三者均不获得 `run_command`。Git、候选 Commit、安全扫描、测试、构建与格式门禁均由 Runner 确定性执行；角色只负责专业修改或独立判断。独立使用 `flow-dev`、`flow-reviewer`、`flow-qa` 时仍保留各自 YAML 声明的原有能力，不受托管配置影响。
 
 Runner 成功只停在【已完成】/`PENDING_USER_ACCEPTANCE`，不会替用户验收、合并、Push 或创建 Tag。
 
-恢复兼容性与边界：已有 Checkpoint 必须使用 `resume`，普通 `start` 不覆盖历史记录。只有明确重启已取消任务时使用 `start --restart-cancelled`（其余参数同首次启动）；旧记录先归档，新运行拒绝旧运行的迟到写入。恢复读取及迁移受运行锁保护，取消和 Checkpoint 保存使用独立短写锁。
+恢复兼容性与边界：已有 Checkpoint 必须使用 `resume`，普通 `start` 不覆盖历史记录。只有明确重启已取消任务时使用 `start --restart-cancelled`（其余参数同首次启动）；旧记录先归档，新运行拒绝旧运行的迟到写入。恢复跳过 Builder 或 Reviewer 前必须找到绑定同一候选与契约的有效前序 Evidence；看板状态本身不能作为跳阶段依据。旧契约快照只有在需求哈希和验收哈希均完全一致时才自动升级，无法证明只是流程日志差异时会停止并报告，不会用“验收标准相同”覆盖需求变化。
 
 权限暂停会保存脱敏、限长的 `approval_diagnostics`（宿主返回的会话、调用、工具事件），单独累计 `approval_attempts`，不消耗本次被拒绝调用的修复/审查/QA 重试预算；不回写修正旧版历史计数。宿主未提供具体授权目标时仍须用户处理，不能据此猜测或添加通配授权。历史 Evidence 不代表当前整改通过。
 

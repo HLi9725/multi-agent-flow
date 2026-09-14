@@ -43,7 +43,12 @@ DEFAULT_TOOLS = ["run_command", "replace_file_content", "write_to_file", "view_f
 WRITE_TOOL_NAMES = {
     "edit", "write", "replace_file_content", "write_to_file",
 }
-RUNNER_BUILDER_ID = "flow-runner-builder"
+RUNNER_MANAGED_AGENT_IDS = {
+    "BUILDER": "flow-runner-builder",
+    "REVIEWER": "flow-runner-reviewer",
+    "QA": "flow-runner-qa",
+}
+RUNNER_BUILDER_ID = RUNNER_MANAGED_AGENT_IDS["BUILDER"]
 
 
 def serialize_runner_builder(platform_key, subagent_spec):
@@ -65,6 +70,69 @@ def serialize_runner_builder(platform_key, subagent_spec):
         "description": "yy-flow Production Runner 专用无终端 Builder",
         "tools": tools,
         "enable_write_tools": True,
+        "subagent": True,
+    }, allow_unicode=True, sort_keys=False)
+    return f"---\n{fm}---\n\n{body}"
+
+
+def serialize_runner_readonly_role(platform_key, role_code, role_data):
+    """Antigravity Runner-managed Reviewer/QA profile without a terminal.
+
+    The profile is derived from the corresponding business-role YAML so its
+    professional duties remain aligned, while orchestration and command
+    execution stay exclusively owned by Production Runner.
+    """
+    role_code = role_code.upper()
+    if role_code not in ("REVIEWER", "QA"):
+        raise ValueError(f"Unsupported managed read-only role: {role_code}")
+    agent_id = RUNNER_MANAGED_AGENT_IDS[role_code]
+    tools = [
+        tool for tool in PLATFORM_TOOLS.get(platform_key, DEFAULT_TOOLS)
+        if tool.lower() in {"view_file", "list_dir", "grep_search", "read", "grep", "glob"}
+    ]
+    responsibility_items = list(role_data.get("responsibilities") or [])
+    if role_code == "QA":
+        responsibility_items = [
+            str(item).replace("测试用例执行", "核验 Runner 提供的测试用例执行结果")
+            for item in responsibility_items
+        ]
+    duties = _as_bullets(responsibility_items)
+    audit_rules = []
+    for item in list(role_data.get("orchestration_rules") or []):
+        text = str(item)
+        if "check_secrets.py" in text:
+            audit_rules.append("必须核对 Runner 提供的候选级安全扫描命令、固定 SHA、退出码和输出摘要")
+        elif any(token in text for token in ("transition_task.py", "run_command")):
+            continue
+        else:
+            audit_rules.append(text)
+    redlines = _as_bullets(audit_rules)
+    verdict = "PASS/REJECT" if role_code == "REVIEWER" else "PASS/FAIL"
+    stage = "审查" if role_code == "REVIEWER" else "测试"
+    body = f"""# Production Runner 托管 {role_code}
+
+这是 `{role_data.get('name', role_code)}` 的 Runner 专用只读执行配置，不是新增业务角色。
+
+## 专业职责
+{duties}
+
+## 角色约束
+- 只对 Runner 固定的 baseline SHA、candidate SHA、契约快照和证据包执行{stage}判断。
+- 可以只读查看 Runner 指定的候选文件或完整差异工件；不得修改任何文件。
+- 不得调用 run_command、Shell、Git、测试命令、包管理器、浏览器或子进程。
+- 不得建卡、修改看板、写入 Evidence 或推进状态；这些动作由 Runner 原子执行。
+- Runner 提供的安全扫描、测试、构建或差异检查未执行、失败或证据不足时，必须拒绝通过。
+- 只返回符合 Runner JSON Schema 的 {verdict} 结构化结论；不得用自然语言包装 JSON。
+- 若读取工具被拒绝，立即返回阻断；不得修改全局权限、创建诊断脚本或尝试绕过。
+
+## 业务角色审计要求（命令执行条款已转换为证据核验）
+{redlines}
+"""
+    fm = yaml.dump({
+        "name": agent_id,
+        "description": f"yy-flow Production Runner 专用无终端 {role_code}",
+        "tools": tools,
+        "enable_write_tools": False,
         "subagent": True,
     }, allow_unicode=True, sort_keys=False)
     return f"---\n{fm}---\n\n{body}"
@@ -465,19 +533,29 @@ def export_platform_assets(platforms_config, active_platforms, global_mode=False
             if not ok:
                 verify_failures.append(f"[{p_key}] {out_rel_path}: {err}")
 
-        # The managed Builder is an execution profile, not a ninth business
-        # role. It exists only on Antigravity surfaces because their headless
-        # sandbox may elevate every terminal command before it can run.
+        # Managed execution profiles are not additional business roles. They
+        # exist only on Antigravity surfaces, where headless terminal calls may
+        # be elevated before a user can approve them.
         if p_key in ("antigravity", "antigravity_cli"):
-            runner_rel = pattern.format(agent_id=RUNNER_BUILDER_ID)
-            runner_abs = os.path.expanduser(runner_rel) if global_mode else os.path.join(TARGET_PROJECT_DIR, runner_rel)
-            os.makedirs(os.path.dirname(runner_abs), exist_ok=True)
-            with open(runner_abs, "w", encoding="utf-8") as fp:
-                fp.write(serialize_runner_builder(p_key, subagent_spec or {}))
-            total_exported += 1
-            ok, err = verify_exported_agent(runner_abs, fmt)
-            if not ok:
-                verify_failures.append(f"[{p_key}] {runner_rel}: {err}")
+            managed_contents = {
+                RUNNER_BUILDER_ID: serialize_runner_builder(p_key, subagent_spec or {}),
+            }
+            for yaml_file, role_code in (("04-reviewer.yaml", "REVIEWER"), ("05-qa.yaml", "QA")):
+                with open(os.path.join(AGENTS_DIR, yaml_file), "r", encoding="utf-8") as fp:
+                    managed_role_data = yaml.safe_load(fp)
+                managed_contents[RUNNER_MANAGED_AGENT_IDS[role_code]] = serialize_runner_readonly_role(
+                    p_key, role_code, managed_role_data
+                )
+            for managed_id, managed_content in managed_contents.items():
+                runner_rel = pattern.format(agent_id=managed_id)
+                runner_abs = os.path.expanduser(runner_rel) if global_mode else os.path.join(TARGET_PROJECT_DIR, runner_rel)
+                os.makedirs(os.path.dirname(runner_abs), exist_ok=True)
+                with open(runner_abs, "w", encoding="utf-8") as fp:
+                    fp.write(managed_content)
+                total_exported += 1
+                ok, err = verify_exported_agent(runner_abs, fmt)
+                if not ok:
+                    verify_failures.append(f"[{p_key}] {runner_rel}: {err}")
 
         print(f"[SUCCESS]  [{p_name}] 成功导出专家子代理 ({exported_count}/8) -> 模式: `{pattern}`")
 
