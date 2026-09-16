@@ -112,10 +112,16 @@ def serialize_runner_readonly_role(platform_key, role_code, role_data):
     redlines = _as_bullets(audit_rules)
     verdict = "PASS/REJECT" if role_code == "REVIEWER" else "PASS/FAIL"
     stage = "审查" if role_code == "REVIEWER" else "测试"
-    qa_inline_only = (
-        "- QA 的全部差异、测试、构建、安全扫描和验收矩阵证据均由 Runner 内联提供；不得调用任何工具。\n"
-        if role_code == "QA" else ""
-    )
+    if role_code == "QA":
+        access_rules = """- QA 的全部差异、测试、构建、安全扫描和验收矩阵证据均由 Runner 内联提供；不得调用任何工具。
+- 不得自行读取文件、列举目录、发起搜索或扩大证据范围；证据不足时直接返回否定结论。
+- 不得修改任何文件。"""
+        denial_rule = "- 若内联证据不足，返回结构化 FAIL；不得请求权限、修改全局配置或尝试绕过。"
+    else:
+        access_rules = """- 只能只读查看 Runner 明确指定且位于本次工作区根目录内的候选文件或完整差异工件；不得修改任何文件。
+- 所有读取必须使用工作区内相对路径；禁止绝对路径、`..`、符号链接/目录联接逃逸，以及读取用户主目录、`.gemini`、`.codex`、其他仓库或任何工作区外路径。
+- 不得自行列举目录或发起全局搜索。证据不足时直接返回否定结论，不得通过扩大读取范围补证。"""
+        denial_rule = "- 若读取工具被拒绝，立即返回阻断；不得修改全局权限、创建诊断脚本或尝试绕过。"
     body = f"""# Production Runner 托管 {role_code}
 
 这是 `{role_data.get('name', role_code)}` 的 Runner 专用只读执行配置，不是新增业务角色。
@@ -125,14 +131,12 @@ def serialize_runner_readonly_role(platform_key, role_code, role_data):
 
 ## 角色约束
 - 只对 Runner 固定的 baseline SHA、candidate SHA、契约快照和证据包执行{stage}判断。
-{qa_inline_only}- 只能只读查看 Runner 明确指定且位于本次工作区根目录内的候选文件或完整差异工件；不得修改任何文件。
-- 所有读取必须使用工作区内相对路径；禁止绝对路径、`..`、符号链接/目录联接逃逸，以及读取用户主目录、`.gemini`、`.codex`、其他仓库或任何工作区外路径。
-- 不得自行列举目录或发起全局搜索。证据不足时直接返回否定结论，不得通过扩大读取范围补证。
+{access_rules}
 - 不得调用 run_command、Shell、Git、测试命令、包管理器、浏览器或子进程。
 - 不得建卡、修改看板、写入 Evidence 或推进状态；这些动作由 Runner 原子执行。
 - Runner 提供的安全扫描、测试、构建或差异检查未执行、失败或证据不足时，必须拒绝通过。
 - 只返回符合 Runner JSON Schema 的 {verdict} 结构化结论；不得用自然语言包装 JSON。
-- 若读取工具被拒绝，立即返回阻断；不得修改全局权限、创建诊断脚本或尝试绕过。
+{denial_rule}
 
 ## 业务角色审计要求（命令执行条款已转换为证据核验）
 {redlines}

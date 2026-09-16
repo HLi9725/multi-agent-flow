@@ -140,11 +140,14 @@ def test_antigravity_runner_readonly_profiles_keep_duties_without_terminal(
     if role_code == "QA":
         assert parsed["tools"] == []
         assert "不得调用任何工具" in body
+        assert "不得自行读取文件" in body
+        assert "若读取工具被拒绝" not in body
+    else:
+        assert "禁止绝对路径" in body
+        assert ".gemini" in body
+        assert "不得自行列举目录或发起全局搜索" in body
     assert "python3 scripts/check_secrets.py" not in body
     assert "不得修改任何文件" in body
-    assert "禁止绝对路径" in body
-    assert ".gemini" in body
-    assert "不得自行列举目录或发起全局搜索" in body
     assert role_data["responsibilities"][0] in body
 
 
