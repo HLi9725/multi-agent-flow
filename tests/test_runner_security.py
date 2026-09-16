@@ -467,6 +467,36 @@ def test_qa_test_command_security_and_path_boundary_validation(tmp_path, monkeyp
     assert ok is True
     assert args == [os.path.realpath(npm_executable), "run", "build"]
 
+    for namespaced_script in (
+        "test:mysql",
+        "test:integration",
+        "test:integration:mysql",
+        "test:mysql-8.0",
+    ):
+        ok, err, args = _validate_qa_test_command(
+            f"npm run {namespaced_script}", worktree_dir
+        )
+        assert ok is True, err
+        assert args == [os.path.realpath(npm_executable), "run", namespaced_script]
+
+    for forbidden_script in (
+        "deploy",
+        "migrate",
+        "pretest",
+        "posttest",
+        "build:release",
+        "test:",
+        "test:../outside",
+        "test:mysql/escape",
+        "test::mysql",
+        "test:-mysql",
+    ):
+        ok, err, _ = _validate_qa_test_command(
+            f"npm run {forbidden_script}", worktree_dir
+        )
+        assert ok is False
+        assert "limited" in err
+
     ok, err, _ = _validate_qa_test_command("tools/npm run build", worktree_dir)
     assert ok is False
     assert "bare allowlisted command" in err

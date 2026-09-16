@@ -109,6 +109,15 @@ FORBIDDEN_DANGEROUS_COMMANDS = {
     "nc", "netcat", "bash", "sh", "powershell", "powershell.exe", "cmd", "cmd.exe",
 }
 
+# Named npm test scripts are common for environment-specific suites
+# (test:mysql, test:integration:mysql).  Keep the namespace narrow: every
+# segment must be an identifier and the root must be exactly ``test``.
+# This intentionally excludes lifecycle siblings (pretest/posttest) and
+# unrelated scripts such as migrate/deploy.
+NPM_TEST_SCRIPT_PATTERN = re.compile(
+    r"^test(?::[A-Za-z0-9][A-Za-z0-9._-]*)+$"
+)
+
 REVIEWER_PROTOCOL_DEFECT_SUFFIXES = (
     "SCHEMA-VIOLATION",
     "IDENTITY-MISMATCH",
@@ -307,12 +316,19 @@ def _validate_qa_test_command(test_cmd: str, worktree_dir: str) -> Tuple[bool, O
     elif base_bin in {"npm", "npm.cmd", "npm.exe"}:
         if args[1:2] == ["test"]:
             runner_args = args[2:]
-        elif args[1:3] == ["run", "test"]:
-            runner_args = args[3:]
-        elif args[1:3] == ["run", "build"]:
-            runner_args = args[3:]
+        elif len(args) >= 3 and args[1] == "run":
+            npm_script = args[2]
+            if npm_script in {"test", "build"} or NPM_TEST_SCRIPT_PATTERN.fullmatch(npm_script):
+                runner_args = args[3:]
+            else:
+                return False, (
+                    "npm QA scripts are limited to 'test', 'test:<safe-namespace>', or 'build'"
+                ), []
         else:
-            return False, "npm QA commands are limited to 'npm test', 'npm run test', or 'npm run build'", []
+            return False, (
+                "npm QA commands are limited to 'npm test', 'npm run test[:<safe-namespace>]', "
+                "or 'npm run build'"
+            ), []
     elif base_bin in {"npx", "npx.cmd", "npx.exe"}:
         if len(args) < 3 or args[1].lower() != "--no-install" or args[2].lower() not in {"jest", "vitest", "mocha"}:
             return False, "npx QA commands require '--no-install' and are limited to jest, vitest, or mocha", []
@@ -2966,12 +2982,30 @@ class ProductionRunner:
                                 "The task remains at QA; business code was not returned to Builder."
                             ),
                         )
+                    pause_message = (
+                        f"QA test command security validation failed for '{test_cmd}': {cmd_err}"
+                    )
+                    paused_checkpoint = replace(
+                        checkpoint,
+                        state=RunnerState.NEEDS_USER_INPUT.value,
+                        current_role="QA",
+                        execution_options=_execution_options_from_spec(spec),
+                        last_error=pause_message,
+                        updated_at=time.time(),
+                    )
+                    self.checkpoint_store.save_checkpoint(paused_checkpoint)
                     return RunnerResult(
                         success=False,
-                        state=RunnerState.FAILED.value,
+                        state=RunnerState.NEEDS_USER_INPUT.value,
                         task_id=task_id,
                         candidate_commit=candidate_commit,
-                        message=f"QA test command security validation failed for '{test_cmd}': {cmd_err}",
+                        candidate_generation=candidate_generation,
+                        evidence_ids=tuple(evidence_ids),
+                        message=pause_message,
+                        diagnostics={
+                            "invalid_test_command": test_cmd,
+                            "validation_error": cmd_err,
+                        },
                     )
                 validated_commands.append((test_cmd, cmd_args))
 
