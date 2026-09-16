@@ -4190,7 +4190,15 @@ class ProductionRunner:
                 "evidence_ids": list(ckpt.evidence_ids),
                 "confirmation_request_id": ckpt.confirmation_request_id,
                 "last_error": ckpt.last_error,
-                "approval_reason": ckpt.approval_reason,
+                # Permission reasons belong to the active APPROVAL_REQUIRED
+                # state.  Keep the transcript under historical diagnostics
+                # after recovery, but do not present a stale reason as the
+                # cause of an unrelated QA/Reviewer pause.
+                "approval_reason": (
+                    ckpt.approval_reason
+                    if ckpt.state == RunnerState.APPROVAL_REQUIRED.value
+                    else None
+                ),
                 "execution_options": dict(ckpt.execution_options),
                 "execution_spec_snapshot": dict(ckpt.execution_spec_snapshot),
                 "active_elapsed_seconds": ckpt.active_elapsed_seconds,

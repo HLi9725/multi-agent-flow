@@ -137,11 +137,31 @@ def test_status_summarizes_persisted_permission_transcript(tmp_path):
     status = ProductionRunner(checkpoint_store=store).get_status(str(tmp_path), 'T0770')
 
     historical = status['historical_approval_diagnostics']
+    assert status['approval_reason'] is None
     assert 'tool_events' not in historical
     assert historical['tool_events_persisted'] is True
     assert historical['tool_events_stored_chars'] > 1000
     assert historical['denied_actions'][0]['action'] == 'read_file'
     assert 'private host transcript' not in json.dumps(status)
+
+
+def test_status_only_exposes_active_approval_reason_in_approval_state(tmp_path):
+    store = make_store(tmp_path)
+    approval_reason = 'User approval is required for read_file.'
+    checkpoint = replace(
+        make_checkpoint(),
+        state=RunnerState.APPROVAL_REQUIRED.value,
+        approval_reason=approval_reason,
+    )
+    store.save_checkpoint(checkpoint)
+    runner = ProductionRunner(checkpoint_store=store)
+
+    active = runner.get_status(str(tmp_path), 'T0770')
+    assert active['approval_reason'] == approval_reason
+
+    store.save_checkpoint(replace(checkpoint, state=RunnerState.NEEDS_USER_INPUT.value))
+    recovered = runner.get_status(str(tmp_path), 'T0770')
+    assert recovered['approval_reason'] is None
 
 
 @pytest.mark.parametrize('source,target', [('进行中','审查中'),('审查中','测试中'),('测试中','已完成'),('已完成','已验收')])
