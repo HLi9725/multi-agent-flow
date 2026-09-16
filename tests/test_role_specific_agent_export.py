@@ -137,6 +137,9 @@ def test_antigravity_runner_readonly_profiles_keep_duties_without_terminal(
     assert "grep_search" not in parsed["tools"]
     assert "list_dir" not in parsed["tools"]
     assert set(parsed["tools"]).issubset({"view_file", "read"})
+    if role_code == "QA":
+        assert parsed["tools"] == []
+        assert "不得调用任何工具" in body
     assert "python3 scripts/check_secrets.py" not in body
     assert "不得修改任何文件" in body
     assert "禁止绝对路径" in body

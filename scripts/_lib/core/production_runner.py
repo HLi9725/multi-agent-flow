@@ -205,6 +205,108 @@ def _extract_embedded_json_object(raw_output: str, required_fields: Sequence[str
     return candidates[0] if len(candidates) == 1 else None
 
 
+def _normalize_known_qa_legacy_shape(
+    data: Mapping[str, Any],
+    *,
+    task_id: str,
+    baseline_commit: str,
+    candidate_commit: str,
+    session_id: str,
+    qa_request_id: str,
+    acceptance_criteria_hash: str,
+) -> Optional[Dict[str, Any]]:
+    """Normalize the one known Antigravity QA legacy contract.
+
+    This is intentionally not a permissive schema coercion.  It only accepts
+    the historical ``verdict``/``acceptance_criteria`` shape, preserves any
+    supplied immutable identities for the normal mismatch checks, and derives
+    deterministic defects from explicit FAIL rows.  A semantic FAIL therefore
+    reaches Builder instead of being discarded as a protocol-only failure.
+    """
+    legacy_required = {
+        "verdict", "baseline_commit", "candidate_commit",
+        "acceptance_criteria_hash", "acceptance_criteria", "test_commands",
+        "negative_scenarios", "uncovered_risks", "summary",
+    }
+    if not legacy_required.issubset(data):
+        return None
+    decision = str(data.get("verdict", "")).upper()
+    if decision not in ("PASS", "FAIL"):
+        return None
+
+    coverage: List[Dict[str, Any]] = []
+    for item in data.get("acceptance_criteria", []):
+        if not isinstance(item, Mapping):
+            return None
+        coverage.append({
+            "criterion_id": str(item.get("criterion_id") or ""),
+            "status": str(item.get("status") or "").upper(),
+            "evidence": str(item.get("evidence") or ""),
+        })
+
+    command_reports: List[Dict[str, Any]] = []
+    for item in data.get("test_commands", []):
+        if not isinstance(item, Mapping):
+            return None
+        exit_code = item.get("exit_code")
+        command_reports.append({
+            "command": str(item.get("command") or ""),
+            "exit_code": exit_code,
+            "summary": str(item.get("summary") or f"QA reported exit code {exit_code}"),
+        })
+
+    negative_scenarios: List[Dict[str, Any]] = []
+    for item in data.get("negative_scenarios", []):
+        if not isinstance(item, Mapping):
+            return None
+        negative_scenarios.append({
+            "name": str(item.get("name") or item.get("scenario") or ""),
+            "status": str(item.get("status") or "").upper(),
+            "evidence": str(item.get("evidence") or ""),
+        })
+
+    defects = [dict(item) for item in data.get("defects", []) if isinstance(item, Mapping)]
+    if decision == "FAIL" and not defects:
+        for item in coverage:
+            if item["status"] == "FAIL":
+                criterion = re.sub(r"[^A-Za-z0-9_-]+", "-", item["criterion_id"]).strip("-") or "CRITERION"
+                defects.append({
+                    "defect_id": f"DEF-{task_id}-QA-{criterion}",
+                    "severity": "P1",
+                    "description": item["evidence"],
+                })
+        for index, item in enumerate(negative_scenarios, start=1):
+            if item["status"] == "FAIL":
+                defects.append({
+                    "defect_id": f"DEF-{task_id}-QA-NEGATIVE-{index}",
+                    "severity": "P1",
+                    "description": f"{item['name']}: {item['evidence']}",
+                })
+        if not defects:
+            risks = [str(item) for item in data.get("uncovered_risks", []) if str(item).strip()]
+            defects.extend({
+                "defect_id": f"DEF-{task_id}-QA-RISK-{index}",
+                "severity": "P2",
+                "description": risk,
+            } for index, risk in enumerate(risks, start=1))
+
+    return {
+        "task_id": data.get("task_id", task_id),
+        "baseline_commit": data.get("baseline_commit", baseline_commit),
+        "candidate_commit": data.get("candidate_commit", candidate_commit),
+        "session_id": data.get("session_id", session_id),
+        "qa_request_id": data.get("qa_request_id", qa_request_id),
+        "acceptance_criteria_hash": data.get("acceptance_criteria_hash", acceptance_criteria_hash),
+        "decision": decision,
+        "acceptance_coverage": coverage,
+        "test_commands": command_reports,
+        "negative_scenarios": negative_scenarios,
+        "uncovered_risks": [str(item) for item in data.get("uncovered_risks", [])],
+        "defects": defects,
+        "summary": str(data.get("summary") or ""),
+    }
+
+
 def _is_repairable_test_failure(command: str, exit_code: int, output: str) -> bool:
     if exit_code in (0, 124):
         return False
@@ -1627,6 +1729,25 @@ class ProductionRunner:
 
         json_obj = _extract_embedded_json_object(raw_output, QA_JSON_SCHEMA["required"])
         if json_obj is None:
+            try:
+                legacy_candidate = json.loads(raw_output.strip())
+            except Exception:
+                legacy_candidate = None
+            if isinstance(legacy_candidate, Mapping):
+                json_obj = dict(legacy_candidate)
+        if isinstance(json_obj, Mapping):
+            normalized_legacy = _normalize_known_qa_legacy_shape(
+                json_obj,
+                task_id=task_id,
+                baseline_commit=baseline_commit,
+                candidate_commit=candidate_commit,
+                session_id=session_id,
+                qa_request_id=qa_request_id,
+                acceptance_criteria_hash=acceptance_criteria_hash,
+            )
+            if normalized_legacy is not None:
+                json_obj = normalized_legacy
+        if json_obj is None:
             return failed("QA-SCHEMA-VIOLATION", "QA did not return a valid structured JSON object.")
 
         valid, error = _validate_qa_schema_builtin(json_obj)
@@ -1905,6 +2026,8 @@ class ProductionRunner:
         defects_history: List[Dict[str, Any]] = list(checkpoint.defects_history)
         qa_test_cache: Dict[Tuple[str, Tuple[str, ...]], Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]] = {}
         qa_reviewer_security_scan: Optional[Dict[str, Any]] = None
+        qa_protocol_feedback: Optional[str] = None
+        qa_protocol_attempts_this_run = 0
         start_role = checkpoint.current_role if existing_checkpoint else "BUILDER"
         # The authoritative board phase wins over a stale checkpoint role.  A
         # crash or a contract guard immediately after a successful transition
@@ -2447,6 +2570,8 @@ class ProductionRunner:
                     candidate_generation += 1
                     review_cycle = 0
                     qa_cycle = 0
+                    qa_protocol_feedback = None
+                    qa_protocol_attempts_this_run = 0
                 self._emit_progress(
                     task_id=task_id,
                     state=RunnerState.BUILDING.value,
@@ -3408,6 +3533,14 @@ class ProductionRunner:
                 f"Baseline Commit: {spec.baseline_commit}\n"
                 f"Candidate Commit: {candidate_commit}\n"
                 f"Reviewer PASS summary: {review_output.summary if 'review_output' in locals() else 'validated reviewer evidence'}\n\n"
+                + (
+                    "PROTOCOL CORRECTION FROM THE PREVIOUS QA ATTEMPT:\n"
+                    f"{qa_protocol_feedback}\n"
+                    "Return the required schema now. Keys verdict, acceptance_criteria, scenario, and target "
+                    "are legacy aliases and MUST NOT be used.\n\n"
+                    if qa_protocol_feedback else ""
+                )
+                +
                 "Authoritative Runner gate manifest (host-observed facts; do not reinterpret these as missing):\n"
                 f"{json.dumps(qa_gate_manifest, ensure_ascii=False, indent=2)}\n\n"
                 f"Immutable candidate diff:\n{qa_diff_bundle}\n\n"
@@ -3432,6 +3565,10 @@ class ProductionRunner:
                 f"{json.dumps(qa_command_evidence, ensure_ascii=False, indent=2)}\n\n"
                 "Return ONLY a JSON object matching this schema:\n"
                 f"{json.dumps(QA_JSON_SCHEMA, ensure_ascii=False, sort_keys=True)}\n"
+                "MANDATORY TOP-LEVEL KEYS EXACTLY: task_id, baseline_commit, candidate_commit, session_id, "
+                "qa_request_id, acceptance_criteria_hash, decision, acceptance_coverage, test_commands, "
+                "negative_scenarios, uncovered_risks, defects, summary. Do not use legacy aliases such as "
+                "verdict, acceptance_criteria, scenario, or target.\n"
                 f"Identity bindings: task_id={task_id}, baseline_commit={spec.baseline_commit}, "
                 f"candidate_commit={candidate_commit}, session_id={sess_qa}, qa_request_id={qa_request_id}, "
                 f"acceptance_criteria_hash={spec.acceptance_criteria_hash}."
@@ -3604,6 +3741,10 @@ class ProductionRunner:
             test_exit_codes = tuple(item["exit_code"] for item in command_results)
             commands_passed = bool(test_exit_codes) and all(code == 0 for code in test_exit_codes)
             qa_passed = qa_output.decision == "PASS" and commands_passed
+            qa_protocol_failure = commands_passed and _has_protocol_defect(
+                [dict(item) for item in qa_output.defects],
+                QA_PROTOCOL_DEFECT_SUFFIXES,
+            )
             self._emit_progress(
                 task_id=task_id,
                 state=RunnerState.QA_TESTING.value,
@@ -3651,6 +3792,68 @@ class ProductionRunner:
                     evidence_ids=tuple(evidence_ids),
                     message=pause_message,
                 )
+
+            if qa_protocol_failure:
+                qa_defects = [dict(item) for item in qa_output.defects]
+                qa_protocol_feedback = qa_output.summary
+                qa_protocol_attempts_this_run += 1
+                protocol_cycle = qa_cycle
+                # Host/schema retries are not business QA failures and must
+                # not consume the candidate's semantic QA retry budget. They
+                # also must not create a false TESTING -> BUILDING Evidence.
+                qa_cycle = max(0, qa_cycle - 1)
+                defects_history.append({
+                    "cycle": protocol_cycle,
+                    "protocol_attempt": qa_protocol_attempts_this_run,
+                    "role": "QA_PROTOCOL",
+                    "defects": qa_defects,
+                    "summary": qa_output.summary,
+                    "host_invocation_id": inv_qa,
+                })
+                if qa_protocol_attempts_this_run >= 2:
+                    pause_message = (
+                        "QA protocol output remained invalid after the bounded protocol retry. "
+                        "Business QA budget was preserved and no business transition Evidence was created."
+                    )
+                    checkpoint = replace(
+                        checkpoint,
+                        state=RunnerState.NEEDS_USER_INPUT.value,
+                        current_role="QA",
+                        candidate_commit=candidate_commit,
+                        candidate_generation=candidate_generation,
+                        review_cycle=review_cycle,
+                        qa_cycle=qa_cycle,
+                        total_attempts=total_attempts,
+                        qa_invocation_id=inv_qa,
+                        evidence_ids=tuple(evidence_ids),
+                        defects_history=tuple(defects_history),
+                        last_error=pause_message,
+                        updated_at=time.time(),
+                    )
+                    self.checkpoint_store.save_checkpoint(checkpoint)
+                    return RunnerResult(
+                        success=False,
+                        state=RunnerState.NEEDS_USER_INPUT.value,
+                        task_id=task_id,
+                        candidate_commit=candidate_commit,
+                        candidate_generation=candidate_generation,
+                        evidence_ids=tuple(evidence_ids),
+                        message=pause_message,
+                        diagnostics={"defects": defects_history},
+                    )
+                checkpoint = replace(
+                    checkpoint,
+                    qa_cycle=qa_cycle,
+                    qa_invocation_id=inv_qa,
+                    evidence_ids=tuple(evidence_ids),
+                    defects_history=tuple(defects_history),
+                    last_error=qa_output.summary,
+                    updated_at=time.time(),
+                )
+                self.checkpoint_store.save_checkpoint(checkpoint)
+                skip_builder = True
+                skip_reviewer = True
+                continue
 
             qa_evidence_id = f"evi_qa_{task_id.lower()}_{int(time.time()*1000)}"
             qa_caps = qa_adapter.detect_capabilities()
@@ -3772,54 +3975,6 @@ class ProductionRunner:
                         if str(defect.get("defect_id", "")) not in existing_ids
                     )
                 qa_exhausted = qa_cycle >= spec.max_qa_cycles
-                qa_protocol_failure = commands_passed and _has_protocol_defect(
-                    qa_defects,
-                    QA_PROTOCOL_DEFECT_SUFFIXES,
-                )
-                if qa_protocol_failure:
-                    defects_history.append({
-                        "cycle": qa_cycle,
-                        "role": "QA_PROTOCOL",
-                        "defects": qa_defects,
-                        "summary": qa_output.summary,
-                    })
-                    if qa_exhausted:
-                        pause_message = (
-                            "QA protocol output remained invalid and exceeded "
-                            f"max QA cycles ({spec.max_qa_cycles}). Business code was not returned to Builder."
-                        )
-                        checkpoint = replace(
-                            checkpoint,
-                            state=RunnerState.NEEDS_USER_INPUT.value,
-                            current_role="QA",
-                            candidate_commit=candidate_commit,
-                            candidate_generation=candidate_generation,
-                            review_cycle=review_cycle,
-                            qa_cycle=qa_cycle,
-                            total_attempts=total_attempts,
-                            qa_invocation_id=inv_qa,
-                            evidence_ids=tuple(evidence_ids),
-                            defects_history=tuple(defects_history),
-                            last_error=pause_message,
-                            updated_at=time.time(),
-                        )
-                        self.checkpoint_store.save_checkpoint(checkpoint)
-                        return RunnerResult(
-                            success=False,
-                            state=RunnerState.NEEDS_USER_INPUT.value,
-                            task_id=task_id,
-                            candidate_commit=candidate_commit,
-                            candidate_generation=candidate_generation,
-                            evidence_ids=tuple(evidence_ids),
-                            message=pause_message,
-                            diagnostics={"defects": defects_history},
-                        )
-                    # Keep the board in 测试中 and retry only QA. The Runner test
-                    # evidence and candidate remain fixed and are not rerun.
-                    skip_builder = True
-                    skip_reviewer = True
-                    continue
-
                 if current_board_status == "测试中":
                     ok_return, err_return = self._do_state_transition(
                         spec.authority_root, task_id, "QA", "测试中", "已退回", "李开发",

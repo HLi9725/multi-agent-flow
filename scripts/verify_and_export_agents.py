@@ -89,7 +89,7 @@ def serialize_runner_readonly_role(platform_key, role_code, role_data):
     # Runner already supplies a complete diff/impact bundle. Managed reviewers
     # only need deterministic reads of files explicitly named by that bundle;
     # broad directory/search tools can wander into user-global configuration.
-    tools = [
+    tools = [] if role_code == "QA" else [
         tool for tool in PLATFORM_TOOLS.get(platform_key, DEFAULT_TOOLS)
         if tool.lower() in {"view_file", "read"}
     ]
@@ -112,6 +112,10 @@ def serialize_runner_readonly_role(platform_key, role_code, role_data):
     redlines = _as_bullets(audit_rules)
     verdict = "PASS/REJECT" if role_code == "REVIEWER" else "PASS/FAIL"
     stage = "审查" if role_code == "REVIEWER" else "测试"
+    qa_inline_only = (
+        "- QA 的全部差异、测试、构建、安全扫描和验收矩阵证据均由 Runner 内联提供；不得调用任何工具。\n"
+        if role_code == "QA" else ""
+    )
     body = f"""# Production Runner 托管 {role_code}
 
 这是 `{role_data.get('name', role_code)}` 的 Runner 专用只读执行配置，不是新增业务角色。
@@ -121,7 +125,7 @@ def serialize_runner_readonly_role(platform_key, role_code, role_data):
 
 ## 角色约束
 - 只对 Runner 固定的 baseline SHA、candidate SHA、契约快照和证据包执行{stage}判断。
-- 只能只读查看 Runner 明确指定且位于本次工作区根目录内的候选文件或完整差异工件；不得修改任何文件。
+{qa_inline_only}- 只能只读查看 Runner 明确指定且位于本次工作区根目录内的候选文件或完整差异工件；不得修改任何文件。
 - 所有读取必须使用工作区内相对路径；禁止绝对路径、`..`、符号链接/目录联接逃逸，以及读取用户主目录、`.gemini`、`.codex`、其他仓库或任何工作区外路径。
 - 不得自行列举目录或发起全局搜索。证据不足时直接返回否定结论，不得通过扩大读取范围补证。
 - 不得调用 run_command、Shell、Git、测试命令、包管理器、浏览器或子进程。

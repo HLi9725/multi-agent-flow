@@ -307,6 +307,37 @@ def test_qa_schema_and_semantic_coverage_fail_closed():
     parsed = runner._parse_qa_structured_json(json.dumps(valid), **kwargs)
     assert parsed.decision == "PASS"
 
+    legacy_fail = {
+        "verdict": "FAIL",
+        "baseline_commit": baseline,
+        "candidate_commit": candidate,
+        "acceptance_criteria_hash": criteria_hash,
+        "acceptance_criteria": [
+            {"criterion_id": "AC-01", "text": "first", "status": "PASS", "evidence": "verified"},
+            {"criterion_id": "AC-02", "text": "second", "status": "FAIL", "evidence": "missing barrier"},
+        ],
+        "test_commands": [
+            {"command": "python -m pytest -q", "exit_code": 0},
+        ],
+        "negative_scenarios": [
+            {"scenario": "concurrent race", "target": "worker", "status": "FAIL", "evidence": "not synchronized"},
+        ],
+        "uncovered_risks": ["race is not proven"],
+        "summary": "QA found a real concurrency gap.",
+    }
+    parsed_legacy = runner._parse_qa_structured_json(json.dumps(legacy_fail), **kwargs)
+    assert parsed_legacy.decision == "FAIL"
+    assert [item["criterion_id"] for item in parsed_legacy.acceptance_coverage] == ["AC-01", "AC-02"]
+    assert parsed_legacy.test_commands[0]["summary"] == "QA reported exit code 0"
+    assert parsed_legacy.negative_scenarios[0]["name"] == "concurrent race"
+    assert any("QA-AC-02" in item["defect_id"] for item in parsed_legacy.defects)
+    assert not any("SCHEMA-VIOLATION" in item["defect_id"] for item in parsed_legacy.defects)
+
+    mismatched_legacy = dict(legacy_fail, candidate_commit="c" * 40)
+    parsed_mismatch = runner._parse_qa_structured_json(json.dumps(mismatched_legacy), **kwargs)
+    assert parsed_mismatch.decision == "FAIL"
+    assert "IDENTITY-MISMATCH" in parsed_mismatch.defects[0]["defect_id"]
+
     mixed_output = "QA assessment complete.\n" + json.dumps(valid)
     parsed = runner._parse_qa_structured_json(mixed_output, **kwargs)
     assert parsed.decision == "PASS"
