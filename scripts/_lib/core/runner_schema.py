@@ -415,6 +415,7 @@ class RunnerCheckpoint:
     run_id: str = ""
     approval_attempts: int = 0
     approval_diagnostics: Mapping[str, Any] = field(default_factory=dict)
+    host_attempt_history: Tuple[Dict[str, Any], ...] = field(default_factory=tuple)
     confirmation_request_id: Optional[str] = None
     defects_history: Tuple[Dict[str, Any], ...] = field(default_factory=tuple)
     approval_reason: Optional[str] = None
@@ -428,6 +429,7 @@ class RunnerCheckpoint:
         object.__setattr__(self, "execution_options", _freeze_runner_value(dict(self.execution_options)))
         object.__setattr__(self, "execution_spec_snapshot", _freeze_runner_value(dict(self.execution_spec_snapshot)))
         object.__setattr__(self, "approval_diagnostics", _freeze_runner_value(dict(self.approval_diagnostics)))
+        object.__setattr__(self, "host_attempt_history", tuple(self.host_attempt_history))
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -455,6 +457,7 @@ class RunnerCheckpoint:
             "run_id": self.run_id,
             "approval_attempts": self.approval_attempts,
             "approval_diagnostics": dict(self.approval_diagnostics),
+            "host_attempt_history": [dict(item) for item in self.host_attempt_history],
             "confirmation_request_id": self.confirmation_request_id,
             "defects_history": [dict(d) for d in self.defects_history],
             "approval_reason": self.approval_reason,
@@ -490,6 +493,7 @@ class RunnerCheckpoint:
             run_id=str(data.get("run_id", "")),
             approval_attempts=int(data.get("approval_attempts", 0)),
             approval_diagnostics=dict(data.get("approval_diagnostics", {})),
+            host_attempt_history=tuple(data.get("host_attempt_history", [])),
             confirmation_request_id=data.get("confirmation_request_id"),
             defects_history=tuple(data.get("defects_history", [])),
             approval_reason=data.get("approval_reason"),

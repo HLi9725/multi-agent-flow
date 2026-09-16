@@ -24,7 +24,12 @@ from scripts._lib.core.agent_schema import (
 )
 from scripts._lib.core.evidence_gate import EvidenceGate
 from scripts._lib.core.evidence_store import EvidenceStore
-from scripts._lib.core.production_runner import ProductionRunner
+from scripts._lib.core.production_runner import (
+    ProductionRunner,
+    _compact_test_diagnostics,
+    _derive_command_failure_defects,
+    _is_empty_host_completion,
+)
 from scripts._lib.core.runner_checkpoint_store import RunnerCheckpointStore
 from scripts._lib.core.runner_schema import RunnerState, TaskExecutionSpec
 from scripts._lib.hosts.antigravity_adapter import AntigravityAdapter, create_antigravity_manifest
@@ -138,6 +143,33 @@ def test_finalize_builder_repair_requires_a_new_candidate(tmp_path):
     ).strip() == ""
 
 
+def test_empty_host_completion_and_repair_diagnostics_are_deterministic():
+    result = AgentResult(
+        session_id="sess_empty",
+        status=AgentStatus.SUCCESS,
+        output="No output returned",
+        partial_results=({"output_empty": True, "invocation_id": "inv-empty"},),
+        is_real_host=True,
+    )
+    assert _is_empty_host_completion(result) is True
+
+    diagnostics = [{
+        "command": "git diff --check base..candidate --",
+        "exit_code": 2,
+        "output_excerpt": (
+            "app/main.py:12: trailing whitespace.\n"
+            "app/main.py:12: trailing whitespace.\n"
+            "tests/test_db.py:30: new blank line at EOF.\n"
+        ),
+        "output_truncated": False,
+    }]
+    compact = _compact_test_diagnostics(diagnostics)
+    assert compact[0]["findings"].count("app/main.py:12") == 1
+    defects = _derive_command_failure_defects("T0014", diagnostics)
+    assert [item["file_path"] for item in defects] == ["app/main.py", "tests/test_db.py"]
+    assert all(item["severity"] == "P2" for item in defects)
+
+
 def test_reviewer_diff_bundle_is_inline_bounded_and_nonempty(tmp_path):
     repo_dir = tmp_path / "review-repo"
     repo_dir.mkdir()
@@ -232,15 +264,31 @@ def test_runner_wait_enforces_outer_deadline():
     assert adapter.cancelled is True
 
 
-@pytest.mark.parametrize("recover_budget", [False, True])
-def test_production_runner_full_pass_pipeline(mock_git_repo, tmp_path, monkeypatch, recover_budget):
+@pytest.mark.parametrize(
+    "recover_budget,empty_builder_completions",
+    [(False, 0), (True, 0), (False, 1), (False, 2)],
+)
+def test_production_runner_full_pass_pipeline(
+    mock_git_repo, tmp_path, monkeypatch, recover_budget, empty_builder_completions
+):
     repo_dir, baseline_sha = mock_git_repo
+    if empty_builder_completions:
+        # Production installations keep Runner control data outside candidate
+        # Git changes. Mirror that boundary so an empty Builder cannot create a
+        # candidate merely by committing board transitions from this fixture.
+        (repo_dir / ".gitignore").write_text("user_data/\n", encoding="utf-8")
+        subprocess.run(["git", "add", ".gitignore", "config/workflow.config.yaml"], cwd=repo_dir, check=True)
+        subprocess.run(["git", "commit", "-m", "test: isolate control data"], cwd=repo_dir, check=True, capture_output=True)
+        baseline_sha = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=repo_dir, text=True
+        ).strip()
     data_root = tmp_path / "data_root"
     data_root.mkdir()
 
     session_workspaces = {}
     review_requests = {}
     qa_requests = {}
+    builder_calls = 0
 
     def mock_detect_caps(self):
         return HostCapabilities(
@@ -270,8 +318,21 @@ def test_production_runner_full_pass_pipeline(mock_git_repo, tmp_path, monkeypat
         )
 
     def mock_codex_wait(self, handle, timeout_seconds=None):
+        nonlocal builder_calls
         target_dir = session_workspaces.get(handle.session_id, str(repo_dir))
         if "builder" in handle.session_id:
+            builder_calls += 1
+            if builder_calls <= empty_builder_completions:
+                return AgentResult(
+                    session_id=handle.session_id,
+                    status=AgentStatus.SUCCESS,
+                    output="No output returned",
+                    partial_results=({
+                        "output_empty": True,
+                        "invocation_id": "inv_builder_empty_first",
+                    },),
+                    is_real_host=True,
+                )
             dummy_file = os.path.join(target_dir, f"new_feature_{int(time.time()*1000)}.py")
             with open(dummy_file, "w", encoding="utf-8") as f:
                 f.write("def dummy(): return True\n")
@@ -403,6 +464,15 @@ def test_production_runner_full_pass_pipeline(mock_git_repo, tmp_path, monkeypat
 
     result = runner.start(spec)
 
+    if empty_builder_completions == 2:
+        assert result.success is False
+        assert result.state == RunnerState.NEEDS_USER_INPUT.value
+        assert result.diagnostics["failure_kind"] == "HOST_EMPTY_COMPLETION"
+        assert result.diagnostics["empty_completion_retries"] == 1
+        assert builder_calls == 2
+        assert checkpoint_store.load_checkpoint("T0088").total_attempts == 1
+        return
+
     if recover_budget:
         assert result.state == RunnerState.NEEDS_USER_INPUT.value
         assert result.diagnostics["total_attempts"] == 0
@@ -467,6 +537,14 @@ def test_production_runner_full_pass_pipeline(mock_git_repo, tmp_path, monkeypat
         if event["event"] == "stage_started"
     ]
     assert stage_roles == ["BUILDER", "REVIEWER", "QA"]
+    assert any(event["event"] == "stage_retrying" for event in progress_events) is bool(empty_builder_completions)
+    assert builder_calls == (2 if empty_builder_completions else 1)
+    checkpoint_after_run = checkpoint_store.load_checkpoint("T0088")
+    if empty_builder_completions:
+        assert checkpoint_after_run.host_attempt_history[-1]["outcome"] == "EMPTY_COMPLETION_RETRIED"
+        assert checkpoint_after_run.host_attempt_history[-1]["host_invocation_id"] == "inv_builder_empty_first"
+    else:
+        assert checkpoint_after_run.host_attempt_history == ()
     assert progress_events[-1]["event"] == "pending_user_acceptance"
     qa_request = next(iter(qa_requests.values()))
     assert "Do not invoke commands" in qa_request.prompt

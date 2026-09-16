@@ -206,6 +206,106 @@ def _is_repairable_test_failure(command: str, exit_code: int, output: str) -> bo
     return bool(re.search(r"(?im)(?:^FAILED\s+\S+|\b[1-9]\d* failed\b|^not ok\s+\d+|^# fail [1-9])", output))
 
 
+def _is_empty_host_completion(result: AgentResult) -> bool:
+    """Detect a successful host turn that produced neither prose nor useful work events."""
+    if result.status != AgentStatus.SUCCESS:
+        return False
+    for item in result.partial_results:
+        if isinstance(item, Mapping) and "output_empty" in item:
+            return bool(item.get("output_empty"))
+    return not str(result.output or "").strip() or result.output == "No output returned"
+
+
+def _compact_test_diagnostics(
+    diagnostics: Sequence[Mapping[str, Any]],
+    *,
+    max_total_chars: int = 18_000,
+    max_findings_per_command: int = 40,
+) -> List[Dict[str, Any]]:
+    """Reduce repetitive test logs to deterministic, repair-oriented findings."""
+    remaining = max_total_chars
+    compacted: List[Dict[str, Any]] = []
+    finding_pattern = re.compile(
+        r"(?i)(?:^FAILED\s+|^ERROR\s+|UnicodeDecodeError|ModuleNotFoundError|"
+        r"Table\s+['\"].+?doesn't exist|trailing whitespace|space before tab|"
+        r"new blank line at EOF|leftover conflict marker|AssertionError|"
+        r"\b[1-9]\d* failed\b|\b[1-9]\d* errors?\b)"
+    )
+    for diagnostic in diagnostics:
+        command = str(diagnostic.get("command", ""))
+        exit_code = diagnostic.get("exit_code")
+        raw = str(diagnostic.get("output_excerpt", ""))
+        findings: List[str] = []
+        seen: Set[str] = set()
+        for line in raw.splitlines():
+            normalized = line.strip()
+            if not normalized or not finding_pattern.search(normalized):
+                continue
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            findings.append(normalized[:1000])
+            if len(findings) >= max_findings_per_command:
+                break
+        if not findings and raw:
+            findings.append(raw[-2000:])
+        joined = "\n".join(findings)
+        if len(joined) > remaining:
+            joined = joined[:remaining] + "\n[diagnostics compacted]"
+        remaining = max(0, remaining - len(joined))
+        compacted.append({
+            "command": command,
+            "exit_code": exit_code,
+            "findings": joined,
+            "source_output_truncated": bool(diagnostic.get("output_truncated")) or len(raw) > len(joined),
+        })
+        if remaining == 0:
+            break
+    return compacted
+
+
+def _derive_command_failure_defects(
+    task_id: str,
+    diagnostics: Sequence[Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Turn Runner-owned command failures into actionable Builder defects."""
+    defects: List[Dict[str, Any]] = []
+    serial = 1
+    for diagnostic in _compact_test_diagnostics(diagnostics):
+        if diagnostic.get("exit_code") == 0:
+            continue
+        command = str(diagnostic.get("command", ""))
+        findings = str(diagnostic.get("findings", "")).strip()
+        if command.startswith("git diff --check "):
+            count_before = len(defects)
+            for line in findings.splitlines():
+                match = re.match(r"^(.+?):(\d+):\s*(.+)$", line)
+                if not match:
+                    continue
+                defects.append({
+                    "defect_id": f"DEF-{task_id}-RUNNER-{serial:02d}",
+                    "severity": "P2",
+                    "file_path": match.group(1),
+                    "line_range": match.group(2),
+                    "description": f"Candidate format gate failed: {match.group(3)}",
+                    "suggested_fix": "Remove the reported whitespace/format defect without changing unrelated behavior.",
+                })
+                serial += 1
+            if len(defects) > count_before:
+                continue
+        defects.append({
+            "defect_id": f"DEF-{task_id}-RUNNER-{serial:02d}",
+            "severity": "P1",
+            "description": (
+                f"Runner-controlled command `{command}` exited {diagnostic.get('exit_code')}. "
+                f"Repair the candidate so the same command passes. Key findings:\n{findings or '[no parseable finding]'}"
+            )[:8000],
+            "suggested_fix": "Fix the underlying application, migration, or test code; do not bypass or weaken the command gate.",
+        })
+        serial += 1
+    return defects
+
+
 def _build_qa_subprocess_env() -> Dict[str, str]:
     """Create a deterministic test environment without inherited host credentials."""
     clean_env = {
@@ -1965,6 +2065,9 @@ class ProductionRunner:
                             defects_history[-1] = last_defect
                             self.checkpoint_store.save_checkpoint(replace(checkpoint, defects_history=tuple(defects_history)))
                             raise ProductionRunnerError("Legacy test failure needs environment diagnosis; see persisted unclassified_test_diagnostics")
+                    compact_repair_diagnostics = _compact_test_diagnostics(
+                        last_defect.get("test_diagnostics", [])
+                    )
                     builder_prompt = (
                         f"Task {task_id}: Previous attempt was rejected by {last_defect.get('role', 'REVIEWER')}.\n"
                         f"Defects: {json.dumps(last_defect.get('defects', []), ensure_ascii=False)}\n"
@@ -1972,7 +2075,10 @@ class ProductionRunner:
                         f"Requirements:\n{spec.requirement_text}\n"
                         f"Acceptance Criteria:\n{spec.acceptance_criteria}\n"
                         f"Baseline: {spec.baseline_commit}\nCandidate: {candidate_commit}\n"
-                        f"Runner test diagnostics: {json.dumps(last_defect.get('test_diagnostics', []), ensure_ascii=False)}\n"
+                        f"Runner-owned compact test diagnostics: "
+                        f"{json.dumps(compact_repair_diagnostics, ensure_ascii=False)}\n"
+                        "Treat the listed command findings as repair requirements. Do not disable, skip, mock, or "
+                        "weaken the tests, migrations, or quality gates.\n"
                         f"Please fix the defects in {worktree_dir} using file read/write tools only."
                     )
                 else:
@@ -2026,22 +2132,97 @@ class ProductionRunner:
                     cycle=builder_attempt,
                 )
 
+                empty_completion_retries = 0
+                builder_pre_head = self._get_git_commit(worktree_dir)
+                builder_pre_status = subprocess.check_output(
+                    ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+                    cwd=worktree_dir,
+                    text=True,
+                ).strip()
                 try:
-                    self._record_pre_granted_approval(
-                        builder_adapter,
-                        builder_request,
-                        pre_granted_approval,
-                    )
-                    builder_handle = builder_adapter.dispatch_agent(builder_request)
-                    with self._lock:
-                        self._active_handles[task_id] = builder_handle
+                    while True:
+                        self._record_pre_granted_approval(
+                            builder_adapter,
+                            builder_request,
+                            pre_granted_approval,
+                        )
+                        builder_handle = builder_adapter.dispatch_agent(builder_request)
+                        with self._lock:
+                            self._active_handles[task_id] = builder_handle
 
-                    builder_result = self._wait_for_result_cancellable(
-                        builder_adapter,
-                        builder_handle,
-                        timeout_seconds=float(spec.builder_timeout_seconds),
-                        task_id=task_id,
-                    )
+                        builder_result = self._wait_for_result_cancellable(
+                            builder_adapter,
+                            builder_handle,
+                            timeout_seconds=float(spec.builder_timeout_seconds),
+                            task_id=task_id,
+                        )
+                        with self._lock:
+                            self._active_handles.pop(task_id, None)
+
+                        worktree_unchanged = (
+                            self._get_git_commit(worktree_dir) == builder_pre_head
+                            and subprocess.check_output(
+                                ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+                                cwd=worktree_dir,
+                                text=True,
+                            ).strip() == builder_pre_status
+                        )
+                        if (
+                            _is_empty_host_completion(builder_result)
+                            and builder_result.session_id == builder_handle.session_id
+                            and builder_result.is_real_host
+                            and builder_handle.is_real_host
+                            and _extract_real_invocation_id(builder_result, builder_handle)
+                            and worktree_unchanged
+                            and empty_completion_retries < 1
+                        ):
+                            empty_completion_retries += 1
+                            self._emit_progress(
+                                task_id=task_id,
+                                state=RunnerState.BUILDING.value,
+                                role="BUILDER",
+                                event="stage_retrying",
+                                message=(
+                                    "Builder host returned an empty completion with no workspace changes; "
+                                    "retrying once within the same business attempt"
+                                ),
+                                cycle=builder_attempt,
+                            )
+                            sess_builder = (
+                                f"sess_builder_runner_{task_id.lower()}_{int(time.time()*1000)}_retry1"
+                            )
+                            builder_request = replace(
+                                builder_request,
+                                session_id=sess_builder,
+                                prompt=(
+                                    builder_prompt
+                                    + "\n\nRetry notice: the prior host turn returned no text, invoked no effective "
+                                    "workspace edit, and left the candidate unchanged. Perform the requested repairs "
+                                    "now and leave concrete file changes. If genuinely blocked, return a concise "
+                                    "explanation instead of an empty response."
+                                ),
+                            )
+                            checkpoint = replace(
+                                checkpoint,
+                                builder_session_id=sess_builder,
+                                host_attempt_history=tuple((
+                                    list(checkpoint.host_attempt_history)
+                                    + [{
+                                        "role": "BUILDER",
+                                        "session_id": builder_result.session_id,
+                                        "host_invocation_id": _extract_real_invocation_id(
+                                            builder_result, builder_handle
+                                        ),
+                                        "outcome": "EMPTY_COMPLETION_RETRIED",
+                                        "created_at": time.time(),
+                                    }]
+                                )[-32:]),
+                                last_error=None,
+                                updated_at=time.time(),
+                            )
+                            self.checkpoint_store.save_checkpoint(checkpoint)
+                            continue
+                        break
                 except RunnerCancelledError as ce:
                     return RunnerResult(
                         success=True,
@@ -2156,6 +2337,7 @@ class ProductionRunner:
                         previous_candidate_commit=previous_candidate_commit,
                     )
                 except Exception as e:
+                    empty_host_completion = _is_empty_host_completion(builder_result)
                     detail = self._sanitize_diagnostic(
                         f"{e}\nHost output: {builder_result.output}", 4000
                     )
@@ -2184,8 +2366,17 @@ class ProductionRunner:
                             "builder_output": self._sanitize_diagnostic(builder_result.output),
                             "host_invocation_id": inv_builder,
                             "host_event_count": len(builder_result.partial_results),
-                            "failure_kind": "BUILDER_NO_CANDIDATE",
-                            "note": "Host completion is not proof of file edits; inspect the bound host session. Empty text alone does not establish the cause.",
+                            "empty_completion_retries": empty_completion_retries,
+                            "failure_kind": (
+                                "HOST_EMPTY_COMPLETION"
+                                if empty_host_completion
+                                else "BUILDER_NO_CANDIDATE"
+                            ),
+                            "note": (
+                                "The host returned an empty completion and produced no candidate after one bounded retry."
+                                if empty_host_completion
+                                else "Host completion is not proof of file edits; inspect the bound host session."
+                            ),
                         },
                     )
 
@@ -3509,6 +3700,16 @@ class ProductionRunner:
                         "severity": "P1",
                         "description": f"Runner-controlled QA commands failed with exit codes {list(test_exit_codes)}.",
                     })
+                    # The semantic QA response may itself be malformed.  The
+                    # Runner nevertheless owns trustworthy command evidence and
+                    # must turn it into deterministic repair instructions rather
+                    # than handing a generic schema failure to Builder.
+                    derived_defects = _derive_command_failure_defects(task_id, qa_command_evidence)
+                    existing_ids = {str(item.get("defect_id", "")) for item in qa_defects}
+                    qa_defects.extend(
+                        defect for defect in derived_defects
+                        if str(defect.get("defect_id", "")) not in existing_ids
+                    )
                 qa_exhausted = qa_cycle >= spec.max_qa_cycles
                 qa_protocol_failure = commands_passed and _has_protocol_defect(
                     qa_defects,
