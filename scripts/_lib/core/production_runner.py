@@ -864,6 +864,38 @@ class ProductionRunner:
         )
         return text[-limit:]
 
+    def _status_approval_diagnostics(self, diagnostics: Mapping[str, Any]) -> Dict[str, Any]:
+        """Expose actionable denial metadata without replaying persisted host transcripts."""
+        if not diagnostics:
+            return {}
+        result: Dict[str, Any] = {}
+        for key in (
+            "host_session_id",
+            "host_invocation_id",
+            "host_exit_code",
+            "denied_command",
+            "host_message",
+        ):
+            if key not in diagnostics:
+                continue
+            value = diagnostics[key]
+            result[key] = value if key == "host_exit_code" else self._sanitize_diagnostic(value, 1000)
+        denied_actions = diagnostics.get("denied_actions", ())
+        if isinstance(denied_actions, (list, tuple)):
+            result["denied_actions"] = [
+                {
+                    "action": self._sanitize_diagnostic(item.get("action"), 200),
+                    "display_name": self._sanitize_diagnostic(item.get("display_name"), 200),
+                }
+                for item in denied_actions
+                if isinstance(item, Mapping)
+            ]
+        tool_events = diagnostics.get("tool_events")
+        if tool_events:
+            result["tool_events_persisted"] = True
+            result["tool_events_stored_chars"] = len(str(tool_events))
+        return result
+
     def _execute_with_checkpoint_guard(self, *args: Any, **kwargs: Any) -> RunnerResult:
         """Run the state machine and durably reconcile every normal exception."""
         spec = args[0] if args else kwargs.get("spec")
@@ -3904,6 +3936,9 @@ class ProductionRunner:
         _validate_task_id(task_id)
         ckpt = self.checkpoint_store.load_checkpoint(task_id)
         if ckpt:
+            status_approval_diagnostics = self._status_approval_diagnostics(
+                ckpt.approval_diagnostics
+            )
             return {
                 "task_id": task_id,
                 "project_id": ckpt.project_id,
@@ -3923,8 +3958,9 @@ class ProductionRunner:
                 "active_elapsed_seconds": ckpt.active_elapsed_seconds,
                 "run_id": ckpt.run_id,
                 "approval_attempts": ckpt.approval_attempts,
-                "approval_diagnostics": dict(ckpt.approval_diagnostics) if ckpt.state == RunnerState.APPROVAL_REQUIRED.value else {},
-                "historical_approval_diagnostics": dict(ckpt.approval_diagnostics) if ckpt.state != RunnerState.APPROVAL_REQUIRED.value else {},
+                "approval_diagnostics": status_approval_diagnostics if ckpt.state == RunnerState.APPROVAL_REQUIRED.value else {},
+                "historical_approval_diagnostics": status_approval_diagnostics if ckpt.state != RunnerState.APPROVAL_REQUIRED.value else {},
+                "host_attempt_history": [dict(item) for item in ckpt.host_attempt_history[-32:]],
                 "total_attempts": ckpt.total_attempts,
                 "evidence_scope": "Historical evidence; not proof that the current repair passed.",
             }

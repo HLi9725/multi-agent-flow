@@ -118,6 +118,32 @@ def test_permission_diagnostics_survive_and_do_not_consume_repair_budget(tmp_pat
     assert '--dangerously-skip-permissions' not in restored.approval_diagnostics['host_message']
 
 
+def test_status_summarizes_persisted_permission_transcript(tmp_path):
+    store = make_store(tmp_path)
+    checkpoint = replace(
+        make_checkpoint(),
+        state=RunnerState.NEEDS_USER_INPUT.value,
+        approval_diagnostics={
+            'host_session_id': 'conv-real',
+            'host_invocation_id': 'conv-real:step_2',
+            'host_exit_code': 0,
+            'denied_actions': ({'action': 'read_file', 'display_name': 'GrepSearch'},),
+            'tool_events': 'private host transcript ' * 1000,
+            'host_message': 'permission denied',
+        },
+    )
+    store.save_checkpoint(checkpoint)
+
+    status = ProductionRunner(checkpoint_store=store).get_status(str(tmp_path), 'T0770')
+
+    historical = status['historical_approval_diagnostics']
+    assert 'tool_events' not in historical
+    assert historical['tool_events_persisted'] is True
+    assert historical['tool_events_stored_chars'] > 1000
+    assert historical['denied_actions'][0]['action'] == 'read_file'
+    assert 'private host transcript' not in json.dumps(status)
+
+
 @pytest.mark.parametrize('source,target', [('进行中','审查中'),('审查中','测试中'),('测试中','已完成'),('已完成','已验收')])
 def test_managed_transition_requires_proof_but_standalone_is_unchanged(tmp_path, source, target):
     store = make_store(tmp_path)
