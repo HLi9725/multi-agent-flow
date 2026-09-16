@@ -1207,6 +1207,50 @@ def test_antigravity_adapter_treats_success_with_denied_actions_as_permission_fa
     ]
 
 
+def test_antigravity_adapter_does_not_treat_model_permission_prose_as_host_denial(monkeypatch):
+    adapter = AntigravityAdapter(
+        is_real_host=True, executable_path=sys.executable,
+        verification_level=VerificationLevel.CLI_VERIFIED,
+    )
+    request = AgentRequest(
+        session_id="sess_permission_prose", prompt="review evidence", role="QA",
+        workspace_dir=os.path.abspath("."),
+    )
+    adapter.record_out_of_band_approval(request)
+
+    class SuccessfulPermissionProsePopen:
+        pid = 77890
+        returncode = 0
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def communicate(self, input=None, timeout=None):
+            response = json.dumps({
+                "decision": "FAIL",
+                "summary": "The report discusses permission denied and approval required as reviewed risks.",
+            })
+            events = [
+                {"event": "init", "conversation_id": "conv-permission-prose"},
+                {"event": "step_update", "step_update": {
+                    "conversation_id": "conv-permission-prose", "step_index": 4,
+                    "state": "COMPLETED", "message": "Model response completed",
+                }},
+                {"event": "result", "result": {
+                    "conversation_id": "conv-permission-prose", "status": "SUCCESS",
+                    "response": response, "denied_actions": [],
+                }},
+            ]
+            return "\n".join(json.dumps(item) for item in events), ""
+
+    monkeypatch.setattr(subprocess, "Popen", SuccessfulPermissionProsePopen)
+    handle = adapter.dispatch_agent(request)
+    result = adapter.wait_for_result(handle, timeout_seconds=5)
+
+    assert result.status == AgentStatus.SUCCESS
+    assert "permission denied" in result.output
+
+
 def test_antigravity_adapter_out_of_band_approval_is_exact_and_bounded():
     adapter = AntigravityAdapter(is_real_host=False)
     workspace = os.path.abspath(".")

@@ -548,6 +548,10 @@ def test_production_runner_full_pass_pipeline(
     assert progress_events[-1]["event"] == "pending_user_acceptance"
     qa_request = next(iter(qa_requests.values()))
     assert "Do not invoke commands" in qa_request.prompt
+    assert "Do not use any tools" in qa_request.prompt
+    assert "Authoritative Runner gate manifest" in qa_request.prompt
+    assert '"reviewer_security_scan"' in qa_request.prompt
+    assert '"all_commands_passed": true' in qa_request.prompt
     assert "Runner-produced test evidence" in qa_request.prompt
     assert '"exit_code": 0' in qa_request.prompt
     assert any(

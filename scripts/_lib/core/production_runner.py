@@ -118,6 +118,15 @@ NPM_TEST_SCRIPT_PATTERN = re.compile(
     r"^test(?::[A-Za-z0-9][A-Za-z0-9._-]*)+$"
 )
 
+
+def _plain_metadata_value(value: Any) -> Any:
+    """Thaw immutable Evidence metadata into JSON-compatible values."""
+    if isinstance(value, Mapping):
+        return {str(key): _plain_metadata_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain_metadata_value(item) for item in value]
+    return value
+
 REVIEWER_PROTOCOL_DEFECT_SUFFIXES = (
     "SCHEMA-VIOLATION",
     "IDENTITY-MISMATCH",
@@ -1895,6 +1904,7 @@ class ProductionRunner:
         evidence_ids: List[str] = list(checkpoint.evidence_ids)
         defects_history: List[Dict[str, Any]] = list(checkpoint.defects_history)
         qa_test_cache: Dict[Tuple[str, Tuple[str, ...]], Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]] = {}
+        qa_reviewer_security_scan: Optional[Dict[str, Any]] = None
         start_role = checkpoint.current_role if existing_checkpoint else "BUILDER"
         # The authoritative board phase wins over a stale checkpoint role.  A
         # crash or a contract guard immediately after a successful transition
@@ -1954,6 +1964,10 @@ class ProductionRunner:
                         candidate_generation=candidate_generation,
                         evidence_ids=tuple(evidence_ids), message=pause_message,
                     )
+                reviewer_record = self.evidence_store.read(reviewer_evidence)
+                stored_security_scan = reviewer_record.metadata.extra.get("security_scan")
+                if isinstance(stored_security_scan, Mapping):
+                    qa_reviewer_security_scan = _plain_metadata_value(stored_security_scan)
                 start_role = "QA"
         skip_builder = (start_role in ("REVIEWER", "QA") and candidate_commit is not None)
         skip_reviewer = (start_role == "QA" and candidate_commit is not None)
@@ -2630,6 +2644,7 @@ class ProductionRunner:
                         spec.baseline_commit,
                         candidate_commit,
                     )
+                    qa_reviewer_security_scan = dict(reviewer_security_scan)
                     self._emit_progress(
                         task_id=task_id,
                         state=RunnerState.REVIEWING.value,
@@ -3373,6 +3388,17 @@ class ProductionRunner:
                     message=f"QA commands exhausted the cumulative {spec.qa_timeout_seconds}s QA-stage budget before semantic QA.",
                 )
             criteria_payload = [item.to_dict() for item in spec.acceptance_criteria_items]
+            qa_gate_manifest = {
+                "candidate_commit": candidate_commit,
+                "commands": [dict(item) for item in command_results],
+                "all_commands_passed": all(
+                    int(item.get("exit_code", 1)) == 0 for item in command_results
+                ),
+                "reviewer_security_scan": qa_reviewer_security_scan or {
+                    "passed": False,
+                    "status": "MISSING_FROM_BOUND_REVIEWER_EVIDENCE",
+                },
+            }
             qa_prompt = (
                 f"You are the independent QA gate for Task {task_id}.\n"
                 f"Requirements:\n{spec.requirement_text}\n\n"
@@ -3382,13 +3408,16 @@ class ProductionRunner:
                 f"Baseline Commit: {spec.baseline_commit}\n"
                 f"Candidate Commit: {candidate_commit}\n"
                 f"Reviewer PASS summary: {review_output.summary if 'review_output' in locals() else 'validated reviewer evidence'}\n\n"
+                "Authoritative Runner gate manifest (host-observed facts; do not reinterpret these as missing):\n"
+                f"{json.dumps(qa_gate_manifest, ensure_ascii=False, indent=2)}\n\n"
                 f"Immutable candidate diff:\n{qa_diff_bundle}\n\n"
                 "Perform a semantic QA assessment from the immutable candidate context and the Runner-produced "
                 "test evidence. Distinguish static inspection of a test from observed execution: never claim a "
                 "named test passed unless Runner output proves it ran successfully. Missing evidence is not PASS. "
-                "test evidence below. You may use read/search tools solely for a Runner-designated complete diff "
-                "artifact or candidate files when the inline bundle says so. Do not invoke commands, browsers, "
-                "write tools, subagents, or permission prompts. Trace changed behavior through every API, background worker, database, "
+                "test evidence below. All evidence required for this managed QA decision is inline. Do not use any "
+                "tools. Do not invoke commands, browsers, write tools, subagents, or permission prompts. A truncated "
+                "output excerpt does not invalidate the Runner-observed command, exit code, or output hash in the "
+                "authoritative manifest. Trace changed behavior through every API, background worker, database, "
                 "authorization, contract/SDK, and frontend boundary that applies. Verify at least one negative or "
                 "adversarial scenario represented by the acceptance criteria, review context, or test evidence. "
                 "If any criterion or risk is not verifiable, return FAIL; never infer PASS from a green regression "

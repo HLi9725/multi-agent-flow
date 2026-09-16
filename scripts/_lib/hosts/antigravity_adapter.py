@@ -132,6 +132,41 @@ def _extract_denied_actions(events: List[Dict[str, Any]]) -> List[Dict[str, str]
                 })
     return denied
 
+
+def _has_authoritative_permission_denial(
+    events: List[Dict[str, Any]],
+    error_message: Optional[str],
+    stderr_text: Optional[str],
+) -> bool:
+    """Return True only for a denial reported by a host error channel.
+
+    A successful agent response is untrusted model-authored content. It may
+    legitimately discuss phrases such as ``permission denied`` or
+    ``approval required`` while reviewing a workflow. Treating that prose as
+    a host denial creates a false APPROVAL_REQUIRED state. The structured
+    ``denied_actions`` payload is handled separately; here we inspect only
+    process/parser errors and structured error events.
+    """
+    if _is_host_permission_denial(error_message, stderr_text):
+        return True
+
+    for event in events:
+        if not isinstance(event, Mapping):
+            continue
+        event_kind = str(event.get("event") or event.get("type") or "").upper()
+        if event_kind == "ERROR":
+            if _is_host_permission_denial(event.get("message"), event.get("error")):
+                return True
+
+        update = event.get("step_update")
+        if not isinstance(update, Mapping) or str(update.get("state") or "").upper() != "ERROR":
+            continue
+        tool_info = update.get("tool_info")
+        tool_error = tool_info.get("error") if isinstance(tool_info, Mapping) else None
+        if _is_host_permission_denial(update.get("message"), update.get("error"), tool_error):
+            return True
+    return False
+
 # Mapping from project roles to specialized Antigravity subagents
 ROLE_AGENT_MAP: Dict[str, str] = {
     "DEV": "flow-dev",
@@ -1050,7 +1085,7 @@ class AntigravityAdapter(BaseHostAdapter):
             self._session_history[handle.session_id] = session_data
             self._running_sessions.pop(handle.session_id, None)
 
-        if denied_actions or _is_host_permission_denial(error_msg, final_output, stderr_data):
+        if denied_actions or _has_authoritative_permission_denial(events, error_msg, stderr_data):
             raise AgentPermissionRequiredError(
                 "Antigravity host denied the requested operation and requires explicit user approval. "
                 "Inspect the persisted permission diagnostics; do not change global permissions automatically.",
