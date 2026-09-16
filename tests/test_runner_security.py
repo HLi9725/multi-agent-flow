@@ -333,6 +333,50 @@ def test_qa_schema_and_semantic_coverage_fail_closed():
     assert any("QA-AC-02" in item["defect_id"] for item in parsed_legacy.defects)
     assert not any("SCHEMA-VIOLATION" in item["defect_id"] for item in parsed_legacy.defects)
 
+    # Real Antigravity response observed in production: semantic FAIL omitted
+    # negative_scenarios and command summaries.  It must still reach Builder as
+    # a business verdict instead of consuming protocol retries.
+    observed_fail = dict(legacy_fail)
+    observed_fail.pop("negative_scenarios")
+    parsed_observed_fail = runner._parse_qa_structured_json(json.dumps(observed_fail), **kwargs)
+    assert parsed_observed_fail.decision == "FAIL"
+    assert parsed_observed_fail.negative_scenarios == ()
+    assert any("QA-AC-02" in item["defect_id"] for item in parsed_observed_fail.defects)
+    assert not any("SCHEMA-VIOLATION" in item["defect_id"] for item in parsed_observed_fail.defects)
+
+    # The structured-output backend has also rewritten a valid PASS into this
+    # alternate alias shape, dropping invocation identities and serializing
+    # negative scenarios as strings.  Trusted identities may be restored, but
+    # all semantic PASS guards still apply after normalization.
+    observed_pass = {
+        "decision": "PASS",
+        "summary": "All acceptance criteria and negative scenarios passed.",
+        "acceptance_matrix": valid["acceptance_coverage"],
+        "test_commands": [
+            {"command": "python -m pytest -q", "exit_code": 0},
+        ],
+        "negative_scenarios": ["unauthenticated request returned 401"],
+        "uncovered_risks": [],
+    }
+    parsed_observed_pass = runner._parse_qa_structured_json(json.dumps(observed_pass), **kwargs)
+    assert parsed_observed_pass.decision == "PASS"
+    assert parsed_observed_pass.task_id == "T0077"
+    assert parsed_observed_pass.qa_request_id == "qa_req_1"
+    assert parsed_observed_pass.test_commands[0]["summary"] == "QA reported exit code 0"
+    assert parsed_observed_pass.negative_scenarios[0]["status"] == "PASS"
+
+    tampered_observed_pass = dict(observed_pass, candidate_commit="c" * 40)
+    parsed_tampered_pass = runner._parse_qa_structured_json(json.dumps(tampered_observed_pass), **kwargs)
+    assert parsed_tampered_pass.decision == "FAIL"
+    assert "IDENTITY-MISMATCH" in parsed_tampered_pass.defects[0]["defect_id"]
+
+    unknown_alias = dict(observed_pass)
+    unknown_alias.pop("acceptance_matrix")
+    unknown_alias["criteria_results"] = valid["acceptance_coverage"]
+    parsed_unknown_alias = runner._parse_qa_structured_json(json.dumps(unknown_alias), **kwargs)
+    assert parsed_unknown_alias.decision == "FAIL"
+    assert "SCHEMA-VIOLATION" in parsed_unknown_alias.defects[0]["defect_id"]
+
     mismatched_legacy = dict(legacy_fail, candidate_commit="c" * 40)
     parsed_mismatch = runner._parse_qa_structured_json(json.dumps(mismatched_legacy), **kwargs)
     assert parsed_mismatch.decision == "FAIL"

@@ -265,11 +265,12 @@ def test_runner_wait_enforces_outer_deadline():
 
 
 @pytest.mark.parametrize(
-    "recover_budget,empty_builder_completions",
-    [(False, 0), (True, 0), (False, 1), (False, 2)],
+    "recover_budget,empty_builder_completions,reviewer_protocol_failures",
+    [(False, 0, 0), (True, 0, 0), (False, 1, 0), (False, 2, 0), (False, 0, 1)],
 )
 def test_production_runner_full_pass_pipeline(
-    mock_git_repo, tmp_path, monkeypatch, recover_budget, empty_builder_completions
+    mock_git_repo, tmp_path, monkeypatch, recover_budget, empty_builder_completions,
+    reviewer_protocol_failures,
 ):
     repo_dir, baseline_sha = mock_git_repo
     if empty_builder_completions:
@@ -289,6 +290,7 @@ def test_production_runner_full_pass_pipeline(
     review_requests = {}
     qa_requests = {}
     builder_calls = 0
+    reviewer_calls = 0
 
     def mock_detect_caps(self):
         return HostCapabilities(
@@ -396,6 +398,16 @@ def test_production_runner_full_pass_pipeline(
         )
 
     def mock_reviewer_wait(self, handle, timeout_seconds=None):
+        nonlocal reviewer_calls
+        reviewer_calls += 1
+        if reviewer_calls <= reviewer_protocol_failures:
+            return AgentResult(
+                session_id=handle.session_id,
+                status=AgentStatus.SUCCESS,
+                output="review completed without the required JSON envelope",
+                partial_results=({"invocation_id": "inv_reviewer_protocol_invalid"},),
+                is_real_host=True,
+            )
         target_dir = session_workspaces.get(handle.session_id, str(repo_dir))
         cand_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=target_dir, text=True).strip()
         out_json = {
@@ -536,10 +548,17 @@ def test_production_runner_full_pass_pipeline(
         for event in progress_events
         if event["event"] == "stage_started"
     ]
-    assert stage_roles == ["BUILDER", "REVIEWER", "QA"]
+    assert stage_roles == ["BUILDER"] + ["REVIEWER"] * (reviewer_protocol_failures + 1) + ["QA"]
     assert any(event["event"] == "stage_retrying" for event in progress_events) is bool(empty_builder_completions)
     assert builder_calls == (2 if empty_builder_completions else 1)
     checkpoint_after_run = checkpoint_store.load_checkpoint("T0088")
+    assert len([item for item in result.evidence_ids if item.startswith("evi_reviewer_")]) == 1
+    if reviewer_protocol_failures:
+        assert any(
+            item.get("role") == "REVIEWER_PROTOCOL"
+            for item in checkpoint_after_run.defects_history
+        )
+        assert checkpoint_after_run.review_cycle == 1
     if empty_builder_completions:
         assert checkpoint_after_run.host_attempt_history[-1]["outcome"] == "EMPTY_COMPLETION_RETRIED"
         assert checkpoint_after_run.host_attempt_history[-1]["host_invocation_id"] == "inv_builder_empty_first"

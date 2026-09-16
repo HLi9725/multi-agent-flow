@@ -215,27 +215,40 @@ def _normalize_known_qa_legacy_shape(
     qa_request_id: str,
     acceptance_criteria_hash: str,
 ) -> Optional[Dict[str, Any]]:
-    """Normalize the one known Antigravity QA legacy contract.
+    """Normalize bounded, observed Antigravity QA response aliases.
 
-    This is intentionally not a permissive schema coercion.  It only accepts
-    the historical ``verdict``/``acceptance_criteria`` shape, preserves any
-    supplied immutable identities for the normal mismatch checks, and derives
-    deterministic defects from explicit FAIL rows.  A semantic FAIL therefore
-    reaches Builder instead of being discarded as a protocol-only failure.
+    Antigravity's structured-output layer has emitted two non-canonical but
+    semantically complete shapes in production: ``verdict`` with
+    ``acceptance_criteria`` and ``decision`` with ``acceptance_matrix``.  This
+    adapter accepts only those explicit aliases, never arbitrary prose.  Any
+    identity supplied by the host is retained so the normal mismatch guard can
+    reject tampering; omitted identities are filled from the trusted Runner
+    invocation context.
     """
-    legacy_required = {
-        "verdict", "baseline_commit", "candidate_commit",
-        "acceptance_criteria_hash", "acceptance_criteria", "test_commands",
-        "negative_scenarios", "uncovered_risks", "summary",
-    }
-    if not legacy_required.issubset(data):
+    legacy_markers = {"verdict", "acceptance_criteria", "acceptance_matrix"}
+    if not legacy_markers.intersection(data):
         return None
-    decision = str(data.get("verdict", "")).upper()
+    if "decision" in data and "verdict" in data:
+        if str(data["decision"]).upper() != str(data["verdict"]).upper():
+            return None
+    decision = str(data.get("decision") or data.get("verdict") or "").upper()
     if decision not in ("PASS", "FAIL"):
         return None
 
+    coverage_keys = [
+        key for key in ("acceptance_coverage", "acceptance_criteria", "acceptance_matrix")
+        if key in data
+    ]
+    if len(coverage_keys) != 1:
+        return None
+    raw_coverage = data.get(coverage_keys[0])
+    if not isinstance(raw_coverage, list) or not isinstance(data.get("test_commands"), list):
+        return None
+    if not isinstance(data.get("summary"), str):
+        return None
+
     coverage: List[Dict[str, Any]] = []
-    for item in data.get("acceptance_criteria", []):
+    for item in raw_coverage:
         if not isinstance(item, Mapping):
             return None
         coverage.append({
@@ -256,16 +269,29 @@ def _normalize_known_qa_legacy_shape(
         })
 
     negative_scenarios: List[Dict[str, Any]] = []
-    for item in data.get("negative_scenarios", []):
-        if not isinstance(item, Mapping):
+    raw_negative_scenarios = data.get("negative_scenarios", [])
+    if not isinstance(raw_negative_scenarios, list):
+        return None
+    for item in raw_negative_scenarios:
+        if isinstance(item, str):
+            negative_scenarios.append({
+                "name": item,
+                "status": decision,
+                "evidence": item,
+            })
+        elif isinstance(item, Mapping):
+            negative_scenarios.append({
+                "name": str(item.get("name") or item.get("scenario") or ""),
+                "status": str(item.get("status") or decision).upper(),
+                "evidence": str(item.get("evidence") or item.get("target") or ""),
+            })
+        else:
             return None
-        negative_scenarios.append({
-            "name": str(item.get("name") or item.get("scenario") or ""),
-            "status": str(item.get("status") or "").upper(),
-            "evidence": str(item.get("evidence") or ""),
-        })
 
-    defects = [dict(item) for item in data.get("defects", []) if isinstance(item, Mapping)]
+    raw_defects = data.get("defects", [])
+    if not isinstance(raw_defects, list) or any(not isinstance(item, Mapping) for item in raw_defects):
+        return None
+    defects = [dict(item) for item in raw_defects]
     if decision == "FAIL" and not defects:
         for item in coverage:
             if item["status"] == "FAIL":
@@ -289,6 +315,16 @@ def _normalize_known_qa_legacy_shape(
                 "severity": "P2",
                 "description": risk,
             } for index, risk in enumerate(risks, start=1))
+        if not defects:
+            defects.append({
+                "defect_id": f"DEF-{task_id}-QA-SEMANTIC-FAIL",
+                "severity": "P1",
+                "description": str(data.get("summary") or "QA returned FAIL."),
+            })
+
+    raw_risks = data.get("uncovered_risks", [])
+    if not isinstance(raw_risks, list):
+        return None
 
     return {
         "task_id": data.get("task_id", task_id),
@@ -301,7 +337,7 @@ def _normalize_known_qa_legacy_shape(
         "acceptance_coverage": coverage,
         "test_commands": command_reports,
         "negative_scenarios": negative_scenarios,
-        "uncovered_risks": [str(item) for item in data.get("uncovered_risks", [])],
+        "uncovered_risks": [str(item) for item in raw_risks],
         "defects": defects,
         "summary": str(data.get("summary") or ""),
     }
@@ -2026,6 +2062,8 @@ class ProductionRunner:
         defects_history: List[Dict[str, Any]] = list(checkpoint.defects_history)
         qa_test_cache: Dict[Tuple[str, Tuple[str, ...]], Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]] = {}
         qa_reviewer_security_scan: Optional[Dict[str, Any]] = None
+        reviewer_protocol_feedback: Optional[str] = None
+        reviewer_protocol_attempts_this_run = 0
         qa_protocol_feedback: Optional[str] = None
         qa_protocol_attempts_this_run = 0
         start_role = checkpoint.current_role if existing_checkpoint else "BUILDER"
@@ -2570,6 +2608,8 @@ class ProductionRunner:
                     candidate_generation += 1
                     review_cycle = 0
                     qa_cycle = 0
+                    reviewer_protocol_feedback = None
+                    reviewer_protocol_attempts_this_run = 0
                     qa_protocol_feedback = None
                     qa_protocol_attempts_this_run = 0
                 self._emit_progress(
@@ -2815,6 +2855,14 @@ class ProductionRunner:
                     f"- defects: [ {{\"defect_id\": \"...\", \"severity\": \"P1\", \"description\": \"...\"}} ]\n"
                     f"- summary: 'summary text'\n"
                 )
+                if reviewer_protocol_feedback:
+                    reviewer_prompt = (
+                        "PROTOCOL CORRECTION FROM THE PREVIOUS REVIEWER ATTEMPT:\n"
+                        f"{reviewer_protocol_feedback}\n"
+                        "Return every required top-level field exactly as specified. This is a protocol retry, "
+                        "not a request to change the semantic review verdict.\n\n"
+                        + reviewer_prompt
+                    )
 
                 reviewer_request = AgentRequest(
                     session_id=sess_reviewer,
@@ -2995,6 +3043,60 @@ class ProductionRunner:
                         },),
                         summary="Candidate failed the mandatory Runner-owned security scan.",
                     )
+                reviewer_protocol_failure = _has_protocol_defect(
+                    review_output.defects,
+                    REVIEWER_PROTOCOL_DEFECT_SUFFIXES,
+                )
+                if reviewer_protocol_failure:
+                    reviewer_protocol_attempts_this_run += 1
+                    protocol_cycle = review_cycle
+                    # A malformed host response is not a business review and
+                    # must not consume the immutable candidate's review budget
+                    # or create REVIEWING -> BUILDING Evidence.
+                    review_cycle = max(0, review_cycle - 1)
+                    reviewer_protocol_feedback = review_output.summary
+                    defects_history.append({
+                        "cycle": protocol_cycle,
+                        "protocol_attempt": reviewer_protocol_attempts_this_run,
+                        "role": "REVIEWER_PROTOCOL",
+                        "defects": list(review_output.defects),
+                        "summary": review_output.summary,
+                        "host_invocation_id": inv_reviewer,
+                    })
+                    if reviewer_protocol_attempts_this_run >= 2:
+                        pause_message = (
+                            "Reviewer protocol output remained invalid after the bounded protocol retry. "
+                            "Business review budget was preserved and no business transition Evidence was created."
+                        )
+                        checkpoint = replace(
+                            checkpoint,
+                            state=RunnerState.NEEDS_USER_INPUT.value,
+                            current_role="REVIEWER",
+                            candidate_commit=candidate_commit,
+                            candidate_generation=candidate_generation,
+                            review_cycle=review_cycle,
+                            qa_cycle=qa_cycle,
+                            total_attempts=total_attempts,
+                            reviewer_invocation_id=inv_reviewer,
+                            evidence_ids=tuple(evidence_ids),
+                            defects_history=tuple(defects_history),
+                            last_error=pause_message,
+                            updated_at=time.time(),
+                        )
+                        self.checkpoint_store.save_checkpoint(checkpoint)
+                        return RunnerResult(
+                            success=False,
+                            state=RunnerState.NEEDS_USER_INPUT.value,
+                            task_id=task_id,
+                            candidate_commit=candidate_commit,
+                            candidate_generation=candidate_generation,
+                            evidence_ids=tuple(evidence_ids),
+                            message=pause_message,
+                            diagnostics={"defects": defects_history},
+                        )
+                    skip_builder = True
+                    skip_reviewer = False
+                    continue
                 self._emit_progress(
                     task_id=task_id,
                     state=RunnerState.REVIEWING.value,
@@ -3097,54 +3199,6 @@ class ProductionRunner:
                         self.checkpoint_store.save_checkpoint(checkpoint)
                 else:
                     review_exhausted = review_cycle >= spec.max_review_cycles
-                    reviewer_protocol_failure = _has_protocol_defect(
-                        review_output.defects,
-                        REVIEWER_PROTOCOL_DEFECT_SUFFIXES,
-                    )
-                    if reviewer_protocol_failure:
-                        defects_history.append({
-                            "cycle": review_cycle,
-                            "role": "REVIEWER_PROTOCOL",
-                            "defects": list(review_output.defects),
-                            "summary": review_output.summary,
-                        })
-                        if review_exhausted:
-                            pause_message = (
-                                "Reviewer protocol output remained invalid and exceeded "
-                                f"max review cycles ({spec.max_review_cycles}). Business code was not returned to Builder."
-                            )
-                            checkpoint = replace(
-                                checkpoint,
-                                state=RunnerState.NEEDS_USER_INPUT.value,
-                                current_role="REVIEWER",
-                                candidate_commit=candidate_commit,
-                                candidate_generation=candidate_generation,
-                                review_cycle=review_cycle,
-                                qa_cycle=qa_cycle,
-                                total_attempts=total_attempts,
-                                reviewer_invocation_id=inv_reviewer,
-                                evidence_ids=tuple(evidence_ids),
-                                defects_history=tuple(defects_history),
-                                last_error=pause_message,
-                                updated_at=time.time(),
-                            )
-                            self.checkpoint_store.save_checkpoint(checkpoint)
-                            return RunnerResult(
-                                success=False,
-                                state=RunnerState.NEEDS_USER_INPUT.value,
-                                task_id=task_id,
-                                candidate_commit=candidate_commit,
-                                candidate_generation=candidate_generation,
-                                evidence_ids=tuple(evidence_ids),
-                                message=pause_message,
-                                diagnostics={"defects": defects_history},
-                            )
-                        # The candidate is unchanged. Retry only the independent
-                        # Reviewer; a host/schema failure is not a code defect.
-                        skip_builder = True
-                        skip_reviewer = False
-                        continue
-
                     # Real review defects go through the legal rejection loop.
                     if current_board_status == "审查中":
                         ok_return, err_return = self._do_state_transition(
