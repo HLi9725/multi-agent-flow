@@ -159,7 +159,7 @@ Antigravity Prompt 通过官方 stdin `stream-json` 协议传输，不进入 Win
 
 Host 权限拒绝属于显式暂停条件：Runner 会原子保存 `APPROVAL_REQUIRED`，释放运行锁并要求用户在 Runner 外部处理授权；其他 Host 失败会持久化为 `NEEDS_USER_INPUT`，不会遗留假的 `BUILDING`、`REVIEWING` 或 `QA_TESTING`。Runner 和角色 Agent 均不得修改用户全局 Antigravity/agy/Codex 设置、创建绕权限诊断脚本，或使用 `command(*)`、`unsandboxed(*)`、`--dangerously-skip-permissions` 等通配/跳过规则。检测到这类危险全局配置时将 Fail-Closed 停止，且 `--approve` 不能绕过安全门禁。
 
-Antigravity 的 Production Runner 使用 `flow-runner-builder`、`flow-runner-reviewer`、`flow-runner-qa` 三份托管执行配置（不是新增业务角色）：Builder 只有项目内文件读写能力，Reviewer/QA 只有读取和搜索能力，三者均不获得 `run_command`。Git、候选 Commit、安全扫描、测试、构建与格式门禁均由 Runner 确定性执行；角色只负责专业修改或独立判断。独立使用 `flow-dev`、`flow-reviewer`、`flow-qa` 时仍保留各自 YAML 声明的原有能力，不受托管配置影响。
+Antigravity 的 Production Runner 使用 `flow-runner-builder`、`flow-runner-reviewer`、`flow-runner-qa` 三份托管执行配置（不是新增业务角色）：Builder 只有项目内文件读写能力，Reviewer/QA 只保留 Runner 明确指定的工作区内文件定点读取能力，不提供目录遍历、全局搜索或 `run_command`。每次托管派发都会注入不可被自定义提示覆盖的规范化工作区根边界，禁止绝对路径、`..`、链接逃逸、用户目录、`.gemini`、`.codex`、其他仓库及任何工作区外读取。Git、候选 Commit、安全扫描、测试、构建与格式门禁均由 Runner 确定性执行；角色只负责专业修改或独立判断。独立使用 `flow-dev`、`flow-reviewer`、`flow-qa` 时仍保留各自 YAML 声明的原有能力，不受托管配置影响。
 
 Runner 成功只停在【已完成】/`PENDING_USER_ACCEPTANCE`，不会替用户验收、合并、Push 或创建 Tag。
 

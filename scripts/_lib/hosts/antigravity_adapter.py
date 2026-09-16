@@ -399,6 +399,29 @@ def _build_stream_input(prompt: str) -> str:
     ) + "\n"
 
 
+def _managed_workspace_prompt(request: AgentRequest) -> str:
+    """Inject a non-overridable worktree boundary for Runner-managed agents."""
+    managed = bool(
+        isinstance(request.extra_context, Mapping)
+        and request.extra_context.get("production_runner_managed") is True
+    )
+    if not managed:
+        return request.prompt
+    workspace = os.path.realpath(os.path.abspath(request.workspace_dir))
+    boundary = (
+        "[YY-FLOW MANAGED WORKSPACE BOUNDARY - MANDATORY]\n"
+        f"Canonical workspace root: {workspace}\n"
+        "Operate only on paths contained by this root. For file tools, use only workspace-relative "
+        "paths explicitly named by the Runner evidence. Never request an absolute path, '..' traversal, "
+        "a symlink/junction escape, the user home directory, .gemini, .codex, another repository, or any "
+        "path outside this workspace. Do not enumerate directories or perform broad/global searches. "
+        "Do not request permission for an out-of-scope path. If evidence is insufficient, return the "
+        "role's structured negative verdict with the missing evidence described.\n"
+        "[END YY-FLOW MANAGED WORKSPACE BOUNDARY]\n\n"
+    )
+    return boundary + request.prompt
+
+
 def _json_compatible(value: Any) -> Any:
     """Thaw immutable AgentRequest context into JSON-compatible containers."""
     if isinstance(value, Mapping):
@@ -800,6 +823,7 @@ class AntigravityAdapter(BaseHostAdapter):
             self._running_sessions[session_id] = {
                 "handle": handle,
                 "request": request,
+                "effective_prompt": _managed_workspace_prompt(request),
                 "invocation_id": invocation_id,
                 "invocation_token": invocation_token,
                 "conversation_id": None,
@@ -958,7 +982,7 @@ class AntigravityAdapter(BaseHostAdapter):
         # Real process execution and parsing
         try:
             stdout_data, stderr_data = process.communicate(
-                input=_build_stream_input(session_data["request"].prompt),
+                input=_build_stream_input(session_data["effective_prompt"]),
                 timeout=timeout,
             )
         except subprocess.TimeoutExpired:

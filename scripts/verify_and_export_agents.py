@@ -86,9 +86,12 @@ def serialize_runner_readonly_role(platform_key, role_code, role_data):
     if role_code not in ("REVIEWER", "QA"):
         raise ValueError(f"Unsupported managed read-only role: {role_code}")
     agent_id = RUNNER_MANAGED_AGENT_IDS[role_code]
+    # Runner already supplies a complete diff/impact bundle. Managed reviewers
+    # only need deterministic reads of files explicitly named by that bundle;
+    # broad directory/search tools can wander into user-global configuration.
     tools = [
         tool for tool in PLATFORM_TOOLS.get(platform_key, DEFAULT_TOOLS)
-        if tool.lower() in {"view_file", "list_dir", "grep_search", "read", "grep", "glob"}
+        if tool.lower() in {"view_file", "read"}
     ]
     responsibility_items = list(role_data.get("responsibilities") or [])
     if role_code == "QA":
@@ -118,7 +121,9 @@ def serialize_runner_readonly_role(platform_key, role_code, role_data):
 
 ## 角色约束
 - 只对 Runner 固定的 baseline SHA、candidate SHA、契约快照和证据包执行{stage}判断。
-- 可以只读查看 Runner 指定的候选文件或完整差异工件；不得修改任何文件。
+- 只能只读查看 Runner 明确指定且位于本次工作区根目录内的候选文件或完整差异工件；不得修改任何文件。
+- 所有读取必须使用工作区内相对路径；禁止绝对路径、`..`、符号链接/目录联接逃逸，以及读取用户主目录、`.gemini`、`.codex`、其他仓库或任何工作区外路径。
+- 不得自行列举目录或发起全局搜索。证据不足时直接返回否定结论，不得通过扩大读取范围补证。
 - 不得调用 run_command、Shell、Git、测试命令、包管理器、浏览器或子进程。
 - 不得建卡、修改看板、写入 Evidence 或推进状态；这些动作由 Runner 原子执行。
 - Runner 提供的安全扫描、测试、构建或差异检查未执行、失败或证据不足时，必须拒绝通过。

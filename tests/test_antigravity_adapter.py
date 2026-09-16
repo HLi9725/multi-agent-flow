@@ -184,6 +184,71 @@ def test_antigravity_adapter_role_based_routing_and_sandbox():
         assert command[command.index("--agent") + 1] == expected
 
 
+def test_runner_managed_prompt_injects_exact_workspace_boundary(monkeypatch):
+    adapter = AntigravityAdapter(is_real_host=True, verification_level=VerificationLevel.CLI_VERIFIED)
+    workspace = os.path.abspath(".")
+    adapter.record_permission_approval(
+        project_id="managed-boundary",
+        auth_context="user_local_ctx",
+        workspace_dir=workspace,
+        command_family="safe_local:REVIEWER",
+        permission_boundary="workspace_read",
+    )
+    captured = {}
+
+    class MockProcess:
+        pid = 98765
+        returncode = 0
+
+        def communicate(self, input=None, timeout=None):
+            captured["input"] = input
+            return (
+                '{"type":"conversation.started","id":"conv-boundary"}\n'
+                '{"type":"message","step_index":1,"content":"done"}\n',
+                "",
+            )
+
+        def poll(self):
+            return 0
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: MockProcess())
+    request = AgentRequest(
+        session_id="sess_managed_boundary",
+        prompt="Custom reviewer prompt without any safety wording.",
+        role="REVIEWER",
+        workspace_dir=workspace,
+        extra_context={
+            "production_runner_managed": True,
+            "project_id": "managed-boundary",
+            "permission_boundary": "workspace_read",
+            "operation_intent": "read-only review",
+        },
+    )
+    handle = adapter.dispatch_agent(request)
+    result = adapter.wait_for_result(handle)
+
+    assert result.status == AgentStatus.SUCCESS
+    envelope = json.loads(captured["input"])
+    content = envelope["message"]["content"]
+    assert f"Canonical workspace root: {os.path.realpath(workspace)}" in content
+    assert "Custom reviewer prompt without any safety wording." in content
+    assert ".gemini" in content
+    assert "another repository" in content
+    assert content.index("YY-FLOW MANAGED WORKSPACE BOUNDARY") < content.index("Custom reviewer prompt")
+
+
+def test_non_managed_prompt_is_not_rewritten():
+    from scripts._lib.hosts.antigravity_adapter import _managed_workspace_prompt
+
+    request = AgentRequest(
+        session_id="sess_plain_prompt",
+        prompt="plain prompt",
+        role="REVIEWER",
+        workspace_dir=os.path.abspath("."),
+    )
+    assert _managed_workspace_prompt(request) == "plain prompt"
+
+
 def test_antigravity_prompt_uses_stdin_with_timeout_and_schema():
     adapter = AntigravityAdapter(is_real_host=False)
     schema = {
