@@ -28,12 +28,21 @@ from scripts._lib.core.production_runner import (
     REVIEWER_PROTOCOL_DEFECT_SUFFIXES,
     ProductionRunner,
     _build_qa_subprocess_env,
+    _extract_embedded_json_object,
     _extract_real_invocation_id,
     _has_protocol_defect,
+    _qa_semantic_fingerprint,
+    _summarize_qa_command_output,
     _validate_qa_test_command,
 )
 from scripts._lib.core.runner_checkpoint_store import RunnerCheckpointStore
-from scripts._lib.core.runner_schema import RunnerCheckpoint, RunnerResult, RunnerState, TaskExecutionSpec
+from scripts._lib.core.runner_schema import (
+    QA_JSON_SCHEMA,
+    RunnerCheckpoint,
+    RunnerResult,
+    RunnerState,
+    TaskExecutionSpec,
+)
 from scripts._lib.core.task_spec_loader import load_task_execution_spec
 from scripts._lib.hosts.antigravity_adapter import AntigravityAdapter, create_antigravity_manifest
 from scripts._lib.hosts.codex_cli_adapter import CodexCliAdapter, create_codex_cli_manifest
@@ -328,7 +337,7 @@ def test_qa_schema_and_semantic_coverage_fail_closed():
     parsed_legacy = runner._parse_qa_structured_json(json.dumps(legacy_fail), **kwargs)
     assert parsed_legacy.decision == "FAIL"
     assert [item["criterion_id"] for item in parsed_legacy.acceptance_coverage] == ["AC-01", "AC-02"]
-    assert parsed_legacy.test_commands[0]["summary"] == "QA reported exit code 0"
+    assert parsed_legacy.test_commands[0]["summary"] == "Runner observed exit code 0"
     assert parsed_legacy.negative_scenarios[0]["name"] == "concurrent race"
     assert any("QA-AC-02" in item["defect_id"] for item in parsed_legacy.defects)
     assert not any("SCHEMA-VIOLATION" in item["defect_id"] for item in parsed_legacy.defects)
@@ -345,9 +354,8 @@ def test_qa_schema_and_semantic_coverage_fail_closed():
     assert not any("SCHEMA-VIOLATION" in item["defect_id"] for item in parsed_observed_fail.defects)
 
     # The structured-output backend has also rewritten a valid PASS into this
-    # alternate alias shape, dropping invocation identities and serializing
-    # negative scenarios as strings.  Trusted identities may be restored, but
-    # all semantic PASS guards still apply after normalization.
+    # alternate alias shape, dropping invocation identities. Trusted identities
+    # may be restored, but all semantic PASS guards still apply after normalization.
     observed_pass = {
         "decision": "PASS",
         "summary": "All acceptance criteria and negative scenarios passed.",
@@ -355,15 +363,54 @@ def test_qa_schema_and_semantic_coverage_fail_closed():
         "test_commands": [
             {"command": "python -m pytest -q", "exit_code": 0},
         ],
-        "negative_scenarios": ["unauthenticated request returned 401"],
+        "negative_scenarios": [{
+            "name": "unauthenticated request",
+            "status": "PASS",
+            "evidence": "test_401 returned 401",
+        }],
         "uncovered_risks": [],
     }
     parsed_observed_pass = runner._parse_qa_structured_json(json.dumps(observed_pass), **kwargs)
     assert parsed_observed_pass.decision == "PASS"
     assert parsed_observed_pass.task_id == "T0077"
     assert parsed_observed_pass.qa_request_id == "qa_req_1"
-    assert parsed_observed_pass.test_commands[0]["summary"] == "QA reported exit code 0"
+    assert parsed_observed_pass.test_commands[0]["summary"] == "Runner observed exit code 0"
     assert parsed_observed_pass.negative_scenarios[0]["status"] == "PASS"
+
+    observed_criteria_pass = dict(observed_pass)
+    observed_criteria_pass.pop("acceptance_matrix")
+    observed_criteria_pass["criteria"] = valid["acceptance_coverage"]
+    mixed_criteria_output = "QA complete.\n" + json.dumps(observed_criteria_pass)
+    parsed_criteria = runner._parse_qa_structured_json(mixed_criteria_output, **kwargs)
+    assert parsed_criteria.decision == "PASS"
+    assert [item["criterion_id"] for item in parsed_criteria.acceptance_coverage] == ["AC-01", "AC-02"]
+
+    string_negative = dict(observed_pass, negative_scenarios=["unauthenticated request returned 401"])
+    parsed_string_negative = runner._parse_qa_structured_json(json.dumps(string_negative), **kwargs)
+    assert parsed_string_negative.decision == "FAIL"
+    assert "SCHEMA-VIOLATION" in parsed_string_negative.defects[0]["defect_id"]
+
+    runner_owned_kwargs = dict(kwargs, expected_command_results=[{
+        "command": "python -m pytest -q",
+        "exit_code": 0,
+        "summary": "exit_code=0; passed=2",
+    }])
+    reported_without_summary = dict(observed_criteria_pass)
+    parsed_runner_owned = runner._parse_qa_structured_json(
+        json.dumps(reported_without_summary), **runner_owned_kwargs
+    )
+    assert parsed_runner_owned.decision == "PASS"
+    assert parsed_runner_owned.test_commands[0]["summary"] == "exit_code=0; passed=2"
+
+    conflicting_command = dict(reported_without_summary)
+    conflicting_command["test_commands"] = [{
+        "command": "python -m pytest -q", "exit_code": 1,
+    }]
+    parsed_conflict = runner._parse_qa_structured_json(
+        json.dumps(conflicting_command), **runner_owned_kwargs
+    )
+    assert parsed_conflict.decision == "FAIL"
+    assert "SCHEMA-VIOLATION" in parsed_conflict.defects[0]["defect_id"]
 
     tampered_observed_pass = dict(observed_pass, candidate_commit="c" * 40)
     parsed_tampered_pass = runner._parse_qa_structured_json(json.dumps(tampered_observed_pass), **kwargs)
@@ -415,6 +462,40 @@ def test_qa_schema_and_semantic_coverage_fail_closed():
     parsed = runner._parse_qa_structured_json(json.dumps(extra_command), **kwargs)
     assert parsed.decision == "FAIL"
     assert "COMMAND-GAP" in parsed.defects[0]["defect_id"]
+
+
+def test_terminal_json_extraction_deduplicates_repeats_and_rejects_conflicts():
+    report = {"decision": "PASS", "criteria": [{"criterion_id": "AC-01"}]}
+    repeated = f"progress\n{json.dumps(report)}\n{json.dumps(report)}"
+    assert _extract_embedded_json_object(repeated, QA_JSON_SCHEMA["required"]) == report
+
+    conflict = (
+        json.dumps(report)
+        + "\n"
+        + json.dumps({"decision": "FAIL", "criteria": report["criteria"]})
+    )
+    assert _extract_embedded_json_object(conflict, QA_JSON_SCHEMA["required"]) is None
+    assert _qa_semantic_fingerprint(json.dumps(report)) != _qa_semantic_fingerprint(
+        json.dumps({"decision": "FAIL", "criteria": report["criteria"]})
+    )
+    evidence_variant = {
+        "decision": "PASS",
+        "criteria": [{"criterion_id": "AC-01", "status": "", "evidence": "rewritten"}],
+    }
+    assert _qa_semantic_fingerprint(json.dumps(report)) == _qa_semantic_fingerprint(
+        json.dumps(evidence_variant)
+    )
+
+
+def test_qa_command_summary_extracts_counts_and_zero_test_signal():
+    summary = _summarize_qa_command_output(
+        "npm test", 0, "================ 405 passed, 8 skipped, 2 warnings ================\n"
+    )
+    assert summary["counts"] == {"passed": 405, "skipped": 8, "warnings": 2}
+    assert summary["no_tests_detected"] is False
+
+    empty = _summarize_qa_command_output("npm run test:mysql", 0, "collected 0 items\nno tests ran")
+    assert empty["no_tests_detected"] is True
 
 
 def test_task_execution_spec_normalizes_and_deduplicates_test_commands(tmp_path):

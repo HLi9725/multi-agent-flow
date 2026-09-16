@@ -341,6 +341,20 @@ def test_antigravity_adapter_prefers_structured_output_over_planner_chatter():
     assert json.loads(text) == {"decision": "PASS", "defects": []}
 
 
+def test_antigravity_adapter_uses_only_terminal_response_not_planner_json():
+    adapter = AntigravityAdapter(is_real_host=False)
+    sample = (
+        '{"type":"PLANNER_RESPONSE","step_index":6,"content":"{\\"decision\\":\\"FAIL\\"}"}\n'
+        '{"event":"result","result":{"conversation_id":"conv-final","status":"SUCCESS",'
+        '"response":"{\\"decision\\":\\"PASS\\",\\"criteria\\":[]}"}}\n'
+    )
+    text, _, err, conv_id, inv_id, _ = adapter._parse_antigravity_output(sample, "")
+    assert err is None
+    assert conv_id == "conv-final"
+    assert inv_id == "conv-final:step_6"
+    assert json.loads(text) == {"decision": "PASS", "criteria": []}
+
+
 def test_antigravity_adapter_accepts_string_structured_output():
     adapter = AntigravityAdapter(is_real_host=False)
     structured = json.dumps({"decision": "PASS", "defects": []})

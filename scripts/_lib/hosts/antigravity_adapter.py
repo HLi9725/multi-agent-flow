@@ -1310,6 +1310,7 @@ class AntigravityAdapter(BaseHostAdapter):
         """
         events: List[Dict[str, Any]] = []
         messages: List[str] = []
+        final_responses: List[str] = []
         structured_outputs: List[str] = []
         error_msg: Optional[str] = None
         detected_conv_id: Optional[str] = None
@@ -1405,7 +1406,11 @@ class AntigravityAdapter(BaseHostAdapter):
                                 else:
                                     structured_outputs.append(json.dumps(structured_value, ensure_ascii=False))
                             elif result_status == "SUCCESS" and isinstance(res_obj.get("response"), str):
-                                messages.append(res_obj["response"])
+                                # A successful result.response is the terminal
+                                # answer.  Keep it separate from planner/progress
+                                # messages so two valid JSON objects are never
+                                # concatenated into an invalid protocol payload.
+                                final_responses.append(res_obj["response"].strip())
                             elif result_status and result_status != "SUCCESS":
                                 error_msg = (
                                     res_obj.get("error")
@@ -1425,9 +1430,19 @@ class AntigravityAdapter(BaseHostAdapter):
         if detected_conv_id and detected_step_id:
             detected_invocation_id = f"{detected_conv_id}:{detected_step_id}"
 
-        # Prefer the last successful structured result. Earlier stream events are
-        # telemetry, not part of the Agent's schema-bound response.
-        output_text = structured_outputs[-1] if structured_outputs else "\n".join(messages).strip()
+        # Prefer the last successful structured result, then the last terminal
+        # result.response. Earlier planner/progress events are telemetry, not
+        # part of the Agent's schema-bound response. For older CLI builds that
+        # emit no terminal result at all, use only the final message rather than
+        # joining multiple potentially structured planner responses.
+        if structured_outputs:
+            output_text = structured_outputs[-1]
+        elif final_responses:
+            output_text = final_responses[-1]
+        elif messages:
+            output_text = messages[-1].strip()
+        else:
+            output_text = ""
         if not output_text and stderr:
             output_text = stderr.strip()
 

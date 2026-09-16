@@ -139,6 +139,7 @@ QA_PROTOCOL_DEFECT_SUFFIXES = (
     "QA-COMMAND-GAP",
     "QA-INVALID-PASS",
     "QA-INVALID-FAIL",
+    "QA-PROTOCOL-SEMANTIC-CONFLICT",
 )
 
 SENSITIVE_QA_ENV_NAME_PARTS = (
@@ -165,17 +166,24 @@ def _has_protocol_defect(defects: Sequence[Mapping[str, Any]], suffixes: Sequenc
 
 
 def _extract_embedded_json_object(raw_output: str, required_fields: Sequence[str]) -> Optional[Dict[str, Any]]:
-    """Extract one schema-shaped object without accepting arbitrary host telemetry."""
+    """Extract one terminal report without mistaking nested objects for reports.
+
+    A managed host may wrap the final object in prose or repeat the same final
+    response.  Nested criterion/defect objects are not terminal reports.  Two
+    distinct terminal reports are ambiguous and therefore fail closed.
+    """
     cleaned = raw_output.strip()
-    candidates: List[Dict[str, Any]] = []
+    if not cleaned:
+        return None
     if cleaned.startswith("{") and cleaned.endswith("}"):
         try:
             value = json.loads(cleaned)
             if isinstance(value, dict):
-                candidates.append(value)
+                return value
         except Exception:
             pass
 
+    candidates: List[Dict[str, Any]] = []
     for match in re.finditer(r"```(?:json)?\s*(\{.*?\})\s*```", raw_output, re.DOTALL):
         try:
             value = json.loads(match.group(1))
@@ -185,8 +193,8 @@ def _extract_embedded_json_object(raw_output: str, required_fields: Sequence[str
             continue
 
     # A stream-json host can emit progress text followed by an unfenced final
-    # object. Decode every object boundary, then accept only an exact schema
-    # shape so that unrelated telemetry objects cannot be mistaken for a verdict.
+    # object. Decode object boundaries, but retain only report-shaped objects;
+    # nested coverage/defect objects do not contain a verdict marker.
     decoder = json.JSONDecoder()
     scan_text = raw_output[-1_000_000:]
     object_starts = [index for index, char in enumerate(scan_text) if char == "{"][-256:]
@@ -199,10 +207,25 @@ def _extract_embedded_json_object(raw_output: str, required_fields: Sequence[str
             candidates.append(value)
 
     expected = set(required_fields)
-    for candidate in reversed(candidates):
-        if set(candidate) == expected:
-            return candidate
-    return candidates[0] if len(candidates) == 1 else None
+    report_markers = {
+        "decision", "verdict", "acceptance_coverage", "acceptance_criteria",
+        "acceptance_matrix", "criteria", "review_request_id", "qa_request_id",
+    }
+    report_candidates = [
+        candidate for candidate in candidates
+        if set(candidate) == expected or report_markers.intersection(candidate)
+    ]
+    unique: Dict[str, Dict[str, Any]] = {}
+    for candidate in report_candidates:
+        canonical = json.dumps(candidate, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        unique[canonical] = candidate
+
+    exact = [candidate for candidate in unique.values() if set(candidate) == expected]
+    if len(exact) == 1:
+        return exact[0]
+    if len(exact) > 1:
+        return None
+    return next(iter(unique.values())) if len(unique) == 1 else None
 
 
 def _normalize_known_qa_legacy_shape(
@@ -214,18 +237,18 @@ def _normalize_known_qa_legacy_shape(
     session_id: str,
     qa_request_id: str,
     acceptance_criteria_hash: str,
+    runner_command_results: Sequence[Mapping[str, Any]] = (),
 ) -> Optional[Dict[str, Any]]:
     """Normalize bounded, observed Antigravity QA response aliases.
 
     Antigravity's structured-output layer has emitted two non-canonical but
-    semantically complete shapes in production: ``verdict`` with
-    ``acceptance_criteria`` and ``decision`` with ``acceptance_matrix``.  This
-    adapter accepts only those explicit aliases, never arbitrary prose.  Any
+    semantically complete shapes in production, including ``criteria``. This
+    adapter accepts only explicit aliases, never arbitrary prose. Any
     identity supplied by the host is retained so the normal mismatch guard can
     reject tampering; omitted identities are filled from the trusted Runner
     invocation context.
     """
-    legacy_markers = {"verdict", "acceptance_criteria", "acceptance_matrix"}
+    legacy_markers = {"verdict", "acceptance_criteria", "acceptance_matrix", "criteria"}
     if not legacy_markers.intersection(data):
         return None
     if "decision" in data and "verdict" in data:
@@ -235,38 +258,72 @@ def _normalize_known_qa_legacy_shape(
     if decision not in ("PASS", "FAIL"):
         return None
 
-    coverage_keys = [
-        key for key in ("acceptance_coverage", "acceptance_criteria", "acceptance_matrix")
-        if key in data
-    ]
-    if len(coverage_keys) != 1:
+    coverage_keys = [key for key in (
+        "acceptance_coverage", "acceptance_criteria", "acceptance_matrix", "criteria"
+    ) if key in data]
+    if not coverage_keys:
         return None
-    raw_coverage = data.get(coverage_keys[0])
-    if not isinstance(raw_coverage, list) or not isinstance(data.get("test_commands"), list):
+    raw_test_commands = data.get("test_commands", [])
+    if not isinstance(raw_test_commands, list):
         return None
     if not isinstance(data.get("summary"), str):
         return None
 
-    coverage: List[Dict[str, Any]] = []
-    for item in raw_coverage:
-        if not isinstance(item, Mapping):
+    normalized_coverages: List[List[Dict[str, Any]]] = []
+    for key in coverage_keys:
+        raw_coverage = data.get(key)
+        if not isinstance(raw_coverage, list):
             return None
-        coverage.append({
-            "criterion_id": str(item.get("criterion_id") or ""),
-            "status": str(item.get("status") or "").upper(),
-            "evidence": str(item.get("evidence") or ""),
-        })
+        normalized: List[Dict[str, Any]] = []
+        for item in raw_coverage:
+            if not isinstance(item, Mapping):
+                return None
+            normalized.append({
+                "criterion_id": str(item.get("criterion_id") or item.get("id") or ""),
+                "status": str(item.get("status") or item.get("decision") or "").upper(),
+                "evidence": str(item.get("evidence") or item.get("proof") or ""),
+            })
+        normalized_coverages.append(normalized)
+    coverage = normalized_coverages[0]
+    if any(item != coverage for item in normalized_coverages[1:]):
+        return None
 
-    command_reports: List[Dict[str, Any]] = []
-    for item in data.get("test_commands", []):
+    trusted_commands = {
+        str(item.get("command") or ""): item for item in runner_command_results
+        if isinstance(item, Mapping) and str(item.get("command") or "")
+    }
+    reported_commands: List[Dict[str, Any]] = []
+    for item in raw_test_commands:
         if not isinstance(item, Mapping):
             return None
         exit_code = item.get("exit_code")
-        command_reports.append({
-            "command": str(item.get("command") or ""),
+        command = str(item.get("command") or "")
+        trusted = trusted_commands.get(command, {})
+        reported_commands.append({
+            "command": command,
             "exit_code": exit_code,
-            "summary": str(item.get("summary") or f"QA reported exit code {exit_code}"),
+            "summary": str(
+                item.get("summary")
+                or trusted.get("summary")
+                or f"Runner observed exit code {trusted.get('exit_code', exit_code)}"
+            ),
         })
+    if trusted_commands:
+        reported_by_command = {item["command"]: item for item in reported_commands}
+        if len(reported_by_command) != len(reported_commands):
+            return None
+        if reported_commands and set(reported_by_command) != set(trusted_commands):
+            return None
+        for command, item in reported_by_command.items():
+            if item["exit_code"] != trusted_commands[command].get("exit_code"):
+                return None
+        command_reports = [{
+            "command": command,
+            "exit_code": trusted.get("exit_code"),
+            "summary": str(trusted.get("summary") or f"Runner observed exit code {trusted.get('exit_code')}"),
+        } for command, trusted in trusted_commands.items()]
+    else:
+        command_reports = reported_commands
 
     negative_scenarios: List[Dict[str, Any]] = []
     raw_negative_scenarios = data.get("negative_scenarios", [])
@@ -274,16 +331,19 @@ def _normalize_known_qa_legacy_shape(
         return None
     for item in raw_negative_scenarios:
         if isinstance(item, str):
-            negative_scenarios.append({
-                "name": item,
-                "status": decision,
-                "evidence": item,
-            })
+            # A scenario name is not proof that the scenario executed or
+            # passed. Require an explicit status and evidence instead of
+            # manufacturing semantic PASS evidence from prose.
+            return None
         elif isinstance(item, Mapping):
+            status = str(item.get("status") or "").upper()
+            evidence = str(item.get("evidence") or item.get("target") or "")
+            if status not in ("PASS", "FAIL") or not evidence.strip():
+                return None
             negative_scenarios.append({
                 "name": str(item.get("name") or item.get("scenario") or ""),
-                "status": str(item.get("status") or decision).upper(),
-                "evidence": str(item.get("evidence") or item.get("target") or ""),
+                "status": status,
+                "evidence": evidence,
             })
         else:
             return None
@@ -343,6 +403,55 @@ def _normalize_known_qa_legacy_shape(
     }
 
 
+def _qa_semantic_fingerprint(raw_output: str) -> Optional[str]:
+    """Fingerprint model-owned QA semantics across protocol-only retries."""
+    data = _extract_embedded_json_object(raw_output, QA_JSON_SCHEMA["required"])
+    if not isinstance(data, Mapping):
+        return None
+    decision = str(data.get("decision") or data.get("verdict") or "").upper()
+    if decision not in ("PASS", "FAIL"):
+        return None
+    coverage = None
+    for key in ("acceptance_coverage", "acceptance_criteria", "acceptance_matrix", "criteria"):
+        if key in data:
+            coverage = data.get(key)
+            break
+    coverage_semantics = []
+    if isinstance(coverage, list):
+        for item in coverage:
+            if isinstance(item, Mapping):
+                coverage_semantics.append({
+                    "criterion_id": item.get("criterion_id") or item.get("id"),
+                    "status": str(item.get("status") or item.get("decision") or "").upper(),
+                })
+    negative_semantics = []
+    for item in data.get("negative_scenarios", []) if isinstance(data.get("negative_scenarios", []), list) else []:
+        if isinstance(item, Mapping):
+            negative_semantics.append({
+                "name": item.get("name") or item.get("scenario"),
+                "status": str(item.get("status") or "").upper(),
+            })
+        elif isinstance(item, str):
+            negative_semantics.append({"name": item, "status": ""})
+    defect_semantics = []
+    for item in data.get("defects", []) if isinstance(data.get("defects", []), list) else []:
+        if isinstance(item, Mapping):
+            defect_semantics.append({
+                "defect_id": item.get("defect_id"),
+                "severity": item.get("severity"),
+            })
+    semantic = {
+        "decision": decision,
+        "coverage": coverage_semantics,
+        "negative_scenarios": negative_semantics,
+        "uncovered_risks": data.get("uncovered_risks"),
+        "defects": defect_semantics,
+    }
+    return hashlib.sha256(
+        json.dumps(semantic, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+
+
 def _is_repairable_test_failure(command: str, exit_code: int, output: str) -> bool:
     if exit_code in (0, 124):
         return False
@@ -361,6 +470,36 @@ def _is_empty_host_completion(result: AgentResult) -> bool:
         if isinstance(item, Mapping) and "output_empty" in item:
             return bool(item.get("output_empty"))
     return not str(result.output or "").strip() or result.output == "No output returned"
+
+
+def _summarize_qa_command_output(command: str, exit_code: int, output: str) -> Dict[str, Any]:
+    """Build a deterministic, non-secret execution summary for managed QA."""
+    counts: Dict[str, int] = {}
+    for label, pattern in (
+        ("passed", r"(?i)\b(\d+)\s+passed\b"),
+        ("failed", r"(?i)\b(\d+)\s+failed\b"),
+        ("errors", r"(?i)\b(\d+)\s+errors?\b"),
+        ("skipped", r"(?i)\b(\d+)\s+skipped\b"),
+        ("warnings", r"(?i)\b(\d+)\s+warnings?\b"),
+        ("tests", r"(?im)^\s*Tests\s+(\d+)\b"),
+    ):
+        matches = re.findall(pattern, output)
+        if matches:
+            counts[label] = int(matches[-1])
+    no_tests = bool(re.search(r"(?i)\b(?:no tests? (?:ran|found)|collected 0 items)\b", output))
+    parts = [f"exit_code={exit_code}"]
+    parts.extend(f"{name}={value}" for name, value in counts.items())
+    if no_tests:
+        parts.append("no_tests_detected=true")
+    if len(parts) == 1:
+        parts.append(f"output_lines={len(output.splitlines())}")
+    return {
+        "text": "; ".join(parts),
+        "counts": counts,
+        "no_tests_detected": no_tests,
+        "output_chars": len(output),
+        "command": command,
+    }
 
 
 def _compact_test_diagnostics(
@@ -1741,6 +1880,7 @@ class ProductionRunner:
         acceptance_criteria_hash: str,
         expected_criterion_ids: Sequence[str],
         expected_test_commands: Sequence[str],
+        expected_command_results: Sequence[Mapping[str, Any]] = (),
     ) -> QAStructuredOutput:
         """Parse QA output and fail closed on identity, coverage, or adversarial-test gaps."""
 
@@ -1780,6 +1920,7 @@ class ProductionRunner:
                 session_id=session_id,
                 qa_request_id=qa_request_id,
                 acceptance_criteria_hash=acceptance_criteria_hash,
+                runner_command_results=expected_command_results,
             )
             if normalized_legacy is not None:
                 json_obj = normalized_legacy
@@ -2066,6 +2207,7 @@ class ProductionRunner:
         reviewer_protocol_attempts_this_run = 0
         qa_protocol_feedback: Optional[str] = None
         qa_protocol_attempts_this_run = 0
+        qa_protocol_semantic_fingerprint: Optional[str] = None
         start_role = checkpoint.current_role if existing_checkpoint else "BUILDER"
         # The authoritative board phase wins over a stale checkpoint role.  A
         # crash or a contract guard immediately after a successful transition
@@ -2612,6 +2754,7 @@ class ProductionRunner:
                     reviewer_protocol_attempts_this_run = 0
                     qa_protocol_feedback = None
                     qa_protocol_attempts_this_run = 0
+                    qa_protocol_semantic_fingerprint = None
                 self._emit_progress(
                     task_id=task_id,
                     state=RunnerState.BUILDING.value,
@@ -3489,16 +3632,33 @@ class ProductionRunner:
                             "message": str(exc),
                         })
                     masked_output = self.evidence_store._mask_text(output_material)
+                    output_hash = hashlib.sha256(
+                        output_material.encode("utf-8", errors="replace")
+                    ).hexdigest()
+                    execution_summary = _summarize_qa_command_output(
+                        command, exit_code, output_material
+                    )
                     command_results.append({
                         "command": command,
                         "exit_code": exit_code,
-                        "output_hash": hashlib.sha256(output_material.encode("utf-8", errors="replace")).hexdigest(),
+                        "output_hash": output_hash,
+                        "summary": execution_summary["text"],
+                        "counts": execution_summary["counts"],
+                        "no_tests_detected": execution_summary["no_tests_detected"],
                     })
                     qa_command_evidence.append({
                         "command": command,
                         "exit_code": exit_code,
+                        "cwd": os.path.realpath(worktree_dir),
+                        "candidate_commit": candidate_commit,
+                        "output_hash": output_hash,
+                        "output_chars": execution_summary["output_chars"],
+                        "summary": execution_summary["text"],
+                        "counts": execution_summary["counts"],
+                        "no_tests_detected": execution_summary["no_tests_detected"],
                         "output_excerpt": masked_output[-12000:],
                         "output_truncated": len(masked_output) > 12000,
+                        "excerpt_scope": "tail" if len(masked_output) > 12000 else "full",
                     })
                     self._emit_progress(
                         task_id=task_id,
@@ -3508,6 +3668,12 @@ class ProductionRunner:
                         message=f"Controlled QA command exited {exit_code}: {command}",
                         candidate_commit=candidate_commit,
                     )
+                    if exit_code == 0 and execution_summary["no_tests_detected"]:
+                        infrastructure_failures.append({
+                            "command": command,
+                            "error_type": "NO_TESTS_EXECUTED",
+                            "message": "The command exited 0 but explicitly reported that no tests were executed.",
+                        })
                     # A nonzero child exit is not itself proof of a code defect.
                     # Only a recognizable failed-test summary can trigger repair;
                     # missing dependencies, timeout and unknown failures pause QA.
@@ -3790,7 +3956,35 @@ class ProductionRunner:
                 acceptance_criteria_hash=spec.acceptance_criteria_hash,
                 expected_criterion_ids=[item.criterion_id for item in spec.acceptance_criteria_items],
                 expected_test_commands=test_commands,
+                expected_command_results=command_results,
             )
+            current_semantic_fingerprint = _qa_semantic_fingerprint(qa_result.output)
+            if (
+                qa_protocol_semantic_fingerprint
+                and current_semantic_fingerprint
+                and current_semantic_fingerprint != qa_protocol_semantic_fingerprint
+            ):
+                conflict = (
+                    "QA changed its semantic verdict/evidence during a protocol-only retry; "
+                    "the Runner will not treat a changed decision as a formatting repair."
+                )
+                qa_output = QAStructuredOutput(
+                    task_id=task_id,
+                    baseline_commit=spec.baseline_commit,
+                    candidate_commit=candidate_commit,
+                    session_id=sess_qa,
+                    host_invocation_id=inv_qa,
+                    qa_request_id=qa_request_id,
+                    acceptance_criteria_hash=spec.acceptance_criteria_hash,
+                    decision="FAIL",
+                    uncovered_risks=(conflict,),
+                    defects=({
+                        "defect_id": f"DEF-{task_id}-QA-PROTOCOL-SEMANTIC-CONFLICT",
+                        "severity": "P1",
+                        "description": conflict,
+                    },),
+                    summary=conflict,
+                )
 
             test_exit_codes = tuple(item["exit_code"] for item in command_results)
             commands_passed = bool(test_exit_codes) and all(code == 0 for code in test_exit_codes)
@@ -3851,6 +4045,8 @@ class ProductionRunner:
                 qa_defects = [dict(item) for item in qa_output.defects]
                 qa_protocol_feedback = qa_output.summary
                 qa_protocol_attempts_this_run += 1
+                if qa_protocol_semantic_fingerprint is None:
+                    qa_protocol_semantic_fingerprint = current_semantic_fingerprint
                 protocol_cycle = qa_cycle
                 # Host/schema retries are not business QA failures and must
                 # not consume the candidate's semantic QA retry budget. They
