@@ -383,6 +383,18 @@ def test_antigravity_adapter_accepts_top_level_structured_output():
     assert json.loads(text) == {"decision": "PASS", "defects": []}
 
 
+def test_antigravity_adapter_accepts_top_level_terminal_response():
+    adapter = AntigravityAdapter(is_real_host=False)
+    sample = (
+        '{"type":"PLANNER_RESPONSE","content":"working"}\n'
+        '{"event":"result","status":"SUCCESS",'
+        '"response":"{\\"decision\\":\\"PASS\\",\\"criteria\\":[]}"}\n'
+    )
+    text, _, err, _, _, _ = adapter._parse_antigravity_output(sample, "")
+    assert err is None
+    assert json.loads(text) == {"decision": "PASS", "criteria": []}
+
+
 @pytest.mark.parametrize("result_status", ["CANCELED", "INTERRUPTED", "INVALID", "WAITING", "RUNNING"])
 def test_antigravity_adapter_rejects_non_success_result_status(result_status):
     adapter = AntigravityAdapter(is_real_host=False)

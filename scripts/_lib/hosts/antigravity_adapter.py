@@ -1336,6 +1336,12 @@ class AntigravityAdapter(BaseHostAdapter):
                                 structured_outputs.append(structured_value.strip())
                             else:
                                 structured_outputs.append(json.dumps(structured_value, ensure_ascii=False))
+                        if (
+                            (ev.get("event") == "result" or ev.get("type") == "result")
+                            and top_status in ("", "SUCCESS")
+                            and isinstance(ev.get("response"), str)
+                        ):
+                            final_responses.append(ev["response"].strip())
 
                         # Extract conversation / session ID
                         c_id = None
