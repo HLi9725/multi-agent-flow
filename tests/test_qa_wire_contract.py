@@ -21,7 +21,7 @@ def assessment():
     }
 
 
-def parse(data, exit_code=0):
+def parse(data, exit_code=0, no_tests_detected=False):
     return ProductionRunner.__new__(ProductionRunner)._parse_qa_structured_json(
         json.dumps(data) if isinstance(data, dict) else data,
         task_id="T0014", baseline_commit="a" * 40, candidate_commit="b" * 40,
@@ -29,6 +29,7 @@ def parse(data, exit_code=0):
         acceptance_criteria_hash="c" * 64, expected_criterion_ids=["AC-01"],
         expected_test_commands=["npm test"], expected_command_results=[{
             "command": "npm test", "exit_code": exit_code, "summary": "observed result", "output_hash": "d" * 64,
+            "no_tests_detected": no_tests_detected,
         }],
     )
 
@@ -89,6 +90,12 @@ def test_both_paths_reject_conflicts(mutation, legacy):
 
 def test_runner_failure_cannot_become_model_pass():
     assert parse(assessment(), exit_code=1).decision == "FAIL"
+
+
+def test_zero_tests_cannot_become_model_pass_or_human_infrastructure_pause():
+    result = parse(assessment(), no_tests_detected=True)
+    assert result.decision == "FAIL"
+    assert result.defects[0]["defect_id"].endswith("QA-NO-TESTS")
 
 
 def test_duplicate_keys_and_multiple_distinct_reports_rejected():

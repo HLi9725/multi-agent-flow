@@ -603,6 +603,37 @@ def _is_repairable_test_failure(command: str, exit_code: int, output: str) -> bo
     return bool(re.search(r"(?im)(?:^FAILED\s+\S+|\b[1-9]\d* failed\b|^not ok\s+\d+|^# fail [1-9])", output))
 
 
+def _is_known_test_infrastructure_failure(exit_code: int, output: str) -> bool:
+    """Return true only for deterministic host/tooling failures.
+
+    Test setup/teardown exceptions, database schema errors, compilation errors,
+    and unknown non-zero exits are deliberately *not* infrastructure failures:
+    semantic QA must see their evidence and can return them to Builder.  This
+    avoids turning ordinary candidate defects into recurring human pauses.
+    """
+    if exit_code == 124:
+        return True
+    hard_infrastructure_patterns = (
+        r"Runner command exception:\s*(?:FileNotFoundError|PermissionError|OSError)",
+        r"(?:command not found|is not recognized as (?:the name of )?(?:a cmdlet|an internal or external command))",
+        r"(?:No module named pytest|ModuleNotFoundError:\s*No module named ['\"]pytest['\"])",
+        r"(?:No space left on device|disk quota exceeded|out of memory|cannot allocate memory)",
+    )
+    if any(re.search(pattern, output, re.I) for pattern in hard_infrastructure_patterns):
+        return True
+    # Network/authentication text emitted *inside* a named test is evidence for
+    # semantic QA: it may be the behavior under test or a candidate config bug.
+    if re.search(r"(?im)^(?:FAILED|ERROR)\s+\S+", output):
+        return False
+    external_service_patterns = (
+        r"(?:connection refused|connection timed out|connectex:|temporary failure in name resolution|"
+        r"name or service not known|could not translate host name|server has gone away)",
+        r"(?:Access denied for user|authentication failed|password authentication failed)",
+        r"(?:certificate verify failed|TLS handshake timeout)",
+    )
+    return any(re.search(pattern, output, re.I) for pattern in external_service_patterns)
+
+
 def _is_empty_host_completion(result: AgentResult) -> bool:
     """Detect a successful host turn that produced neither prose nor useful work events."""
     if result.status != AgentStatus.SUCCESS:
@@ -2273,6 +2304,16 @@ class ProductionRunner:
                 command for command in expected_test_commands
                 if command in reports_by_command and reports_by_command[command]["exit_code"] != 0
             ]
+            no_test_commands = [
+                str(item.get("command")) for item in expected_command_results
+                if item.get("no_tests_detected")
+            ]
+            if no_test_commands:
+                return failed(
+                    "QA-NO-TESTS",
+                    "Required test commands executed zero tests and must be repaired: "
+                    + ", ".join(no_test_commands),
+                )
             if missing_commands or unexpected_commands or duplicate_commands or failed_commands:
                 return failed(
                     "QA-COMMAND-GAP",
@@ -4018,22 +4059,20 @@ class ProductionRunner:
                         message=f"Controlled QA command exited {exit_code}: {command}",
                         candidate_commit=candidate_commit,
                     )
-                    if exit_code == 0 and execution_summary["no_tests_detected"]:
-                        infrastructure_failures.append({
-                            "command": command,
-                            "error_type": "NO_TESTS_EXECUTED",
-                            "message": "The command exited 0 but explicitly reported that no tests were executed.",
-                        })
-                    # A nonzero child exit is not itself proof of a code defect.
-                    # Only a recognizable failed-test summary can trigger repair;
-                    # missing dependencies, timeout and unknown failures pause QA.
+                    # Zero tests is a deterministic test configuration defect,
+                    # not a host outage.  Preserve it in Runner evidence and let
+                    # semantic QA return it to Builder; PASS is rejected below.
+                    # Pause only for positively identified host/tooling failures.
+                    # All other non-zero results (including pytest setup/teardown,
+                    # SQL schema and compilation failures) are candidate evidence
+                    # for semantic QA, which may return them to Builder.
                     if exit_code != 0 and not any(
                         item.get("command") == command for item in infrastructure_failures
                     ):
-                        if not _is_repairable_test_failure(command, exit_code, output_material):
+                        if _is_known_test_infrastructure_failure(exit_code, output_material):
                             infrastructure_failures.append({
                                 "command": command,
-                                "error_type": "EXECUTION_FAILURE_UNCLASSIFIED",
+                                "error_type": "EXECUTION_INFRASTRUCTURE_FAILURE",
                                 "message": masked_output[-12000:],
                             })
                 if infrastructure_failures:

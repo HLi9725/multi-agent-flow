@@ -123,12 +123,46 @@ def test_diagnostic_masking_preserves_failure_context(tmp_path):
 
 
 def test_failure_classification_does_not_send_environment_errors_to_builder():
-    from scripts._lib.core.production_runner import _is_repairable_test_failure
+    from scripts._lib.core.production_runner import (
+        _is_known_test_infrastructure_failure,
+        _is_repairable_test_failure,
+    )
     assert _is_repairable_test_failure("npm test", 1, "FAILED tests/test_api.py::test_auth - AssertionError\n1 failed")
     assert not _is_repairable_test_failure("npm test", 1, "No module named pytest")
     assert not _is_repairable_test_failure("npm test", 1, "unknown execution error")
     assert not _is_repairable_test_failure("npm test", 124, "1 failed")
     assert not _is_repairable_test_failure("npm test", 0, "1 failed")
+    assert _is_known_test_infrastructure_failure(124, "1 failed")
+    assert _is_known_test_infrastructure_failure(1, "No module named pytest")
+    assert _is_known_test_infrastructure_failure(1, "connectex: connection refused")
+    assert _is_known_test_infrastructure_failure(1, "Access denied for user 'test'")
+    assert _is_known_test_infrastructure_failure(1, "No space left on device")
+
+
+@pytest.mark.parametrize("output", [
+    "ERROR tests/test_mysql.py::test_cleanup - sqlalchemy.exc.OperationalError: Unknown column 'remarks'\n6 errors",
+    "ERROR at setup of test_case\nNameError: name 'Session' is not defined\n1 error",
+    "ProgrammingError: Table 'test.orders' doesn't exist\n10 errors",
+    "SyntaxError: invalid syntax",
+    "BUILD FAILURE\nCOMPILATION ERROR",
+    "unknown execution error",
+])
+def test_candidate_failures_reach_semantic_qa_instead_of_pausing(output):
+    from scripts._lib.core.production_runner import _is_known_test_infrastructure_failure
+    assert not _is_known_test_infrastructure_failure(1, output)
+
+
+def test_zero_tests_is_not_classified_as_host_infrastructure():
+    from scripts._lib.core.production_runner import _is_known_test_infrastructure_failure
+    assert not _is_known_test_infrastructure_failure(0, "collected 0 items\nno tests ran")
+
+
+@pytest.mark.parametrize("detail", ["connection refused", "Access denied for user 'test'", "TLS handshake timeout"])
+def test_external_error_inside_named_test_reaches_semantic_qa(detail):
+    from scripts._lib.core.production_runner import _is_known_test_infrastructure_failure
+    assert not _is_known_test_infrastructure_failure(
+        1, f"FAILED tests/test_external.py::test_boundary - RuntimeError: {detail}\n1 failed"
+    )
 
 
 def test_diagnostic_masking_covers_multiline_private_key(tmp_path):
