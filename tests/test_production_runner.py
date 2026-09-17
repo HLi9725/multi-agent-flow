@@ -265,12 +265,13 @@ def test_runner_wait_enforces_outer_deadline():
 
 
 @pytest.mark.parametrize(
-    "recover_budget,empty_builder_completions,reviewer_protocol_failures",
-    [(False, 0, 0), (True, 0, 0), (False, 1, 0), (False, 2, 0), (False, 0, 1)],
+    "recover_budget,empty_builder_completions,reviewer_protocol_failures,qa_wire_mode",
+    [(False, 0, 0, "full"), (True, 0, 0, "full"), (False, 1, 0, "full"), (False, 2, 0, "full"),
+     (False, 0, 1, "full"), (False, 0, 0, "semantic"), (False, 0, 0, "repair")],
 )
 def test_production_runner_full_pass_pipeline(
     mock_git_repo, tmp_path, monkeypatch, recover_budget, empty_builder_completions,
-    reviewer_protocol_failures,
+    reviewer_protocol_failures, qa_wire_mode,
 ):
     repo_dir, baseline_sha = mock_git_repo
     if empty_builder_completions:
@@ -377,6 +378,14 @@ def test_production_runner_full_pass_pipeline(
                 "defects": [],
                 "summary": "All acceptance criteria and negative scenarios passed.",
             }
+            if qa_wire_mode in ("semantic", "repair"):
+                from scripts._lib.core.production_runner import QA_MODEL_FIELDS
+                qa_json = {key: qa_json[key] for key in QA_MODEL_FIELDS}
+                if qa_wire_mode == "repair" and len(qa_requests) == 1:
+                    qa_json["unexpected_field"] = True
+                elif qa_wire_mode == "repair":
+                    assert "Previous untrusted assessment" in qa_req.prompt
+                    assert "Repair only the JSON format" in qa_req.prompt
             return AgentResult(
                 session_id=handle.session_id,
                 status=AgentStatus.SUCCESS,
@@ -548,7 +557,7 @@ def test_production_runner_full_pass_pipeline(
         for event in progress_events
         if event["event"] == "stage_started"
     ]
-    assert stage_roles == ["BUILDER"] + ["REVIEWER"] * (reviewer_protocol_failures + 1) + ["QA"]
+    assert stage_roles == ["BUILDER"] + ["REVIEWER"] * (reviewer_protocol_failures + 1) + ["QA"] * (2 if qa_wire_mode == "repair" else 1)
     assert any(event["event"] == "stage_retrying" for event in progress_events) is bool(empty_builder_completions)
     assert builder_calls == (2 if empty_builder_completions else 1)
     checkpoint_after_run = checkpoint_store.load_checkpoint("T0088")

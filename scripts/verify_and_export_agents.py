@@ -105,7 +105,7 @@ def serialize_runner_readonly_role(platform_key, role_code, role_data):
         text = str(item)
         if "check_secrets.py" in text:
             audit_rules.append("必须核对 Runner 提供的候选级安全扫描命令、固定 SHA、退出码和输出摘要")
-        elif any(token in text for token in ("transition_task.py", "run_command")):
+        elif any(token in text for token in ("transition_task.py", "run_command", "--end-time")):
             continue
         else:
             audit_rules.append(text)
@@ -114,6 +114,7 @@ def serialize_runner_readonly_role(platform_key, role_code, role_data):
     stage = "审查" if role_code == "REVIEWER" else "测试"
     if role_code == "QA":
         access_rules = """- QA 的全部差异、测试、构建、安全扫描和验收矩阵证据均由 Runner 内联提供；不得调用任何工具。
+- 输出只包含 decision、acceptance_coverage、negative_scenarios、uncovered_risks、defects、summary 六个判断字段；会话身份、候选 SHA 和受控测试记录由 Runner 绑定，不能自行编造。
 - 不得自行读取文件、列举目录、发起搜索或扩大证据范围；证据不足时直接返回否定结论。
 - 不得修改任何文件。"""
         denial_rule = "- 若内联证据不足，返回结构化 FAIL；不得请求权限、修改全局配置或尝试绕过。"

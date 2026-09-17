@@ -482,7 +482,7 @@ def test_terminal_json_extraction_deduplicates_repeats_and_rejects_conflicts():
         "decision": "PASS",
         "criteria": [{"criterion_id": "AC-01", "status": "", "evidence": "rewritten"}],
     }
-    assert _qa_semantic_fingerprint(json.dumps(report)) == _qa_semantic_fingerprint(
+    assert _qa_semantic_fingerprint(json.dumps(report)) != _qa_semantic_fingerprint(
         json.dumps(evidence_variant)
     )
 
