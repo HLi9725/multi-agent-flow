@@ -16,6 +16,7 @@ import yaml
 from scripts._lib.core.adapter_registry import AdapterRegistry
 from scripts._lib.core.agent_schema import (
     AgentHandle,
+    AgentRequest,
     AgentResult,
     AgentStatus,
     AgentTimeoutError,
@@ -29,9 +30,10 @@ from scripts._lib.core.production_runner import (
     _compact_test_diagnostics,
     _derive_command_failure_defects,
     _is_empty_host_completion,
+    _transient_host_failure_kind,
 )
 from scripts._lib.core.runner_checkpoint_store import RunnerCheckpointStore
-from scripts._lib.core.runner_schema import RunnerState, TaskExecutionSpec
+from scripts._lib.core.runner_schema import RunnerCheckpoint, RunnerState, TaskExecutionSpec
 from scripts._lib.hosts.antigravity_adapter import AntigravityAdapter, create_antigravity_manifest
 from scripts._lib.hosts.codex_cli_adapter import CodexCliAdapter, create_codex_cli_manifest
 
@@ -262,6 +264,141 @@ def test_runner_wait_enforces_outer_deadline():
         runner._wait_for_result_cancellable(adapter, handle, 0.05, "T0088")
     assert time.monotonic() - started < 1.0
     assert adapter.cancelled is True
+
+
+@pytest.mark.parametrize(
+    "message,expected",
+    [
+        ("UNAVAILABLE (code 503): No capacity available for model x", "CAPACITY"),
+        ("HTTP 502 Bad Gateway", "BAD_GATEWAY"),
+        ("HTTP 504 Gateway Timeout", "GATEWAY_TIMEOUT"),
+        ("429 Too Many Requests: rate limit", "RATE_LIMIT"),
+        ("connection reset by peer", "TRANSIENT_NETWORK"),
+        ("429 RESOURCE_EXHAUSTED: quota exceeded", None),
+        ("permission denied", None),
+        ("invalid structured JSON", None),
+    ],
+)
+def test_transient_host_failure_classifier_is_narrow(message, expected):
+    result = AgentResult(
+        session_id="sess",
+        status=AgentStatus.FAILED,
+        output=message,
+        error_message=message,
+        is_real_host=True,
+    )
+    assert _transient_host_failure_kind(result) == expected
+
+
+@pytest.mark.parametrize(
+    "role,session_field",
+    [
+        ("BUILDER", "builder_session_id"),
+        ("REVIEWER", "reviewer_session_id"),
+        ("QA", "qa_session_id"),
+    ],
+)
+def test_transient_host_failure_retries_without_consuming_business_budget(role, session_field):
+    class Store:
+        def __init__(self):
+            self.saved = []
+
+        def save_checkpoint(self, checkpoint):
+            self.saved.append(checkpoint)
+
+        @staticmethod
+        def query_status(task_id):
+            return {}
+
+    class Adapter:
+        def __init__(self):
+            self.requests = []
+
+        def dispatch_agent(self, request):
+            self.requests.append(request)
+            return AgentHandle(
+                session_id=request.session_id,
+                host_id="host",
+                status="running",
+                is_real_host=True,
+                adapter_instance_id="instance",
+                invocation_token="token-1234567890",
+            )
+
+        def wait_for_result(self, handle, timeout_seconds=None):
+            if len(self.requests) == 1:
+                return AgentResult(
+                    session_id=handle.session_id,
+                    status=AgentStatus.FAILED,
+                    output="API error: UNAVAILABLE (code 503): No capacity available for model",
+                    error_message="API error: UNAVAILABLE (code 503): No capacity available for model",
+                    is_real_host=True,
+                )
+            return AgentResult(
+                session_id=handle.session_id,
+                status=AgentStatus.SUCCESS,
+                output='{"decision":"PASS"}',
+                partial_results=({"invocation_id": "host:step_2"},),
+                is_real_host=True,
+            )
+
+        @staticmethod
+        def cancel_agent(handle):
+            return True
+
+    store = Store()
+    runner = ProductionRunner(checkpoint_store=store)
+    adapter = Adapter()
+    request = AgentRequest(
+        session_id="sess_original",
+        prompt="session=sess_original",
+        role=role,
+        workspace_dir=".",
+        extra_context={},
+    )
+    checkpoint = RunnerCheckpoint(
+        task_id="T0088",
+        project_id="repo",
+        state=RunnerState.BUILDING.value,
+        current_role=role,
+        total_attempts=9,
+    )
+    spec = TaskExecutionSpec(
+        project_id="repo",
+        project_root=".",
+        authority_root=".",
+        task_id="T0088",
+        task_name="retry",
+        requirement_text="retry transient host failures",
+        acceptance_criteria="验收标准: retry succeeds",
+        acceptance_criteria_hash="hash",
+        task_version="1",
+        status_at_read="进行中",
+        host_transient_max_retries=2,
+        host_transient_retry_base_seconds=0,
+        host_transient_retry_max_seconds=0,
+    )
+
+    handle, result, final_request, final_checkpoint = runner._dispatch_with_transient_host_retries(
+        adapter=adapter,
+        request=request,
+        task_id="T0088",
+        state=RunnerState.BUILDING.value,
+        role=role,
+        timeout_seconds=1,
+        checkpoint=checkpoint,
+        spec=spec,
+    )
+
+    assert result.status == AgentStatus.SUCCESS
+    assert handle.session_id == final_request.session_id
+    assert final_request.session_id != request.session_id
+    assert final_request.session_id in final_request.prompt
+    assert final_checkpoint.total_attempts == 9
+    assert getattr(final_checkpoint, session_field) == final_request.session_id
+    assert final_checkpoint.host_attempt_history[-1]["failure_kind"] == "CAPACITY"
+    assert final_checkpoint.host_attempt_history[-1]["outcome"] == "TRANSIENT_HOST_RETRY"
+    assert len(adapter.requests) == 2
 
 
 @pytest.mark.parametrize(

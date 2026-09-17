@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 import hashlib
 import json
+import math
 import re
 import time
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -312,6 +313,9 @@ class TaskExecutionSpec:
     max_qa_cycles: int = 3
     max_total_attempts: int = 6
     total_wall_clock_timeout_seconds: int = 1800
+    host_transient_max_retries: int = 3
+    host_transient_retry_base_seconds: float = 5.0
+    host_transient_retry_max_seconds: float = 30.0
     allow_git_push: bool = False
     allow_merge_main: bool = False
     allow_auto_accept: bool = False
@@ -347,6 +351,16 @@ class TaskExecutionSpec:
             commands.insert(0, self.test_command.strip())
         commands = tuple(commands)
         object.__setattr__(self, "test_commands", commands)
+        if self.host_transient_max_retries < 0:
+            raise ValueError("host_transient_max_retries must be non-negative")
+        if not math.isfinite(self.host_transient_retry_base_seconds) or self.host_transient_retry_base_seconds < 0:
+            raise ValueError("host_transient_retry_base_seconds must be non-negative")
+        if not math.isfinite(self.host_transient_retry_max_seconds):
+            raise ValueError("host_transient_retry_max_seconds must be finite")
+        if self.host_transient_retry_max_seconds < self.host_transient_retry_base_seconds:
+            raise ValueError(
+                "host_transient_retry_max_seconds must be greater than or equal to the base delay"
+            )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -381,6 +395,9 @@ class TaskExecutionSpec:
             "max_qa_cycles": self.max_qa_cycles,
             "max_total_attempts": self.max_total_attempts,
             "total_wall_clock_timeout_seconds": self.total_wall_clock_timeout_seconds,
+            "host_transient_max_retries": self.host_transient_max_retries,
+            "host_transient_retry_base_seconds": self.host_transient_retry_base_seconds,
+            "host_transient_retry_max_seconds": self.host_transient_retry_max_seconds,
             "allow_git_push": self.allow_git_push,
             "allow_merge_main": self.allow_merge_main,
             "allow_auto_accept": self.allow_auto_accept,

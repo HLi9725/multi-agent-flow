@@ -120,6 +120,40 @@ NPM_TEST_SCRIPT_PATTERN = re.compile(
     r"^test(?::[A-Za-z0-9][A-Za-z0-9._-]*)+$"
 )
 
+_TRANSIENT_HOST_FAILURE_PATTERNS = (
+    ("CAPACITY", re.compile(r"\b503\b|service unavailable|(?:\bunavailable\b).*(?:capacity|temporar|server)|no capacity available", re.I)),
+    ("RATE_LIMIT", re.compile(r"(?:\b429\b|rate[ -]?limit|too many requests|resource_exhausted)", re.I)),
+    ("BAD_GATEWAY", re.compile(r"\b502\b|bad gateway", re.I)),
+    ("GATEWAY_TIMEOUT", re.compile(r"\b504\b|gateway timeout", re.I)),
+    ("TRANSIENT_NETWORK", re.compile(r"connection (?:reset|aborted)|temporar(?:y|ily) unavailable|i/o timeout", re.I)),
+)
+_NON_RETRYABLE_HOST_FAILURE_PATTERN = re.compile(
+    r"permission|denied_actions|access denied|unauthori[sz]ed|forbidden|authentication|"
+    r"invalid argument|model .*not found|context length|billing|quota (?:exhausted|exceeded)",
+    re.I,
+)
+
+
+def _transient_host_failure_kind(value: Any) -> Optional[str]:
+    """Classify only explicit, retry-safe host/service failures.
+
+    Protocol, permission, authentication, quota, and business failures are
+    intentionally excluded.  A bounded retry must never turn a semantic
+    failure into a silent success path.
+    """
+    if isinstance(value, AgentResult):
+        if value.status == AgentStatus.SUCCESS:
+            return None
+        text = "\n".join(filter(None, (value.error_message, value.output)))
+    else:
+        text = str(value or "")
+    if not text or _NON_RETRYABLE_HOST_FAILURE_PATTERN.search(text):
+        return None
+    for kind, pattern in _TRANSIENT_HOST_FAILURE_PATTERNS:
+        if pattern.search(text):
+            return kind
+    return None
+
 
 def _plain_metadata_value(value: Any) -> Any:
     """Thaw immutable Evidence metadata into JSON-compatible values."""
@@ -1000,6 +1034,9 @@ def _execution_options_from_spec(spec: TaskExecutionSpec) -> Dict[str, Any]:
         "max_qa_cycles": spec.max_qa_cycles,
         "max_total_attempts": spec.max_total_attempts,
         "total_wall_clock_timeout_seconds": spec.total_wall_clock_timeout_seconds,
+        "host_transient_max_retries": spec.host_transient_max_retries,
+        "host_transient_retry_base_seconds": spec.host_transient_retry_base_seconds,
+        "host_transient_retry_max_seconds": spec.host_transient_retry_max_seconds,
     }
 
 
@@ -1150,6 +1187,180 @@ class ProductionRunner:
         recorder = getattr(adapter, "record_out_of_band_approval", None)
         if callable(recorder):
             recorder(request)
+
+    def _wait_retry_delay(self, task_id: str, delay_seconds: float) -> None:
+        """Wait for a host retry while remaining responsive to cancellation."""
+        deadline = time.monotonic() + max(0.0, delay_seconds)
+        while time.monotonic() < deadline:
+            if self._is_cancellation_requested(task_id):
+                raise RunnerCancelledError(f"Task {task_id} cancelled during host retry backoff")
+            time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+
+    def _dispatch_with_transient_host_retries(
+        self,
+        *,
+        adapter: Any,
+        request: AgentRequest,
+        task_id: str,
+        state: str,
+        role: str,
+        timeout_seconds: float,
+        checkpoint: RunnerCheckpoint,
+        spec: TaskExecutionSpec,
+        retry_guard: Optional[Callable[[], bool]] = None,
+    ) -> Tuple[AgentHandle, AgentResult, AgentRequest, RunnerCheckpoint]:
+        """Dispatch one semantic role turn with bounded infrastructure retries.
+
+        Only explicit transient service/transport failures are retried.  Each
+        retry gets a fresh host session identity, is persisted for audit, and
+        does not consume Builder/Reviewer/QA business cycles.  Builder callers
+        provide a guard so an ambiguous partial workspace mutation can never be
+        replayed automatically.
+        """
+        current_request = request
+        retry_index = 0
+        max_retries = int(spec.host_transient_max_retries)
+        while True:
+            handle: Optional[AgentHandle] = None
+            result: Optional[AgentResult] = None
+            failure: Optional[BaseException] = None
+            try:
+                self._record_pre_granted_approval(
+                    adapter,
+                    current_request,
+                    bool(current_request.extra_context.get("pre_granted_approval")),
+                )
+                handle = adapter.dispatch_agent(current_request)
+                with self._lock:
+                    self._active_handles[task_id] = handle
+                result = self._wait_for_result_cancellable(
+                    adapter,
+                    handle,
+                    timeout_seconds=timeout_seconds,
+                    task_id=task_id,
+                )
+            except (RunnerCancelledError, AgentPermissionRequiredError):
+                raise
+            except Exception as exc:
+                failure = exc
+            finally:
+                with self._lock:
+                    self._active_handles.pop(task_id, None)
+
+            retry_kind = _transient_host_failure_kind(failure or result)
+            proposed_delay = min(
+                float(spec.host_transient_retry_max_seconds),
+                float(spec.host_transient_retry_base_seconds) * (2 ** retry_index),
+            )
+            can_retry = retry_kind is not None and retry_index < max_retries
+            blocked_outcome: Optional[str] = None
+            if can_retry and retry_guard is not None and not retry_guard():
+                can_retry = False
+                blocked_outcome = "TRANSIENT_RETRY_BLOCKED_WORKSPACE_CHANGED"
+            started_at, elapsed_base = self._run_timing.get(
+                task_id,
+                (time.time(), checkpoint.active_elapsed_seconds),
+            )
+            active_elapsed = max(
+                checkpoint.active_elapsed_seconds,
+                elapsed_base + max(0.0, time.time() - started_at),
+            )
+            remaining_wall_clock = max(
+                0.0,
+                float(spec.total_wall_clock_timeout_seconds) - active_elapsed,
+            )
+            if can_retry and proposed_delay >= remaining_wall_clock:
+                can_retry = False
+                blocked_outcome = "TRANSIENT_RETRY_BLOCKED_WALL_CLOCK_BUDGET"
+
+            if not can_retry:
+                if blocked_outcome:
+                    history = list(checkpoint.host_attempt_history)
+                    history.append({
+                        "role": role,
+                        "session_id": current_request.session_id,
+                        "host_invocation_id": (
+                            _extract_real_invocation_id(result, handle)
+                            if result is not None and handle is not None else None
+                        ),
+                        "outcome": blocked_outcome,
+                        "failure_kind": retry_kind,
+                        "created_at": time.time(),
+                    })
+                    checkpoint = replace(
+                        checkpoint,
+                        active_elapsed_seconds=active_elapsed,
+                        host_attempt_history=tuple(history[-32:]),
+                        updated_at=time.time(),
+                    )
+                    self.checkpoint_store.save_checkpoint(checkpoint)
+                if failure is not None:
+                    raise failure
+                if handle is None or result is None:
+                    raise ProductionRunnerError("Host dispatch produced no handle or result")
+                return handle, result, current_request, checkpoint
+
+            if handle is not None and failure is not None:
+                try:
+                    adapter.cancel_agent(handle)
+                except Exception:
+                    pass
+
+            retry_index += 1
+            delay = proposed_delay
+            invocation_id = (
+                _extract_real_invocation_id(result, handle)
+                if result is not None and handle is not None else None
+            )
+            history = list(checkpoint.host_attempt_history)
+            history.append({
+                "role": role,
+                "session_id": current_request.session_id,
+                "host_invocation_id": invocation_id,
+                "outcome": "TRANSIENT_HOST_RETRY",
+                "failure_kind": retry_kind,
+                "retry_index": retry_index,
+                "delay_seconds": delay,
+                "created_at": time.time(),
+            })
+            new_session_id = (
+                f"{request.session_id}_hostretry{retry_index}_{int(time.time() * 1000)}"
+            )
+            session_field = {
+                "BUILDER": "builder_session_id",
+                "REVIEWER": "reviewer_session_id",
+                "QA": "qa_session_id",
+            }[role]
+            checkpoint = replace(
+                checkpoint,
+                **{
+                    session_field: new_session_id,
+                    "active_elapsed_seconds": active_elapsed,
+                    "host_attempt_history": tuple(history[-32:]),
+                    "last_error": None,
+                    "updated_at": time.time(),
+                },
+            )
+            self.checkpoint_store.save_checkpoint(checkpoint)
+            self._emit_progress(
+                task_id=task_id,
+                state=state,
+                role=role,
+                event="host_transient_retrying",
+                message=(
+                    f"Transient host failure ({retry_kind}); retry "
+                    f"{retry_index}/{max_retries} after {delay:g}s"
+                ),
+            )
+            self._wait_retry_delay(task_id, delay)
+            current_request = replace(
+                current_request,
+                session_id=new_session_id,
+                prompt=current_request.prompt.replace(
+                    current_request.session_id,
+                    new_session_id,
+                ),
+            )
 
     def _synchronize_failed_result_checkpoint(self, result: RunnerResult) -> RunnerResult:
         """Keep a failed/paused Runner result and its durable checkpoint consistent.
@@ -2539,25 +2750,33 @@ class ProductionRunner:
                     cwd=worktree_dir,
                     text=True,
                 ).strip()
+
+                def builder_retry_guard() -> bool:
+                    """A transient Builder turn is replayable only before any file mutation."""
+                    return (
+                        self._get_git_commit(worktree_dir) == builder_pre_head
+                        and subprocess.check_output(
+                            ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+                            cwd=worktree_dir,
+                            text=True,
+                        ).strip() == builder_pre_status
+                    )
                 try:
                     while True:
-                        self._record_pre_granted_approval(
-                            builder_adapter,
-                            builder_request,
-                            pre_granted_approval,
+                        builder_handle, builder_result, builder_request, checkpoint = (
+                            self._dispatch_with_transient_host_retries(
+                                adapter=builder_adapter,
+                                request=builder_request,
+                                task_id=task_id,
+                                state=RunnerState.BUILDING.value,
+                                role="BUILDER",
+                                timeout_seconds=float(spec.builder_timeout_seconds),
+                                checkpoint=checkpoint,
+                                spec=spec,
+                                retry_guard=builder_retry_guard,
+                            )
                         )
-                        builder_handle = builder_adapter.dispatch_agent(builder_request)
-                        with self._lock:
-                            self._active_handles[task_id] = builder_handle
-
-                        builder_result = self._wait_for_result_cancellable(
-                            builder_adapter,
-                            builder_handle,
-                            timeout_seconds=float(spec.builder_timeout_seconds),
-                            task_id=task_id,
-                        )
-                        with self._lock:
-                            self._active_handles.pop(task_id, None)
+                        sess_builder = builder_request.session_id
 
                         worktree_unchanged = (
                             self._get_git_commit(worktree_dir) == builder_pre_head
@@ -3088,21 +3307,19 @@ class ProductionRunner:
                 )
 
                 try:
-                    self._record_pre_granted_approval(
-                        reviewer_adapter,
-                        reviewer_request,
-                        pre_granted_approval,
+                    reviewer_handle, reviewer_result, reviewer_request, checkpoint = (
+                        self._dispatch_with_transient_host_retries(
+                            adapter=reviewer_adapter,
+                            request=reviewer_request,
+                            task_id=task_id,
+                            state=RunnerState.REVIEWING.value,
+                            role="REVIEWER",
+                            timeout_seconds=float(spec.reviewer_timeout_seconds),
+                            checkpoint=checkpoint,
+                            spec=spec,
+                        )
                     )
-                    reviewer_handle = reviewer_adapter.dispatch_agent(reviewer_request)
-                    with self._lock:
-                        self._active_handles[task_id] = reviewer_handle
-
-                    reviewer_result = self._wait_for_result_cancellable(
-                        reviewer_adapter,
-                        reviewer_handle,
-                        timeout_seconds=float(spec.reviewer_timeout_seconds),
-                        task_id=task_id,
-                    )
+                    sess_reviewer = reviewer_request.session_id
                 except RunnerCancelledError as ce:
                     return RunnerResult(
                         success=True,
@@ -3880,21 +4097,19 @@ class ProductionRunner:
             )
 
             try:
-                self._record_pre_granted_approval(
-                    qa_adapter,
-                    qa_request,
-                    pre_granted_approval,
+                qa_handle, qa_result, qa_request, checkpoint = (
+                    self._dispatch_with_transient_host_retries(
+                        adapter=qa_adapter,
+                        request=qa_request,
+                        task_id=task_id,
+                        state=RunnerState.QA_TESTING.value,
+                        role="QA",
+                        timeout_seconds=float(qa_remaining_seconds),
+                        checkpoint=checkpoint,
+                        spec=spec,
+                    )
                 )
-                qa_handle = qa_adapter.dispatch_agent(qa_request)
-                with self._lock:
-                    self._active_handles[task_id] = qa_handle
-
-                qa_result = self._wait_for_result_cancellable(
-                    qa_adapter,
-                    qa_handle,
-                    timeout_seconds=float(qa_remaining_seconds),
-                    task_id=task_id,
-                )
+                sess_qa = qa_request.session_id
             except RunnerCancelledError as ce:
                 return RunnerResult(
                     success=True,

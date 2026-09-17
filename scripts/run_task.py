@@ -7,6 +7,7 @@ scripts/run_task.py
 """
 import argparse
 import json
+import math
 import os
 import sys
 
@@ -56,6 +57,20 @@ def _positive_int(value):
     return parsed
 
 
+def _non_negative_int(value):
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be a non-negative integer")
+    return parsed
+
+
+def _non_negative_float(value):
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed < 0:
+        raise argparse.ArgumentTypeError("must be a non-negative number")
+    return parsed
+
+
 def _overrides_from_args(args):
     overrides = {}
     if getattr(args, "max_total_attempts", None) is not None:
@@ -80,7 +95,28 @@ def _overrides_from_args(args):
         overrides["test_commands"] = tuple(args.test_commands)
     if getattr(args, "workspace_mode", None):
         overrides["workspace_mode"] = args.workspace_mode
+    if getattr(args, "host_transient_max_retries", None) is not None:
+        overrides["host_transient_max_retries"] = args.host_transient_max_retries
+    if getattr(args, "host_transient_retry_base_seconds", None) is not None:
+        overrides["host_transient_retry_base_seconds"] = args.host_transient_retry_base_seconds
+    if getattr(args, "host_transient_retry_max_seconds", None) is not None:
+        overrides["host_transient_retry_max_seconds"] = args.host_transient_retry_max_seconds
     return overrides
+
+
+def _add_host_retry_args(parser):
+    parser.add_argument(
+        "--host-transient-max-retries", type=_non_negative_int, default=None,
+        help="Bounded retries for explicit transient host failures; does not consume business cycles",
+    )
+    parser.add_argument(
+        "--host-transient-retry-base-seconds", type=_non_negative_float, default=None,
+        help="Initial delay for transient host retries",
+    )
+    parser.add_argument(
+        "--host-transient-retry-max-seconds", type=_non_negative_float, default=None,
+        help="Maximum delay between transient host retries",
+    )
 
 
 def cmd_start(args):
@@ -203,6 +239,7 @@ def main():
     )
     p_start.set_defaults(func=cmd_start)
     p_start.add_argument("--restart-cancelled", action="store_true", help="Archive a cancelled run and start a new run of the same task")
+    _add_host_retry_args(p_start)
 
     # status
     p_status = subparsers.add_parser("status", help="Query task execution status (read-only)")
@@ -249,6 +286,7 @@ def main():
         help="Override persisted workspace mode (checkpoint worktree is still authoritative)",
     )
     p_resume.set_defaults(func=cmd_resume)
+    _add_host_retry_args(p_resume)
 
     for name, help_text, func in (
         ("accept", "Accept the exact pending candidate", cmd_accept),
