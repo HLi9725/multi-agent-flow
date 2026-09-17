@@ -108,6 +108,11 @@ def serialize_runner_readonly_role(platform_key, role_code, role_data):
         elif any(token in text for token in ("transition_task.py", "run_command", "--end-time")):
             continue
         else:
+            if role_code == "QA":
+                text = text.replace(
+                    "PASS 必须返回完整验收覆盖矩阵、受控命令结果、反向场景和零未覆盖风险",
+                    "PASS 必须核验 Runner 受控命令结果，并返回完整验收覆盖矩阵、反向场景和零未覆盖风险",
+                )
             audit_rules.append(text)
     redlines = _as_bullets(audit_rules)
     verdict = "PASS/REJECT" if role_code == "REVIEWER" else "PASS/FAIL"
