@@ -763,6 +763,44 @@ def _derive_command_failure_defects(
     return defects
 
 
+def _qa_fail_from_runner_command_evidence(
+    *, task_id: str, baseline_commit: str, candidate_commit: str,
+    session_id: str, invocation_id: str, qa_request_id: str,
+    acceptance_criteria_hash: str, criterion_ids: Sequence[str],
+    command_results: Sequence[Mapping[str, Any]],
+    command_evidence: Sequence[Mapping[str, Any]],
+    protocol_diagnostic: Optional[Mapping[str, Any]] = None,
+) -> QAStructuredOutput:
+    """Build an auditable FAIL from immutable Runner command evidence."""
+    defects = _derive_command_failure_defects(task_id, command_evidence)
+    zero_test_commands = [str(item.get("command")) for item in command_results
+                          if item.get("no_tests_detected")]
+    if zero_test_commands:
+        defects.append({
+            "defect_id": f"DEF-{task_id}-RUNNER-NO-TESTS", "severity": "P1",
+            "description": "Required commands executed zero tests: " + ", ".join(zero_test_commands),
+            "suggested_fix": "Repair test discovery/configuration; do not weaken the required command.",
+        })
+    if not defects:
+        raise ProductionRunnerError("Runner command fallback requires failing or zero-test evidence")
+    risk = "QA host report was protocol-invalid and ignored; verdict derives from Runner-owned command evidence."
+    if protocol_diagnostic:
+        risk += " Diagnostic: " + str(protocol_diagnostic.get("kind", "UNKNOWN"))
+    return QAStructuredOutput(
+        task_id=task_id, baseline_commit=baseline_commit,
+        candidate_commit=candidate_commit, session_id=session_id,
+        host_invocation_id=invocation_id, qa_request_id=qa_request_id,
+        acceptance_criteria_hash=acceptance_criteria_hash, decision="FAIL",
+        acceptance_coverage=tuple({
+            "criterion_id": criterion_id, "status": "FAIL",
+            "evidence": "Blocked by failing Runner-controlled command evidence.",
+        } for criterion_id in criterion_ids),
+        test_commands=tuple(dict(item) for item in command_results),
+        negative_scenarios=(), uncovered_risks=(risk,), defects=tuple(defects),
+        summary="Runner-controlled QA command gate failed; malformed host report was ignored.",
+    )
+
+
 def _build_qa_subprocess_env() -> Dict[str, str]:
     """Create a deterministic test environment without inherited host credentials."""
     clean_env = {
@@ -4389,12 +4427,34 @@ class ProductionRunner:
                 )
 
             test_exit_codes = tuple(item["exit_code"] for item in command_results)
-            commands_passed = bool(test_exit_codes) and all(code == 0 for code in test_exit_codes)
+            commands_passed = (
+                bool(test_exit_codes)
+                and all(code == 0 for code in test_exit_codes)
+                and not any(item.get("no_tests_detected") for item in command_results)
+            )
             qa_passed = qa_output.decision == "PASS" and commands_passed
             qa_protocol_failure = _has_protocol_defect(
                 [dict(item) for item in qa_output.defects],
                 QA_PROTOCOL_DEFECT_SUFFIXES,
             )
+            qa_protocol_fallback_diagnostic: Optional[Dict[str, Any]] = None
+            if qa_protocol_failure and not commands_passed:
+                qa_protocol_fallback_diagnostic = report_diagnostic(qa_result.output, raw_qa_report)
+                qa_output = _qa_fail_from_runner_command_evidence(
+                    task_id=task_id,
+                    baseline_commit=spec.baseline_commit,
+                    candidate_commit=candidate_commit,
+                    session_id=sess_qa,
+                    invocation_id=inv_qa,
+                    qa_request_id=qa_request_id,
+                    acceptance_criteria_hash=spec.acceptance_criteria_hash,
+                    criterion_ids=[item.criterion_id for item in spec.acceptance_criteria_items],
+                    command_results=command_results,
+                    command_evidence=qa_command_evidence,
+                    protocol_diagnostic=qa_protocol_fallback_diagnostic,
+                )
+                qa_protocol_failure = False
+                qa_passed = False
             self._emit_progress(
                 task_id=task_id,
                 state=RunnerState.QA_TESTING.value,
@@ -4547,11 +4607,17 @@ class ProductionRunner:
                 "test_command_hash": test_command_hash,
                 "test_output_hash": test_output_hash,
                 "test_exit_codes": test_exit_codes,
+                "qa_decision_source": (
+                    "RUNNER_COMMAND_GATE" if qa_protocol_fallback_diagnostic else "QA_HOST_REPORT"
+                ),
+                "qa_host_report_valid": qa_protocol_fallback_diagnostic is None,
                 "qa_report": qa_report,
                 "required_test_commands": stored_test_commands,
                 "runner_test_results": stored_command_results,
                 "test_diagnostics": qa_command_evidence,
             }
+            if qa_protocol_fallback_diagnostic is not None:
+                qa_semantic_metadata["qa_protocol_diagnostic"] = qa_protocol_fallback_diagnostic
             qa_semantic_metadata = self.evidence_store.prepare_metadata(qa_semantic_metadata)
             qa_extra = _extract_capabilities_extra(qa_caps)
             qa_extra.update(qa_semantic_metadata)
@@ -4663,6 +4729,10 @@ class ProductionRunner:
                     "defects": qa_defects,
                     "summary": qa_output.summary,
                     "test_diagnostics": qa_command_evidence,
+                    "qa_decision_source": (
+                        "RUNNER_COMMAND_GATE" if qa_protocol_fallback_diagnostic else "QA_HOST_REPORT"
+                    ),
+                    "protocol_diagnostic": qa_protocol_fallback_diagnostic,
                 })
                 if qa_exhausted:
                     return RunnerResult(

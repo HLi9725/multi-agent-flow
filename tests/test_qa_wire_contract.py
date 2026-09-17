@@ -6,7 +6,7 @@ import pytest
 
 from scripts._lib.core.production_runner import (
     ProductionRunner, QA_MODEL_JSON_SCHEMA, _extract_embedded_json_object,
-    _qa_semantic_fingerprint,
+    _qa_fail_from_runner_command_evidence, _qa_semantic_fingerprint,
 )
 from scripts._lib.core.runner_schema import QA_JSON_SCHEMA
 from scripts._lib.core.qa_protocol_diagnostics import report_diagnostic, repair_changes_known_semantics
@@ -90,6 +90,46 @@ def test_both_paths_reject_conflicts(mutation, legacy):
 
 def test_runner_failure_cannot_become_model_pass():
     assert parse(assessment(), exit_code=1).decision == "FAIL"
+
+
+def test_malformed_host_report_with_failed_commands_has_deterministic_fail_fallback():
+    result = _qa_fail_from_runner_command_evidence(
+        task_id="T0014", baseline_commit="a" * 40, candidate_commit="b" * 40,
+        session_id="runner-session", invocation_id="real-host:step_7",
+        qa_request_id="request-1", acceptance_criteria_hash="c" * 64,
+        criterion_ids=["AC-01", "AC-02"],
+        command_results=[{
+            "command": "npm test", "exit_code": 1, "summary": "2 failed",
+            "output_hash": "d" * 64, "no_tests_detected": False,
+        }],
+        command_evidence=[{
+            "command": "npm test", "exit_code": 1,
+            "output_excerpt": "FAILED tests/test_mysql.py::test_cleanup - Unknown column remarks",
+        }],
+        protocol_diagnostic={"kind": "JSON_SYNTAX_OR_FRAMING"},
+    )
+    assert result.decision == "FAIL"
+    assert result.session_id == "runner-session"
+    assert result.host_invocation_id == "real-host:step_7"
+    assert {item["status"] for item in result.acceptance_coverage} == {"FAIL"}
+    assert result.defects[0]["defect_id"].startswith("DEF-T0014-RUNNER-")
+    assert "JSON_SYNTAX_OR_FRAMING" in result.uncovered_risks[0]
+
+
+def test_zero_test_malformed_report_fallback_is_actionable():
+    result = _qa_fail_from_runner_command_evidence(
+        task_id="T0014", baseline_commit="a" * 40, candidate_commit="b" * 40,
+        session_id="runner-session", invocation_id="real-host:step_8",
+        qa_request_id="request-2", acceptance_criteria_hash="c" * 64,
+        criterion_ids=["AC-01"],
+        command_results=[{
+            "command": "npm test", "exit_code": 0, "summary": "no_tests_detected=true",
+            "output_hash": "d" * 64, "no_tests_detected": True,
+        }],
+        command_evidence=[{"command": "npm test", "exit_code": 0, "output_excerpt": "no tests ran"}],
+    )
+    assert result.decision == "FAIL"
+    assert result.defects[0]["defect_id"].endswith("RUNNER-NO-TESTS")
 
 
 def test_zero_tests_cannot_become_model_pass_or_human_infrastructure_pause():
