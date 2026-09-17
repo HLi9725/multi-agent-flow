@@ -132,6 +132,34 @@ _NON_RETRYABLE_HOST_FAILURE_PATTERN = re.compile(
     r"invalid argument|model .*not found|context length|billing|quota (?:exhausted|exceeded)",
     re.I,
 )
+_RUNNER_CONTROL_PATHSPECS = (
+    ".",
+    ":(exclude,glob)user_data/board.json*",
+    ":(exclude,glob)user_data/locks/**",
+    ":(exclude,glob)user_data/logs/**",
+    ":(exclude)config/workflow.config.yaml",
+    ":(exclude,glob).yy-flow/**",
+    ":(exclude,glob).yy-flow/user_data/board.json*",
+    ":(exclude,glob).yy-flow/user_data/locks/**",
+    ":(exclude,glob).yy-flow/user_data/logs/**",
+    ":(exclude,glob).yy-flow/runner_checkpoints/**",
+    ":(exclude,glob).yy-flow/runner_evidence/**",
+    ":(exclude,glob).yy-flow/runner_artifacts/**",
+)
+
+
+def _builder_candidate_status(worktree_dir: str) -> str:
+    """Return only business-code dirtiness, excluding Runner control data."""
+    return subprocess.check_output(
+        [
+            "git", "status", "--porcelain=v1", "--untracked-files=all", "--",
+            *_RUNNER_CONTROL_PATHSPECS,
+        ],
+        cwd=worktree_dir,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    ).strip()
 
 
 def _transient_host_failure_kind(value: Any) -> Optional[str]:
@@ -153,6 +181,19 @@ def _transient_host_failure_kind(value: Any) -> Optional[str]:
         if pattern.search(text):
             return kind
     return None
+
+
+def _interrupted_builder_recovery_eligible(checkpoint: RunnerCheckpoint) -> bool:
+    """Prove that dirty files can belong to an interrupted Builder host turn."""
+    if checkpoint.current_role != "BUILDER":
+        return False
+    if _transient_host_failure_kind(checkpoint.last_error) is not None:
+        return True
+    return bool(
+        checkpoint.host_attempt_history
+        and checkpoint.host_attempt_history[-1].get("outcome")
+        == "TRANSIENT_RETRY_BLOCKED_WORKSPACE_CHANGED"
+    )
 
 
 def _plain_metadata_value(value: Any) -> Any:
@@ -1870,12 +1911,7 @@ class ProductionRunner:
         或提交后仍不干净都会 Fail-Closed。
         """
         head = self._get_git_commit(worktree_dir)
-        status = subprocess.check_output(
-            ["git", "status", "--porcelain=v1", "--untracked-files=all"],
-            cwd=worktree_dir,
-            encoding="utf-8",
-            errors="replace",
-        ).strip()
+        status = _builder_candidate_status(worktree_dir)
 
         expected_start = previous_candidate_commit or baseline_commit
         if head.lower() != expected_start.lower():
@@ -1897,7 +1933,7 @@ class ProductionRunner:
             )
 
         add_proc = subprocess.run(
-            ["git", "add", "--all", "--", "."],
+            ["git", "add", "--all", "--", *_RUNNER_CONTROL_PATHSPECS],
             cwd=worktree_dir,
             capture_output=True,
             text=True,
@@ -1922,12 +1958,7 @@ class ProductionRunner:
         if candidate.lower() == expected_start.lower():
             raise RuntimeError("Controlled Builder commit did not advance HEAD (Fail-Closed).")
 
-        remaining = subprocess.check_output(
-            ["git", "status", "--porcelain=v1", "--untracked-files=all"],
-            cwd=worktree_dir,
-            encoding="utf-8",
-            errors="replace",
-        ).strip()
+        remaining = _builder_candidate_status(worktree_dir)
         if remaining:
             raise RuntimeError("Builder worktree remained dirty after controlled commit (Fail-Closed).")
         return candidate
@@ -2745,21 +2776,65 @@ class ProductionRunner:
 
                 empty_completion_retries = 0
                 builder_pre_head = self._get_git_commit(worktree_dir)
-                builder_pre_status = subprocess.check_output(
-                    ["git", "status", "--porcelain=v1", "--untracked-files=all"],
-                    cwd=worktree_dir,
-                    text=True,
-                ).strip()
+                builder_pre_status = _builder_candidate_status(worktree_dir)
+
+                if builder_pre_status:
+                    interrupted_builder_turn = _interrupted_builder_recovery_eligible(checkpoint)
+                    changed_paths = sorted({
+                        line[3:].strip().replace("\\", "/")
+                        for line in builder_pre_status.splitlines()
+                        if len(line) > 3 and line[3:].strip()
+                    })
+                    if not (
+                        interrupted_builder_turn
+                        and spec.recover_partial_builder_changes
+                    ):
+                        pause_message = (
+                            "Builder workspace contains pre-existing uncommitted changes. "
+                            "Runner will not attribute or commit them without an explicit "
+                            "--recover-partial-builder-changes resume authorization."
+                        )
+                        checkpoint = replace(
+                            checkpoint,
+                            state=RunnerState.NEEDS_USER_INPUT.value,
+                            current_role="BUILDER",
+                            last_error=pause_message,
+                            updated_at=time.time(),
+                        )
+                        self.checkpoint_store.save_checkpoint(checkpoint)
+                        return RunnerResult(
+                            success=False,
+                            state=RunnerState.NEEDS_USER_INPUT.value,
+                            task_id=task_id,
+                            candidate_commit=candidate_commit,
+                            candidate_generation=candidate_generation,
+                            evidence_ids=tuple(evidence_ids),
+                            message=pause_message,
+                            diagnostics={
+                                "failure_kind": "PREEXISTING_BUILDER_CHANGES",
+                                "changed_paths": changed_paths[:100],
+                                "eligible_interrupted_turn": interrupted_builder_turn,
+                            },
+                        )
+                    builder_request = replace(
+                        builder_request,
+                        prompt=(
+                            builder_request.prompt
+                            + "\n\nInterrupted-turn recovery: a prior transient host failure left "
+                            "uncommitted workspace changes in these paths: "
+                            + json.dumps(changed_paths[:100], ensure_ascii=False)
+                            + ". Inspect the complete existing diff, verify that every change belongs "
+                            "to the recorded defects, correct or complete it using workspace file tools, "
+                            "and explicitly report whether the resulting workspace is ready for Runner "
+                            "commit. Do not assume the partial edits are correct merely because they exist."
+                        ),
+                    )
 
                 def builder_retry_guard() -> bool:
                     """A transient Builder turn is replayable only before any file mutation."""
                     return (
                         self._get_git_commit(worktree_dir) == builder_pre_head
-                        and subprocess.check_output(
-                            ["git", "status", "--porcelain=v1", "--untracked-files=all"],
-                            cwd=worktree_dir,
-                            text=True,
-                        ).strip() == builder_pre_status
+                        and _builder_candidate_status(worktree_dir) == builder_pre_status
                     )
                 try:
                     while True:
@@ -2780,11 +2855,7 @@ class ProductionRunner:
 
                         worktree_unchanged = (
                             self._get_git_commit(worktree_dir) == builder_pre_head
-                            and subprocess.check_output(
-                                ["git", "status", "--porcelain=v1", "--untracked-files=all"],
-                                cwd=worktree_dir,
-                                text=True,
-                            ).strip() == builder_pre_status
+                            and _builder_candidate_status(worktree_dir) == builder_pre_status
                         )
                         if (
                             _is_empty_host_completion(builder_result)

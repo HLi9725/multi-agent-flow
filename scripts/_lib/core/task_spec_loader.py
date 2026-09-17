@@ -431,6 +431,7 @@ def load_task_execution_spec(
         host_transient_max_retries=int(ov.get("host_transient_max_retries", 3)),
         host_transient_retry_base_seconds=float(ov.get("host_transient_retry_base_seconds", 5.0)),
         host_transient_retry_max_seconds=float(ov.get("host_transient_retry_max_seconds", 30.0)),
+        recover_partial_builder_changes=bool(ov.get("recover_partial_builder_changes", False)),
         allow_git_push=bool(ov.get("allow_git_push", False)),
         allow_merge_main=bool(ov.get("allow_merge_main", False)),
         allow_auto_accept=bool(ov.get("allow_auto_accept", False)),

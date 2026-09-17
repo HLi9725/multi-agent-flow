@@ -101,6 +101,8 @@ def _overrides_from_args(args):
         overrides["host_transient_retry_base_seconds"] = args.host_transient_retry_base_seconds
     if getattr(args, "host_transient_retry_max_seconds", None) is not None:
         overrides["host_transient_retry_max_seconds"] = args.host_transient_retry_max_seconds
+    if getattr(args, "recover_partial_builder_changes", False):
+        overrides["recover_partial_builder_changes"] = True
     return overrides
 
 
@@ -116,6 +118,13 @@ def _add_host_retry_args(parser):
     parser.add_argument(
         "--host-transient-retry-max-seconds", type=_non_negative_float, default=None,
         help="Maximum delay between transient host retries",
+    )
+    parser.add_argument(
+        "--recover-partial-builder-changes", action="store_true",
+        help=(
+            "Explicitly authorize the resumed Builder to inspect and complete uncommitted changes "
+            "left by a previously interrupted transient host turn"
+        ),
     )
 
 

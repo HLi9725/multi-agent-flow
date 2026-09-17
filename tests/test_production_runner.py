@@ -9,6 +9,7 @@ import os
 import subprocess
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 import pytest
 import yaml
@@ -30,6 +31,7 @@ from scripts._lib.core.production_runner import (
     _compact_test_diagnostics,
     _derive_command_failure_defects,
     _is_empty_host_completion,
+    _interrupted_builder_recovery_eligible,
     _transient_host_failure_kind,
 )
 from scripts._lib.core.runner_checkpoint_store import RunnerCheckpointStore
@@ -288,6 +290,32 @@ def test_transient_host_failure_classifier_is_narrow(message, expected):
         is_real_host=True,
     )
     assert _transient_host_failure_kind(result) == expected
+
+
+def test_partial_builder_recovery_requires_proven_transient_builder_turn():
+    base = RunnerCheckpoint(
+        task_id="T0088",
+        project_id="repo",
+        state=RunnerState.NEEDS_USER_INPUT.value,
+        current_role="BUILDER",
+        last_error="API error (attempt 1): UNAVAILABLE (code 503): No capacity available",
+    )
+    assert _interrupted_builder_recovery_eligible(base) is True
+    assert _interrupted_builder_recovery_eligible(
+        replace(base, current_role="REVIEWER")
+    ) is False
+    assert _interrupted_builder_recovery_eligible(
+        replace(base, last_error="permission denied")
+    ) is False
+    assert _interrupted_builder_recovery_eligible(
+        replace(
+            base,
+            last_error=None,
+            host_attempt_history=({
+                "outcome": "TRANSIENT_RETRY_BLOCKED_WORKSPACE_CHANGED",
+            },),
+        )
+    ) is True
 
 
 @pytest.mark.parametrize(

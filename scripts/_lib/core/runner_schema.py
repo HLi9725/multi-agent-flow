@@ -316,6 +316,7 @@ class TaskExecutionSpec:
     host_transient_max_retries: int = 3
     host_transient_retry_base_seconds: float = 5.0
     host_transient_retry_max_seconds: float = 30.0
+    recover_partial_builder_changes: bool = False
     allow_git_push: bool = False
     allow_merge_main: bool = False
     allow_auto_accept: bool = False
@@ -398,6 +399,7 @@ class TaskExecutionSpec:
             "host_transient_max_retries": self.host_transient_max_retries,
             "host_transient_retry_base_seconds": self.host_transient_retry_base_seconds,
             "host_transient_retry_max_seconds": self.host_transient_retry_max_seconds,
+            "recover_partial_builder_changes": self.recover_partial_builder_changes,
             "allow_git_push": self.allow_git_push,
             "allow_merge_main": self.allow_merge_main,
             "allow_auto_accept": self.allow_auto_accept,
