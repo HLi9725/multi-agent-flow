@@ -53,11 +53,13 @@ def test_protocol_defects_are_distinct_from_business_defects():
     reviewer_business = [{"defect_id": "DEF-T0012-ATOMICITY"}]
     qa_schema = [{"defect_id": "DEF-T0012-QA-SCHEMA-VIOLATION"}]
     qa_business = [{"defect_id": "DEF-T0012-QA-CONCURRENCY"}]
+    qa_command_failure = [{"defect_id": "DEF-T0012-QA-COMMAND-GAP"}]
 
     assert _has_protocol_defect(reviewer_schema, REVIEWER_PROTOCOL_DEFECT_SUFFIXES)
     assert not _has_protocol_defect(reviewer_business, REVIEWER_PROTOCOL_DEFECT_SUFFIXES)
     assert _has_protocol_defect(qa_schema, QA_PROTOCOL_DEFECT_SUFFIXES)
     assert not _has_protocol_defect(qa_business, QA_PROTOCOL_DEFECT_SUFFIXES)
+    assert not _has_protocol_defect(qa_command_failure, QA_PROTOCOL_DEFECT_SUFFIXES)
 
 
 def test_qa_subprocess_environment_removes_host_credentials(monkeypatch):
