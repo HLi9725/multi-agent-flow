@@ -22,7 +22,16 @@ from _lib.core.task_spec_loader import load_task_execution_spec
 
 def _emit_progress(event):
     """Human-readable JSONL progress on stderr; final result remains clean stdout JSON."""
-    print("[YY-FLOW] " + json.dumps(dict(event), ensure_ascii=False), file=sys.stderr, flush=True)
+    print("[YY-FLOW] " + json.dumps(dict(event), ensure_ascii=True), file=sys.stderr, flush=True)
+
+
+def _emit_result(data):
+    """ASCII JSON survives GBK/ASCII pipes without losing any Unicode value.
+
+    Escapes are lossless after JSON decoding. Do not reconfigure the caller's
+    terminal, and never let an emoji hide an already-persisted terminal state.
+    """
+    print(json.dumps(data, indent=2, ensure_ascii=True), flush=True)
 
 
 def _runner_for(project_root, authority_root, project_id=None):
@@ -88,14 +97,14 @@ def cmd_start(args):
             overrides=overrides,
         )
     except Exception as e:
-        print(f"[ERROR] Failed to load task execution spec for {args.task_id}: {e}", file=sys.stderr)
+        print("[ERROR] " + json.dumps({"task_id": args.task_id, "message": f"Failed to load task execution spec: {e}"}, ensure_ascii=True), file=sys.stderr)
         return 1
 
     runner = _runner_for(project_root, authority_root, spec.project_id)
     result = runner.start(spec, pre_granted_approval=getattr(args, "approve", False),
                           restart_cancelled=getattr(args, "restart_cancelled", False))
 
-    print(json.dumps(result.to_dict(), indent=2, ensure_ascii=False))
+    _emit_result(result.to_dict())
     return 0 if result.success else 1
 
 
@@ -105,7 +114,7 @@ def cmd_status(args):
 
     runner = _runner_for(project_root, authority_root)
     status_data = runner.get_status(project_root=project_root, task_id=args.task_id, authority_root=authority_root)
-    print(json.dumps(status_data, indent=2, ensure_ascii=False))
+    _emit_result(status_data)
     return 0
 
 
@@ -123,7 +132,7 @@ def cmd_resume(args):
         overrides=overrides,
         rejection_reason=getattr(args, "reason", None),
     )
-    print(json.dumps(result.to_dict(), indent=2, ensure_ascii=False))
+    _emit_result(result.to_dict())
     return 0 if result.success else 1
 
 
@@ -133,7 +142,7 @@ def cmd_cancel(args):
 
     runner = _runner_for(project_root, authority_root)
     result = runner.cancel(project_root=project_root, task_id=args.task_id, authority_root=authority_root)
-    print(json.dumps(result.to_dict(), indent=2, ensure_ascii=False))
+    _emit_result(result.to_dict())
     return 0 if result.success else 1
 
 
@@ -143,7 +152,7 @@ def cmd_accept(args):
     result = _runner_for(project_root, authority_root).accept(
         project_root, args.task_id, args.confirmation_request_id, authority_root,
     )
-    print(json.dumps(result.to_dict(), indent=2, ensure_ascii=False))
+    _emit_result(result.to_dict())
     return 0 if result.success else 1
 
 
@@ -153,7 +162,7 @@ def cmd_reject(args):
     result = _runner_for(project_root, authority_root).reject(
         project_root, args.task_id, args.confirmation_request_id, args.reason, authority_root,
     )
-    print(json.dumps(result.to_dict(), indent=2, ensure_ascii=False))
+    _emit_result(result.to_dict())
     return 0 if result.success else 1
 
 

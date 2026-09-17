@@ -1,7 +1,40 @@
 import os
+import io
+import json
+import pytest
 from types import SimpleNamespace
 
 from scripts.run_task import _runner_for, _overrides_from_args
+
+
+@pytest.mark.parametrize('encoding', ['gbk', 'ascii', 'utf-8'])
+def test_terminal_result_and_progress_roundtrip_on_legacy_console(monkeypatch, encoding):
+    from scripts import run_task
+    out_bytes, err_bytes = io.BytesIO(), io.BytesIO()
+    out = io.TextIOWrapper(out_bytes, encoding=encoding, errors='strict')
+    err = io.TextIOWrapper(err_bytes, encoding=encoding, errors='strict')
+    monkeypatch.setattr(run_task.sys, 'stdout', out)
+    monkeypatch.setattr(run_task.sys, 'stderr', err)
+    data = {'success': False, 'state': 'NEEDS_USER_INPUT', 'message': '测试🚨 Unicode \ud800', 'task_id': 'T1'}
+    run_task._emit_result(data)
+    run_task._emit_progress(data)
+    out.flush()
+    err.flush()
+    assert json.loads(out_bytes.getvalue().decode(encoding)) == data
+    assert json.loads(err_bytes.getvalue().decode(encoding).removeprefix('[YY-FLOW] ')) == data
+
+
+def test_resume_error_exit_preserves_persisted_result_on_gbk(monkeypatch):
+    from scripts import run_task
+    payload = {'success': False, 'state': 'NEEDS_USER_INPUT', 'message': '🚨 请检查字段'}
+    fake_result = SimpleNamespace(success=False, to_dict=lambda: payload)
+    monkeypatch.setattr(run_task, '_runner_for', lambda *args: SimpleNamespace(resume=lambda **kw: fake_result))
+    buffer = io.BytesIO()
+    stream = io.TextIOWrapper(buffer, encoding='gbk')
+    monkeypatch.setattr(run_task.sys, 'stdout', stream)
+    args = SimpleNamespace(project_root='.', authority_root=None, task_id='T1')
+    assert run_task.cmd_resume(args) == 1
+    assert json.loads(buffer.getvalue().decode('gbk')) == payload
 
 
 def test_resume_overrides_are_optional_and_complete():

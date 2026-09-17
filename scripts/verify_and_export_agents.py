@@ -120,6 +120,7 @@ def serialize_runner_readonly_role(platform_key, role_code, role_data):
     if role_code == "QA":
         access_rules = """- QA 的全部差异、测试、构建、安全扫描和验收矩阵证据均由 Runner 内联提供；不得调用任何工具。
 - 输出只包含 decision、acceptance_coverage、negative_scenarios、uncovered_risks、defects、summary 六个判断字段；会话身份、候选 SHA 和受控测试记录由 Runner 绑定，不能自行编造。
+- 每条验收项和负向场景都必须显式填写 status 为 PASS 或 FAIL；不得用 COVERED/OK 代替结论，不得省略负向场景状态。证据引用具体测试或文件，避免重复长篇说明；evidence 建议不超过 600 字符，summary 不超过 400 字符。
 - 不得自行读取文件、列举目录、发起搜索或扩大证据范围；证据不足时直接返回否定结论。
 - 不得修改任何文件。"""
         denial_rule = "- 若内联证据不足，返回结构化 FAIL；不得请求权限、修改全局配置或尝试绕过。"

@@ -9,6 +9,7 @@ from scripts._lib.core.production_runner import (
     _qa_semantic_fingerprint,
 )
 from scripts._lib.core.runner_schema import QA_JSON_SCHEMA
+from scripts._lib.core.qa_protocol_diagnostics import report_diagnostic, repair_changes_known_semantics
 
 
 def assessment():
@@ -108,3 +109,46 @@ def test_wire_schema_excludes_runner_owned_fields_and_fingerprint_ignores_order(
     assert _qa_semantic_fingerprint(json.dumps(first)) == _qa_semantic_fingerprint(json.dumps(second))
     second["criteria"][0]["evidence"] = "fabricated"
     assert _qa_semantic_fingerprint(json.dumps(first)) != _qa_semantic_fingerprint(json.dumps(second))
+
+
+def test_complete_real_report_is_field_error_not_json_truncation():
+    data = assessment()
+    data['acceptance_coverage'][0]['status'] = 'COVERED'
+    data['negative_scenarios'] = [{'scenario': 'reject duplicate', 'observed_behavior': 'test_duplicate passed'}]
+    result = parse(data)
+    assert result.decision == 'FAIL'
+    assert '$.acceptance_coverage[0].status' in result.summary
+    assert '$.negative_scenarios[0].status' in result.summary
+    assert 'JSON_FIELD_CONTRACT' in result.summary
+    assert 'not return a valid' not in result.summary
+    assert not repair_changes_known_semantics(data, assessment())
+    reversed_verdict = assessment()
+    reversed_verdict['decision'] = 'FAIL'
+    assert repair_changes_known_semantics(data, reversed_verdict)
+
+
+def test_missing_fields_cannot_be_inferred_from_overall_pass():
+    data = assessment()
+    del data['negative_scenarios'][0]['status']
+    assert parse(data).decision == 'FAIL'
+    data['negative_scenarios'][0]['status'] = 'PASS'
+    data['acceptance_coverage'][0]['status'] = 'COVERED'
+    assert parse(data).decision == 'FAIL'
+
+
+def test_diagnostics_distinguish_syntax_from_fields_without_dumping_content():
+    raw = '{"summary":"private-secret'
+    diag = report_diagnostic(raw)
+    assert diag['kind'] == 'JSON_SYNTAX_OR_FRAMING'
+    assert diag['output_chars'] == len(raw)
+    assert 'private-secret' not in diag['detail']
+    assert 'does not establish token truncation' in diag['detail']
+    assert parse('x' * 262145).decision == 'FAIL'
+
+
+def test_large_complete_unicode_report_is_not_silently_cut():
+    data = assessment()
+    data['summary'] = '测试完成🚨' * 1200
+    assert parse(data).decision == 'PASS'
+    assert QA_MODEL_JSON_SCHEMA['properties']['summary']['maxLength'] == 400
+    assert 'maxLength' not in QA_JSON_SCHEMA['properties']['summary']

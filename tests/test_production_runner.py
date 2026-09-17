@@ -267,7 +267,8 @@ def test_runner_wait_enforces_outer_deadline():
 @pytest.mark.parametrize(
     "recover_budget,empty_builder_completions,reviewer_protocol_failures,qa_wire_mode",
     [(False, 0, 0, "full"), (True, 0, 0, "full"), (False, 1, 0, "full"), (False, 2, 0, "full"),
-     (False, 0, 1, "full"), (False, 0, 0, "semantic"), (False, 0, 0, "repair")],
+     (False, 0, 1, "full"), (False, 0, 0, "semantic"), (False, 0, 0, "repair"),
+     (False, 0, 0, "field-repair"), (False, 0, 0, "invalid")],
 )
 def test_production_runner_full_pass_pipeline(
     mock_git_repo, tmp_path, monkeypatch, recover_budget, empty_builder_completions,
@@ -378,7 +379,7 @@ def test_production_runner_full_pass_pipeline(
                 "defects": [],
                 "summary": "All acceptance criteria and negative scenarios passed.",
             }
-            if qa_wire_mode in ("semantic", "repair"):
+            if qa_wire_mode in ("semantic", "repair", "field-repair", "invalid"):
                 from scripts._lib.core.production_runner import QA_MODEL_FIELDS
                 qa_json = {key: qa_json[key] for key in QA_MODEL_FIELDS}
                 if qa_wire_mode == "repair" and len(qa_requests) == 1:
@@ -386,6 +387,14 @@ def test_production_runner_full_pass_pipeline(
                 elif qa_wire_mode == "repair":
                     assert "Previous untrusted assessment" in qa_req.prompt
                     assert "Repair only the JSON format" in qa_req.prompt
+                if qa_wire_mode == "invalid" or (qa_wire_mode == "field-repair" and len(qa_requests) == 1):
+                    qa_json['acceptance_coverage'][0]['status'] = 'COVERED'
+                    qa_json['negative_scenarios'][0].pop('status')
+                elif qa_wire_mode == "field-repair":
+                    assert '$.acceptance_coverage[0].status' in qa_req.prompt
+                    assert '$.negative_scenarios[0].status' in qa_req.prompt
+                    assert '"status": "COVERED"' in qa_req.prompt
+                    assert '"evidence": "***MASKED***"' in qa_req.prompt
             return AgentResult(
                 session_id=handle.session_id,
                 status=AgentStatus.SUCCESS,
@@ -541,6 +550,15 @@ def test_production_runner_full_pass_pipeline(
         assert checkpoint_store.load_checkpoint("T0088").execution_options["total_wall_clock_timeout_seconds"] == 4500
         assert checkpoint_store.load_checkpoint("T0088").total_attempts == 22
 
+    if qa_wire_mode == "invalid":
+        assert result.state == RunnerState.NEEDS_USER_INPUT.value
+        assert len(qa_requests) == 2
+        assert not any(item.startswith('evi_qa_') for item in result.evidence_ids)
+        checkpoint = checkpoint_store.load_checkpoint('T0088')
+        assert checkpoint.current_role == 'QA'
+        assert checkpoint.qa_cycle == 0
+        assert checkpoint.defects_history[-1]['protocol_diagnostic']['kind'] == 'JSON_FIELD_CONTRACT'
+        return
     assert result.success is True, result.message
     assert result.state == RunnerState.PENDING_USER_ACCEPTANCE.value
     assert result.candidate_commit is not None
@@ -557,7 +575,7 @@ def test_production_runner_full_pass_pipeline(
         for event in progress_events
         if event["event"] == "stage_started"
     ]
-    assert stage_roles == ["BUILDER"] + ["REVIEWER"] * (reviewer_protocol_failures + 1) + ["QA"] * (2 if qa_wire_mode == "repair" else 1)
+    assert stage_roles == ["BUILDER"] + ["REVIEWER"] * (reviewer_protocol_failures + 1) + ["QA"] * (2 if qa_wire_mode in ("repair", "field-repair") else 1)
     assert any(event["event"] == "stage_retrying" for event in progress_events) is bool(empty_builder_completions)
     assert builder_calls == (2 if empty_builder_completions else 1)
     checkpoint_after_run = checkpoint_store.load_checkpoint("T0088")

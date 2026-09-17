@@ -16,6 +16,7 @@ import sys
 import threading
 import time
 import uuid
+import copy
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 try:
@@ -85,6 +86,7 @@ from .runner_schema import (
     TaskExecutionSpec,
 )
 from .task_spec_loader import load_task_execution_spec, verify_optimistic_concurrency
+from .qa_protocol_diagnostics import MAX_QA_OUTPUT_CHARS, report_diagnostic, repair_changes_known_semantics
 from .worktree_manager import WorktreeManager
 from .worktree_schema import WorktreeRequest
 from ..hosts.antigravity_adapter import AntigravityAdapter, create_antigravity_manifest
@@ -168,9 +170,12 @@ QA_MODEL_JSON_SCHEMA = {
     "title": "ManagedQAAssessment",
     "type": "object",
     "required": list(QA_MODEL_FIELDS),
-    "properties": {key: QA_JSON_SCHEMA["properties"][key] for key in QA_MODEL_FIELDS},
+    "properties": {key: copy.deepcopy(QA_JSON_SCHEMA["properties"][key]) for key in QA_MODEL_FIELDS},
     "additionalProperties": False,
 }
+QA_MODEL_JSON_SCHEMA["properties"]["summary"]["maxLength"] = 400
+for _field in ("acceptance_coverage", "negative_scenarios"):
+    QA_MODEL_JSON_SCHEMA["properties"][_field]["items"]["properties"]["evidence"]["maxLength"] = 600
 
 
 def _unique_json_pairs(pairs):
@@ -1954,7 +1959,10 @@ class ProductionRunner:
                 summary=description,
             )
 
+        if len(raw_output) > MAX_QA_OUTPUT_CHARS:
+            return failed("QA-SCHEMA-VIOLATION", report_diagnostic(raw_output)["detail"])
         json_obj = _extract_embedded_json_object(raw_output, QA_JSON_SCHEMA["required"])
+        diagnostic = report_diagnostic(raw_output, json_obj)
         if isinstance(json_obj, Mapping):
             normalized_legacy = _normalize_known_qa_legacy_shape(
                 json_obj,
@@ -1968,11 +1976,11 @@ class ProductionRunner:
             )
             json_obj = normalized_legacy
         if json_obj is None:
-            return failed("QA-SCHEMA-VIOLATION", "QA did not return a valid structured JSON object.")
+            return failed("QA-SCHEMA-VIOLATION", f"{diagnostic['kind']}: {diagnostic['detail']}")
 
         valid, error = _validate_qa_schema_builtin(json_obj)
         if not valid:
-            return failed("QA-SCHEMA-VIOLATION", f"QA JSON failed schema validation: {error}")
+            return failed("QA-SCHEMA-VIOLATION", f"QA JSON failed schema validation: {error}; {diagnostic['detail']}")
 
         expected_identity = {
             "task_id": task_id,
@@ -2250,7 +2258,7 @@ class ProductionRunner:
         reviewer_protocol_attempts_this_run = 0
         qa_protocol_feedback: Optional[str] = None
         qa_protocol_attempts_this_run = 0
-        qa_protocol_semantic_fingerprint: Optional[str] = None
+        qa_protocol_previous_report: Optional[Mapping[str, Any]] = None
         start_role = checkpoint.current_role if existing_checkpoint else "BUILDER"
         # The authoritative board phase wins over a stale checkpoint role.  A
         # crash or a contract guard immediately after a successful transition
@@ -2797,7 +2805,7 @@ class ProductionRunner:
                     reviewer_protocol_attempts_this_run = 0
                     qa_protocol_feedback = None
                     qa_protocol_attempts_this_run = 0
-                    qa_protocol_semantic_fingerprint = None
+                    qa_protocol_previous_report = None
                 self._emit_progress(
                     task_id=task_id,
                     state=RunnerState.BUILDING.value,
@@ -3800,7 +3808,9 @@ class ProductionRunner:
                     "PROTOCOL CORRECTION FROM THE PREVIOUS QA ATTEMPT:\n"
                     f"{qa_protocol_feedback}\n"
                     "Repair only the JSON format of the previous assessment below. Preserve its verdict, "
-                    "criterion statuses, evidence, negative scenarios, risks and defects. Do not reassess. "
+                    "valid PASS/FAIL statuses, evidence, negative scenarios, risks and defects. "
+                    "For missing or invalid statuses (including COVERED), explicitly choose PASS or FAIL "
+                    "from the supplied evidence; never mechanically convert coverage into PASS. "
                     "Omit Runner-owned identity and command fields.\n\n"
                     if qa_protocol_feedback else ""
                 )
@@ -3830,7 +3840,12 @@ class ProductionRunner:
                 "Return ONLY a JSON object matching this schema:\n"
                 f"{json.dumps(QA_MODEL_JSON_SCHEMA, ensure_ascii=False, sort_keys=True)}\n"
                 "MANDATORY TOP-LEVEL KEYS EXACTLY: decision, acceptance_coverage, "
-                "negative_scenarios, uncovered_risks, defects, summary."
+                "negative_scenarios, uncovered_risks, defects, summary. "
+                "Every acceptance_coverage item MUST have criterion_id, status (exactly PASS or FAIL), evidence. "
+                "Every negative_scenarios item MUST have name, status (exactly PASS or FAIL), evidence. "
+                "COVERED/OK are NOT verdicts. Do not omit a negative scenario status. "
+                "Keep each evidence field within 600 characters and summary within 400; cite specific observed "
+                "test/file references, not repeated narrative. Return all criteria exactly once and complete closing braces."
             )
 
             qa_request = AgentRequest(
@@ -3997,12 +4012,24 @@ class ProductionRunner:
                 expected_test_commands=test_commands,
                 expected_command_results=command_results,
             )
-            safe_qa_output = self._sanitize_diagnostic(qa_result.output, 64000)
-            current_semantic_fingerprint = _qa_semantic_fingerprint(safe_qa_output)
+            raw_qa_report = (
+                _extract_embedded_json_object(qa_result.output, QA_JSON_SCHEMA["required"])
+                if len(qa_result.output) <= MAX_QA_OUTPUT_CHARS else None
+            )
+            if isinstance(raw_qa_report, Mapping):
+                # Redact values, never the serialized JSON line: a test name
+                # containing access_token used to mask the ENTIRE report.
+                try:
+                    safe_qa_output = json.dumps(self.evidence_store.prepare_metadata(raw_qa_report), ensure_ascii=True)
+                except Exception:
+                    safe_qa_output = "***MASKED: report cannot be safely serialized***"
+            else:
+                safe_qa_output = self._sanitize_diagnostic(qa_result.output, MAX_QA_OUTPUT_CHARS)
+            current_qa_report = _extract_embedded_json_object(safe_qa_output, QA_JSON_SCHEMA["required"])
             if (
-                qa_protocol_semantic_fingerprint
-                and current_semantic_fingerprint
-                and current_semantic_fingerprint != qa_protocol_semantic_fingerprint
+                qa_protocol_previous_report
+                and current_qa_report
+                and repair_changes_known_semantics(qa_protocol_previous_report, current_qa_report)
             ):
                 conflict = (
                     "QA changed its semantic verdict/evidence during a protocol-only retry; "
@@ -4037,8 +4064,8 @@ class ProductionRunner:
                 task_id=task_id,
                 state=RunnerState.QA_TESTING.value,
                 role="QA",
-                event="stage_completed",
-                message=f"QA decision: {'PASS' if qa_passed else 'FAIL'}",
+                event="stage_protocol_invalid" if qa_protocol_failure else "stage_completed",
+                message="QA report protocol invalid; no business decision accepted" if qa_protocol_failure else f"QA decision: {'PASS' if qa_passed else 'FAIL'}",
                 candidate_commit=candidate_commit,
                 cycle=qa_cycle,
             )
@@ -4088,8 +4115,8 @@ class ProductionRunner:
                     + safe_qa_output
                 )
                 qa_protocol_attempts_this_run += 1
-                if qa_protocol_semantic_fingerprint is None:
-                    qa_protocol_semantic_fingerprint = current_semantic_fingerprint
+                if qa_protocol_previous_report is None:
+                    qa_protocol_previous_report = current_qa_report
                 protocol_cycle = qa_cycle
                 # Host/schema retries are not business QA failures and must
                 # not consume the candidate's semantic QA retry budget. They
@@ -4102,10 +4129,13 @@ class ProductionRunner:
                     "defects": qa_defects,
                     "summary": qa_output.summary,
                     "host_invocation_id": inv_qa,
+                    "protocol_diagnostic": report_diagnostic(qa_result.output, raw_qa_report),
                 })
-                if qa_protocol_attempts_this_run >= 2:
+                if qa_protocol_attempts_this_run >= 2 or len(safe_qa_output) > 64000:
                     pause_message = (
-                        "QA protocol output remained invalid after the bounded protocol retry. "
+                        ("QA invalid report exceeds the safe repair payload budget; no truncated repair was dispatched. "
+                         if len(safe_qa_output) > 64000 else
+                         "QA protocol output remained invalid after the bounded protocol retry. ") +
                         "Business QA budget was preserved and no business transition Evidence was created."
                     )
                     checkpoint = replace(
