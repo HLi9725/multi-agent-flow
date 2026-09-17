@@ -38,6 +38,7 @@ from .adapter_manifest import (
     VerificationLevel,
 )
 from .adapter_registry import AdapterRegistry
+from .builder_git import assert_safe_index, candidate_paths, stage_candidate, workspace_fingerprint
 from .agent_schema import (
     AgentHandle,
     AgentInvalidHandleError,
@@ -159,7 +160,7 @@ def _builder_candidate_status(worktree_dir: str) -> str:
         text=True,
         encoding="utf-8",
         errors="replace",
-    ).strip()
+    ).rstrip("\r\n")
 
 
 def _transient_host_failure_kind(value: Any) -> Optional[str]:
@@ -189,10 +190,19 @@ def _interrupted_builder_recovery_eligible(checkpoint: RunnerCheckpoint) -> bool
         return False
     if _transient_host_failure_kind(checkpoint.last_error) is not None:
         return True
+    finalization_error = str(checkpoint.last_error or "").removeprefix(
+        "Failed to finalize candidate commit from Builder worktree: "
+    )
+    if (checkpoint.builder_session_id and checkpoint.builder_invocation_id
+            and finalization_error.startswith((
+                "Failed to stage Builder changes:", "Failed to commit Builder changes:"))):
+        # Older checkpoints already persist the completed host identity. This
+        # only permits explicit recovery/reinspection, never fabricates Evidence.
+        return True
     return bool(
         checkpoint.host_attempt_history
         and checkpoint.host_attempt_history[-1].get("outcome")
-        == "TRANSIENT_RETRY_BLOCKED_WORKSPACE_CHANGED"
+        in {"TRANSIENT_RETRY_BLOCKED_WORKSPACE_CHANGED", "BUILDER_RECOVERY_AUTHORIZATION_REQUIRED"}
     )
 
 
@@ -1343,9 +1353,13 @@ class ProductionRunner:
 
             if handle is not None and failure is not None:
                 try:
-                    adapter.cancel_agent(handle)
-                except Exception:
-                    pass
+                    cancelled = adapter.cancel_agent(handle)
+                    if cancelled is False:
+                        raise ProductionRunnerError("Host did not acknowledge cancellation")
+                except Exception as cleanup_error:
+                    raise ProductionRunnerError(
+                        "Cannot confirm failed host cancellation; refusing overlapping retry"
+                    ) from cleanup_error
 
             retry_index += 1
             delay = proposed_delay
@@ -1911,6 +1925,7 @@ class ProductionRunner:
         或提交后仍不干净都会 Fail-Closed。
         """
         head = self._get_git_commit(worktree_dir)
+        assert_safe_index(worktree_dir)
         status = _builder_candidate_status(worktree_dir)
 
         expected_start = previous_candidate_commit or baseline_commit
@@ -1932,16 +1947,7 @@ class ProductionRunner:
                 "Builder repair cycle produced no new candidate: no new commits or working-tree changes (Fail-Closed)."
             )
 
-        add_proc = subprocess.run(
-            ["git", "add", "--all", "--", *_RUNNER_CONTROL_PATHSPECS],
-            cwd=worktree_dir,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-        if add_proc.returncode != 0:
-            raise RuntimeError(f"Failed to stage Builder changes: {add_proc.stderr or add_proc.stdout}")
+        stage_candidate(worktree_dir)
 
         commit_proc = subprocess.run(
             ["git", "commit", "-m", "feat(runner): 固化自动开发产物"],
@@ -2356,6 +2362,7 @@ class ProductionRunner:
         restart_cancelled: bool = False,
     ) -> RunnerResult:
         start_wall_clock = time.time()
+        run_elapsed_base = existing_checkpoint.active_elapsed_seconds if existing_checkpoint else 0.0
         project_root = spec.project_root
         task_id = spec.task_id
         self._run_timing[task_id] = (
@@ -2603,7 +2610,7 @@ class ProductionRunner:
                     diagnostics={"total_attempts": total_attempts, "max_total_attempts": spec.max_total_attempts, "remaining_attempts": 0, "defects": defects_history},
                 )
 
-            active_elapsed = checkpoint.active_elapsed_seconds + (time.time() - start_wall_clock)
+            active_elapsed = run_elapsed_base + (time.time() - start_wall_clock)
             if active_elapsed >= spec.total_wall_clock_timeout_seconds:
                 pause_message = f"Task exceeded wall clock timeout ({spec.total_wall_clock_timeout_seconds}s). Paused at NEEDS_USER_INPUT."
                 checkpoint = replace(
@@ -2777,14 +2784,11 @@ class ProductionRunner:
                 empty_completion_retries = 0
                 builder_pre_head = self._get_git_commit(worktree_dir)
                 builder_pre_status = _builder_candidate_status(worktree_dir)
+                builder_pre_fingerprint = workspace_fingerprint(worktree_dir)
 
                 if builder_pre_status:
                     interrupted_builder_turn = _interrupted_builder_recovery_eligible(checkpoint)
-                    changed_paths = sorted({
-                        line[3:].strip().replace("\\", "/")
-                        for line in builder_pre_status.splitlines()
-                        if len(line) > 3 and line[3:].strip()
-                    })
+                    changed_paths = candidate_paths(worktree_dir)
                     if not (
                         interrupted_builder_turn
                         and spec.recover_partial_builder_changes
@@ -2799,6 +2803,12 @@ class ProductionRunner:
                             state=RunnerState.NEEDS_USER_INPUT.value,
                             current_role="BUILDER",
                             last_error=pause_message,
+                            host_attempt_history=(
+                                (*checkpoint.host_attempt_history, {
+                                    "outcome": "BUILDER_RECOVERY_AUTHORIZATION_REQUIRED",
+                                    "created_at": time.time(),
+                                }) if interrupted_builder_turn else checkpoint.host_attempt_history
+                            ),
                             updated_at=time.time(),
                         )
                         self.checkpoint_store.save_checkpoint(checkpoint)
@@ -2820,7 +2830,7 @@ class ProductionRunner:
                         builder_request,
                         prompt=(
                             builder_request.prompt
-                            + "\n\nInterrupted-turn recovery: a prior transient host failure left "
+                            + "\n\nInterrupted-turn recovery: a prior Builder or candidate finalization attempt left "
                             "uncommitted workspace changes in these paths: "
                             + json.dumps(changed_paths[:100], ensure_ascii=False)
                             + ". Inspect the complete existing diff, verify that every change belongs "
@@ -2834,7 +2844,7 @@ class ProductionRunner:
                     """A transient Builder turn is replayable only before any file mutation."""
                     return (
                         self._get_git_commit(worktree_dir) == builder_pre_head
-                        and _builder_candidate_status(worktree_dir) == builder_pre_status
+                        and workspace_fingerprint(worktree_dir) == builder_pre_fingerprint
                     )
                 try:
                     while True:
@@ -2855,7 +2865,7 @@ class ProductionRunner:
 
                         worktree_unchanged = (
                             self._get_git_commit(worktree_dir) == builder_pre_head
-                            and _builder_candidate_status(worktree_dir) == builder_pre_status
+                            and workspace_fingerprint(worktree_dir) == builder_pre_fingerprint
                         )
                         if (
                             _is_empty_host_completion(builder_result)
@@ -3060,7 +3070,8 @@ class ProductionRunner:
                             "failure_kind": (
                                 "HOST_EMPTY_COMPLETION"
                                 if empty_host_completion
-                                else "BUILDER_NO_CANDIDATE"
+                                else ("CANDIDATE_FINALIZATION_FAILED" if _builder_candidate_status(worktree_dir)
+                                      else "BUILDER_NO_CANDIDATE")
                             ),
                             "note": (
                                 "The host returned an empty completion and produced no candidate after one bounded retry."
