@@ -1134,6 +1134,14 @@ def create_default_registry(context_id: str = "prod_runner") -> AdapterRegistry:
         reg.register(ag_adapter, ag_manifest)
     except Exception:
         pass
+
+    try:
+        from ..hosts.cursor_sdk_adapter import CursorSdkAdapter, create_cursor_sdk_manifest
+        cursor_manifest = create_cursor_sdk_manifest(adapter_id="cursor_sdk", verified_version="0.1.0")
+        cursor_adapter = CursorSdkAdapter(adapter_id="cursor_sdk", is_real_host=True)
+        reg.register(cursor_adapter, cursor_manifest)
+    except Exception:
+        pass
     return reg
 
 
@@ -1156,6 +1164,9 @@ def _execution_options_from_spec(spec: TaskExecutionSpec) -> Dict[str, Any]:
         "host_transient_max_retries": spec.host_transient_max_retries,
         "host_transient_retry_base_seconds": spec.host_transient_retry_base_seconds,
         "host_transient_retry_max_seconds": spec.host_transient_retry_max_seconds,
+        "cursor_model": spec.cursor_model,
+        "cursor_api_key_env": spec.cursor_api_key_env,
+        "cursor_runtime": spec.cursor_runtime,
     }
 
 
@@ -2550,6 +2561,24 @@ class ProductionRunner:
                 message=f"Missing adapter: builder={spec.builder_adapter_id}, reviewer={spec.reviewer_adapter_id}, qa={spec.qa_adapter_id}",
             )
 
+        if "cursor_sdk" in (spec.builder_adapter_id, spec.reviewer_adapter_id, spec.qa_adapter_id):
+            if not spec.cursor_model:
+                pause_message = "Cursor adapter 'cursor_sdk' requires an explicit model via --cursor-model."
+                if existing_checkpoint is not None:
+                    checkpoint = replace(
+                        checkpoint,
+                        state=RunnerState.NEEDS_USER_INPUT.value,
+                        last_error=pause_message,
+                        updated_at=time.time(),
+                    )
+                    self.checkpoint_store.save_checkpoint(checkpoint)
+                return RunnerResult(
+                    success=False,
+                    state=RunnerState.NEEDS_USER_INPUT.value,
+                    task_id=task_id,
+                    message=pause_message,
+                )
+
         # PM creates/assigns the A-class card; once all local prerequisites are
         # ready, Runner legally claims it as DEV immediately before host dispatch.
         if existing_checkpoint is None and current_board_status == "待开始":
@@ -2848,6 +2877,8 @@ class ProductionRunner:
                         "pre_granted_approval": pre_granted_approval,
                         "approve_for_me": pre_granted_approval,
                         "enforce_host_config_safety": True,
+                        "cursor_model": spec.cursor_model,
+                        "cursor_runtime": spec.cursor_runtime,
                     },
                 )
                 self._emit_progress(
@@ -3454,8 +3485,23 @@ class ProductionRunner:
                         "review_request_id": review_request_id,
                         "pre_granted_approval": pre_granted_approval,
                         "enforce_host_config_safety": True,
+                        "cursor_model": spec.cursor_model,
+                        "cursor_runtime": spec.cursor_runtime,
                     },
                 )
+
+                rev_pre_ok, rev_pre_err = self._verify_qa_immutability(worktree_dir, candidate_commit)
+                if not rev_pre_ok:
+                    return RunnerResult(
+                        success=False,
+                        state=RunnerState.NEEDS_USER_INPUT.value,
+                        task_id=task_id,
+                        candidate_commit=candidate_commit,
+                        candidate_generation=candidate_generation,
+                        evidence_ids=tuple(evidence_ids),
+                        message=f"Worktree was dirty before Reviewer dispatch: {rev_pre_err}",
+                    )
+
                 self._emit_progress(
                     task_id=task_id,
                     state=RunnerState.REVIEWING.value,
@@ -3584,6 +3630,16 @@ class ProductionRunner:
                         state=RunnerState.FAILED.value,
                         task_id=task_id,
                         message="Reviewer host did not produce a valid canonical invocation identity (Fail-Closed).",
+                    )
+
+                rev_post_ok, rev_post_err = self._verify_qa_immutability(worktree_dir, candidate_commit)
+                if not rev_post_ok:
+                    return RunnerResult(
+                        success=False,
+                        state=RunnerState.FAILED.value,
+                        task_id=task_id,
+                        candidate_commit=candidate_commit,
+                        message=f"Reviewer violated code immutability boundary: {rev_post_err}",
                     )
 
                 review_output = self._parse_reviewer_structured_json(
@@ -4242,6 +4298,8 @@ class ProductionRunner:
                     "required_test_commands": test_commands,
                     "pre_granted_approval": pre_granted_approval,
                     "enforce_host_config_safety": True,
+                    "cursor_model": spec.cursor_model,
+                    "cursor_runtime": spec.cursor_runtime,
                 },
             )
             self._emit_progress(

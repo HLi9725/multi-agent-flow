@@ -1,0 +1,687 @@
+# -*- coding: utf-8 -*-
+"""
+tests/test_cursor_sdk_adapter.py
+Unit and conformance tests for CursorSdkAdapter.
+Uses FakeCursorSdk for complete isolation and zero network access.
+"""
+import json
+import hashlib
+import os
+import re
+import subprocess
+import sys
+import pytest
+from unittest.mock import patch
+import yaml
+
+from scripts._lib.core.adapter_registry import AdapterRegistry
+from scripts._lib.core.agent_schema import (
+    AgentCancelledError,
+    AgentHandle,
+    AgentInvalidHandleError,
+    AgentNotSupportedError,
+    AgentRequest,
+    AgentResult,
+    AgentStatus,
+    AgentTimeoutError,
+    CapabilitySupport,
+    ConfirmationRequest,
+    HostCapabilities,
+)
+from scripts._lib.core.adapter_manifest import (
+    AdapterManifest,
+    AuthBoundaryType,
+    BillingBoundaryType,
+    HostSurface,
+    VerificationLevel,
+)
+from scripts._lib.core.evidence_gate import EvidenceGate
+from scripts._lib.core.evidence_store import EvidenceStore
+from scripts._lib.core.production_runner import (
+    ProductionRunner,
+    create_default_registry,
+    _execution_options_from_spec,
+)
+from scripts._lib.core.runner_checkpoint_store import RunnerCheckpointStore
+from scripts._lib.core.runner_schema import (
+    RunnerCheckpoint,
+    RunnerState,
+    TaskExecutionSpec,
+)
+from scripts._lib.core.adapter_conformance import (
+    assert_capabilities_conformance,
+    assert_handle_conformance,
+    assert_manifest_conformance,
+    assert_zero_side_effects,
+    run_adapter_conformance_suite,
+)
+from scripts._lib.hosts.cursor_sdk_adapter import (
+    CursorSdkAdapter,
+    create_cursor_sdk_manifest,
+)
+from tests.fixtures.cursor_sdk import fake_cursor_sdk
+from tests.fixtures.cursor_sdk.fake_cursor_sdk import (
+    Agent,
+    AuthenticationError,
+    ConfigurationError,
+    CursorAgentError,
+    FakeCursorSdkState,
+    RateLimitError,
+)
+
+
+@pytest.fixture(autouse=True)
+def reset_fake_sdk():
+    FakeCursorSdkState.reset()
+    yield
+    FakeCursorSdkState.reset()
+
+
+def test_cursor_sdk_manifest_structure_and_conformance():
+    manifest = create_cursor_sdk_manifest()
+    assert manifest.adapter_id == "cursor_sdk"
+    assert manifest.host_surface == HostSurface.NATIVE
+    assert manifest.verification_level == VerificationLevel.STATIC_ONLY
+    assert manifest.auth_boundary == AuthBoundaryType.ENVIRONMENT
+    assert manifest.billing_boundary == BillingBoundaryType.API_KEY
+    assert "windows" in manifest.platform_verifications
+    assert manifest.platform_verifications["windows"].verification_level == VerificationLevel.STATIC_ONLY
+
+    assert_manifest_conformance(manifest)
+
+
+def test_cursor_sdk_adapter_capabilities_zero_side_effects():
+    adapter = CursorSdkAdapter(is_real_host=False, sdk_module=fake_cursor_sdk)
+    manifest = create_cursor_sdk_manifest()
+
+    assert_zero_side_effects(adapter)
+
+    caps = adapter.detect_capabilities()
+    assert caps.supports_real_subagents == CapabilitySupport.SUPPORTED
+    assert caps.supports_worktree == CapabilitySupport.SUPPORTED
+    assert caps.supports_isolated_context == CapabilitySupport.SUPPORTED
+    assert caps.supports_parallelism == CapabilitySupport.SUPPORTED
+    assert caps.supports_interactive_confirmation == CapabilitySupport.UNSUPPORTED
+
+
+def test_cursor_sdk_adapter_lazy_import_and_missing_sdk_error(monkeypatch):
+    adapter = CursorSdkAdapter(is_real_host=True)
+    # Ensure cursor_sdk cannot be imported
+    monkeypatch.setitem(sys.modules, "cursor_sdk", None)
+
+    req = AgentRequest(
+        session_id="sess_missing_sdk",
+        prompt="hello",
+        role="BUILDER",
+        workspace_dir=os.path.abspath("."),
+        extra_context={"cursor_model": "composer-2.5"},
+    )
+    with pytest.raises(AgentNotSupportedError, match="pip install cursor-sdk"):
+        adapter.dispatch_agent(req)
+
+
+def test_cursor_sdk_adapter_model_and_runtime_validation():
+    adapter = CursorSdkAdapter(is_real_host=False, sdk_module=fake_cursor_sdk)
+
+    # 1. Missing model must raise AgentNotSupportedError
+    req_no_model = AgentRequest(
+        session_id="sess_no_model",
+        prompt="implement feature",
+        role="BUILDER",
+        workspace_dir=os.path.abspath("."),
+    )
+    with pytest.raises(AgentNotSupportedError, match="Cursor model must be explicitly specified"):
+        adapter.dispatch_agent(req_no_model)
+
+    # 2. Cloud runtime must be rejected
+    req_cloud = AgentRequest(
+        session_id="sess_cloud",
+        prompt="implement feature",
+        role="BUILDER",
+        workspace_dir=os.path.abspath("."),
+        extra_context={"cursor_model": "composer-2.5", "cursor_runtime": "cloud"},
+    )
+    with pytest.raises(AgentNotSupportedError, match="Only 'local' runtime is supported"):
+        adapter.dispatch_agent(req_cloud)
+
+    # 3. Invalid workspace dir rejected
+    req_bad_dir = AgentRequest(
+        session_id="sess_bad_dir",
+        prompt="implement feature",
+        role="BUILDER",
+        workspace_dir="C:\\nonexistent_workspace_dir_12345",
+        extra_context={"cursor_model": "composer-2.5"},
+    )
+    with pytest.raises(AgentNotSupportedError, match="Workspace directory"):
+        adapter.dispatch_agent(req_bad_dir)
+
+    # 4. Reviewer requesting writable workspace sandbox rejected
+    req_rev_write = AgentRequest(
+        session_id="sess_rev_write",
+        prompt="review",
+        role="REVIEWER",
+        workspace_dir=os.path.abspath("."),
+        extra_context={"cursor_model": "composer-2.5", "sandbox_mode": "workspace-write"},
+    )
+    with pytest.raises(AgentNotSupportedError, match="strictly read-only"):
+        adapter.dispatch_agent(req_rev_write)
+
+
+def test_cursor_sdk_adapter_dispatch_and_identity_mapping(tmp_path):
+    adapter = CursorSdkAdapter(
+        is_real_host=False,
+        default_model="composer-2.5",
+        sdk_module=fake_cursor_sdk,
+    )
+
+    req = AgentRequest(
+        session_id="sess_dispatch_01",
+        prompt="hello builder",
+        role="BUILDER",
+        workspace_dir=str(tmp_path),
+    )
+    handle = adapter.dispatch_agent(req)
+
+    assert handle.host_id == "cursor_sdk"
+    assert handle.status == "running"
+    assert handle.session_id == "sess_dispatch_01"
+    assert handle.invocation_token
+    assert handle.adapter_instance_id == adapter._instance_id
+
+    FakeCursorSdkState.set_next_response("Builder output text")
+    res = adapter.wait_for_result(handle)
+
+    assert res.status == AgentStatus.SUCCESS
+    assert res.output == "Builder output text"
+    assert res.session_id == "sess_dispatch_01"
+    assert len(res.partial_results) == 1
+    assert res.partial_results[0]["invocation_id"].startswith("run_")
+    assert res.partial_results[0]["agent_id"].startswith("ag_")
+
+
+def test_cursor_sdk_adapter_cancel_and_idempotence(tmp_path):
+    adapter = CursorSdkAdapter(
+        is_real_host=False,
+        default_model="composer-2.5",
+        sdk_module=fake_cursor_sdk,
+    )
+
+    req = AgentRequest(
+        session_id="sess_cancel",
+        prompt="do work",
+        role="BUILDER",
+        workspace_dir=str(tmp_path),
+    )
+    handle = adapter.dispatch_agent(req)
+
+    # Cancel once
+    ok1 = adapter.cancel_agent(handle)
+    assert ok1 is True
+
+    # Cancel again idempotently
+    ok2 = adapter.cancel_agent(handle)
+    assert ok2 is True
+
+    # Wait after cancel returns CANCELLED
+    res = adapter.wait_for_result(handle)
+    assert res.status == AgentStatus.CANCELLED
+
+
+def test_cursor_sdk_adapter_anti_forgery_and_cross_instance_rejection(tmp_path):
+    adapter = CursorSdkAdapter(is_real_host=False, default_model="composer-2.5", sdk_module=fake_cursor_sdk)
+    req = AgentRequest(
+        session_id="sess_sec",
+        prompt="work",
+        role="BUILDER",
+        workspace_dir=str(tmp_path),
+    )
+    handle = adapter.dispatch_agent(req)
+
+    # 1. Tampered adapter instance id
+    forged_inst_handle = AgentHandle(
+        session_id=handle.session_id,
+        host_id=handle.host_id,
+        status="running",
+        is_real_host=handle.is_real_host,
+        adapter_instance_id="foreign_inst_123",
+        invocation_token=handle.invocation_token,
+    )
+    with pytest.raises(AgentInvalidHandleError, match="adapter_instance_id"):
+        adapter.wait_for_result(forged_inst_handle)
+
+    # 2. Tampered token
+    forged_token_handle = AgentHandle(
+        session_id=handle.session_id,
+        host_id=handle.host_id,
+        status="running",
+        is_real_host=handle.is_real_host,
+        adapter_instance_id=handle.adapter_instance_id,
+        invocation_token="wrong_token_abc",
+    )
+    with pytest.raises(AgentInvalidHandleError, match="token"):
+        adapter.wait_for_result(forged_token_handle)
+
+
+def test_cursor_sdk_adapter_error_classification(tmp_path):
+    adapter = CursorSdkAdapter(is_real_host=False, default_model="composer-2.5", sdk_module=fake_cursor_sdk)
+
+    # 1. RateLimitError -> transient retryable
+    req1 = AgentRequest(session_id="s1", prompt="p", role="BUILDER", workspace_dir=str(tmp_path))
+    h1 = adapter.dispatch_agent(req1)
+    FakeCursorSdkState.set_next_error(RateLimitError("Quota limit hit, please retry"))
+    res1 = adapter.wait_for_result(h1)
+    assert res1.status == AgentStatus.FAILED
+    assert "transient_cursor_host_failure" in res1.error_message
+    assert "429 rate limit" in res1.error_message
+
+    # 2. AuthenticationError -> non-retryable
+    req2 = AgentRequest(session_id="s2", prompt="p", role="BUILDER", workspace_dir=str(tmp_path))
+    h2 = adapter.dispatch_agent(req2)
+    FakeCursorSdkState.set_next_error(AuthenticationError("API key invalid"))
+    res2 = adapter.wait_for_result(h2)
+    assert res2.status == AgentStatus.FAILED
+    assert "Cursor authentication failed" in res2.error_message
+    assert "transient" not in res2.error_message
+
+    # 3. ConfigurationError -> non-retryable
+    req3 = AgentRequest(session_id="s3", prompt="p", role="BUILDER", workspace_dir=str(tmp_path))
+    h3 = adapter.dispatch_agent(req3)
+    FakeCursorSdkState.set_next_error(ConfigurationError("Invalid model configuration"))
+    res3 = adapter.wait_for_result(h3)
+    assert res3.status == AgentStatus.FAILED
+    assert "Cursor configuration or request error" in res3.error_message
+    assert "transient" not in res3.error_message
+
+
+def test_cursor_sdk_adapter_interactive_confirmation_unsupported():
+    adapter = CursorSdkAdapter(is_real_host=False, sdk_module=fake_cursor_sdk)
+    req = ConfirmationRequest(request_id="c1", prompt="Confirm this?", options=("yes", "no"))
+    with pytest.raises(AgentNotSupportedError, match="does not support interactive confirmation"):
+        adapter.request_confirmation(req)
+
+
+def test_cursor_sdk_adapter_conformance_suite(tmp_path):
+    adapter = CursorSdkAdapter(
+        is_real_host=False,
+        default_model="composer-2.5",
+        sdk_module=fake_cursor_sdk,
+    )
+    manifest = create_cursor_sdk_manifest()
+    result = run_adapter_conformance_suite(adapter, manifest)
+    assert result["status"] == "PASSED"
+    assert result["adapter_id"] == "cursor_sdk"
+    assert result["is_real_host"] is False
+
+
+@pytest.fixture
+def mock_repo(tmp_path):
+    repo_dir = tmp_path / "cursor_test_repo"
+    repo_dir.mkdir()
+    subprocess.run(["git", "init"], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "TestDev"], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo_dir, check=True, capture_output=True)
+    (repo_dir / "README.md").write_text("# Test\n", encoding="utf-8")
+    (repo_dir / "test_app.py").write_text("def test_dummy(): assert True\n", encoding="utf-8")
+    config_dir = repo_dir / "config"
+    config_dir.mkdir()
+    user_data_dir = repo_dir / "user_data"
+    user_data_dir.mkdir()
+    board_file = user_data_dir / "board.json"
+    with open(config_dir / "workflow.config.yaml", "w", encoding="utf-8") as f:
+        yaml.safe_dump({"board": {"provider": "local", "board_file": str(board_file)}}, f)
+    board_file.write_text(json.dumps([{
+        "id": "T0099", "name": "Cursor E2E Test", "status": "\u5f85\u5f00\u59cb", "type": "A",
+        "owner": "\u674e\u5f00\u53d1", "handler": "\u674e\u5f00\u53d1", "updated_at": "1.0",
+        "process": "\u9700\u6c42: \u589e\u52a0\u529f\u80fd\u3002\u9a8c\u6536\u6807\u51c6: \u6d4b\u8bd5\u901a\u8fc7",
+    }], ensure_ascii=False), encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "initial commit"], cwd=repo_dir, check=True, capture_output=True)
+    head_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo_dir, text=True).strip()
+    return repo_dir, head_sha
+
+
+def test_default_registry_includes_cursor_sdk():
+    reg = create_default_registry()
+    manifest = reg.get_manifest("cursor_sdk")
+    assert manifest is not None
+    assert manifest.adapter_id == "cursor_sdk"
+    adapter = reg.get("cursor_sdk")
+    assert adapter is not None
+    assert isinstance(adapter, CursorSdkAdapter)
+
+
+def test_runner_validation_requires_cursor_model_when_using_cursor_sdk(mock_repo, tmp_path):
+    repo_dir, head_sha = mock_repo
+    data_root = tmp_path / "data_val"
+    data_root.mkdir()
+    checkpoint_store = RunnerCheckpointStore(data_root=str(data_root), project_root=str(repo_dir), project_id="test-proj")
+    evidence_store = EvidenceStore(root_dir=str(data_root / "evidence"))
+    evidence_gate = EvidenceGate(store=evidence_store, project_root=str(repo_dir))
+
+    reg = AdapterRegistry()
+    fake_adapter = CursorSdkAdapter(is_real_host=True, sdk_module=fake_cursor_sdk)
+    manifest = create_cursor_sdk_manifest()
+    reg.register(fake_adapter, manifest)
+
+    runner = ProductionRunner(
+        registry=reg,
+        evidence_store=evidence_store,
+        evidence_gate=evidence_gate,
+        checkpoint_store=checkpoint_store,
+    )
+    ac_text = "验收标准: 测试通过"
+    ac_hash = hashlib.sha256(ac_text.encode("utf-8")).hexdigest()
+    spec = TaskExecutionSpec(
+        project_id="test-proj",
+        project_root=str(repo_dir),
+        authority_root=str(repo_dir),
+        task_id="T0099",
+        task_name="Cursor E2E Test",
+        requirement_text="需求: 增加功能",
+        acceptance_criteria=ac_text,
+        acceptance_criteria_hash=ac_hash,
+        task_version="1.0",
+        status_at_read="待开始",
+        baseline_commit=head_sha,
+        builder_adapter_id="cursor_sdk",
+        reviewer_adapter_id="cursor_sdk",
+        qa_adapter_id="cursor_sdk",
+        workspace_mode="inherit",
+        cursor_model=None,
+    )
+    res = runner.start(spec)
+    assert res.success is False
+    assert res.state == RunnerState.NEEDS_USER_INPUT.value
+    assert "--cursor-model" in res.message
+
+
+def test_runner_reviewer_immutability_fail_closed(mock_repo):
+    repo_dir, head_sha = mock_repo
+    runner = ProductionRunner()
+
+    # Clean initially
+    clean, err = runner._verify_qa_immutability(str(repo_dir), head_sha)
+    assert clean is True
+
+    # Mutated file triggers Fail-Closed
+    (repo_dir / "unauthorized_file.txt").write_text("tampered content", encoding="utf-8")
+    clean2, err2 = runner._verify_qa_immutability(str(repo_dir), head_sha)
+    assert clean2 is False
+    assert "Code immutability boundary violated" in err2
+    (repo_dir / "unauthorized_file.txt").unlink()
+
+
+def test_runner_checkpoint_preserves_cursor_configuration():
+    spec = TaskExecutionSpec(
+        project_id="p1",
+        project_root=".",
+        authority_root=".",
+        task_id="T1",
+        task_name="N",
+        requirement_text="R",
+        acceptance_criteria="AC",
+        acceptance_criteria_hash="hash",
+        task_version="1",
+        status_at_read="待开始",
+        builder_adapter_id="cursor_sdk",
+        cursor_model="composer-2.5",
+        cursor_api_key_env="MY_CURSOR_KEY",
+        cursor_runtime="local",
+    )
+    opts = _execution_options_from_spec(spec)
+    assert opts["cursor_model"] == "composer-2.5"
+    assert opts["cursor_api_key_env"] == "MY_CURSOR_KEY"
+    assert opts["cursor_runtime"] == "local"
+
+    ckpt = RunnerCheckpoint(
+        task_id="T1",
+        project_id="p1",
+        state=RunnerState.BUILDING.value,
+        current_role="BUILDER",
+        execution_options=opts,
+    )
+    assert ckpt.execution_options["cursor_model"] == "composer-2.5"
+    assert ckpt.execution_options["cursor_api_key_env"] == "MY_CURSOR_KEY"
+    assert ckpt.execution_options["cursor_runtime"] == "local"
+
+
+def test_runner_full_e2e_with_cursor_sdk(mock_repo, tmp_path, monkeypatch):
+    monkeypatch.setenv("CURSOR_API_KEY", "mock_key_test_123")
+    repo_dir, head_sha = mock_repo
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+
+    FakeCursorSdkState.reset()
+
+    def sdk_hook(prompt, agent):
+        cwd = agent.local.cwd if agent.local else str(repo_dir)
+        if "review_request_id:" in prompt:
+            m_task = re.search(r"- task_id: '([^']+)'", prompt)
+            m_base = re.search(r"- baseline_commit: '([^']+)'", prompt)
+            m_cand = re.search(r"- candidate_commit: '([^']+)'", prompt)
+            m_sess = re.search(r"- session_id: '([^']+)'", prompt)
+            m_req = re.search(r"- review_request_id: '([^']+)'", prompt)
+            return json.dumps({
+                "task_id": m_task.group(1) if m_task else "T0099",
+                "baseline_commit": m_base.group(1) if m_base else head_sha,
+                "candidate_commit": m_cand.group(1) if m_cand else head_sha,
+                "session_id": m_sess.group(1) if m_sess else "sess_rev",
+                "review_request_id": m_req.group(1) if m_req else "req_rev",
+                "decision": "PASS",
+                "defects": [],
+                "summary": "Review passed successfully",
+            })
+
+        if "independent QA gate" in prompt or "Acceptance criteria hash:" in prompt:
+            return json.dumps({
+                "decision": "PASS",
+                "acceptance_coverage": [{
+                    "criterion_id": "AC-01",
+                    "status": "PASS",
+                    "evidence": "Observed test_app.py passed cleanly",
+                }],
+                "negative_scenarios": [{
+                    "name": "negative check",
+                    "status": "PASS",
+                    "evidence": "Observed negative conditions",
+                }],
+                "uncovered_risks": [],
+                "defects": [],
+                "summary": "All QA criteria passed",
+            })
+
+        # Builder: write file and leave uncommitted for Runner to finalize
+        feature_file = os.path.join(cwd, "feature.py")
+        with open(feature_file, "w", encoding="utf-8") as f:
+            f.write("def dummy(): return True\n")
+        return "Builder successfully added feature."
+
+    FakeCursorSdkState.set_on_send_hook(sdk_hook)
+
+    reg = AdapterRegistry()
+    fake_adapter = CursorSdkAdapter(is_real_host=True, sdk_module=fake_cursor_sdk)
+    manifest = create_cursor_sdk_manifest()
+    reg.register(fake_adapter, manifest)
+
+    evidence_store = EvidenceStore(root_dir=str(data_root / "evidence"))
+    evidence_gate = EvidenceGate(store=evidence_store, project_root=str(repo_dir))
+    checkpoint_store = RunnerCheckpointStore(data_root=str(data_root), project_root=str(repo_dir), project_id="test-proj")
+    progress_events = []
+
+    runner = ProductionRunner(
+        registry=reg,
+        evidence_store=evidence_store,
+        evidence_gate=evidence_gate,
+        checkpoint_store=checkpoint_store,
+        progress_callback=progress_events.append,
+    )
+
+    ac_text = "验收标准: 测试通过"
+    ac_hash = hashlib.sha256(ac_text.encode("utf-8")).hexdigest()
+    spec = TaskExecutionSpec(
+        project_id="test-proj",
+        project_root=str(repo_dir),
+        authority_root=str(repo_dir),
+        task_id="T0099",
+        task_name="Cursor E2E Test",
+        requirement_text="需求: 增加功能",
+        acceptance_criteria=ac_text,
+        acceptance_criteria_hash=ac_hash,
+        task_version="1.0",
+        status_at_read="待开始",
+        baseline_commit=head_sha,
+        builder_adapter_id="cursor_sdk",
+        reviewer_adapter_id="cursor_sdk",
+        qa_adapter_id="cursor_sdk",
+        workspace_mode="inherit",
+        test_command="python -m pytest test_app.py -q",
+        cursor_model="composer-2.5",
+        cursor_runtime="local",
+    )
+
+    result = runner.start(spec)
+    assert result.success is True, f"Runner failed with: {result.message}"
+    assert result.state == RunnerState.PENDING_USER_ACCEPTANCE.value
+    assert result.candidate_commit is not None
+    assert len(result.evidence_ids) >= 3
+    FakeCursorSdkState.reset()
+
+
+def test_runner_mixed_host_cursor_builder_with_other_hosts(mock_repo, tmp_path, monkeypatch):
+    """Test mixed-host orchestration: Builder on cursor_sdk, Reviewer on cursor_sdk, QA on custom mock host."""
+    monkeypatch.setenv("CURSOR_API_KEY", "mock_key_test_123")
+    repo_dir, head_sha = mock_repo
+    data_root = tmp_path / "data_mixed"
+    data_root.mkdir()
+
+    FakeCursorSdkState.reset()
+
+    def sdk_hook(prompt, agent):
+        cwd = agent.local.cwd if agent.local else str(repo_dir)
+        if "review_request_id:" in prompt:
+            m_task = re.search(r"- task_id: '([^']+)'", prompt)
+            m_base = re.search(r"- baseline_commit: '([^']+)'", prompt)
+            m_cand = re.search(r"- candidate_commit: '([^']+)'", prompt)
+            m_sess = re.search(r"- session_id: '([^']+)'", prompt)
+            m_req = re.search(r"- review_request_id: '([^']+)'", prompt)
+            return json.dumps({
+                "task_id": m_task.group(1) if m_task else "T0099",
+                "baseline_commit": m_base.group(1) if m_base else head_sha,
+                "candidate_commit": m_cand.group(1) if m_cand else head_sha,
+                "session_id": m_sess.group(1) if m_sess else "sess_rev",
+                "review_request_id": m_req.group(1) if m_req else "req_rev",
+                "decision": "PASS",
+                "defects": [],
+                "summary": "Review passed successfully",
+            })
+        # Builder
+        feature_file = os.path.join(cwd, "feature_mixed.py")
+        with open(feature_file, "w", encoding="utf-8") as f:
+            f.write("def dummy(): return True\n")
+        return "Builder implemented feature"
+
+    FakeCursorSdkState.set_on_send_hook(sdk_hook)
+
+    # Codex QA adapter conforming to EvidenceGate real host rules
+    from scripts._lib.core.host_adapter import BaseHostAdapter
+
+    class CodexQAAdapter(BaseHostAdapter):
+        def __init__(self, adapter_id="codex_cli", is_real_host=True):
+            self.adapter_id = adapter_id
+            self.is_real_host = is_real_host
+
+        def detect_capabilities(self):
+            return HostCapabilities(
+                is_real_host=True,
+                supports_interactive_confirmation=CapabilitySupport.UNSUPPORTED,
+            )
+        def dispatch_agent(self, request):
+            return AgentHandle(
+                session_id=request.session_id,
+                host_id="codex_cli",
+                status="running",
+                is_real_host=True,
+                adapter_instance_id="codex_inst_qa",
+                invocation_token="codex_tok_12345678",
+            )
+        def wait_for_result(self, handle, timeout_seconds=None):
+            qa_json = {
+                "decision": "PASS",
+                "acceptance_coverage": [{
+                    "criterion_id": "AC-01",
+                    "status": "PASS",
+                    "evidence": "Observed test_app.py passed cleanly",
+                }],
+                "negative_scenarios": [{
+                    "name": "negative check",
+                    "status": "PASS",
+                    "evidence": "Observed negative conditions",
+                }],
+                "uncovered_risks": [],
+                "defects": [],
+                "summary": "Codex QA passed cleanly",
+            }
+            return AgentResult(
+                session_id=handle.session_id,
+                status=AgentStatus.SUCCESS,
+                output=json.dumps(qa_json),
+                partial_results=({"invocation_id": "inv_qa_codex_real"},),
+                is_real_host=True,
+            )
+        def cancel_agent(self, handle):
+            return True
+        def request_confirmation(self, request):
+            raise AgentNotSupportedError("Not supported")
+
+    from scripts._lib.hosts.codex_cli_adapter import create_codex_cli_manifest
+    qa_manifest = create_codex_cli_manifest(adapter_id="codex_cli")
+
+    reg = AdapterRegistry()
+    fake_cursor_adapter = CursorSdkAdapter(is_real_host=True, sdk_module=fake_cursor_sdk)
+    cursor_manifest = create_cursor_sdk_manifest()
+    reg.register(fake_cursor_adapter, cursor_manifest)
+    reg.register(CodexQAAdapter(adapter_id="codex_cli", is_real_host=True), qa_manifest)
+
+    evidence_store = EvidenceStore(root_dir=str(data_root / "evidence"))
+    evidence_gate = EvidenceGate(store=evidence_store, project_root=str(repo_dir))
+    checkpoint_store = RunnerCheckpointStore(data_root=str(data_root), project_root=str(repo_dir), project_id="test-proj")
+
+    runner = ProductionRunner(
+        registry=reg,
+        evidence_store=evidence_store,
+        evidence_gate=evidence_gate,
+        checkpoint_store=checkpoint_store,
+    )
+
+    ac_text = "验收标准: 测试通过"
+    ac_hash = hashlib.sha256(ac_text.encode("utf-8")).hexdigest()
+    spec = TaskExecutionSpec(
+        project_id="test-proj",
+        project_root=str(repo_dir),
+        authority_root=str(repo_dir),
+        task_id="T0099",
+        task_name="Cursor Mixed Host Test",
+        requirement_text="需求: 增加功能",
+        acceptance_criteria=ac_text,
+        acceptance_criteria_hash=ac_hash,
+        task_version="1.0",
+        status_at_read="待开始",
+        baseline_commit=head_sha,
+        builder_adapter_id="cursor_sdk",
+        reviewer_adapter_id="cursor_sdk",
+        qa_adapter_id="codex_cli",
+        workspace_mode="inherit",
+        test_command="python -m pytest test_app.py -q",
+        cursor_model="composer-2.5",
+        cursor_runtime="local",
+    )
+
+    result = runner.start(spec)
+    assert result.success is True, f"Runner failed with: {result.message}"
+    assert result.state == RunnerState.PENDING_USER_ACCEPTANCE.value
+    assert result.candidate_commit is not None
+    assert len(result.evidence_ids) >= 3
+    FakeCursorSdkState.reset()
+
+
+

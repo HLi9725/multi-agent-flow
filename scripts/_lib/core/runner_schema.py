@@ -317,6 +317,9 @@ class TaskExecutionSpec:
     host_transient_retry_base_seconds: float = 5.0
     host_transient_retry_max_seconds: float = 30.0
     recover_partial_builder_changes: bool = False
+    cursor_model: Optional[str] = None
+    cursor_api_key_env: str = "CURSOR_API_KEY"
+    cursor_runtime: str = "local"
     allow_git_push: bool = False
     allow_merge_main: bool = False
     allow_auto_accept: bool = False
@@ -400,6 +403,9 @@ class TaskExecutionSpec:
             "host_transient_retry_base_seconds": self.host_transient_retry_base_seconds,
             "host_transient_retry_max_seconds": self.host_transient_retry_max_seconds,
             "recover_partial_builder_changes": self.recover_partial_builder_changes,
+            "cursor_model": self.cursor_model,
+            "cursor_api_key_env": self.cursor_api_key_env,
+            "cursor_runtime": self.cursor_runtime,
             "allow_git_push": self.allow_git_push,
             "allow_merge_main": self.allow_merge_main,
             "allow_auto_accept": self.allow_auto_accept,

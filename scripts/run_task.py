@@ -103,7 +103,32 @@ def _overrides_from_args(args):
         overrides["host_transient_retry_max_seconds"] = args.host_transient_retry_max_seconds
     if getattr(args, "recover_partial_builder_changes", False):
         overrides["recover_partial_builder_changes"] = True
+    if getattr(args, "cursor_model", None):
+        overrides["cursor_model"] = args.cursor_model
+    if getattr(args, "cursor_api_key_env", None):
+        overrides["cursor_api_key_env"] = args.cursor_api_key_env
+    if getattr(args, "cursor_runtime", None):
+        overrides["cursor_runtime"] = args.cursor_runtime
     return overrides
+
+
+def _add_cursor_args(parser):
+    parser.add_argument(
+        "--cursor-model",
+        default=None,
+        help="Explicit model identifier for cursor_sdk adapter (e.g. composer-2.5)",
+    )
+    parser.add_argument(
+        "--cursor-api-key-env",
+        default=None,
+        help="Environment variable name providing Cursor API key (default: CURSOR_API_KEY)",
+    )
+    parser.add_argument(
+        "--cursor-runtime",
+        default=None,
+        choices=["local"],
+        help="Cursor execution runtime (Phase 3 supports 'local' only)",
+    )
 
 
 def _add_host_retry_args(parser):
@@ -249,6 +274,7 @@ def main():
     p_start.set_defaults(func=cmd_start)
     p_start.add_argument("--restart-cancelled", action="store_true", help="Archive a cancelled run and start a new run of the same task")
     _add_host_retry_args(p_start)
+    _add_cursor_args(p_start)
 
     # status
     p_status = subparsers.add_parser("status", help="Query task execution status (read-only)")
@@ -296,6 +322,7 @@ def main():
     )
     p_resume.set_defaults(func=cmd_resume)
     _add_host_retry_args(p_resume)
+    _add_cursor_args(p_resume)
 
     for name, help_text, func in (
         ("accept", "Accept the exact pending candidate", cmd_accept),

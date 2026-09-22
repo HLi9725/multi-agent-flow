@@ -139,6 +139,16 @@ python scripts/run_task.py start --task-id T0003 --approve `
   --qa-adapter antigravity `
   --timeout-seconds 900 `
   --test-command "python -m pytest tests -q"
+
+# Cursor Python SDK 扩展链（支持单一宿主或与 Codex/Antigravity 混合编排）
+# 依赖环境：pip install cursor-sdk，并配置环境变量 CURSOR_API_KEY
+python scripts/run_task.py start --task-id T0003 --approve `
+  --builder-adapter cursor_sdk `
+  --reviewer-adapter cursor_sdk `
+  --qa-adapter cursor_sdk `
+  --cursor-model composer-2.5 `
+  --cursor-runtime local `
+  --test-command "python -m pytest tests -q"
 ```
 
 `status` 是纯只读查询；`resume` 用于审批、退回修复或故障消除后的断点恢复。旧版已经手工把看板退回、但 Checkpoint 仍为 `PENDING_USER_ACCEPTANCE` 时，使用 `resume --reason "<完整验收缺陷>"` 对账并把缺陷注入 Builder。用户验收必须使用 Runner 返回的不可预测 `confirmation_request_id`：`run_task.py accept --task-id <id> --confirmation-request-id <id>` 或 `run_task.py reject --task-id <id> --confirmation-request-id <id> --reason "<缺陷>"`。`reject` 退回原任务，下次 `resume` 回到 Builder，不新建卡片。Checkpoint 会保存 Adapter、测试命令、超时与循环预算，新候选提交会重置该候选的 Reviewer/QA 轮次。
