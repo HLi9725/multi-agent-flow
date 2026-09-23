@@ -36,15 +36,15 @@ RUNNER_MANAGED_AGENT_MAP: Dict[str, str] = {
     "QA": "flow-runner-qa",
 }
 
-VALID_SDK_TOOLS: Set[str] = {"read", "grep", "shell", "edit", "task"}
+VALID_SDK_TOOLS: Set[str] = {"read", "grep", "glob", "shell", "edit", "task"}
 
 CURSOR_SESSION_TO_SDK_TOOL_MAP: Dict[str, str] = {
     "read": "read",
     "view_file": "read",
     "grep": "grep",
     "grep_search": "grep",
-    "glob": "grep",
-    "find_by_name": "grep",
+    "glob": "glob",
+    "find_by_name": "glob",
     "shell": "shell",
     "bash": "shell",
     "run_command": "shell",
@@ -274,23 +274,24 @@ class CursorSdkAdapter(BaseHostAdapter):
 
         if "runner-qa" in agent_id_lower:
             sub_tools = []
-            sub_disallowed_tools = ["edit", "shell", "read", "grep"]
+            sub_disallowed_tools = ["edit", "glob", "grep", "read", "shell"]
         elif "qa" in agent_id_lower:
             sub_tools = sorted(list(mapped_tools - {"edit", "shell"}))
             sub_disallowed_tools = ["edit", "shell"]
         elif "runner-reviewer" in agent_id_lower:
             sub_tools = ["read"]
-            sub_disallowed_tools = ["edit", "shell", "grep"]
+            sub_disallowed_tools = ["edit", "glob", "grep", "shell"]
         elif "reviewer" in agent_id_lower or enable_write_tools is False:
             sub_tools = sorted(list(mapped_tools - {"edit", "shell"}))
             sub_disallowed_tools = ["edit", "shell"]
         elif "runner-builder" in agent_id_lower:
-            sub_tools = sorted(list((mapped_tools | {"read", "edit", "grep"}) - {"shell", "task"}))
+            sub_tools = sorted(list((mapped_tools | {"read", "edit", "grep", "glob"}) - {"shell", "task"}))
             sub_disallowed_tools = ["shell"]
         else:
             if isinstance(raw_tools, list):
                 sub_tools = sorted(list(mapped_tools))
-            if enable_write_tools is False:
+                sub_disallowed_tools = sorted(list((VALID_SDK_TOOLS - {"task"}) - set(sub_tools)))
+            elif enable_write_tools is False:
                 sub_disallowed_tools = ["edit", "shell"]
 
         return str(name).strip(), str(desc).strip(), prompt_body, sub_tools, sub_disallowed_tools
@@ -400,8 +401,19 @@ class CursorSdkAdapter(BaseHostAdapter):
                     "model": "inherit",
                 }
 
+            if sub_tools is not None:
+                try:
+                    setattr(agent_def, "tools", sub_tools)
+                except Exception:
+                    pass
+            if sub_disallowed is not None:
+                try:
+                    setattr(agent_def, "disallowed_tools", sub_disallowed)
+                except Exception:
+                    pass
+
             parent_tools = ["task"]
-            parent_disallowed_tools = ["edit", "shell", "read", "grep"]
+            parent_disallowed_tools = ["edit", "glob", "grep", "read", "shell"]
             parent_agents = {subagent_name: agent_def}
 
             resume_id = (

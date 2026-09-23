@@ -857,17 +857,28 @@ def test_cursor_sdk_readonly_role_tool_isolation(tmp_path):
     assert "shell" in agent_rev.disallowed_tools
     assert "read" in agent_rev.disallowed_tools
     assert "grep" in agent_rev.disallowed_tools
+    assert "glob" in agent_rev.disallowed_tools
     assert "write" not in agent_rev.disallowed_tools
     assert agent_rev.tools == ["task"]
     assert "flow-runner-reviewer" in agent_rev.agents
     rev_sub = agent_rev.agents["flow-runner-reviewer"]
-    assert "[TOOL CONSTRAINTS]" in rev_sub.prompt
-    assert "Allowed Tools: ['read']" in rev_sub.prompt
-    assert "Prohibited Tools: ['edit', 'grep', 'shell']" in rev_sub.prompt
+    assert rev_sub.tools == ["read"]
+    assert rev_sub.disallowed_tools == ["edit", "glob", "grep", "shell"]
+
+    # Verify actual tool permission enforcement and rejection
+    assert agent_rev.is_tool_allowed("read", subagent="flow-runner-reviewer") is True
+    assert agent_rev.is_tool_allowed("edit", subagent="flow-runner-reviewer") is False
+    assert agent_rev.is_tool_allowed("shell", subagent="flow-runner-reviewer") is False
+    assert agent_rev.is_tool_allowed("grep", subagent="flow-runner-reviewer") is False
+    assert agent_rev.is_tool_allowed("glob", subagent="flow-runner-reviewer") is False
+    for prohibited in ["edit", "shell", "grep", "glob"]:
+        with pytest.raises(fake_cursor_sdk.ToolNotAllowedError):
+            agent_rev.execute_tool(prohibited, subagent="flow-runner-reviewer")
+
     res_rev = adapter.wait_for_result(handle_rev)
     assert res_rev.status == AgentStatus.SUCCESS
 
-    # QA dispatch: parent has tools=["task"], disallowed contains edit, shell, read, grep; subagent is flow-runner-qa
+    # QA dispatch: parent has tools=["task"], disallowed contains edit, shell, read, grep, glob; subagent is flow-runner-qa
     FakeCursorSdkState.set_next_tool_calls([{"tool": "task", "subagent": "flow-runner-qa"}])
     req_qa = AgentRequest(
         session_id="sess_qa_tools",
@@ -882,13 +893,20 @@ def test_cursor_sdk_readonly_role_tool_isolation(tmp_path):
     assert "shell" in agent_qa.disallowed_tools
     assert "read" in agent_qa.disallowed_tools
     assert "grep" in agent_qa.disallowed_tools
+    assert "glob" in agent_qa.disallowed_tools
     assert "write" not in agent_qa.disallowed_tools
     assert agent_qa.tools == ["task"]
     assert "flow-runner-qa" in agent_qa.agents
     qa_sub = agent_qa.agents["flow-runner-qa"]
-    assert "[TOOL CONSTRAINTS]" in qa_sub.prompt
-    assert "Allowed Tools: NONE" in qa_sub.prompt
-    assert "Prohibited Tools: ['edit', 'grep', 'read', 'shell']" in qa_sub.prompt
+    assert qa_sub.tools == []
+    assert qa_sub.disallowed_tools == ["edit", "glob", "grep", "read", "shell"]
+
+    # Verify actual QA tool permission enforcement and rejection
+    for prohibited in ["read", "edit", "shell", "grep", "glob"]:
+        assert agent_qa.is_tool_allowed(prohibited, subagent="flow-runner-qa") is False
+        with pytest.raises(fake_cursor_sdk.ToolNotAllowedError):
+            agent_qa.execute_tool(prohibited, subagent="flow-runner-qa")
+
     res_qa = adapter.wait_for_result(handle_qa)
     assert res_qa.status == AgentStatus.SUCCESS
 
@@ -997,12 +1015,12 @@ def test_cursor_sdk_parent_agent_has_only_task_tool_and_single_agent(tmp_path):
 
     # Parent Agent must ONLY have 'task' tool
     assert agent.tools == ["task"]
-    # Parent Agent must have disallowed edit, shell, read, grep (no write)
-    for tool in ["edit", "shell", "read", "grep"]:
+    # Parent Agent must have disallowed edit, shell, read, grep, glob (no write)
+    for tool in ["edit", "shell", "read", "grep", "glob"]:
         assert tool in agent.disallowed_tools
     assert "write" not in agent.disallowed_tools
 
-    # Parent Agent must register exactly ONE subagent
+    # Parent Agent registers subagent discovered from .cursor/agents/*.md
     assert isinstance(agent.agents, dict)
     assert len(agent.agents) == 1
     assert "flow-runner-builder" in agent.agents
@@ -1012,10 +1030,18 @@ def test_cursor_sdk_parent_agent_has_only_task_tool_and_single_agent(tmp_path):
     assert hasattr(sub_def, "prompt")
     assert sub_def.description
     assert sub_def.prompt
-    assert sub_def.model == "inherit"
-    assert "[TOOL CONSTRAINTS]" in sub_def.prompt
-    assert "Prohibited Tools: ['shell']" in sub_def.prompt
-    assert "Allowed Tools: ['edit', 'grep', 'read']" in sub_def.prompt
+    assert sub_def.tools == ["edit", "glob", "grep", "read"]
+    assert sub_def.disallowed_tools == ["shell"]
+
+    # Verify tool permission enforcement on Builder subagent
+    assert agent.is_tool_allowed("glob", subagent="flow-runner-builder") is True
+    assert agent.is_tool_allowed("grep", subagent="flow-runner-builder") is True
+    assert agent.is_tool_allowed("read", subagent="flow-runner-builder") is True
+    assert agent.is_tool_allowed("edit", subagent="flow-runner-builder") is True
+    assert agent.is_tool_allowed("shell", subagent="flow-runner-builder") is False
+
+    with pytest.raises(fake_cursor_sdk.ToolNotAllowedError):
+        agent.execute_tool("shell", subagent="flow-runner-builder")
 
     res = adapter.wait_for_result(handle)
     assert res.status == AgentStatus.SUCCESS
@@ -1325,6 +1351,89 @@ def test_cursor_sdk_timeout_thread_refuses_to_exit_logs_warning_and_raises_timeo
     worker = session_data.get("worker")
     assert worker is not None
     assert worker.is_alive()
+
+
+def test_cursor_sdk_glob_and_grep_distinct_tools():
+    """Verify glob and grep are distinct SDK tools and both supported without conflation."""
+    assert "glob" in fake_cursor_sdk.VALID_TOOLS
+    assert "grep" in fake_cursor_sdk.VALID_TOOLS
+    assert fake_cursor_sdk.CURSOR_SESSION_TO_SDK_TOOL_MAP["glob"] == "glob"
+    assert fake_cursor_sdk.CURSOR_SESSION_TO_SDK_TOOL_MAP["find_by_name"] == "glob"
+    assert fake_cursor_sdk.CURSOR_SESSION_TO_SDK_TOOL_MAP["grep"] == "grep"
+    assert fake_cursor_sdk.CURSOR_SESSION_TO_SDK_TOOL_MAP["grep_search"] == "grep"
+
+
+def test_cursor_sdk_subagent_tool_rejection_and_inline_override(tmp_path):
+    """
+    Verify:
+    1. Subagents loaded from .cursor/agents/*.md enforce tool permissions:
+       - flow-runner-reviewer can ONLY use 'read'; 'edit', 'shell', 'grep', 'glob' are rejected.
+       - flow-runner-qa has [] tools; all tools are rejected.
+       - flow-runner-builder can use 'read', 'edit', 'grep', 'glob'; 'shell' is rejected.
+    2. Overriding with an inline AgentDefinition (which lacks tools in official SDK)
+       overwrites the file definition and loses tool isolation, confirming why the adapter
+       must never pass inline AgentDefinition for file-based subagents.
+    """
+    local_opts = fake_cursor_sdk.LocalAgentOptions(cwd=str(tmp_path))
+
+    # A) File-based subagents discovered from .cursor/agents/*.md
+    agent_file = fake_cursor_sdk.Agent.create(
+        options=fake_cursor_sdk.AgentOptions(
+            model="composer-2.5",
+            local=local_opts,
+            tools=["task"],
+            disallowed_tools=["edit", "glob", "grep", "read", "shell"],
+        )
+    )
+
+    # Reviewer checks
+    assert agent_file.is_tool_allowed("read", subagent="flow-runner-reviewer") is True
+    assert agent_file.is_tool_allowed("edit", subagent="flow-runner-reviewer") is False
+    assert agent_file.is_tool_allowed("shell", subagent="flow-runner-reviewer") is False
+    assert agent_file.is_tool_allowed("grep", subagent="flow-runner-reviewer") is False
+    assert agent_file.is_tool_allowed("glob", subagent="flow-runner-reviewer") is False
+    for t in ["edit", "shell", "grep", "glob"]:
+        with pytest.raises(fake_cursor_sdk.ToolNotAllowedError) as exc_info:
+            agent_file.execute_tool(t, subagent="flow-runner-reviewer")
+        assert f"Tool '{t}' is not permitted for subagent 'flow-runner-reviewer'" in str(exc_info.value)
+
+    # QA checks
+    for t in ["read", "edit", "shell", "grep", "glob"]:
+        assert agent_file.is_tool_allowed(t, subagent="flow-runner-qa") is False
+        with pytest.raises(fake_cursor_sdk.ToolNotAllowedError):
+            agent_file.execute_tool(t, subagent="flow-runner-qa")
+
+    # Builder checks
+    for t in ["read", "edit", "grep", "glob"]:
+        assert agent_file.is_tool_allowed(t, subagent="flow-runner-builder") is True
+        assert "executed successfully" in agent_file.execute_tool(t, subagent="flow-runner-builder")
+    assert agent_file.is_tool_allowed("shell", subagent="flow-runner-builder") is False
+    with pytest.raises(fake_cursor_sdk.ToolNotAllowedError):
+        agent_file.execute_tool("shell", subagent="flow-runner-builder")
+
+    # B) Inline AgentDefinition overwrite scenario:
+    # If someone passes inline agents={"flow-runner-reviewer": AgentDefinition(...)},
+    # it overwrites the markdown file and loses tool isolation!
+    inline_def = fake_cursor_sdk.AgentDefinition(
+        description="Inline reviewer without tools",
+        prompt="Review code",
+        model="inherit",
+    )
+    agent_inline = fake_cursor_sdk.Agent.create(
+        options=fake_cursor_sdk.AgentOptions(
+            model="composer-2.5",
+            local=local_opts,
+            tools=["task"],
+            disallowed_tools=["edit", "glob", "grep", "read", "shell"],
+            agents={"flow-runner-reviewer": inline_def},
+        )
+    )
+
+    # Inline definition has overwritten flow-runner-reviewer, losing tool isolation
+    assert agent_inline.is_tool_allowed("edit", subagent="flow-runner-reviewer") is True
+    assert agent_inline.is_tool_allowed("shell", subagent="flow-runner-reviewer") is True
+    assert agent_inline.is_tool_allowed("grep", subagent="flow-runner-reviewer") is True
+    assert agent_inline.is_tool_allowed("glob", subagent="flow-runner-reviewer") is True
 
 
 

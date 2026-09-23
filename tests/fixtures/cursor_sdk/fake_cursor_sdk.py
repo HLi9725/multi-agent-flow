@@ -60,7 +60,31 @@ class BadRequestError(CursorAgentError):
         super().__init__(message, is_retryable=False, code=kwargs.get("code", "bad_request"), status_code=400)
 
 
-VALID_TOOLS = {"read", "grep", "shell", "edit", "task"}
+class ToolNotAllowedError(BadRequestError):
+    """Raised when an agent or subagent attempts to execute a prohibited tool."""
+    def __init__(self, message: str = "Tool is not allowed", **kwargs: Any):
+        super().__init__(message, code=kwargs.get("code", "tool_not_allowed"), **kwargs)
+
+
+VALID_TOOLS = {"read", "grep", "glob", "shell", "edit", "task"}
+
+CURSOR_SESSION_TO_SDK_TOOL_MAP: Dict[str, str] = {
+    "read": "read",
+    "view_file": "read",
+    "grep": "grep",
+    "grep_search": "grep",
+    "glob": "glob",
+    "find_by_name": "glob",
+    "shell": "shell",
+    "bash": "shell",
+    "terminal": "shell",
+    "run_command": "shell",
+    "edit": "edit",
+    "write": "edit",
+    "write_to_file": "edit",
+    "replace_file_content": "edit",
+    "task": "task",
+}
 
 
 @dataclass
@@ -69,6 +93,96 @@ class AgentDefinition:
     prompt: str
     model: str = "inherit"
     mcp_servers: Optional[Any] = None
+
+
+import os
+import yaml
+
+
+def discover_subagents_from_dir(cwd: Optional[str]) -> Dict[str, AgentDefinition]:
+    """
+    Discover subagent definitions from .cursor/agents/*.md in cwd (or repo fallback),
+    parsing YAML frontmatter to extract curated tools and disallowed_tools.
+    """
+    discovered: Dict[str, AgentDefinition] = {}
+    search_dirs: List[str] = []
+    if cwd:
+        search_dirs.append(os.path.join(cwd, ".cursor", "agents"))
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+    repo_agents = os.path.join(repo_root, ".cursor", "agents")
+    if repo_agents not in search_dirs and os.path.isdir(repo_agents):
+        search_dirs.append(repo_agents)
+
+    for adir in search_dirs:
+        if not os.path.isdir(adir):
+            continue
+        for fname in sorted(os.listdir(adir)):
+            if not fname.endswith(".md"):
+                continue
+            fpath = os.path.join(adir, fname)
+            try:
+                with open(fpath, "r", encoding="utf-8") as f:
+                    content = f.read()
+                if not content.startswith("---"):
+                    continue
+                parts = content.split("---", 2)
+                if len(parts) < 3:
+                    continue
+                fm = yaml.safe_load(parts[1])
+                if not isinstance(fm, dict):
+                    continue
+                name = str(fm.get("name") or "").strip()
+                if not name or name in discovered:
+                    continue
+                desc = str(fm.get("description") or "").strip()
+                prompt_body = parts[2].strip()
+                raw_tools = fm.get("tools")
+                enable_write = fm.get("enable_write_tools")
+
+                mapped_tools: Set[str] = set()
+                if isinstance(raw_tools, list):
+                    for t in raw_tools:
+                        sdk_t = CURSOR_SESSION_TO_SDK_TOOL_MAP.get(str(t).strip().lower())
+                        if sdk_t and sdk_t in VALID_TOOLS:
+                            mapped_tools.add(sdk_t)
+
+                name_lower = name.lower()
+                if "runner-qa" in name_lower:
+                    sub_tools: Optional[List[str]] = []
+                    sub_disallowed: Optional[List[str]] = sorted(["edit", "glob", "grep", "read", "shell"])
+                elif "qa" in name_lower:
+                    sub_tools = sorted(list(mapped_tools - {"edit", "shell"}))
+                    sub_disallowed = ["edit", "shell"]
+                elif "runner-reviewer" in name_lower:
+                    sub_tools = ["read"]
+                    sub_disallowed = sorted(["edit", "glob", "grep", "shell"])
+                elif "reviewer" in name_lower or enable_write is False:
+                    sub_tools = sorted(list(mapped_tools - {"edit", "shell"}))
+                    sub_disallowed = ["edit", "shell"]
+                elif "runner-builder" in name_lower:
+                    sub_tools = sorted(list((mapped_tools | {"read", "edit", "grep", "glob"}) - {"shell", "task"}))
+                    sub_disallowed = ["shell"]
+                else:
+                    if isinstance(raw_tools, list):
+                        sub_tools = sorted(list(mapped_tools))
+                        sub_disallowed = sorted(list((VALID_TOOLS - {"task"}) - set(sub_tools)))
+                    else:
+                        sub_tools = sorted(list(VALID_TOOLS - {"task"}))
+                        sub_disallowed = []
+                        if enable_write is False:
+                            sub_tools = sorted(list(set(sub_tools) - {"edit", "shell"}))
+                            sub_disallowed = sorted(["edit", "shell"])
+
+                sub_def = AgentDefinition(description=desc, prompt=prompt_body, model="inherit")
+                setattr(sub_def, "tools", sub_tools)
+                setattr(sub_def, "disallowed_tools", sub_disallowed)
+                setattr(sub_def, "from_file", True)
+                discovered[name] = sub_def
+            except Exception:
+                continue
+
+    return discovered
 
 
 @dataclass
@@ -199,8 +313,9 @@ class FakeCursorSdkState:
                         msgs.append(SDKMessage("task", subagent=sub, status="completed", text=f"Subagent {sub} executed"))
                         msgs.append(SDKMessage("tool_call", name="task", status="completed", id=cid))
                     else:
-                        msgs.append(SDKMessage("tool_call", name=tool_name, status="started", args=tc.get("args", {}), id=cid))
-                        msgs.append(SDKMessage("tool_call", name=tool_name, status="completed", id=cid))
+                        sub = tc.get("subagent") or tc.get("subagent_name")
+                        msgs.append(SDKMessage("tool_call", name=tool_name, status="started", args=tc.get("args", {}), id=cid, subagent=sub))
+                        msgs.append(SDKMessage("tool_call", name=tool_name, status="completed", id=cid, subagent=sub))
                 cls._next_messages = msgs
 
     @classmethod
@@ -317,8 +432,47 @@ class Agent:
         self.is_closed = False
         self.tools = tools
         self.disallowed_tools = disallowed_tools
-        self.agents = agents or {}
+
+        if agents is not None:
+            self.agents = {}
+            for aname, adef in agents.items():
+                if not hasattr(adef, "tools"):
+                    # Unadorned inline AgentDefinition: gets platform default tools, losing file-based tool restrictions
+                    setattr(adef, "tools", sorted(list(VALID_TOOLS - {"task"})))
+                    setattr(adef, "disallowed_tools", [])
+                    setattr(adef, "from_file", False)
+                self.agents[aname] = adef
+        else:
+            cwd = (local.cwd if local else None) or os.getcwd()
+            self.agents = discover_subagents_from_dir(cwd)
         FakeCursorSdkState._agents[agent_id] = self
+
+    def is_tool_allowed(self, tool: str, subagent: Optional[str] = None) -> bool:
+        tool_norm = str(tool).strip().lower()
+        tool_name = CURSOR_SESSION_TO_SDK_TOOL_MAP.get(tool_norm, tool_norm)
+        if subagent:
+            sub_def = self.agents.get(subagent)
+            if not sub_def:
+                return False
+            disallowed = getattr(sub_def, "disallowed_tools", None) or []
+            if tool_name in disallowed:
+                return False
+            allowed = getattr(sub_def, "tools", None)
+            if allowed is not None:
+                return tool_name in allowed
+            return True
+        # Parent agent
+        if self.disallowed_tools and tool_name in self.disallowed_tools:
+            return False
+        if self.tools is not None:
+            return tool_name in self.tools
+        return True
+
+    def execute_tool(self, tool: str, subagent: Optional[str] = None) -> str:
+        if not self.is_tool_allowed(tool, subagent=subagent):
+            target = f"subagent '{subagent}'" if subagent else "parent agent"
+            raise ToolNotAllowedError(f"Tool '{tool}' is not permitted for {target}")
+        return f"Tool '{tool}' executed successfully"
 
     def close(self) -> None:
         self.is_closed = True
@@ -479,23 +633,42 @@ class Agent:
             effective_messages = list(custom_messages)
             if not any(getattr(m, "type", None) == "assistant" for m in effective_messages):
                 effective_messages.append(SDKMessage("assistant", text=text_result))
+            current_subagent = None
             for msg in effective_messages:
                 m_type = getattr(msg, "type", None)
                 sub_name = None
                 if m_type == "task":
                     sub_name = getattr(msg, "subagent", None)
-                elif m_type == "tool_call" and getattr(msg, "name", None) == "task":
+                    if sub_name:
+                        current_subagent = sub_name
+                        with FakeCursorSdkState._lock:
+                            if not any(e.get("subagent_name") == sub_name and e.get("agent_id") == self.agent_id for e in FakeCursorSdkState._executed_subagents):
+                                FakeCursorSdkState._executed_subagents.append({
+                                    "subagent_name": sub_name,
+                                    "agent_id": self.agent_id,
+                                    "prompt": message,
+                                    "subagent_def": (self.agents or {}).get(sub_name),
+                                })
+                elif m_type == "tool_call":
+                    tool_name = getattr(msg, "name", None)
                     args = getattr(msg, "args", {}) or {}
-                    sub_name = args.get("subagent") or args.get("subagent_name") or getattr(msg, "subagent", None)
-                if sub_name:
-                    with FakeCursorSdkState._lock:
-                        if not any(e.get("subagent_name") == sub_name and e.get("agent_id") == self.agent_id for e in FakeCursorSdkState._executed_subagents):
-                            FakeCursorSdkState._executed_subagents.append({
-                                "subagent_name": sub_name,
-                                "agent_id": self.agent_id,
-                                "prompt": message,
-                                "subagent_def": (self.agents or {}).get(sub_name),
-                            })
+                    if tool_name == "task":
+                        sub_name = args.get("subagent") or args.get("subagent_name") or getattr(msg, "subagent", None)
+                        if sub_name:
+                            current_subagent = sub_name
+                            with FakeCursorSdkState._lock:
+                                if not any(e.get("subagent_name") == sub_name and e.get("agent_id") == self.agent_id for e in FakeCursorSdkState._executed_subagents):
+                                    FakeCursorSdkState._executed_subagents.append({
+                                        "subagent_name": sub_name,
+                                        "agent_id": self.agent_id,
+                                        "prompt": message,
+                                        "subagent_def": (self.agents or {}).get(sub_name),
+                                    })
+                    elif tool_name:
+                        target_sub = getattr(msg, "subagent", None) or args.get("subagent") or current_subagent
+                        if not self.is_tool_allowed(tool_name, subagent=target_sub):
+                            setattr(msg, "status", "error")
+                            setattr(msg, "error", f"Tool '{tool_name}' is not permitted for {'subagent ' + str(target_sub) if target_sub else 'parent agent'}")
         else:
             effective_messages = [
                 SDKMessage("assistant", text=text_result),
