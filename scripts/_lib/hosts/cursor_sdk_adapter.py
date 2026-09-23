@@ -6,6 +6,7 @@ Enforces local runtime constraints, isolated sessions, deterministic identity bi
 and fail-closed workspace immutability for multi-agent flow orchestration.
 """
 from collections.abc import Mapping
+import logging
 import os
 import secrets
 import threading
@@ -13,6 +14,8 @@ import time
 from types import MappingProxyType
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 import uuid
+
+logger = logging.getLogger("cursor_sdk_adapter")
 
 from ..core.agent_schema import (
     AgentCancelledError,
@@ -223,7 +226,16 @@ class CursorSdkAdapter(BaseHostAdapter):
             ) if isinstance(request.extra_context, Mapping) else None
 
             if resume_id and hasattr(sdk.Agent, "resume"):
-                agent = sdk.Agent.resume(agent_id=str(resume_id), api_key=api_key)
+                resume_opts = None
+                if hasattr(sdk, "AgentOptions"):
+                    resume_opts = sdk.AgentOptions(api_key=api_key)
+                if resume_opts is not None:
+                    try:
+                        agent = sdk.Agent.resume(str(resume_id), options=resume_opts)
+                    except TypeError:
+                        agent = sdk.Agent.resume(str(resume_id), resume_opts)
+                else:
+                    agent = sdk.Agent.resume(str(resume_id))
             else:
                 if hasattr(sdk, "AgentOptions"):
                     agent_options = sdk.AgentOptions(

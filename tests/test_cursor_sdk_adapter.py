@@ -877,7 +877,17 @@ def test_cursor_sdk_strict_signatures_rejects_client_kwargs(tmp_path):
 
     with pytest.raises(TypeError) as exc2:
         fake_cursor_sdk.Agent.resume("ag_123", client=object())
-    assert "unexpected keyword argument 'client'" in str(exc2.value)
+    assert "unexpected keyword argument" in str(exc2.value)
+
+    # Reject api_key passed directly as keyword argument
+    with pytest.raises(TypeError) as exc3:
+        fake_cursor_sdk.Agent.resume("ag_123", api_key="secret")
+    assert "unexpected keyword argument" in str(exc3.value)
+
+    # Valid resume via options=AgentOptions(...)
+    resumed = fake_cursor_sdk.Agent.resume("ag_123", options=fake_cursor_sdk.AgentOptions(api_key="secret"))
+    assert resumed.agent_id == "ag_123"
+    assert resumed.api_key == "secret"
 
     # agent.send() must reject extra keyword arguments like prompt=, tools=, disallowed_tools=
     ag = fake_cursor_sdk.Agent.create("composer-2.5")
@@ -1012,6 +1022,35 @@ def test_cursor_sdk_timeout_thread_fully_joined(tmp_path):
     worker = session_data.get("worker")
     assert worker is not None
     assert not worker.is_alive()
+
+
+def test_cursor_sdk_timeout_thread_refuses_to_exit_logs_warning_and_raises_timeout(tmp_path, caplog):
+    """Verify that when a thread refuses to exit after timeout and cancellation,
+    the adapter logs a warning (without NameError on logger) and properly raises AgentTimeoutError."""
+    import logging
+    adapter = CursorSdkAdapter(is_real_host=False, default_model="composer-2.5", sdk_module=fake_cursor_sdk)
+    req = AgentRequest(
+        session_id="sess_timeout_refuse",
+        prompt="hang forever",
+        role="BUILDER",
+        workspace_dir=str(tmp_path),
+    )
+    handle = adapter.dispatch_agent(req)
+    session_data = adapter._running_sessions[handle.invocation_token]
+    run = session_data["run"]
+    run.delay_seconds = 4.0
+    run.refuse_cancel = True
+
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(AgentTimeoutError) as exc_info:
+            adapter.wait_for_result(handle, timeout_seconds=0.05)
+
+    assert "timed out after 0.05 seconds" in str(exc_info.value)
+    # Verify warning was logged by logger without crashing with NameError
+    assert "did not exit after grace period following run.cancel()" in caplog.text
+    worker = session_data.get("worker")
+    assert worker is not None
+    assert worker.is_alive()
 
 
 

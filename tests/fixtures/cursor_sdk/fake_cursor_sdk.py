@@ -112,6 +112,7 @@ class FakeCursorSdkState:
     _next_status: str = "finished"
     _next_error: Optional[Exception] = None
     _next_create_error: Optional[Exception] = None
+    _next_refuse_cancel: bool = False
     _on_send_hook: Optional[Callable[[str, "Agent"], None]] = None
     _runs: Dict[str, "Run"] = {}
     _agents: Dict[str, "Agent"] = {}
@@ -123,6 +124,7 @@ class FakeCursorSdkState:
             cls._next_status = "finished"
             cls._next_error = None
             cls._next_create_error = None
+            cls._next_refuse_cancel = False
             cls._on_send_hook = None
             cls._runs.clear()
             cls._agents.clear()
@@ -145,6 +147,11 @@ class FakeCursorSdkState:
             cls._next_create_error = exc
 
     @classmethod
+    def set_next_refuse_cancel(cls, refuse: bool = True) -> None:
+        with cls._lock:
+            cls._next_refuse_cancel = refuse
+
+    @classmethod
     def set_on_send_hook(cls, hook: Optional[Callable[[str, "Agent"], None]]) -> None:
         with cls._lock:
             cls._on_send_hook = hook
@@ -159,6 +166,7 @@ class Run:
         result: Optional[str] = None,
         error: Optional[CursorAgentError] = None,
         delay_seconds: float = 0.0,
+        refuse_cancel: bool = False,
     ):
         self.id = run_id
         self.agent_id = agent_id
@@ -166,6 +174,7 @@ class Run:
         self.result = result
         self.error = error
         self.delay_seconds = delay_seconds
+        self.refuse_cancel = refuse_cancel
         self.is_cancelled = False
         FakeCursorSdkState._runs[run_id] = self
 
@@ -210,8 +219,9 @@ class Run:
         )
 
     def cancel(self) -> None:
-        self.is_cancelled = True
-        self.status = "cancelled"
+        if not self.refuse_cancel:
+            self.is_cancelled = True
+            self.status = "cancelled"
 
 
 class CursorClient:
@@ -318,18 +328,23 @@ class Agent:
     def resume(
         cls,
         agent_id: str,
-        api_key: Optional[str] = None,
+        options: Optional[AgentOptions] = None,
         **kwargs: Any,
     ) -> "Agent":
-        if "client" in kwargs and kwargs["client"] is not None:
+        if kwargs:
             raise TypeError(
-                "Agent.resume() got an unexpected keyword argument 'client'. "
-                "Pass api_key directly to Agent.resume(agent_id=..., api_key=...)."
+                f"Agent.resume() got unexpected keyword argument(s): {list(kwargs.keys())}. "
+                "Official signature is Agent.resume(agent_id, options=AgentOptions(api_key=...))."
             )
+        if options is not None and not isinstance(options, AgentOptions):
+            raise TypeError(f"options must be an instance of AgentOptions, got {type(options).__name__}")
+        api_key = options.api_key if options else None
         with FakeCursorSdkState._lock:
             if agent_id in FakeCursorSdkState._agents:
                 agent = FakeCursorSdkState._agents[agent_id]
                 agent.is_closed = False
+                if api_key:
+                    agent.api_key = api_key
                 return agent
         return cls(agent_id=agent_id, model="resumed-model", api_key=api_key)
 
@@ -346,8 +361,10 @@ class Agent:
             resp = FakeCursorSdkState._next_response
             status = FakeCursorSdkState._next_status
             err = FakeCursorSdkState._next_error
+            refuse_cancel = FakeCursorSdkState._next_refuse_cancel
             # Clear one-shot errors
             FakeCursorSdkState._next_error = None
+            FakeCursorSdkState._next_refuse_cancel = False
 
         hook_result = None
         if hook:
@@ -356,7 +373,7 @@ class Agent:
         run_id = f"run_{uuid.uuid4().hex[:12]}"
         if err is not None:
             if isinstance(err, CursorAgentError):
-                return Run(run_id=run_id, agent_id=self.agent_id, status="error", error=err)
+                return Run(run_id=run_id, agent_id=self.agent_id, status="error", error=err, refuse_cancel=refuse_cancel)
             raise err
 
         if hook_result is not None:
@@ -365,7 +382,7 @@ class Agent:
             text_result = resp
         else:
             text_result = f"Mock execution complete for {self.agent_id}"
-        return Run(run_id=run_id, agent_id=self.agent_id, status=status, result=text_result)
+        return Run(run_id=run_id, agent_id=self.agent_id, status=status, result=text_result, refuse_cancel=refuse_cancel)
 
     @classmethod
     def get_run(cls, run_id: str, client: Optional[CursorClient] = None) -> Run:

@@ -24,54 +24,50 @@
   - `[T0027-N12] 2026-09-23 09:31:26` 进行中 -> 审查中（李开发 -> 周审查）
   - `[T0027-N13] 2026-09-23 09:31:29` 审查中 -> 测试中（周审查 -> 章测试）
   - `[T0027-N14] 2026-09-23 09:31:53` 测试中 -> 已完成（章测试 -> 严经理）
+  - `[T0027-N15] 2026-09-23 09:40:06` 已完成 -> 已退回（严经理，响应用户复核 Agent.resume 签名及超时未定义 logger 问题打回）
+  - `[T0027-N16] 2026-09-23 09:40:12` 已退回 -> 进行中（李开发，开工修复两项调用链问题）
+  - `[T0027-N17] 2026-09-23 09:47:20` 进行中 -> 审查中（李开发 -> 周审查）
+  - `[T0027-N18] 2026-09-23 09:47:23` 审查中 -> 测试中（周审查 -> 章测试）
+  - `[T0027-N19] 2026-09-23 09:47:33` 测试中 -> 已完成（章测试 -> 严经理）
 
 ---
 
-## 二、本次 4 项关键阻塞问题精准修复与改进
+## 二、本次两项关键调用链问题精准修复
 
-### 1. 真实 SDK `send()` 签名严苛对齐与 kwargs 拦截
-- **问题**：官方签名是 `send(message, options=SendOptions(...))`。之前调用传入 `prompt=...`、`tools=...`、`disallowed_tools=...`，在真实 SDK 上会抛出 `TypeError`。
+### 1. 严格对齐 `Agent.resume(agent_id, options=AgentOptions(api_key=...))` 官方签名
+- **根因**：官方接口定义为 `Agent.resume(agent_id, options=AgentOptions(api_key=...))`。此前适配器调用的是 `Agent.resume(agent_id=..., api_key=...)`，且 Fake SDK 把 `api_key` 作为关键字参数接收，导致测试虽通但真实 SDK 会在断点续跑时抛出 `TypeError: unexpected keyword argument 'api_key'`。
 - **解决**：
-  - 在 [`tests/fixtures/cursor_sdk/fake_cursor_sdk.py`](file:///c:/Users/user/Desktop/Project/user/multi-agent-flow/tests/fixtures/cursor_sdk/fake_cursor_sdk.py)：方法签名改为 `def send(self, message: str, options: Optional[SendOptions] = None, **kwargs: Any) -> Run:`，并在接收到非法 `kwargs` 时严格抛出 `TypeError`。
-  - 在 [`scripts/_lib/hosts/cursor_sdk_adapter.py`](file:///c:/Users/user/Desktop/Project/user/multi-agent-flow/scripts/_lib/hosts/cursor_sdk_adapter.py)：调用方式重构为 `agent.send(request.prompt, options=send_opts)`，彻底移除 `send()` 中的多余参数。
+  - 在 [`tests/fixtures/cursor_sdk/fake_cursor_sdk.py`](file:///c:/Users/user/Desktop/Project/user/multi-agent-flow/tests/fixtures/cursor_sdk/fake_cursor_sdk.py)：
+    - 将 `Agent.resume` 签名修改为 `resume(cls, agent_id: str, options: Optional[AgentOptions] = None, **kwargs: Any) -> "Agent"`；
+    - 对任何额外的关键字参数（包括非法传入的 `api_key=...`、`client=...` 等）严格拦截并抛出 `TypeError`；
+    - 校验 `options` 必须为 `AgentOptions` 实例；
+  - 在 [`scripts/_lib/hosts/cursor_sdk_adapter.py`](file:///c:/Users/user/Desktop/Project/user/multi-agent-flow/scripts/_lib/hosts/cursor_sdk_adapter.py)：
+    - 恢复断点 Agent 时，构造 `resume_opts = sdk.AgentOptions(api_key=api_key)` 并调用 `sdk.Agent.resume(str(resume_id), options=resume_opts)`；
+  - 在 [`tests/test_cursor_sdk_adapter.py`](file:///c:/Users/user/Desktop/Project/user/multi-agent-flow/tests/test_cursor_sdk_adapter.py)：
+    - 显式验证 `Agent.resume("ag_123", api_key="secret")` 会抛出 `TypeError`；
+    - 验证通过 `AgentOptions(api_key=...)` 恢复的正确性。
 
-### 2. 只读工具规范（小写名称 + `AgentOptions` 创建时配置 + `BadRequestError` 校验）
-- **问题**：官方工具名是小写 `read`、`grep`、`shell`、`edit`，未知名称会在创建时返回 `BadRequestError`。此前传入大写工具名且传给 `send()`，在真实 SDK 上既未生效又会失败。
-- **解决**：
-  - 在 [`tests/fixtures/cursor_sdk/fake_cursor_sdk.py`](file:///c:/Users/user/Desktop/Project/user/multi-agent-flow/tests/fixtures/cursor_sdk/fake_cursor_sdk.py)：定义 `VALID_TOOLS = {"read", "grep", "shell", "edit"}`，在 `AgentOptions` 初始化或 `Agent.create` 阶段，对任何非法工具名（如大写 `Edit`、`Bash` 等）统一抛出 `BadRequestError`。
-  - 在 [`scripts/_lib/hosts/cursor_sdk_adapter.py`](file:///c:/Users/user/Desktop/Project/user/multi-agent-flow/scripts/_lib/hosts/cursor_sdk_adapter.py)：将工具限制移至 `Agent.create(AgentOptions(...))` 阶段：
-    - `REVIEWER`：`tools=["read", "grep"]`，`disallowed_tools=["edit", "shell"]`；
-    - `QA`：`tools=[]`（文本专用模式），`disallowed_tools=["edit", "shell"]`；
-    - `BUILDER`：默认全开放（`tools=None`, `disallowed_tools=None`）。
-
-### 3. 断点续跑绑定真实 Cursor `agent_id`
-- **问题**：Runner 此前将内部 session ID（形如 `sess_builder_runner_...`）存入 `builder_session_id` 并传给 `resume_agent_id`，而官方 `Agent.resume()` 需要的是 Cursor 生成的 `agent.agent_id`。
-- **解决**：
-  - 在 [`scripts/_lib/hosts/cursor_sdk_adapter.py`](file:///c:/Users/user/Desktop/Project/user/multi-agent-flow/scripts/_lib/hosts/cursor_sdk_adapter.py)：提供 `get_agent_id(handle)` 提取底层真实 `canonical_agent_id`，同时在 `AgentResult.partial_results` 中记录 `agent_id`。
-  - 在 [`scripts/_lib/core/production_runner.py`](file:///c:/Users/user/Desktop/Project/user/multi-agent-flow/scripts/_lib/core/production_runner.py)：
-    - 在 Builder 派发成功后及完成开发后，自动提取底层真实 `host_agent_id`（以 `ag_` 开头），并固化至 `checkpoint.builder_session_id`；
-    - 在 `runner.resume()` 唤醒 Builder 时，将固化的真实 `agent.agent_id` 注入 `resume_agent_id`，实现真正的官方 `Agent.resume(agent_id="ag_...")` 闭环续跑；
-    - 专项测试显式断言 `resume_agent_id == prior_cursor_agent_id` 且以 `ag_` 开头。
-
-### 4. 超时后有界优雅 Join 彻底终结后台线程
-- **问题**：超时只等待 `join(0.2)`，若 `run.wait()` 未及时响应 `run.cancel()`，后台 daemon 线程会残留在 Runner 进程中。
+### 2. 补全 logging 导入与守护线程超时拒绝退出场景治理
+- **根因**：`cursor_sdk_adapter.py` 遗漏了 `import logging`。当超时发生且守护线程在 2 秒宽限期内未退出时，调用 `logger.warning(...)` 会触发 `NameError: name 'logger' is not defined`，导致覆盖原本应抛出的 `AgentTimeoutError`；且单元测试未覆盖线程拒绝退出或取消延迟的情况。
 - **解决**：
   - 在 [`scripts/_lib/hosts/cursor_sdk_adapter.py`](file:///c:/Users/user/Desktop/Project/user/multi-agent-flow/scripts/_lib/hosts/cursor_sdk_adapter.py)：
-    - 超时发生时，主动触发 `run.cancel()` 与 `agent.close()`；
-    - 启动有界递增轮询 join（步长 0.05s，最多持续等待 2.0s），确保 `run.wait()` 收到取消信号后立即退出，主线程确认线程终结后再抛出 `AgentTimeoutError`；
-    - 在 `cancel_agent()` 中同步加入 worker 优雅 join；
-  - 编写 `test_cursor_sdk_timeout_thread_fully_joined`，断言超时后 `worker.is_alive() is False`。
+    - 显式导入 `import logging` 并声明 `logger = logging.getLogger("cursor_sdk_adapter")`；
+  - 在 [`tests/fixtures/cursor_sdk/fake_cursor_sdk.py`](file:///c:/Users/user/Desktop/Project/user/multi-agent-flow/tests/fixtures/cursor_sdk/fake_cursor_sdk.py)：
+    - 在 `Run` 和 `FakeCursorSdkState` 中支持 `refuse_cancel` 模拟机制，允许构造在收到 `run.cancel()` 后仍不退出的工作线程；
+  - 在 [`tests/test_cursor_sdk_adapter.py`](file:///c:/Users/user/Desktop/Project/user/multi-agent-flow/tests/test_cursor_sdk_adapter.py)：
+    - 编写专项测试 `test_cursor_sdk_timeout_thread_refuses_to_exit_logs_warning_and_raises_timeout`；
+    - 验证线程拒绝退出时：适配器不抛 `NameError`，准确记录 `logger.warning` 日志，并正确抛出 `AgentTimeoutError`。
 
 ---
 
 ## 三、测试与验证结论
 
 1. **CursorSdkAdapter 专项测试**：
-   - 执行：`pytest tests/test_cursor_sdk_adapter.py -v`
-   - 结果：**25 passed in 11.41s (100% 全部通过)**。
+   - 执行：`python -m pytest tests/test_cursor_sdk_adapter.py -v`
+   - 结果：**26 passed in 12.94s (100% 全部通过)**。
 2. **全量回归测试**：
-   - 执行：`pytest tests/ -q`
-   - 结果：**628 passed in 145.60s (100% 全部通过，无任何回归问题)**。
+   - 执行：`python -m pytest tests/ -q`
+   - 结果：**629 passed in 159.73s (100% 全部通过，无任何回归问题)**。
 3. **安全与密钥扫描**：
    - 执行：`python scripts/check_secrets.py`
    - 结果：**PASS**，未发现硬编码凭据与密钥泄露风险。
@@ -80,11 +76,11 @@
 
 ## 四、后续操作：用户人工最终验收
 
-遵照您的明确要求：**本助手绝不执行自动验收**。任务卡 `T0027` 当前停留在 **【已完成】** 状态（Assignee: 严经理）。
+遵照您的明确要求：**本助手绝不执行自动验收**。任务卡 `T0027` 当前停留在 **【已完成】** 状态（Assignee: 严经理，节点: `T0027-N19`）。
 
 在您人工核对代码提交与测试结果完毕后，您可在终端执行以下标准流转指令完成最终验收闭环：
 
 ```bash
 # 执行最终验收（--end-time 必填）
-python scripts/transition_task.py --role PM --from-status 已完成 --to-status 已验收 --task-id T0027 --assignee 严经理 --end-time "2026-09-23 09:35:00"
+python scripts/transition_task.py --role PM --from-status 已完成 --to-status 已验收 --task-id T0027 --assignee 严经理 --end-time "2026-09-23 09:50:00"
 ```
