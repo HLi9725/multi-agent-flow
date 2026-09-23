@@ -503,12 +503,73 @@ class CursorSdkAdapter(BaseHostAdapter):
         """Map SDK errors during dispatch to typed framework exceptions."""
         exc_name = type(exc).__name__
         msg = str(exc)
-        if "Authentication" in exc_name or "unauthorized" in msg.lower():
+        is_retryable = getattr(exc, "is_retryable", False)
+        retry_after = getattr(exc, "retry_after", None)
+        status_code = getattr(exc, "status_code", None)
+
+        if is_retryable or status_code in (429, 502, 503, 504):
+            if retry_after is not None:
+                try:
+                    time.sleep(min(float(retry_after), 5.0))
+                except Exception:
+                    pass
+            raise RuntimeError(
+                f"transient_cursor_host_failure: 503 service unavailable or 429 rate limit exceeded: {msg}"
+            ) from exc
+
+        if "Authentication" in exc_name or status_code == 401 or "unauthorized" in msg.lower():
             raise AgentNotSupportedError(f"Cursor authentication failed: {msg}") from exc
         if "Configuration" in exc_name:
             raise AgentNotSupportedError(f"Cursor configuration error: {msg}") from exc
-        if "BadRequest" in exc_name:
+        if "BadRequest" in exc_name or status_code == 400:
             raise AgentNotSupportedError(f"Cursor bad request error: {msg}") from exc
+
+    def _extract_assistant_text(self, collected_messages: Sequence[Any]) -> str:
+        """
+        Extract assistant response text from official run.messages() stream.
+        Handles official message structure: message.type == 'assistant' with
+        message.message.content containing text blocks, with defensive fallbacks.
+        """
+        def _get_val(obj: Any, *keys: str, default: Any = None) -> Any:
+            for k in keys:
+                if isinstance(obj, Mapping):
+                    if k in obj and obj[k] is not None:
+                        return obj[k]
+                elif hasattr(obj, k):
+                    v = getattr(obj, k)
+                    if v is not None:
+                        return v
+            return default
+
+        text_pieces: List[str] = []
+        for msg in (collected_messages or []):
+            msg_type = str(_get_val(msg, "type", default="") or "").lower()
+            if msg_type != "assistant":
+                continue
+
+            inner_msg = _get_val(msg, "message", default=None)
+            target = inner_msg if inner_msg is not None else msg
+            content = _get_val(target, "content", default=None)
+
+            msg_extracted: List[str] = []
+            if isinstance(content, str) and content.strip():
+                msg_extracted.append(content)
+            elif isinstance(content, (list, tuple)):
+                for block in content:
+                    b_type = str(_get_val(block, "type", default="") or "").lower()
+                    if b_type == "text":
+                        b_text = _get_val(block, "text", default="")
+                        if b_text and str(b_text).strip():
+                            msg_extracted.append(str(b_text))
+            if not msg_extracted:
+                raw_text = _get_val(msg, "text", default="") or _get_val(target, "text", default="")
+                if raw_text and str(raw_text).strip():
+                    msg_extracted.append(str(raw_text))
+
+            if msg_extracted:
+                text_pieces.append("".join(msg_extracted))
+
+        return "\n".join(text_pieces).strip()
 
     def _extract_gate_events(
         self,
@@ -548,59 +609,95 @@ class CursorSdkAdapter(BaseHostAdapter):
 
         current_subagent = None
 
+        def _process_tool_invocation(
+            raw_tool: str,
+            args: Any,
+            call_id: str,
+            status: str,
+            msg_err: Any,
+            sub_sender: Optional[str] = None,
+        ):
+            nonlocal current_subagent
+            if not raw_tool:
+                return
+            tool_name = CURSOR_SESSION_TO_SDK_TOOL_MAP.get(raw_tool, raw_tool)
+
+            if call_id:
+                if call_id in seen_call_ids:
+                    return
+                seen_call_ids.add(call_id)
+            elif status == "completed" and tool_name in seen_tool_invocations:
+                return
+
+            if status in ("started", "") or not call_id:
+                seen_tool_invocations.add(tool_name)
+
+            if tool_name and sub_tools_set is not None:
+                if tool_name not in sub_tools_set:
+                    parent_prohibited_calls.append(tool_name)
+                return
+
+            if tool_name == "task":
+                target_sub = (
+                    _get_val(args, "subagent", "subagent_name", "subagent_type", "agent", "name", "type", default="")
+                    or sub_sender
+                    or ""
+                )
+                sub_str = str(target_sub).strip()
+                task_calls.append(sub_str)
+                current_subagent = sub_str
+            elif tool_name:
+                msg_subagent = sub_sender or current_subagent
+                if msg_subagent or task_calls:
+                    if status == "error" or msg_err:
+                        subagent_violations.append(
+                            f"Tool '{raw_tool}' call failed with error: {msg_err or 'status=error'}"
+                        )
+                    sub_label = msg_subagent or expected_subagent or "subagent"
+                    if tool_name in sub_disallowed_set:
+                        subagent_violations.append(
+                            f"Subagent '{sub_label}' attempted prohibited tool '{tool_name}'"
+                        )
+                    elif sub_tools_set is not None and tool_name not in sub_tools_set:
+                        subagent_violations.append(
+                            f"Subagent '{sub_label}' attempted unauthorized tool '{tool_name}'. Allowed: {sorted(list(sub_tools_set))}"
+                        )
+                else:
+                    parent_prohibited_calls.append(tool_name)
+
         for msg in (collected_messages or []):
             msg_type = str(_get_val(msg, "type", default="") or "").lower()
             call_id = str(_get_val(msg, "id", "call_id", default="") or "")
             status = str(_get_val(msg, "status", default="") or "").lower()
             msg_err = _get_val(msg, "error", "error_message", default="")
 
-            if msg_type == "tool_call":
+            if msg_type in ("tool_call", "tool_use"):
                 raw_tool = str(_get_val(msg, "name", "tool", "tool_name", default="") or "").lower()
-                tool_name = CURSOR_SESSION_TO_SDK_TOOL_MAP.get(raw_tool, raw_tool)
-                args = _get_val(msg, "args", "arguments", default={}) or {}
+                args = _get_val(msg, "args", "arguments", "input", default={}) or {}
+                sub_sender = _get_val(msg, "subagent", "author", "sender", default="")
+                _process_tool_invocation(raw_tool, args, call_id, status, msg_err, sub_sender=sub_sender)
 
-                # Deduplicate completed event for the same call
-                if call_id:
-                    if call_id in seen_call_ids:
-                        continue
-                    seen_call_ids.add(call_id)
-                elif status == "completed" and tool_name in seen_tool_invocations:
-                    continue
-
-                if status in ("started", "") or not call_id:
-                    seen_tool_invocations.add(tool_name)
-
-                if tool_name and sub_tools_set is not None:
-                    if tool_name not in sub_tools_set:
-                        parent_prohibited_calls.append(tool_name)
-                    continue
-
-                if tool_name == "task":
-                    target_sub = (
-                        _get_val(args, "subagent", "subagent_name", "subagent_type", "agent", "name", "type", default="")
-                        or _get_val(msg, "subagent", "target", default="")
+            elif msg_type == "tool_result":
+                is_err = _get_val(msg, "is_error", default=False)
+                if status == "error" or msg_err or is_err:
+                    subagent_violations.append(
+                        f"Tool execution failed: {msg_err or 'status=error'}"
                     )
-                    sub_str = str(target_sub).strip()
-                    task_calls.append(sub_str)
-                    current_subagent = sub_str
-                elif tool_name:
-                    msg_subagent = _get_val(msg, "subagent", "author", "sender", default="") or current_subagent
-                    if msg_subagent or task_calls:
-                        if status == "error" or msg_err:
-                            subagent_violations.append(
-                                f"Tool '{raw_tool}' call failed with error: {msg_err or 'status=error'}"
-                            )
-                        sub_label = msg_subagent or expected_subagent or "subagent"
-                        if tool_name in sub_disallowed_set:
-                            subagent_violations.append(
-                                f"Subagent '{sub_label}' attempted prohibited tool '{tool_name}'"
-                            )
-                        elif sub_tools_set is not None and tool_name not in sub_tools_set:
-                            subagent_violations.append(
-                                f"Subagent '{sub_label}' attempted unauthorized tool '{tool_name}'. Allowed: {sorted(list(sub_tools_set))}"
-                            )
-                    else:
-                        parent_prohibited_calls.append(tool_name)
+
+            elif msg_type == "assistant":
+                inner_msg = _get_val(msg, "message", default=None)
+                target = inner_msg if inner_msg is not None else msg
+                content = _get_val(target, "content", default=None)
+                if isinstance(content, (list, tuple)):
+                    for block in content:
+                        b_type = str(_get_val(block, "type", default="") or "").lower()
+                        if b_type in ("tool_use", "tool_call"):
+                            raw_tool = str(_get_val(block, "name", "tool", "tool_name", default="") or "").lower()
+                            b_args = _get_val(block, "input", "args", "arguments", default={}) or {}
+                            b_id = str(_get_val(block, "id", "call_id", default="") or "")
+                            b_status = str(_get_val(block, "status", default="") or "").lower()
+                            b_err = _get_val(block, "error", "error_message", default="")
+                            _process_tool_invocation(raw_tool, b_args, b_id, b_status, b_err)
 
             elif msg_type == "task":
                 target_sub = (
@@ -701,168 +798,169 @@ class CursorSdkAdapter(BaseHostAdapter):
             except Exception as e:
                 run_exc_holder.append(e)
 
-        worker = threading.Thread(
-            target=_wait_target,
-            name=f"cursor_sdk_wait_{run_id}",
-            daemon=True,
-        )
-        with self._lock:
-            session_data["worker"] = worker
-        worker.start()
-        worker.join(timeout=timeout)
+        try:
+            worker = threading.Thread(
+                target=_wait_target,
+                name=f"cursor_sdk_wait_{run_id}",
+                daemon=True,
+            )
+            with self._lock:
+                session_data["worker"] = worker
+            worker.start()
+            worker.join(timeout=timeout)
 
-        if worker.is_alive():
-            # Timed out! Proactively cancel run and close agent to interrupt socket/subprocess
-            try:
-                run.cancel()
-            except Exception:
-                pass
+            if worker.is_alive():
+                # Timed out! Proactively cancel run and close agent to interrupt socket/subprocess
+                try:
+                    run.cancel()
+                except Exception:
+                    pass
+                if agent is not None and hasattr(agent, "close") and callable(agent.close):
+                    try:
+                        agent.close()
+                    except Exception:
+                        pass
+                # Bounded grace join: check repeatedly up to 2.0s to ensure thread exits cleanly
+                grace_deadline = time.monotonic() + 2.0
+                while worker.is_alive() and time.monotonic() < grace_deadline:
+                    worker.join(timeout=0.05)
+                if worker.is_alive():
+                    logger.warning(
+                        f"Cursor SDK worker thread {worker.name} did not exit after grace period following run.cancel()"
+                    )
+                raise AgentTimeoutError(f"Cursor SDK run timed out after {timeout} seconds")
+
+            if run_exc_holder:
+                return self._finalize_run_exception(handle, session_data, run, agent, run_exc_holder[0])
+
+            if not run_result_holder:
+                raise AgentTimeoutError(f"Cursor SDK run produced no result within {timeout} seconds")
+
+            run_result = run_result_holder[0]
+
+            # Post-wait fallback if streaming was unconsumed
+            if not collected_messages and hasattr(run, "messages"):
+                try:
+                    m_iter = run.messages() if callable(run.messages) else run.messages
+                    if m_iter is not None:
+                        for msg in m_iter:
+                            collected_messages.append(msg)
+                except Exception:
+                    pass
+
+            status_str = getattr(run_result, "status", "finished").lower()
+            assistant_output = self._extract_assistant_text(collected_messages)
+            output_text = assistant_output or getattr(run_result, "result", "") or ""
+
+            expected_subagent = session_data.get("expected_subagent")
+            expected_tools = session_data.get("expected_subagent_tools")
+            expected_disallowed = session_data.get("expected_subagent_disallowed")
+
+            task_calls, prohibited_tool_calls, subagent_violations = self._extract_gate_events(
+                collected_messages,
+                run,
+                run_result,
+                expected_subagent=expected_subagent,
+                expected_subagent_tools=expected_tools,
+                expected_subagent_disallowed=expected_disallowed,
+            )
+
+            if subagent_violations or prohibited_tool_calls:
+                if subagent_violations:
+                    err_detail = (
+                        f"Subagent '{expected_subagent}' tool restriction gate violated: "
+                        f"{'; '.join(subagent_violations)}"
+                    )
+                else:
+                    err_detail = (
+                        f"Agent violated the role tool allowlist: used prohibited tool(s) {prohibited_tool_calls}."
+                    )
+                res = AgentResult(
+                    session_id=handle.session_id,
+                    status=AgentStatus.FAILED,
+                    output="",
+                    error_message=err_detail,
+                    is_real_host=self._is_real_host,
+                )
+            elif status_str == "cancelled":
+                res = AgentResult(
+                    session_id=handle.session_id,
+                    status=AgentStatus.CANCELLED,
+                    output="",
+                    error_message="Cursor Run was cancelled",
+                    is_real_host=self._is_real_host,
+                )
+            elif status_str == "error":
+                err_detail = None
+                if subagent_violations:
+                    err_detail = f"Subagent '{expected_subagent}' tool restriction gate violated: {'; '.join(subagent_violations)}"
+                elif prohibited_tool_calls:
+                    err_detail = f"Parent agent violated tool restriction gate: used prohibited tool(s) {prohibited_tool_calls}"
+                else:
+                    err_detail = getattr(run_result, "error", None) or output_text or "Cursor Run completed with error status"
+                res = AgentResult(
+                    session_id=handle.session_id,
+                    status=AgentStatus.FAILED,
+                    output=output_text,
+                    error_message=str(err_detail),
+                    is_real_host=self._is_real_host,
+                )
+            elif status_str == "expired":
+                res = AgentResult(
+                    session_id=handle.session_id,
+                    status=AgentStatus.TIMEOUT,
+                    output=output_text,
+                    error_message="Cursor Run expired",
+                    is_real_host=self._is_real_host,
+                )
+            else:
+                gate_error = None
+                if subagent_violations:
+                    gate_error = (
+                        f"Subagent '{expected_subagent}' tool restriction gate violated: {'; '.join(subagent_violations)}"
+                    )
+                elif prohibited_tool_calls:
+                    gate_error = (
+                        f"Agent violated the role tool allowlist: used prohibited tool(s) {prohibited_tool_calls}."
+                    )
+
+                if gate_error:
+                    res = AgentResult(
+                        session_id=handle.session_id,
+                        status=AgentStatus.FAILED,
+                        output="",
+                        error_message=gate_error,
+                        is_real_host=self._is_real_host,
+                    )
+                else:
+                    res = AgentResult(
+                        session_id=handle.session_id,
+                        status=AgentStatus.SUCCESS,
+                        output=output_text,
+                        partial_results=(
+                            {
+                                "invocation_id": run_id,
+                                "host_invocation_id": run_id,
+                                "agent_id": agent_id,
+                                "subagent": expected_subagent,
+                            },
+                        ),
+                        is_real_host=self._is_real_host,
+                    )
+
+            with self._lock:
+                session_data["completed"] = True
+                session_data["result"] = res
+                self._session_history[handle.invocation_token] = session_data
+                self._running_sessions.pop(handle.invocation_token, None)
+
+            return res
+        finally:
             if agent is not None and hasattr(agent, "close") and callable(agent.close):
                 try:
                     agent.close()
                 except Exception:
                     pass
-            # Bounded grace join: check repeatedly up to 2.0s to ensure thread exits cleanly
-            grace_deadline = time.monotonic() + 2.0
-            while worker.is_alive() and time.monotonic() < grace_deadline:
-                worker.join(timeout=0.05)
-            if worker.is_alive():
-                logger.warning(
-                    f"Cursor SDK worker thread {worker.name} did not exit after grace period following run.cancel()"
-                )
-            raise AgentTimeoutError(f"Cursor SDK run timed out after {timeout} seconds")
-
-        if run_exc_holder:
-            return self._finalize_run_exception(handle, session_data, run, agent, run_exc_holder[0])
-
-        if not run_result_holder:
-            raise AgentTimeoutError(f"Cursor SDK run produced no result within {timeout} seconds")
-
-        run_result = run_result_holder[0]
-
-        # Post-wait fallback if streaming was unconsumed
-        if not collected_messages and hasattr(run, "messages"):
-            try:
-                m_iter = run.messages() if callable(run.messages) else run.messages
-                if m_iter is not None:
-                    for msg in m_iter:
-                        collected_messages.append(msg)
-            except Exception:
-                pass
-
-        # Ensure agent resources are closed upon completion
-        if agent is not None and hasattr(agent, "close") and callable(agent.close):
-            try:
-                agent.close()
-            except Exception:
-                pass
-
-        status_str = getattr(run_result, "status", "finished").lower()
-        output_text = getattr(run_result, "result", "") or ""
-
-        expected_subagent = session_data.get("expected_subagent")
-        expected_tools = session_data.get("expected_subagent_tools")
-        expected_disallowed = session_data.get("expected_subagent_disallowed")
-
-        task_calls, prohibited_tool_calls, subagent_violations = self._extract_gate_events(
-            collected_messages,
-            run,
-            run_result,
-            expected_subagent=expected_subagent,
-            expected_subagent_tools=expected_tools,
-            expected_subagent_disallowed=expected_disallowed,
-        )
-
-        if subagent_violations or prohibited_tool_calls:
-            if subagent_violations:
-                err_detail = (
-                    f"Subagent '{expected_subagent}' tool restriction gate violated: "
-                    f"{'; '.join(subagent_violations)}"
-                )
-            else:
-                err_detail = (
-                    f"Agent violated the role tool allowlist: used prohibited tool(s) {prohibited_tool_calls}."
-                )
-            res = AgentResult(
-                session_id=handle.session_id,
-                status=AgentStatus.FAILED,
-                output="",
-                error_message=err_detail,
-                is_real_host=self._is_real_host,
-            )
-        elif status_str == "cancelled":
-            res = AgentResult(
-                session_id=handle.session_id,
-                status=AgentStatus.CANCELLED,
-                output="",
-                error_message="Cursor Run was cancelled",
-                is_real_host=self._is_real_host,
-            )
-        elif status_str == "error":
-            err_detail = None
-            if subagent_violations:
-                err_detail = f"Subagent '{expected_subagent}' tool restriction gate violated: {'; '.join(subagent_violations)}"
-            elif prohibited_tool_calls:
-                err_detail = f"Parent agent violated tool restriction gate: used prohibited tool(s) {prohibited_tool_calls}"
-            else:
-                err_detail = getattr(run_result, "error", None) or output_text or "Cursor Run completed with error status"
-            res = AgentResult(
-                session_id=handle.session_id,
-                status=AgentStatus.FAILED,
-                output=output_text,
-                error_message=str(err_detail),
-                is_real_host=self._is_real_host,
-            )
-        elif status_str == "expired":
-            res = AgentResult(
-                session_id=handle.session_id,
-                status=AgentStatus.TIMEOUT,
-                output=output_text,
-                error_message="Cursor Run expired",
-                is_real_host=self._is_real_host,
-            )
-        else:
-            gate_error = None
-            if subagent_violations:
-                gate_error = (
-                    f"Subagent '{expected_subagent}' tool restriction gate violated: {'; '.join(subagent_violations)}"
-                )
-            elif prohibited_tool_calls:
-                gate_error = (
-                    f"Agent violated the role tool allowlist: used prohibited tool(s) {prohibited_tool_calls}."
-                )
-
-            if gate_error:
-                res = AgentResult(
-                    session_id=handle.session_id,
-                    status=AgentStatus.FAILED,
-                    output="",
-                    error_message=gate_error,
-                    is_real_host=self._is_real_host,
-                )
-            else:
-                res = AgentResult(
-                    session_id=handle.session_id,
-                    status=AgentStatus.SUCCESS,
-                    output=output_text,
-                    partial_results=(
-                        {
-                            "invocation_id": run_id,
-                            "host_invocation_id": run_id,
-                            "agent_id": agent_id,
-                            "subagent": expected_subagent,
-                        },
-                    ),
-                    is_real_host=self._is_real_host,
-                )
-
-        with self._lock:
-            session_data["completed"] = True
-            session_data["result"] = res
-            self._session_history[handle.invocation_token] = session_data
-            self._running_sessions.pop(handle.invocation_token, None)
-
-        return res
 
     def _finalize_run_exception(
         self,
@@ -877,6 +975,7 @@ class CursorSdkAdapter(BaseHostAdapter):
         msg = str(exc)
         is_retryable = getattr(exc, "is_retryable", False)
         status_code = getattr(exc, "status_code", None)
+        retry_after = getattr(exc, "retry_after", None)
 
         if "Timeout" in exc_type:
             try:
@@ -886,6 +985,11 @@ class CursorSdkAdapter(BaseHostAdapter):
             raise AgentTimeoutError(f"Cursor SDK run timed out: {msg}") from exc
 
         if is_retryable or status_code in (429, 502, 503, 504) or "rate limit" in msg.lower():
+            if retry_after is not None:
+                try:
+                    time.sleep(min(float(retry_after), 5.0))
+                except Exception:
+                    pass
             err_msg = f"transient_cursor_host_failure: 429 rate limit exceeded or server temporarily unavailable: {msg}"
         elif "Authentication" in exc_type or status_code == 401 or "unauthorized" in msg.lower():
             err_msg = f"Cursor authentication failed (unauthorized): {msg}"

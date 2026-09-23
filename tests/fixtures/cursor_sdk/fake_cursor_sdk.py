@@ -217,12 +217,37 @@ class SendOptions:
     pass
 
 
+@dataclass
+class TextBlock:
+    text: str
+    type: str = "text"
+
+
+@dataclass
+class ToolUseBlock:
+    id: str
+    name: str
+    input: Dict[str, Any] = field(default_factory=dict)
+    type: str = "tool_use"
+    status: str = "completed"
+    error: Optional[str] = None
+
+
+@dataclass
+class AssistantPayload:
+    content: List[Any] = field(default_factory=list)
+
+
 class SDKMessage:
     """Represents a message or event in official cursor-sdk run.messages() stream."""
     def __init__(self, msg_type: str, **kwargs: Any):
         self.type = msg_type
         for k, v in kwargs.items():
             setattr(self, k, v)
+        if msg_type == "assistant":
+            if not hasattr(self, "message"):
+                text = getattr(self, "text", "") or ""
+                self.message = AssistantPayload(content=[TextBlock(text=str(text))])
 
     def __repr__(self) -> str:
         attrs = {k: v for k, v in self.__dict__.items() if k != "type"}
@@ -640,11 +665,28 @@ class Agent:
         tool_violation_error = None
         if custom_messages is not None:
             effective_messages = list(custom_messages)
-            assistant_msg = next((m for m in effective_messages if getattr(m, "type", None) == "assistant" and getattr(m, "text", None)), None)
-            if assistant_msg is not None:
-                text_result = assistant_msg.text
-            else:
-                effective_messages.append(SDKMessage("assistant", text=text_result))
+            assistant_msg = None
+            for m in effective_messages:
+                if getattr(m, "type", None) == "assistant":
+                    inner_msg = getattr(m, "message", None)
+                    if inner_msg and hasattr(inner_msg, "content"):
+                        for block in inner_msg.content:
+                            if getattr(block, "type", None) == "text":
+                                text_result = getattr(block, "text", "")
+                                assistant_msg = m
+                                break
+                    if assistant_msg is None and getattr(m, "text", None):
+                        text_result = m.text
+                        assistant_msg = m
+                        break
+            if assistant_msg is None:
+                effective_messages.append(
+                    SDKMessage(
+                        "assistant",
+                        message=AssistantPayload(content=[TextBlock(text=text_result)]),
+                        text=text_result,
+                    )
+                )
             current_subagent = None
             for msg in effective_messages:
                 m_type = getattr(msg, "type", None)
@@ -661,9 +703,9 @@ class Agent:
                                     "prompt": message,
                                     "subagent_def": (self.agents or {}).get(sub_name),
                                 })
-                elif m_type == "tool_call":
-                    tool_name = getattr(msg, "name", None)
-                    args = getattr(msg, "args", {}) or {}
+                elif m_type in ("tool_call", "tool_use"):
+                    tool_name = getattr(msg, "name", None) or getattr(msg, "tool", None)
+                    args = getattr(msg, "args", {}) or getattr(msg, "input", {}) or {}
                     if tool_name and not self.is_tool_allowed(tool_name):
                         err_msg = f"Tool '{tool_name}' is not permitted for this agent"
                         setattr(msg, "status", "error")
@@ -689,9 +731,25 @@ class Agent:
                             setattr(msg, "status", "error")
                             setattr(msg, "error", err_msg)
                             tool_violation_error = err_msg
+                elif m_type == "assistant":
+                    inner_msg = getattr(msg, "message", None)
+                    if inner_msg and hasattr(inner_msg, "content"):
+                        for block in inner_msg.content:
+                            b_type = getattr(block, "type", None)
+                            if b_type in ("tool_use", "tool_call"):
+                                tool_name = getattr(block, "name", None)
+                                if tool_name and not self.is_tool_allowed(tool_name):
+                                    err_msg = f"Tool '{tool_name}' is not permitted for this agent"
+                                    setattr(block, "status", "error")
+                                    setattr(block, "error", err_msg)
+                                    tool_violation_error = err_msg
         else:
             effective_messages = [
-                SDKMessage("assistant", text=text_result),
+                SDKMessage(
+                    "assistant",
+                    message=AssistantPayload(content=[TextBlock(text=text_result)]),
+                    text=text_result,
+                ),
             ]
 
         if tool_violation_error is not None:

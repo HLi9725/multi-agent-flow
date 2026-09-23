@@ -1345,13 +1345,9 @@ def test_cursor_sdk_subagent_tool_rejection_and_inline_override(tmp_path, monkey
     monkeypatch.setenv("CURSOR_API_KEY", "test_key_gate_123")
     FakeCursorSdkState.reset()
 
-    # Set up .cursor/agents in tmp_path workspace so file discovery succeeds natively
-    repo_agents = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".cursor", "agents")
-    ws_agents = tmp_path / ".cursor" / "agents"
-    ws_agents.parent.mkdir(parents=True, exist_ok=True)
-    if os.path.isdir(repo_agents):
-        import shutil
-        shutil.copytree(repo_agents, str(ws_agents))
+    # Workspace directory without any .cursor directory: verifies .cursor is never copied
+    clean_workspace = tmp_path / "clean_ws"
+    clean_workspace.mkdir(parents=True, exist_ok=True)
 
     adapter = CursorSdkAdapter(is_real_host=True, sdk_module=fake_cursor_sdk)
 
@@ -1360,7 +1356,7 @@ def test_cursor_sdk_subagent_tool_rejection_and_inline_override(tmp_path, monkey
         session_id="test_rev_reject_edit",
         role="REVIEWER",
         prompt="Review code changes",
-        workspace_dir=str(tmp_path),
+        workspace_dir=str(clean_workspace),
         extra_context={"production_runner_managed": True, "cursor_model": "composer-2.5"},
     )
     FakeCursorSdkState.set_next_messages([
@@ -1376,7 +1372,7 @@ def test_cursor_sdk_subagent_tool_rejection_and_inline_override(tmp_path, monkey
         session_id="test_qa_reject_read",
         role="QA",
         prompt="Verify test execution",
-        workspace_dir=str(tmp_path),
+        workspace_dir=str(clean_workspace),
         extra_context={"production_runner_managed": True, "cursor_model": "composer-2.5"},
     )
     FakeCursorSdkState.set_next_messages([
@@ -1387,29 +1383,44 @@ def test_cursor_sdk_subagent_tool_rejection_and_inline_override(tmp_path, monkey
     assert result_qa.status == AgentStatus.FAILED
     assert "prohibited tool(s) ['read']" in result_qa.error_message
 
-    # 3. Reviewer using authorized 'read' tool succeeds through adapter
-    rev_ok_req = AgentRequest(
-        session_id="test_rev_pass_read",
-        role="REVIEWER",
-        prompt="Review code changes",
-        workspace_dir=str(tmp_path),
+    # 3. Builder attempting prohibited tool 'shell' fails through adapter gate
+    bld_shell_req = AgentRequest(
+        session_id="test_bld_reject_shell",
+        role="BUILDER",
+        prompt="Execute command",
+        workspace_dir=str(clean_workspace),
         extra_context={"production_runner_managed": True, "cursor_model": "composer-2.5"},
     )
     FakeCursorSdkState.set_next_messages([
-        fake_cursor_sdk.SDKMessage("tool_call", name="read", args={"path": "app.py"}),
-        fake_cursor_sdk.SDKMessage("assistant", text='{"decision": "PASS", "defects": [], "summary": "Looks good"}'),
+        fake_cursor_sdk.SDKMessage("tool_call", name="shell", args={"command": "rm -rf /"}),
     ])
-    handle_rev_ok = adapter.dispatch_agent(rev_ok_req)
-    result_rev_ok = adapter.wait_for_result(handle_rev_ok)
-    assert result_rev_ok.status == AgentStatus.SUCCESS
-    assert "decision" in result_rev_ok.output
+    handle_bld_shell = adapter.dispatch_agent(bld_shell_req)
+    result_bld_shell = adapter.wait_for_result(handle_bld_shell)
+    assert result_bld_shell.status == AgentStatus.FAILED
+    assert "prohibited tool(s) ['shell']" in result_bld_shell.error_message
 
-    # 4. Builder using authorized 'edit' and 'glob' tools succeeds through adapter
+    # 4. Builder attempting prohibited tool 'task' fails through adapter gate
+    bld_task_req = AgentRequest(
+        session_id="test_bld_reject_task",
+        role="BUILDER",
+        prompt="Delegate task",
+        workspace_dir=str(clean_workspace),
+        extra_context={"production_runner_managed": True, "cursor_model": "composer-2.5"},
+    )
+    FakeCursorSdkState.set_next_messages([
+        fake_cursor_sdk.SDKMessage("tool_call", name="task", args={"subagent": "flow-dev"}),
+    ])
+    handle_bld_task = adapter.dispatch_agent(bld_task_req)
+    result_bld_task = adapter.wait_for_result(handle_bld_task)
+    assert result_bld_task.status == AgentStatus.FAILED
+    assert "prohibited tool(s) ['task']" in result_bld_task.error_message
+
+    # 5. Builder using authorized 'edit' and 'glob' tools succeeds through adapter
     builder_ok_req = AgentRequest(
         session_id="test_bld_pass_edit_glob",
         role="BUILDER",
         prompt="Implement feature",
-        workspace_dir=str(tmp_path),
+        workspace_dir=str(clean_workspace),
         extra_context={"production_runner_managed": True, "cursor_model": "composer-2.5"},
     )
     FakeCursorSdkState.set_next_messages([
@@ -1421,6 +1432,75 @@ def test_cursor_sdk_subagent_tool_rejection_and_inline_override(tmp_path, monkey
     result_bld = adapter.wait_for_result(handle_bld)
     assert result_bld.status == AgentStatus.SUCCESS
 
+    # 6. Reviewer using authorized 'read' tool succeeds through adapter
+    rev_ok_req = AgentRequest(
+        session_id="test_rev_pass_read",
+        role="REVIEWER",
+        prompt="Review code changes",
+        workspace_dir=str(clean_workspace),
+        extra_context={"production_runner_managed": True, "cursor_model": "composer-2.5"},
+    )
+    FakeCursorSdkState.set_next_messages([
+        fake_cursor_sdk.SDKMessage("tool_call", name="read", args={"path": "app.py"}),
+        fake_cursor_sdk.SDKMessage("assistant", text='{"decision": "PASS", "defects": [], "summary": "Looks good"}'),
+    ])
+    handle_rev_ok = adapter.dispatch_agent(rev_ok_req)
+    result_rev_ok = adapter.wait_for_result(handle_rev_ok)
+    assert result_rev_ok.status == AgentStatus.SUCCESS
+    assert "decision" in result_rev_ok.output
+
+    # 7. Official nested message shape: AssistantPayload with TextBlock extracts into output
+    rev_official_req = AgentRequest(
+        session_id="test_rev_official_shape",
+        role="REVIEWER",
+        prompt="Review code changes with official shape",
+        workspace_dir=str(clean_workspace),
+        extra_context={"production_runner_managed": True, "cursor_model": "composer-2.5"},
+    )
+    official_json = '{"task_id": "T0001", "decision": "PASS", "defects": [], "summary": "Official schema pass"}'
+    FakeCursorSdkState.set_next_messages([
+        fake_cursor_sdk.SDKMessage(
+            "assistant",
+            message=fake_cursor_sdk.AssistantPayload(
+                content=[
+                    fake_cursor_sdk.TextBlock(text=official_json),
+                ]
+            ),
+        ),
+    ])
+    handle_official = adapter.dispatch_agent(rev_official_req)
+    result_official = adapter.wait_for_result(handle_official)
+    assert result_official.status == AgentStatus.SUCCESS
+    assert "Official schema pass" in result_official.output
+
+    # 8. Official nested message shape: Nested ToolUseBlock with prohibited tool is intercepted
+    rev_nested_tool_req = AgentRequest(
+        session_id="test_rev_nested_tool_violation",
+        role="REVIEWER",
+        prompt="Review code with nested tool violation",
+        workspace_dir=str(clean_workspace),
+        extra_context={"production_runner_managed": True, "cursor_model": "composer-2.5"},
+    )
+    FakeCursorSdkState.set_next_messages([
+        fake_cursor_sdk.SDKMessage(
+            "assistant",
+            message=fake_cursor_sdk.AssistantPayload(
+                content=[
+                    fake_cursor_sdk.ToolUseBlock(id="call_nested_edit", name="edit", input={"path": "secret.py"}),
+                ]
+            ),
+        ),
+    ])
+    handle_nested = adapter.dispatch_agent(rev_nested_tool_req)
+    result_nested = adapter.wait_for_result(handle_nested)
+    assert result_nested.status == AgentStatus.FAILED
+    assert "prohibited tool(s) ['edit']" in result_nested.error_message
+
+    # 9. Verify boundary invariants:
+    # - No .cursor directory was copied into clean_workspace
+    assert not (clean_workspace / ".cursor").exists()
+
+    # - Created Agent invariants
     session_data = adapter._session_history.get(handle_rev_ok.invocation_token)
     assert session_data is not None
     created_agent = session_data["agent"]
@@ -1428,6 +1508,135 @@ def test_cursor_sdk_subagent_tool_rejection_and_inline_override(tmp_path, monkey
     assert not created_agent.agents
     assert created_agent.local.setting_sources is None
     assert not created_agent.local.dirs
+
+
+def test_live_e2e_cli_validations(monkeypatch, capsys):
+    from scripts.run_cursor_sdk_live_e2e import main as live_e2e_main
+
+    # 1. Missing --cursor-model
+    monkeypatch.setattr(sys, "argv", ["run_cursor_sdk_live_e2e.py"])
+    rc = live_e2e_main()
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "--cursor-model is required" in err
+
+    # 2. Missing CURSOR_API_KEY
+    monkeypatch.delenv("CURSOR_API_KEY", raising=False)
+    monkeypatch.setattr(sys, "argv", ["run_cursor_sdk_live_e2e.py", "--cursor-model", "composer-2.5"])
+    rc = live_e2e_main()
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "Cursor API key environment variable" in err
+
+    # 3. Invalid --task-id
+    monkeypatch.setenv("CURSOR_API_KEY", "test_key")
+    monkeypatch.setattr(sys, "argv", ["run_cursor_sdk_live_e2e.py", "--cursor-model", "composer-2.5", "--task-id", "T_LIVE_CURSOR_01"])
+    rc = live_e2e_main()
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "Invalid --task-id" in err
+
+
+def test_live_e2e_setup_fixture_and_spec_loading():
+    from scripts.run_cursor_sdk_live_e2e import _setup_isolated_fixture, _safe_rmtree
+    from scripts._lib.core.task_spec_loader import load_task_execution_spec
+
+    temp_repo = _setup_isolated_fixture("T99999")
+    try:
+        assert os.path.isdir(temp_repo)
+        assert os.path.isfile(os.path.join(temp_repo, "calc.py"))
+        assert os.path.isfile(os.path.join(temp_repo, "tests", "test_calc.py"))
+        assert os.path.isfile(os.path.join(temp_repo, "config", "workflow.config.yaml"))
+        assert os.path.isfile(os.path.join(temp_repo, "user_data", "board.json"))
+
+        spec = load_task_execution_spec(
+            project_root=temp_repo,
+            task_id="T99999",
+            authority_root=temp_repo,
+            overrides={"test_commands": ("python -m pytest tests/test_calc.py",)},
+        )
+        assert spec.task_id == "T99999"
+        assert len(spec.acceptance_criteria_items) >= 2
+        assert "add(a, b)" in spec.acceptance_criteria
+    finally:
+        _safe_rmtree(temp_repo)
+        assert not os.path.exists(temp_repo)
+
+
+def test_live_e2e_execution_terminal_state_and_cleanup(monkeypatch):
+    from scripts.run_cursor_sdk_live_e2e import main as live_e2e_main
+
+    monkeypatch.setenv("CURSOR_API_KEY", "test_key")
+    created_fixtures = []
+
+    real_setup = __import__("scripts.run_cursor_sdk_live_e2e", fromlist=["_setup_isolated_fixture"])._setup_isolated_fixture
+
+    def tracked_setup(task_id):
+        repo = real_setup(task_id)
+        created_fixtures.append(repo)
+        return repo
+
+    monkeypatch.setattr("scripts.run_cursor_sdk_live_e2e._setup_isolated_fixture", tracked_setup)
+
+    # Case A: Pipeline exits with failure code -> returns 1 and cleans up fixture
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=["run_task.py"],
+            returncode=1,
+            stdout=json.dumps({"success": False, "state": "BUILDING"}),
+            stderr="Simulated failure",
+        )
+        monkeypatch.setattr(sys, "argv", ["run_cursor_sdk_live_e2e.py", "--cursor-model", "composer-2.5", "--task-id", "T99999"])
+        rc = live_e2e_main()
+        assert rc == 1
+        assert len(created_fixtures) == 1
+        assert not os.path.exists(created_fixtures[0])
+
+    # Case B: Pipeline succeeds but terminal state is not PENDING_USER_ACCEPTANCE -> returns 1 and cleans up
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=["run_task.py"],
+            returncode=0,
+            stdout=json.dumps({"success": True, "state": "COMPLETED", "candidate_commit": "abc", "evidence_ids": []}),
+            stderr="",
+        )
+        monkeypatch.setattr(sys, "argv", ["run_cursor_sdk_live_e2e.py", "--cursor-model", "composer-2.5", "--task-id", "T99999"])
+        rc = live_e2e_main()
+        assert rc == 1
+        assert len(created_fixtures) == 2
+        assert not os.path.exists(created_fixtures[1])
+
+    # Case C: Pipeline succeeds and terminal state is PENDING_USER_ACCEPTANCE -> returns 0 and cleans up
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=["run_task.py"],
+            returncode=0,
+            stdout=json.dumps({"success": True, "state": "PENDING_USER_ACCEPTANCE", "candidate_commit": "abc", "evidence_ids": ["evi-1"]}),
+            stderr="",
+        )
+        monkeypatch.setattr(sys, "argv", ["run_cursor_sdk_live_e2e.py", "--cursor-model", "composer-2.5", "--task-id", "T99999"])
+        rc = live_e2e_main()
+        assert rc == 0
+        assert len(created_fixtures) == 3
+        assert not os.path.exists(created_fixtures[2])
+
+    # Case D: --keep-fixture preserves directory
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=["run_task.py"],
+            returncode=0,
+            stdout=json.dumps({"success": True, "state": "PENDING_USER_ACCEPTANCE", "candidate_commit": "abc", "evidence_ids": ["evi-1"]}),
+            stderr="",
+        )
+        monkeypatch.setattr(sys, "argv", ["run_cursor_sdk_live_e2e.py", "--cursor-model", "composer-2.5", "--task-id", "T99999", "--keep-fixture"])
+        rc = live_e2e_main()
+        assert rc == 0
+        assert len(created_fixtures) == 4
+        assert os.path.exists(created_fixtures[3])
+        # Manually cleanup fixture 4
+        from scripts.run_cursor_sdk_live_e2e import _safe_rmtree
+        _safe_rmtree(created_fixtures[3])
+        assert not os.path.exists(created_fixtures[3])
 
 
 
