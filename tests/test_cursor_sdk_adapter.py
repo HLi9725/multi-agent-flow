@@ -324,6 +324,10 @@ def mock_repo(tmp_path):
     subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo_dir, check=True, capture_output=True)
     (repo_dir / "README.md").write_text("# Test\n", encoding="utf-8")
     (repo_dir / "test_app.py").write_text("def test_dummy(): assert True\n", encoding="utf-8")
+    agents_src = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".cursor", "agents")
+    if os.path.isdir(agents_src):
+        import shutil
+        shutil.copytree(agents_src, repo_dir / ".cursor" / "agents")
     config_dir = repo_dir / "config"
     config_dir.mkdir()
     user_data_dir = repo_dir / "user_data"
@@ -1363,57 +1367,112 @@ def test_cursor_sdk_glob_and_grep_distinct_tools():
     assert fake_cursor_sdk.CURSOR_SESSION_TO_SDK_TOOL_MAP["grep_search"] == "grep"
 
 
-def test_cursor_sdk_subagent_tool_rejection_and_inline_override(tmp_path):
+def test_cursor_sdk_subagent_tool_rejection_and_inline_override(tmp_path, monkeypatch):
     """
     Verify:
-    1. Subagents loaded from .cursor/agents/*.md enforce tool permissions:
-       - flow-runner-reviewer can ONLY use 'read'; 'edit', 'shell', 'grep', 'glob' are rejected.
-       - flow-runner-qa has [] tools; all tools are rejected.
-       - flow-runner-builder can use 'read', 'edit', 'grep', 'glob'; 'shell' is rejected.
-    2. Overriding with an inline AgentDefinition (which lacks tools in official SDK)
-       overwrites the file definition and loses tool isolation, confirming why the adapter
-       must never pass inline AgentDefinition for file-based subagents.
+    1. Subagents dispatched through CursorSdkAdapter enforce tool permissions via file-based definitions:
+       - Reviewer attempting 'edit' is rejected and fails the adapter gate.
+       - QA attempting 'read' is rejected and fails the adapter gate.
+       - Reviewer using 'read' passes the adapter gate.
+       - Builder using 'edit' and 'glob' passes the adapter gate.
+    2. The adapter never passes inline AgentDefinition for file-based subagents,
+       ensuring file-based toolsets (tools: [Read]) are preserved natively without being overwritten.
+    3. Explicitly passing an inline AgentDefinition demonstrates the overwrite behavior,
+       confirming why the adapter's agents=None design is essential.
     """
-    local_opts = fake_cursor_sdk.LocalAgentOptions(cwd=str(tmp_path))
+    monkeypatch.setenv("CURSOR_API_KEY", "test_key_gate_123")
+    FakeCursorSdkState.reset()
 
-    # A) File-based subagents discovered from .cursor/agents/*.md
-    agent_file = fake_cursor_sdk.Agent.create(
-        options=fake_cursor_sdk.AgentOptions(
-            model="composer-2.5",
-            local=local_opts,
-            tools=["task"],
-            disallowed_tools=["edit", "glob", "grep", "read", "shell"],
-        )
+    # Set up .cursor/agents in tmp_path workspace so file discovery succeeds natively
+    repo_agents = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".cursor", "agents")
+    ws_agents = tmp_path / ".cursor" / "agents"
+    ws_agents.parent.mkdir(parents=True, exist_ok=True)
+    if os.path.isdir(repo_agents):
+        import shutil
+        shutil.copytree(repo_agents, str(ws_agents))
+
+    adapter = CursorSdkAdapter(is_real_host=True, sdk_module=fake_cursor_sdk)
+
+    # 1. Reviewer attempting prohibited tool 'edit' fails through adapter gate
+    rev_req = AgentRequest(
+        session_id="test_rev_reject_edit",
+        role="REVIEWER",
+        prompt="Review code changes",
+        workspace_dir=str(tmp_path),
+        extra_context={"production_runner_managed": True, "cursor_model": "composer-2.5"},
     )
+    FakeCursorSdkState.set_next_messages([
+        fake_cursor_sdk.SDKMessage("tool_call", name="task", args={"subagent": "flow-runner-reviewer"}),
+        fake_cursor_sdk.SDKMessage("tool_call", name="edit", subagent="flow-runner-reviewer", args={"path": "app.py"}),
+    ])
+    handle_rev = adapter.dispatch_agent(rev_req)
+    result_rev = adapter.wait_for_result(handle_rev)
+    assert result_rev.status == AgentStatus.FAILED
+    assert "tool restriction gate violated" in result_rev.error_message or "Tool 'edit' is not permitted" in result_rev.error_message
 
-    # Reviewer checks
-    assert agent_file.is_tool_allowed("read", subagent="flow-runner-reviewer") is True
-    assert agent_file.is_tool_allowed("edit", subagent="flow-runner-reviewer") is False
-    assert agent_file.is_tool_allowed("shell", subagent="flow-runner-reviewer") is False
-    assert agent_file.is_tool_allowed("grep", subagent="flow-runner-reviewer") is False
-    assert agent_file.is_tool_allowed("glob", subagent="flow-runner-reviewer") is False
-    for t in ["edit", "shell", "grep", "glob"]:
-        with pytest.raises(fake_cursor_sdk.ToolNotAllowedError) as exc_info:
-            agent_file.execute_tool(t, subagent="flow-runner-reviewer")
-        assert f"Tool '{t}' is not permitted for subagent 'flow-runner-reviewer'" in str(exc_info.value)
+    # 2. QA attempting prohibited tool 'read' fails through adapter gate
+    qa_req = AgentRequest(
+        session_id="test_qa_reject_read",
+        role="QA",
+        prompt="Verify test execution",
+        workspace_dir=str(tmp_path),
+        extra_context={"production_runner_managed": True, "cursor_model": "composer-2.5"},
+    )
+    FakeCursorSdkState.set_next_messages([
+        fake_cursor_sdk.SDKMessage("tool_call", name="task", args={"subagent": "flow-runner-qa"}),
+        fake_cursor_sdk.SDKMessage("tool_call", name="read", subagent="flow-runner-qa", args={"path": "app.py"}),
+    ])
+    handle_qa = adapter.dispatch_agent(qa_req)
+    result_qa = adapter.wait_for_result(handle_qa)
+    assert result_qa.status == AgentStatus.FAILED
+    assert "tool restriction gate violated" in result_qa.error_message or "Tool 'read' is not permitted" in result_qa.error_message
 
-    # QA checks
-    for t in ["read", "edit", "shell", "grep", "glob"]:
-        assert agent_file.is_tool_allowed(t, subagent="flow-runner-qa") is False
-        with pytest.raises(fake_cursor_sdk.ToolNotAllowedError):
-            agent_file.execute_tool(t, subagent="flow-runner-qa")
+    # 3. Reviewer using authorized 'read' tool succeeds through adapter
+    rev_ok_req = AgentRequest(
+        session_id="test_rev_pass_read",
+        role="REVIEWER",
+        prompt="Review code changes",
+        workspace_dir=str(tmp_path),
+        extra_context={"production_runner_managed": True, "cursor_model": "composer-2.5"},
+    )
+    FakeCursorSdkState.set_next_messages([
+        fake_cursor_sdk.SDKMessage("tool_call", name="task", args={"subagent": "flow-runner-reviewer"}),
+        fake_cursor_sdk.SDKMessage("tool_call", name="read", subagent="flow-runner-reviewer", args={"path": "app.py"}),
+        fake_cursor_sdk.SDKMessage("assistant", text='{"decision": "PASS", "defects": [], "summary": "Looks good"}'),
+    ])
+    handle_rev_ok = adapter.dispatch_agent(rev_ok_req)
+    result_rev_ok = adapter.wait_for_result(handle_rev_ok)
+    assert result_rev_ok.status == AgentStatus.SUCCESS
+    assert "decision" in result_rev_ok.output
 
-    # Builder checks
-    for t in ["read", "edit", "grep", "glob"]:
-        assert agent_file.is_tool_allowed(t, subagent="flow-runner-builder") is True
-        assert "executed successfully" in agent_file.execute_tool(t, subagent="flow-runner-builder")
-    assert agent_file.is_tool_allowed("shell", subagent="flow-runner-builder") is False
-    with pytest.raises(fake_cursor_sdk.ToolNotAllowedError):
-        agent_file.execute_tool("shell", subagent="flow-runner-builder")
+    # 4. Builder using authorized 'edit' and 'glob' tools succeeds through adapter
+    builder_ok_req = AgentRequest(
+        session_id="test_bld_pass_edit_glob",
+        role="BUILDER",
+        prompt="Implement feature",
+        workspace_dir=str(tmp_path),
+        extra_context={"production_runner_managed": True, "cursor_model": "composer-2.5"},
+    )
+    FakeCursorSdkState.set_next_messages([
+        fake_cursor_sdk.SDKMessage("tool_call", name="task", args={"subagent": "flow-runner-builder"}),
+        fake_cursor_sdk.SDKMessage("tool_call", name="glob", subagent="flow-runner-builder", args={"pattern": "*.py"}),
+        fake_cursor_sdk.SDKMessage("tool_call", name="edit", subagent="flow-runner-builder", args={"path": "app.py"}),
+        fake_cursor_sdk.SDKMessage("assistant", text="Implemented feature successfully"),
+    ])
+    handle_bld = adapter.dispatch_agent(builder_ok_req)
+    result_bld = adapter.wait_for_result(handle_bld)
+    assert result_bld.status == AgentStatus.SUCCESS
 
-    # B) Inline AgentDefinition overwrite scenario:
-    # If someone passes inline agents={"flow-runner-reviewer": AgentDefinition(...)},
-    # it overwrites the markdown file and loses tool isolation!
+    # 5. Verify the adapter did NOT pass inline agents to Agent.create (subagent was loaded from file)
+    session_data = adapter._session_history.get(handle_rev_ok.invocation_token)
+    assert session_data is not None
+    created_agent = session_data["agent"]
+    rev_def = created_agent.agents.get("flow-runner-reviewer")
+    assert rev_def is not None
+    assert getattr(rev_def, "from_file", False) is True
+    assert getattr(rev_def, "tools", None) == ["read"]
+
+    # 6. Inline override verification: demonstrates why the adapter must NEVER pass inline agents
     inline_def = fake_cursor_sdk.AgentDefinition(
         description="Inline reviewer without tools",
         prompt="Review code",
@@ -1422,13 +1481,12 @@ def test_cursor_sdk_subagent_tool_rejection_and_inline_override(tmp_path):
     agent_inline = fake_cursor_sdk.Agent.create(
         options=fake_cursor_sdk.AgentOptions(
             model="composer-2.5",
-            local=local_opts,
+            local=fake_cursor_sdk.LocalAgentOptions(cwd=str(tmp_path)),
             tools=["task"],
             disallowed_tools=["edit", "glob", "grep", "read", "shell"],
             agents={"flow-runner-reviewer": inline_def},
         )
     )
-
     # Inline definition has overwritten flow-runner-reviewer, losing tool isolation
     assert agent_inline.is_tool_allowed("edit", subagent="flow-runner-reviewer") is True
     assert agent_inline.is_tool_allowed("shell", subagent="flow-runner-reviewer") is True

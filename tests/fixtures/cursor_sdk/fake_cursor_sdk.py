@@ -98,89 +98,60 @@ class AgentDefinition:
 import os
 import yaml
 
+try:
+    from scripts._lib.hosts.cursor_sdk_adapter import resolve_subagent_tool_policy
+except ImportError:
+    from _lib.hosts.cursor_sdk_adapter import resolve_subagent_tool_policy
+
 
 def discover_subagents_from_dir(cwd: Optional[str]) -> Dict[str, AgentDefinition]:
     """
-    Discover subagent definitions from .cursor/agents/*.md in cwd (or repo fallback),
+    Discover subagent definitions from .cursor/agents/*.md in cwd,
     parsing YAML frontmatter to extract curated tools and disallowed_tools.
+    Strictly discovers from cwd without hidden fallback to repo_root, matching official SDK.
     """
     discovered: Dict[str, AgentDefinition] = {}
-    search_dirs: List[str] = []
-    if cwd:
-        search_dirs.append(os.path.join(cwd, ".cursor", "agents"))
+    if not cwd:
+        return discovered
 
-    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-    repo_agents = os.path.join(repo_root, ".cursor", "agents")
-    if repo_agents not in search_dirs and os.path.isdir(repo_agents):
-        search_dirs.append(repo_agents)
+    adir = os.path.join(cwd, ".cursor", "agents")
+    if not os.path.isdir(adir):
+        return discovered
 
-    for adir in search_dirs:
-        if not os.path.isdir(adir):
+    for fname in sorted(os.listdir(adir)):
+        if not fname.endswith(".md"):
             continue
-        for fname in sorted(os.listdir(adir)):
-            if not fname.endswith(".md"):
+        fpath = os.path.join(adir, fname)
+        try:
+            with open(fpath, "r", encoding="utf-8") as f:
+                content = f.read()
+            if not content.startswith("---"):
                 continue
-            fpath = os.path.join(adir, fname)
-            try:
-                with open(fpath, "r", encoding="utf-8") as f:
-                    content = f.read()
-                if not content.startswith("---"):
-                    continue
-                parts = content.split("---", 2)
-                if len(parts) < 3:
-                    continue
-                fm = yaml.safe_load(parts[1])
-                if not isinstance(fm, dict):
-                    continue
-                name = str(fm.get("name") or "").strip()
-                if not name or name in discovered:
-                    continue
-                desc = str(fm.get("description") or "").strip()
-                prompt_body = parts[2].strip()
-                raw_tools = fm.get("tools")
-                enable_write = fm.get("enable_write_tools")
-
-                mapped_tools: Set[str] = set()
-                if isinstance(raw_tools, list):
-                    for t in raw_tools:
-                        sdk_t = CURSOR_SESSION_TO_SDK_TOOL_MAP.get(str(t).strip().lower())
-                        if sdk_t and sdk_t in VALID_TOOLS:
-                            mapped_tools.add(sdk_t)
-
-                name_lower = name.lower()
-                if "runner-qa" in name_lower:
-                    sub_tools: Optional[List[str]] = []
-                    sub_disallowed: Optional[List[str]] = sorted(["edit", "glob", "grep", "read", "shell"])
-                elif "qa" in name_lower:
-                    sub_tools = sorted(list(mapped_tools - {"edit", "shell"}))
-                    sub_disallowed = ["edit", "shell"]
-                elif "runner-reviewer" in name_lower:
-                    sub_tools = ["read"]
-                    sub_disallowed = sorted(["edit", "glob", "grep", "shell"])
-                elif "reviewer" in name_lower or enable_write is False:
-                    sub_tools = sorted(list(mapped_tools - {"edit", "shell"}))
-                    sub_disallowed = ["edit", "shell"]
-                elif "runner-builder" in name_lower:
-                    sub_tools = sorted(list((mapped_tools | {"read", "edit", "grep", "glob"}) - {"shell", "task"}))
-                    sub_disallowed = ["shell"]
-                else:
-                    if isinstance(raw_tools, list):
-                        sub_tools = sorted(list(mapped_tools))
-                        sub_disallowed = sorted(list((VALID_TOOLS - {"task"}) - set(sub_tools)))
-                    else:
-                        sub_tools = sorted(list(VALID_TOOLS - {"task"}))
-                        sub_disallowed = []
-                        if enable_write is False:
-                            sub_tools = sorted(list(set(sub_tools) - {"edit", "shell"}))
-                            sub_disallowed = sorted(["edit", "shell"])
-
-                sub_def = AgentDefinition(description=desc, prompt=prompt_body, model="inherit")
-                setattr(sub_def, "tools", sub_tools)
-                setattr(sub_def, "disallowed_tools", sub_disallowed)
-                setattr(sub_def, "from_file", True)
-                discovered[name] = sub_def
-            except Exception:
+            parts = content.split("---", 2)
+            if len(parts) < 3:
                 continue
+            fm = yaml.safe_load(parts[1])
+            if not isinstance(fm, dict):
+                continue
+            name = str(fm.get("name") or "").strip()
+            if not name or name in discovered:
+                continue
+            desc = str(fm.get("description") or "").strip()
+            prompt_body = parts[2].strip()
+            raw_tools = fm.get("tools")
+            enable_write = fm.get("enable_write_tools")
+
+            sub_tools, sub_disallowed = resolve_subagent_tool_policy(
+                name, raw_tools=raw_tools, enable_write_tools=enable_write
+            )
+
+            sub_def = AgentDefinition(description=desc, prompt=prompt_body, model="inherit")
+            setattr(sub_def, "tools", sub_tools)
+            setattr(sub_def, "disallowed_tools", sub_disallowed)
+            setattr(sub_def, "from_file", True)
+            discovered[name] = sub_def
+        except Exception:
+            continue
 
     return discovered
 
@@ -238,6 +209,7 @@ class RunResult:
     result: Optional[str] = None
     duration_ms: Optional[int] = None
     usage: Optional[Dict[str, Any]] = None
+    error: Optional[Any] = None
 
 
 class FakeCursorSdkState:
@@ -389,6 +361,14 @@ class Run:
                     duration_ms=120,
                     usage={"prompt_tokens": 10, "completion_tokens": 20},
                 )
+        if self.status == "error":
+            return RunResult(
+                status="error",
+                result=self.result,
+                duration_ms=120,
+                usage={"prompt_tokens": 10, "completion_tokens": 20},
+                error=self.error,
+            )
         if self.error is not None:
             raise self.error
         return RunResult(
@@ -396,6 +376,7 @@ class Run:
             result=self.result,
             duration_ms=120,
             usage={"prompt_tokens": 10, "completion_tokens": 20},
+            error=self.error,
         )
 
 
@@ -629,9 +610,13 @@ class Agent:
         else:
             text_result = f"Mock execution complete for {self.agent_id}"
 
+        tool_violation_error = None
         if custom_messages is not None:
             effective_messages = list(custom_messages)
-            if not any(getattr(m, "type", None) == "assistant" for m in effective_messages):
+            assistant_msg = next((m for m in effective_messages if getattr(m, "type", None) == "assistant" and getattr(m, "text", None)), None)
+            if assistant_msg is not None:
+                text_result = assistant_msg.text
+            else:
                 effective_messages.append(SDKMessage("assistant", text=text_result))
             current_subagent = None
             for msg in effective_messages:
@@ -667,12 +652,25 @@ class Agent:
                     elif tool_name:
                         target_sub = getattr(msg, "subagent", None) or args.get("subagent") or current_subagent
                         if not self.is_tool_allowed(tool_name, subagent=target_sub):
+                            err_msg = f"Tool '{tool_name}' is not permitted for {'subagent ' + str(target_sub) if target_sub else 'parent agent'}"
                             setattr(msg, "status", "error")
-                            setattr(msg, "error", f"Tool '{tool_name}' is not permitted for {'subagent ' + str(target_sub) if target_sub else 'parent agent'}")
+                            setattr(msg, "error", err_msg)
+                            tool_violation_error = err_msg
         else:
             effective_messages = [
                 SDKMessage("assistant", text=text_result),
             ]
+
+        if tool_violation_error is not None:
+            return Run(
+                run_id=run_id,
+                agent_id=self.agent_id,
+                status="error",
+                result=f"Execution failed: {tool_violation_error}",
+                error=BadRequestError(tool_violation_error),
+                refuse_cancel=refuse_cancel,
+                messages=effective_messages,
+            )
 
         if err is not None:
             if isinstance(err, CursorAgentError):

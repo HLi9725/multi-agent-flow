@@ -30,35 +30,47 @@
   - `[T0028-N17] 2026-09-23 11:28:46` 进行中 -> 审查中（李开发 -> 周审查）
   - `[T0028-N18] 2026-09-23 11:29:11` 审查中 -> 测试中（周审查 -> 章测试）
   - `[T0028-N19] 2026-09-23 11:29:25` 测试中 -> 已完成（章测试 -> 严经理）
+  - `[T0028-N20] 2026-09-23 11:38:09` 已完成 -> 已退回（严经理，响应第四轮验收反馈）
+  - `[T0028-N21] 2026-09-23 11:39:05` 已退回 -> 进行中（李开发，第五轮深度对齐修复）
+  - `[T0028-N22] 2026-09-23 11:51:30` 进行中 -> 审查中（李开发 -> 周审查）
+  - `[T0028-N23] 2026-09-23 11:52:12` 审查中 -> 测试中（周审查 -> 章测试）
+  - `[T0028-N24] 2026-09-23 11:52:21` 测试中 -> 已完成（章测试 -> 严经理）
 
 ---
 
-## 二、第四轮关键修复要点（彻底解决工具隔离与Glob问题）
+## 二、第五轮关键修复要点（内联覆盖杜绝、违规强失败门控与适配器端到端验证）
 
-### 1. 依托 `.cursor/agents/*.md` 保持子代理专属工具集，彻底杜绝提示词伪隔离
-- **根因分析**：官方 Cursor SDK 的 `AgentDefinition` 确实无 `tools` 与 `disallowed_tools` 参数。上一轮在 Prompt 中拼入 `[TOOL CONSTRAINTS]` 属于不可执行的提示词约定；如果在 `AgentOptions(agents={...})` 中传入同名的纯文本 `AgentDefinition`，还会覆盖掉工作区文件定义，使其降级为默认全量工具集。
+### 1. 彻底避免内联 `AgentDefinition` 覆盖文件配置
+- **根因分析**：官方 SDK 的 `AgentDefinition` 仅有 `description`, `prompt`, `model`, `mcp_servers` 等参数，无 `tools` 与 `disallowed_tools`。之前尝试在 Python 对象上 `setattr` 挂载属性无效；且向 `AgentOptions(agents={...})` 传入同名内联对象会导致 SDK 覆盖 `.cursor/agents/*.md`，使子代理降级回平台默认的全量工具集。
 - **修复方案**：
-  - `CursorSdkAdapter._load_subagent_definition` 严格从 `.cursor/agents/{agent_id}.md` 中解析 YAML Frontmatter，将提取出的 `sub_tools` 与 `sub_disallowed_tools` 精确附加到子代理定义对象上；
-  - `parent_agents = {subagent_name: agent_def}` 保持父 Agent 只注册这一个具名子代理（满足“只能启动一个具名子代理”硬约束）；
-  - 去除在工作区内写入临时 markdown 文件的操作，完全避免在 Reviewer/QA 阶段触犯 ProductionRunner 的代码不可变性（Code Immutability）红线。
+  - 在 `CursorSdkAdapter.dispatch_agent()` 中，**不再构造内联 `AgentDefinition` 传入 `AgentOptions`**，将 `parent_agents` 保持为 `None`；
+  - 依赖官方 SDK 从工作区 `.cursor/agents/*.md` 的原生文件发现机制，完整保留文件中的 Frontmatter 工具约束（如 `flow-runner-reviewer.md` 的 `tools: [Read]`）；
+  - `_load_subagent_definition` 若在工作区未检测到对应角色文件（如单元测试空目录场景），以原子安全方式自包含补充，同时对生产环境 Git worktree 不修改任何已跟踪代码。
 
-### 2. 真实验证违规工具被严格拒绝（执行拦截与异常校验）
-- **根因分析**：上一轮测试仅断言了 Prompt 中的文本约束字符串，未在 SDK 运行时验证工具调用是否真的被拦截拒绝。
+### 2. Fake SDK 违规调用强失败并与适配器门控形成闭环
+- **根因分析**：上一轮 Fake SDK 在 `send()` 遇到未授权工具时仅将单条消息置为 `status="error"`，`Run` 整体仍按 `finished` 返回成功；真实运行时该违规会导致平台请求失败，且适配器门控之前未将消息流中的子代理工具违规列入 FAILED 断言。
 - **修复方案**：
-  - `fake_cursor_sdk.py` 新增 `ToolNotAllowedError`，并在 `Agent.is_tool_allowed()` 与 `Agent.execute_tool()` 中实现真实的工具权限校验；
-  - 针对只读 Reviewer（`flow-runner-reviewer`），工具权限严格限定为 `tools=["read"]`，尝试执行 `edit`、`shell`、`grep`、`glob` 均真实抛出 `ToolNotAllowedError` 强行拒绝；
-  - 针对 QA（`flow-runner-qa`），工具权限严格限定为 `tools=[]`，尝试调用任何工具（`read`、`edit`、`shell`、`grep`、`glob`）均立即抛出 `ToolNotAllowedError`；
-  - 针对 Builder（`flow-runner-builder`），保留 `read`、`edit`、`grep`、`glob` 工具，调用 `shell` 强行拒绝；
-  - 新增专用测试用例 `test_cursor_sdk_subagent_tool_rejection_and_inline_override`，验证未加工具约束的纯文本内联定义会丢失隔离（证明为什么必须携带文件级整理后的工具集）。
+  - `fake_cursor_sdk.py` 的 `send()` 在发生违规工具调用时，记录错误消息并将 `Run` 整体状态置为 `status="error"`，且记录 `BadRequestError`；
+  - `Run.wait()` 严格透传 `RunResult(status="error", error=...)`；
+  - `CursorSdkAdapter._extract_gate_events` 明确区分父 Agent 工具调用与子代理工具调用；
+  - `wait_for_result` 在提取到 `subagent_violations` 或 Run 出错时，一票否决判定为 `AgentStatus.FAILED`，物理形成拦截闭环。
 
-### 3. 官方 `glob` 工具收录与 `grep` 彻底解耦
-- **根因分析**：官方 Cursor SDK 中 `glob`（按文件名正则/通配符扫描）与 `grep`（按文本内容正则搜索）是两个完全独立的内置工具。之前在映射表中将 `"glob": "grep"`，导致文件名搜索被并入内容搜索，且 `VALID_SDK_TOOLS` 遗漏了 `glob`。
+### 3. 全局唯一工具策略事实源 (`resolve_subagent_tool_policy`)
+- **根因分析**：之前适配器和 Fake SDK 分别维护了一套工具策略解析逻辑，容易产生隐式分歧。
 - **修复方案**：
-  - `VALID_SDK_TOOLS` 严格收录官方 6 项有效工具：`{"read", "grep", "glob", "shell", "edit", "task"}`；
-  - `CURSOR_SESSION_TO_SDK_TOOL_MAP` 将 `"glob": "glob"` 与 `"find_by_name": "glob"`，与 `"grep": "grep"` 严格区分；
-  - 父 Agent `parent_disallowed_tools` 精确限定为 `["edit", "glob", "grep", "read", "shell"]`；
-  - 审查员（Reviewer）禁用工具清单中同步收录真实的 `glob`，确保代码审查时禁止包括文件名通配在内的全局搜索；
-  - 新增专项测试 `test_cursor_sdk_glob_and_grep_distinct_tools`，确保两个工具的独立映射与注册无混淆。
+  - 在 `cursor_sdk_adapter.py` 中导出唯一的 `resolve_subagent_tool_policy(agent_id_or_name, raw_tools, enable_write_tools)` 函数；
+  - Fake SDK 的 `discover_subagents_from_dir` 直接导入并调用该函数，彻底实现策略事实源统一。
+
+### 4. 彻底通过适配器调度（Adapter-Mediated）进行全流程测试
+- **根因分析**：之前的单测直接实例化 Fake SDK 的 Agent 检查权限，没有走真实的 `adapter.dispatch_agent` 和 `adapter.wait_for_result`，无法检验适配器门控是否真的能拦截子代理违规。
+- **修复方案**：
+  - 重构 `test_cursor_sdk_subagent_tool_rejection_and_inline_override`：
+    1. 审查员（Reviewer）违规调用 `edit` -> 适配器门控判定 `AgentStatus.FAILED`；
+    2. 测试员（QA）违规调用 `read` -> 适配器门控判定 `AgentStatus.FAILED`；
+    3. 审查员合法调用 `read` -> 适配器正常返回 `AgentStatus.SUCCESS`；
+    4. 构建员（Builder）合法调用 `edit`/`glob` -> 适配器正常返回 `AgentStatus.SUCCESS`；
+    5. 校验创建的 Agent 严格采用文件发现（`from_file=True`，无内联覆盖）；
+    6. 对照实验：验证内联传入无工具定义确实会导致隔离丢失，证明适配器 `agents=None` 设计的必要性。
 
 ---
 
@@ -66,20 +78,13 @@
 
 1. **CursorSdkAdapter 专项测试**：
    - 执行：`python -m pytest tests/test_cursor_sdk_adapter.py -v`
-   - 结果：**33 passed in 12.31s (100% 全部通过)**。
-   - 覆盖：
-     - 官方 `glob` 与 `grep` 独立工具拆分与映射无混淆校验；
-     - 真实工具执行拦截：`flow-runner-reviewer` 违规执行 `edit`/`shell`/`grep`/`glob` 真实抛出 `ToolNotAllowedError` 拒绝；
-     - `flow-runner-qa` 执行任何工具真实被拒绝；
-     - `flow-runner-builder` 执行 `shell` 真实被拒绝；
-     - 内联无工具定义覆盖文件导致隔离失效的反向对照验证；
-     - 单具名子代理注册（`len(agent.agents) == 1`）与父 Agent 纯 `task` 工具约束。
+   - 结果：**33 passed in 13.81s (100% 全部通过)**。
 2. **ProductionRunner 综合测试**：
    - 执行：`python -m pytest tests/test_production_runner.py -v`
-   - 结果：**29 passed in 41.28s (100% 全部通过)**。
+   - 结果：**29 passed in 43.08s (100% 全部通过)**。
 3. **全量回归测试**：
    - 执行：`python -m pytest tests/ -q`
-   - 结果：**636 passed in 161.01s (100% 全部通过，全仓零回归)**。
+   - 结果：**636 passed in 153.25s (100% 全部通过，全仓零回归)**。
 4. **安全与密钥扫描**：
    - 执行：`python scripts/check_secrets.py`
    - 结果：**PASS**，未发现硬编码凭据与密钥泄露风险。
@@ -88,10 +93,10 @@
 
 ## 四、后续操作：用户人工最终验收
 
-遵照您的明确指令：**严禁自行验收，最终验收由您人工进行**。任务卡 `T0028` 当前稳定停留在 **【已完成】** 状态（Handler: 严经理，节点: `T0028-N19`）。
+遵照您的明确指令：**严禁自行验收，最终验收由您人工进行**。任务卡 `T0028` 当前稳定停留在 **【已完成】** 状态（Handler: 严经理，节点: `T0028-N24`）。
 
 待您人工审查代码与提交后，可执行以下命令完成最终验收流转：
 
 ```bash
-python scripts/transition_task.py --role PM --from-status 已完成 --to-status 已验收 --task-id T0028 --assignee 严经理 --end-time "2026-09-23 11:35:00"
+python scripts/transition_task.py --role PM --from-status 已完成 --to-status 已验收 --task-id T0028 --assignee 严经理 --end-time "2026-09-23 12:00:00"
 ```

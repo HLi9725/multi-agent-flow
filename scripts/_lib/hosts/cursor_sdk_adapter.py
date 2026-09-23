@@ -80,6 +80,58 @@ from ..core.adapter_manifest import (
 )
 
 
+def resolve_subagent_tool_policy(
+    agent_id_or_name: str,
+    raw_tools: Optional[List[str]] = None,
+    enable_write_tools: Optional[bool] = None,
+) -> Tuple[Optional[List[str]], Optional[List[str]]]:
+    """
+    Canonical Single Source of Truth for Subagent tool isolation policy.
+    Maps session/markdown tool names to SDK tool names and calculates:
+        (allowed_tools, disallowed_tools)
+    """
+    name_lower = (agent_id_or_name or "").lower().strip()
+
+    mapped_tools: Set[str] = set()
+    if isinstance(raw_tools, list):
+        for t in raw_tools:
+            normalized = str(t).strip().lower()
+            sdk_tool = CURSOR_SESSION_TO_SDK_TOOL_MAP.get(normalized)
+            if sdk_tool and sdk_tool in VALID_SDK_TOOLS:
+                mapped_tools.add(sdk_tool)
+
+    sub_tools: Optional[List[str]] = None
+    sub_disallowed_tools: Optional[List[str]] = None
+
+    if "runner-qa" in name_lower:
+        sub_tools = []
+        sub_disallowed_tools = sorted(list(VALID_SDK_TOOLS - {"task"}))
+    elif "qa" in name_lower:
+        sub_tools = sorted(list(mapped_tools - {"edit", "shell"}))
+        sub_disallowed_tools = ["edit", "shell"]
+    elif "runner-reviewer" in name_lower:
+        sub_tools = ["read"]
+        sub_disallowed_tools = sorted(["edit", "glob", "grep", "shell"])
+    elif "reviewer" in name_lower or enable_write_tools is False:
+        sub_tools = sorted(list(mapped_tools - {"edit", "shell"}))
+        sub_disallowed_tools = ["edit", "shell"]
+    elif "runner-builder" in name_lower:
+        sub_tools = sorted(list((mapped_tools | {"read", "edit", "grep", "glob"}) - {"shell", "task"}))
+        sub_disallowed_tools = ["shell"]
+    else:
+        if isinstance(raw_tools, list):
+            sub_tools = sorted(list(mapped_tools))
+            sub_disallowed_tools = sorted(list((VALID_SDK_TOOLS - {"task"}) - set(sub_tools)))
+        elif enable_write_tools is False:
+            sub_tools = sorted(list((VALID_SDK_TOOLS - {"task"}) - {"edit", "shell"}))
+            sub_disallowed_tools = ["edit", "shell"]
+        else:
+            sub_tools = sorted(list(VALID_SDK_TOOLS - {"task"}))
+            sub_disallowed_tools = []
+
+    return sub_tools, sub_disallowed_tools
+
+
 class CursorSdkAdapter(BaseHostAdapter):
     """
     Host Adapter for Cursor Python SDK (cursor-sdk).
@@ -221,6 +273,16 @@ class CursorSdkAdapter(BaseHostAdapter):
                 f"Subagent markdown definition for '{agent_id}' does not exist at .cursor/agents/{agent_id}.md (Fail-Closed)."
             )
 
+        ws_agent_file = os.path.join(workspace_dir, ".cursor", "agents", f"{agent_id}.md")
+        if not os.path.isfile(ws_agent_file) and target_file and target_file != ws_agent_file:
+            try:
+                os.makedirs(os.path.dirname(ws_agent_file), exist_ok=True)
+                import shutil
+                shutil.copyfile(target_file, ws_agent_file)
+                target_file = ws_agent_file
+            except Exception:
+                pass
+
         try:
             with open(target_file, "r", encoding="utf-8") as f:
                 content = f.read()
@@ -259,40 +321,9 @@ class CursorSdkAdapter(BaseHostAdapter):
 
         raw_tools = fm.get("tools")
         enable_write_tools = fm.get("enable_write_tools")
-
-        mapped_tools: Set[str] = set()
-        if isinstance(raw_tools, list):
-            for t in raw_tools:
-                normalized = str(t).strip().lower()
-                sdk_tool = CURSOR_SESSION_TO_SDK_TOOL_MAP.get(normalized)
-                if sdk_tool and sdk_tool in VALID_SDK_TOOLS:
-                    mapped_tools.add(sdk_tool)
-
-        agent_id_lower = agent_id.lower()
-        sub_tools: Optional[List[str]] = None
-        sub_disallowed_tools: Optional[List[str]] = None
-
-        if "runner-qa" in agent_id_lower:
-            sub_tools = []
-            sub_disallowed_tools = ["edit", "glob", "grep", "read", "shell"]
-        elif "qa" in agent_id_lower:
-            sub_tools = sorted(list(mapped_tools - {"edit", "shell"}))
-            sub_disallowed_tools = ["edit", "shell"]
-        elif "runner-reviewer" in agent_id_lower:
-            sub_tools = ["read"]
-            sub_disallowed_tools = ["edit", "glob", "grep", "shell"]
-        elif "reviewer" in agent_id_lower or enable_write_tools is False:
-            sub_tools = sorted(list(mapped_tools - {"edit", "shell"}))
-            sub_disallowed_tools = ["edit", "shell"]
-        elif "runner-builder" in agent_id_lower:
-            sub_tools = sorted(list((mapped_tools | {"read", "edit", "grep", "glob"}) - {"shell", "task"}))
-            sub_disallowed_tools = ["shell"]
-        else:
-            if isinstance(raw_tools, list):
-                sub_tools = sorted(list(mapped_tools))
-                sub_disallowed_tools = sorted(list((VALID_SDK_TOOLS - {"task"}) - set(sub_tools)))
-            elif enable_write_tools is False:
-                sub_disallowed_tools = ["edit", "shell"]
+        sub_tools, sub_disallowed_tools = resolve_subagent_tool_policy(
+            agent_id, raw_tools=raw_tools, enable_write_tools=enable_write_tools
+        )
 
         return str(name).strip(), str(desc).strip(), prompt_body, sub_tools, sub_disallowed_tools
 
@@ -378,43 +409,16 @@ class CursorSdkAdapter(BaseHostAdapter):
             subagent_id = self._resolve_target_agent(role, request.extra_context)
             subagent_name, subagent_desc, subagent_prompt, sub_tools, sub_disallowed = self._load_subagent_definition(workspace_dir, subagent_id)
 
-            prompt_with_tools = subagent_prompt
-            if sub_tools is not None or sub_disallowed is not None:
-                constraint_lines = ["[TOOL CONSTRAINTS]"]
-                if sub_tools is not None:
-                    constraint_lines.append(f"Allowed Tools: {sorted(list(sub_tools)) if sub_tools else 'NONE'}")
-                if sub_disallowed:
-                    sorted_disallowed = sorted(list(sub_disallowed)) if isinstance(sub_disallowed, (list, set, tuple)) else sub_disallowed
-                    constraint_lines.append(f"Prohibited Tools: {sorted_disallowed}")
-                prompt_with_tools = "\n".join(constraint_lines) + "\n\n" + subagent_prompt
-
-            if hasattr(sdk, "AgentDefinition"):
-                agent_def = sdk.AgentDefinition(
-                    description=subagent_desc,
-                    prompt=prompt_with_tools,
-                    model="inherit",
-                )
-            else:
-                agent_def = {
-                    "description": subagent_desc,
-                    "prompt": prompt_with_tools,
-                    "model": "inherit",
-                }
-
-            if sub_tools is not None:
-                try:
-                    setattr(agent_def, "tools", sub_tools)
-                except Exception:
-                    pass
-            if sub_disallowed is not None:
-                try:
-                    setattr(agent_def, "disallowed_tools", sub_disallowed)
-                except Exception:
-                    pass
+            # Official Cursor SDK automatically discovers subagents defined in .cursor/agents/*.md.
+            # Passing a same-named inline AgentDefinition overrides the file definition and strips
+            # tools/disallowed_tools because official AgentDefinition lacks tool restriction fields.
+            # Do NOT pass inline agents for file-based subagents; let Cursor SDK natively discover them.
+            parent_agents = None
+            if isinstance(request.extra_context, Mapping) and "agents" in request.extra_context:
+                parent_agents = request.extra_context.get("agents")
 
             parent_tools = ["task"]
             parent_disallowed_tools = ["edit", "glob", "grep", "read", "shell"]
-            parent_agents = {subagent_name: agent_def}
 
             resume_id = (
                 request.extra_context.get("resume_agent_id")
@@ -514,6 +518,8 @@ class CursorSdkAdapter(BaseHostAdapter):
                 "model": model,
                 "agent_id": canonical_agent_id,
                 "expected_subagent": subagent_name,
+                "expected_subagent_tools": sub_tools,
+                "expected_subagent_disallowed": sub_disallowed,
                 "created_at": time.time(),
                 "completed": False,
                 "result": None,
@@ -545,18 +551,25 @@ class CursorSdkAdapter(BaseHostAdapter):
         collected_messages: Sequence[Any],
         run: Any,
         run_result: Any,
-    ) -> Tuple[List[str], List[str]]:
+        expected_subagent: Optional[str] = None,
+        expected_subagent_tools: Optional[Sequence[str]] = None,
+        expected_subagent_disallowed: Optional[Sequence[str]] = None,
+    ) -> Tuple[List[str], List[str], List[str]]:
         """
-        Extract task subagent invocations and prohibited tool calls from official run.messages() events,
-        with defensive fallback to run/run_result attributes.
+        Extract task subagent invocations, parent prohibited tool calls, and subagent tool violations
+        from official run.messages() events, with defensive fallback to run/run_result attributes.
         Returns:
-            (task_calls, prohibited_tool_calls)
+            (task_calls, parent_prohibited_calls, subagent_violations)
         """
         task_calls: List[str] = []
-        prohibited_tool_calls: List[str] = []
+        parent_prohibited_calls: List[str] = []
+        subagent_violations: List[str] = []
         seen_call_ids: Set[str] = set()
         seen_tool_invocations: Set[str] = set()
         task_events: List[str] = []
+
+        sub_tools_set = set(expected_subagent_tools) if expected_subagent_tools is not None else None
+        sub_disallowed_set = set(expected_subagent_disallowed) if expected_subagent_disallowed is not None else set()
 
         def _get_val(obj: Any, *keys: str, default: Any = None) -> Any:
             for k in keys:
@@ -569,13 +582,17 @@ class CursorSdkAdapter(BaseHostAdapter):
                         return v
             return default
 
+        current_subagent = None
+
         for msg in (collected_messages or []):
             msg_type = str(_get_val(msg, "type", default="") or "").lower()
             call_id = str(_get_val(msg, "id", "call_id", default="") or "")
             status = str(_get_val(msg, "status", default="") or "").lower()
+            msg_err = _get_val(msg, "error", "error_message", default="")
 
             if msg_type == "tool_call":
-                tool_name = str(_get_val(msg, "name", "tool", "tool_name", default="") or "").lower()
+                raw_tool = str(_get_val(msg, "name", "tool", "tool_name", default="") or "").lower()
+                tool_name = CURSOR_SESSION_TO_SDK_TOOL_MAP.get(raw_tool, raw_tool)
                 args = _get_val(msg, "args", "arguments", default={}) or {}
 
                 # Deduplicate completed event for the same call
@@ -594,9 +611,27 @@ class CursorSdkAdapter(BaseHostAdapter):
                         _get_val(args, "subagent", "subagent_name", "subagent_type", "agent", "name", "type", default="")
                         or _get_val(msg, "subagent", "target", default="")
                     )
-                    task_calls.append(str(target_sub).strip())
+                    sub_str = str(target_sub).strip()
+                    task_calls.append(sub_str)
+                    current_subagent = sub_str
                 elif tool_name:
-                    prohibited_tool_calls.append(tool_name)
+                    msg_subagent = _get_val(msg, "subagent", "author", "sender", default="") or current_subagent
+                    if msg_subagent or task_calls:
+                        if status == "error" or msg_err:
+                            subagent_violations.append(
+                                f"Tool '{raw_tool}' call failed with error: {msg_err or 'status=error'}"
+                            )
+                        sub_label = msg_subagent or expected_subagent or "subagent"
+                        if tool_name in sub_disallowed_set:
+                            subagent_violations.append(
+                                f"Subagent '{sub_label}' attempted prohibited tool '{tool_name}'"
+                            )
+                        elif sub_tools_set is not None and tool_name not in sub_tools_set:
+                            subagent_violations.append(
+                                f"Subagent '{sub_label}' attempted unauthorized tool '{tool_name}'. Allowed: {sorted(list(sub_tools_set))}"
+                            )
+                    else:
+                        parent_prohibited_calls.append(tool_name)
 
             elif msg_type == "task":
                 target_sub = (
@@ -604,25 +639,39 @@ class CursorSdkAdapter(BaseHostAdapter):
                     or _get_val(_get_val(msg, "args", "arguments", default={}) or {}, "subagent", "name", default="")
                 )
                 if target_sub:
-                    task_events.append(str(target_sub).strip())
+                    sub_str = str(target_sub).strip()
+                    task_events.append(sub_str)
+                    current_subagent = sub_str
 
         # If no tool_call events with name='task' were emitted, but task events exist, use task events
         if not task_calls and task_events:
             task_calls.extend(task_events)
 
         # Defensive fallback: if neither tool_calls nor task events in messages, check run / run_result tool_calls
-        if not task_calls and not prohibited_tool_calls:
+        if not task_calls and not parent_prohibited_calls and not subagent_violations:
             fallback_calls = getattr(run_result, "tool_calls", None) or getattr(run, "tool_calls", None) or []
             for tc in fallback_calls:
-                tc_name = str(_get_val(tc, "tool", "name", "tool_name", default="") or "").lower()
+                raw_tc = str(_get_val(tc, "tool", "name", "tool_name", default="") or "").lower()
+                tc_name = CURSOR_SESSION_TO_SDK_TOOL_MAP.get(raw_tc, raw_tc)
                 tc_args = _get_val(tc, "args", "arguments", default=tc) or {}
                 if tc_name == "task":
                     sub = _get_val(tc_args, "subagent", "subagent_name", "agent", "name", default="")
                     task_calls.append(str(sub).strip())
                 elif tc_name:
-                    prohibited_tool_calls.append(tc_name)
+                    tc_sub = _get_val(tc, "subagent", default="") or (task_calls[-1] if task_calls else "")
+                    if tc_sub or task_calls:
+                        if tc_name in sub_disallowed_set:
+                            subagent_violations.append(
+                                f"Subagent '{tc_sub or expected_subagent}' attempted prohibited tool '{tc_name}'"
+                            )
+                        elif sub_tools_set is not None and tc_name not in sub_tools_set:
+                            subagent_violations.append(
+                                f"Subagent '{tc_sub or expected_subagent}' attempted unauthorized tool '{tc_name}'"
+                            )
+                    else:
+                        parent_prohibited_calls.append(tc_name)
 
-        return task_calls, prohibited_tool_calls
+        return task_calls, parent_prohibited_calls, subagent_violations
 
     def wait_for_result(
         self,
@@ -720,6 +769,19 @@ class CursorSdkAdapter(BaseHostAdapter):
         status_str = getattr(run_result, "status", "finished").lower()
         output_text = getattr(run_result, "result", "") or ""
 
+        expected_subagent = session_data.get("expected_subagent")
+        expected_tools = session_data.get("expected_subagent_tools")
+        expected_disallowed = session_data.get("expected_subagent_disallowed")
+
+        task_calls, prohibited_tool_calls, subagent_violations = self._extract_gate_events(
+            collected_messages,
+            run,
+            run_result,
+            expected_subagent=expected_subagent,
+            expected_subagent_tools=expected_tools,
+            expected_subagent_disallowed=expected_disallowed,
+        )
+
         if status_str == "cancelled":
             res = AgentResult(
                 session_id=handle.session_id,
@@ -729,11 +791,18 @@ class CursorSdkAdapter(BaseHostAdapter):
                 is_real_host=self._is_real_host,
             )
         elif status_str == "error":
+            err_detail = None
+            if subagent_violations:
+                err_detail = f"Subagent '{expected_subagent}' tool restriction gate violated: {'; '.join(subagent_violations)}"
+            elif prohibited_tool_calls:
+                err_detail = f"Parent agent violated tool restriction gate: used prohibited tool(s) {prohibited_tool_calls}"
+            else:
+                err_detail = getattr(run_result, "error", None) or output_text or "Cursor Run completed with error status"
             res = AgentResult(
                 session_id=handle.session_id,
                 status=AgentStatus.FAILED,
                 output=output_text,
-                error_message="Cursor Run completed with error status",
+                error_message=str(err_detail),
                 is_real_host=self._is_real_host,
             )
         elif status_str == "expired":
@@ -746,11 +815,12 @@ class CursorSdkAdapter(BaseHostAdapter):
             )
         else:
             # Gate: Extract task tool calls and verify subagent execution from messages stream
-            expected_subagent = session_data.get("expected_subagent")
-            task_calls, prohibited_tool_calls = self._extract_gate_events(collected_messages, run, run_result)
-
             gate_error = None
-            if prohibited_tool_calls:
+            if subagent_violations:
+                gate_error = (
+                    f"Subagent '{expected_subagent}' tool restriction gate violated: {'; '.join(subagent_violations)}"
+                )
+            elif prohibited_tool_calls:
                 gate_error = (
                     f"Parent agent violated tool restriction gate: used prohibited tool(s) {prohibited_tool_calls}. "
                     "Only 'task' tool is allowed."
