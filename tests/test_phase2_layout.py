@@ -127,6 +127,25 @@ class TestNewInstallDataInHost:
 class TestExportOverlay:
     """导出时技术栈覆盖 + agents yaml 只读"""
 
+    def test_cursor_rules_are_exported_from_single_source(self, tmp_path):
+        host = tmp_path / "cursorhost"
+        (host / ".cursor").mkdir(parents=True)
+        command = [os.path.join(SCRIPTS, "verify_and_export_agents.py")]
+        for _ in range(2):
+            result = _run(command, env_extra={"YY_FLOW_PROJECT_ROOT": str(host)}, cwd=str(host))
+            assert result.returncode == 0, result.stdout[-600:] + result.stderr[-300:]
+
+        for name in ("yy-flow.mdc", "yy-flow-orchestrator.mdc"):
+            exported = (host / ".cursor" / "rules" / name).read_bytes()
+            with open(os.path.join(REPO_ROOT, ".cursor", "rules", name), "rb") as source_file:
+                source = source_file.read()
+            assert exported == source
+
+        orchestrator = (host / ".cursor" / "rules" / "yy-flow-orchestrator.mdc").read_text(encoding="utf-8")
+        assert ".yy-flow/skill/scripts/quick_task.py" in orchestrator
+        assert "--type <类型> --force" not in orchestrator
+        assert "skills/multi-agent-flow/SKILL.md" not in orchestrator
+
     def test_overlay_applies_and_template_immutable(self, tmp_path):
         host = tmp_path / "overlayhost"
         host.mkdir()

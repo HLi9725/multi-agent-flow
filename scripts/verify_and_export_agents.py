@@ -6,6 +6,7 @@
 """
 
 import os
+import shutil
 import sys
 import yaml
 
@@ -499,55 +500,17 @@ def export_platform_assets(platforms_config, active_platforms, global_mode=False
         if not global_mode and spec.get("mount_type") == "cursor_mdc" and "rule_target" in spec:
             rel_rule = spec["rule_target"].format(skill_name=skill_name)
             abs_rule = os.path.join(TARGET_PROJECT_DIR, rel_rule)
-            os.makedirs(os.path.dirname(abs_rule), exist_ok=True)
-            with open(abs_rule, "w", encoding="utf-8") as fp:
-                fp.write(
-                    "---\n"
-                    "description: yy-flow 多专家协同研发工作流规则\n"
-                    "globs: [\"*\"]\n"
-                    "alwaysApply: true\n"
-                    "---\n"
-                    "# YY-Flow Multi-Agent Workflow\n\n"
-                    "在 Cursor 会话中开发或解决任务时，主 Agent 必须担任调度中枢，遵循以下流转闭环：\n"
-                    "1. L1/L2 研发任务强制开工门禁：通过 `python scripts/quick_task.py create` 建立任务卡，并推至【进行中】；\n"
-                    "2. 串行调度对应专家子代理（`.cursor/agents/`）：\n"
-                    "   - 开发实现：`@flow-dev` (李开发)\n"
-                    "   - 凭证扫描与审查：`@flow-reviewer` (周审查，只读)\n"
-                    "   - 测试验证与矩阵覆盖：`@flow-qa` (章测试，只读)\n"
-                    "   - 交付与验收推进：`@flow-pm` (严经理)\n"
-                    "3. 状态落库必须经由 `python scripts/transition_task.py` 严格校验；\n"
-                    "4. 详见 `.cursor/rules/yy-flow-orchestrator.mdc` 与 `skills/multi-agent-flow/SKILL.md`。\n"
-                )
-            print(f"[SUCCESS]  [{p_name}] 成功创建 MDC 规则 -> {rel_rule}")
-
-            orch_rule = os.path.join(TARGET_PROJECT_DIR, ".cursor", "rules", "yy-flow-orchestrator.mdc")
-            with open(orch_rule, "w", encoding="utf-8") as fp:
-                fp.write(
-                    "---\n"
-                    "description: yy-flow 多专家全自动协同流转编排规约 (Cursor Autonomous Multi-Agent Orchestration)\n"
-                    "globs: [\"*\"]\n"
-                    "alwaysApply: true\n"
-                    "---\n\n"
-                    "# yy-flow Cursor 对话自主多专家流转编排规约 (Autonomous Orchestrator)\n\n"
-                    "当用户在 Cursor 会话中提出任务、需求、缺陷修复或功能开发请求时，当前主 Agent 自动担任全局编排主控 (Autonomous Orchestrator)，遵循本规约无人值守自主推进全流程。\n\n"
-                    "## 一、核心原则：中枢调度与自主推进\n"
-                    "1. 中枢受控调度 (Hub-and-Spoke)：Cursor 当前子代理机制不支持 P2P 点对点自主转交。主 Agent 必须作为唯一的中枢调度器，按照看板状态机顺序通过子代理工具按名称启动对应专家子代理（`flow-*`），严禁在当前主对话窗口直接扮演角色，严禁跳过审查与测试节点。\n"
-                    "2. 闭环推进不中断 (Autonomous Continuation)：除非遇到不可解决的冲突、致命报错或最终需要人类用户验收，主 Agent 必须自动连续执行各阶段动作，严禁在中间阶段向人类询问“是否继续”。\n\n"
-                    "## 二、任务分级与开工门禁\n"
-                    "- L0 咨询/只读排查：无需建卡，直接回答或使用只读工具分析。\n"
-                    "- L1/L2 研发任务（代码变更、Bug 修复、新功能、重构）：强制开工门禁：\n"
-                    "  1. 动态识别任务类型与责任人：后端/通用为 A 类/李开发 (--role DEV)，前端为 A 类/马前端 (--role FRONTEND)，架构为 B 类/钱架构 (--role ARCHITECT)，文档为 C 类/李文通 (--role DOCS)，运维为 D 类/吕改特 (--role DEVOPS)；\n"
-                    "  2. 检查 `user_data/board.json` 是否已有对应卡片；若无卡片通过 CLI 建卡：\n"
-                    "     `python scripts/quick_task.py create --name \"<任务名称>\" --role PM --assignee <负责人> --type <类型> --force`\n"
-                    "  3. 获取新建任务 ID，并推进至【进行中】（注意：--role 必须使用对应承接角色的代码，如 DEV/FRONTEND/ARCHITECT/DOCS/DEVOPS，严禁全用 DEV）：\n"
-                    "     `python scripts/transition_task.py --role <对应承接角色> --from-status 待开始 --to-status 进行中 --task-id <TASK_ID> --assignee <负责人>`\n\n"
-                    "## 三、标准流转流水线\n"
-                    "1. 开发实现：由分派的专家子代理实施修改并确认 diff；\n"
-                    "2. 代码审查 (REVIEWER - @flow-reviewer)：状态推至【审查中】；运行 `python scripts/check_secrets.py`，只读审查 diff；若有缺陷通过 `transition_task.py` 退回至合法状态【已退回】（禁止使用不存在的状态），PASS 则流转至【测试中】；\n"
-                    "3. 测试验证 (QA - @flow-qa)：运行 `pytest`，核验验收矩阵；若失败同样退回至【已退回】，PASS 则流转至【已完成】；\n"
-                    "4. 完工交付 (PM - @flow-pm)：核验交付物并总结，停在【已完成】等待用户人工进行【已验收】核验。\n"
-                )
-            print(f"[SUCCESS]  [{p_name}] 成功创建 MDC 编排规约 -> .cursor/rules/yy-flow-orchestrator.mdc")
+            for source_name, destination in (
+                ("yy-flow.mdc", abs_rule),
+                ("yy-flow-orchestrator.mdc", os.path.join(TARGET_PROJECT_DIR, ".cursor", "rules", "yy-flow-orchestrator.mdc")),
+            ):
+                source = os.path.join(PROJECT_ROOT, ".cursor", "rules", source_name)
+                if not os.path.isfile(source):
+                    raise FileNotFoundError(f"Cursor rule template missing: {source}")
+                os.makedirs(os.path.dirname(destination), exist_ok=True)
+                if not os.path.exists(destination) or not os.path.samefile(source, destination):
+                    shutil.copyfile(source, destination)
+                print(f"[SUCCESS]  [{p_name}] 已同步 Cursor 规则 -> {os.path.relpath(destination, TARGET_PROJECT_DIR)}")
 
         # 3. 执行 Subagent 导出（全局模式：仅 user_pattern；项目模式：pattern）
         subagent_spec = spec.get("subagent_export")
