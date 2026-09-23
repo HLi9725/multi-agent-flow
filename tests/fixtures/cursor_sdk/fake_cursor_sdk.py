@@ -68,22 +68,7 @@ class AgentDefinition:
     description: str
     prompt: str
     model: str = "inherit"
-    tools: Optional[List[str]] = None
-    disallowed_tools: Optional[List[str]] = None
-
-    def __post_init__(self) -> None:
-        if self.tools is not None:
-            for t in self.tools:
-                if t not in VALID_TOOLS:
-                    raise BadRequestError(
-                        f"Unknown tool '{t}'. Valid tools are: {sorted(list(VALID_TOOLS))}"
-                    )
-        if self.disallowed_tools is not None:
-            for t in self.disallowed_tools:
-                if t not in VALID_TOOLS:
-                    raise BadRequestError(
-                        f"Unknown tool '{t}'. Valid tools are: {sorted(list(VALID_TOOLS))}"
-                    )
+    mcp_servers: Optional[Any] = None
 
 
 @dataclass
@@ -465,6 +450,12 @@ class Agent:
             raise TypeError(f"options must be an instance of SendOptions, got {type(options).__name__}")
         with FakeCursorSdkState._lock:
             hook = FakeCursorSdkState._on_send_hook
+
+        hook_result = None
+        if hook:
+            hook_result = hook(message, self)
+
+        with FakeCursorSdkState._lock:
             resp = FakeCursorSdkState._next_response
             status = FakeCursorSdkState._next_status
             err = FakeCursorSdkState._next_error
@@ -475,10 +466,6 @@ class Agent:
             FakeCursorSdkState._next_refuse_cancel = False
             FakeCursorSdkState._next_messages = None
             FakeCursorSdkState._next_tool_calls = None
-
-        hook_result = None
-        if hook:
-            hook_result = hook(message, self)
 
         run_id = f"run_{uuid.uuid4().hex[:12]}"
         if hook_result is not None:
@@ -492,31 +479,23 @@ class Agent:
             effective_messages = list(custom_messages)
             if not any(getattr(m, "type", None) == "assistant" for m in effective_messages):
                 effective_messages.append(SDKMessage("assistant", text=text_result))
-        elif self.agents:
-            subagent_name = None
-            for name in self.agents.keys():
-                if f"'{name}'" in message or f'"{name}"' in message or name in message:
-                    subagent_name = name
-                    break
-            if not subagent_name:
-                subagent_name = list(self.agents.keys())[0]
-
-            subagent_def = self.agents.get(subagent_name)
-            with FakeCursorSdkState._lock:
-                FakeCursorSdkState._executed_subagents.append({
-                    "subagent_name": subagent_name,
-                    "agent_id": self.agent_id,
-                    "prompt": message,
-                    "subagent_def": subagent_def,
-                })
-
-            cid = f"call_{uuid.uuid4().hex[:8]}"
-            effective_messages = [
-                SDKMessage("tool_call", name="task", status="started", args={"subagent": subagent_name, "prompt": message}, id=cid),
-                SDKMessage("task", subagent=subagent_name, status="completed", text=f"Subagent {subagent_name} executed"),
-                SDKMessage("tool_call", name="task", status="completed", id=cid),
-                SDKMessage("assistant", text=text_result),
-            ]
+            for msg in effective_messages:
+                m_type = getattr(msg, "type", None)
+                sub_name = None
+                if m_type == "task":
+                    sub_name = getattr(msg, "subagent", None)
+                elif m_type == "tool_call" and getattr(msg, "name", None) == "task":
+                    args = getattr(msg, "args", {}) or {}
+                    sub_name = args.get("subagent") or args.get("subagent_name") or getattr(msg, "subagent", None)
+                if sub_name:
+                    with FakeCursorSdkState._lock:
+                        if not any(e.get("subagent_name") == sub_name and e.get("agent_id") == self.agent_id for e in FakeCursorSdkState._executed_subagents):
+                            FakeCursorSdkState._executed_subagents.append({
+                                "subagent_name": sub_name,
+                                "agent_id": self.agent_id,
+                                "prompt": message,
+                                "subagent_def": (self.agents or {}).get(sub_name),
+                            })
         else:
             effective_messages = [
                 SDKMessage("assistant", text=text_result),

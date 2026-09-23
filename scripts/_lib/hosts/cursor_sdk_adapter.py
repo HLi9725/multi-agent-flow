@@ -43,6 +43,8 @@ CURSOR_SESSION_TO_SDK_TOOL_MAP: Dict[str, str] = {
     "view_file": "read",
     "grep": "grep",
     "grep_search": "grep",
+    "glob": "grep",
+    "find_by_name": "grep",
     "shell": "shell",
     "bash": "shell",
     "run_command": "shell",
@@ -277,8 +279,8 @@ class CursorSdkAdapter(BaseHostAdapter):
             sub_tools = sorted(list(mapped_tools - {"edit", "shell"}))
             sub_disallowed_tools = ["edit", "shell"]
         elif "runner-reviewer" in agent_id_lower:
-            sub_tools = sorted(list((mapped_tools | {"read", "grep"}) - {"edit", "shell"}))
-            sub_disallowed_tools = ["edit", "shell"]
+            sub_tools = ["read"]
+            sub_disallowed_tools = ["edit", "shell", "grep"]
         elif "reviewer" in agent_id_lower or enable_write_tools is False:
             sub_tools = sorted(list(mapped_tools - {"edit", "shell"}))
             sub_disallowed_tools = ["edit", "shell"]
@@ -375,24 +377,27 @@ class CursorSdkAdapter(BaseHostAdapter):
             subagent_id = self._resolve_target_agent(role, request.extra_context)
             subagent_name, subagent_desc, subagent_prompt, sub_tools, sub_disallowed = self._load_subagent_definition(workspace_dir, subagent_id)
 
+            prompt_with_tools = subagent_prompt
+            if sub_tools is not None or sub_disallowed is not None:
+                constraint_lines = ["[TOOL CONSTRAINTS]"]
+                if sub_tools is not None:
+                    constraint_lines.append(f"Allowed Tools: {sorted(list(sub_tools)) if sub_tools else 'NONE'}")
+                if sub_disallowed:
+                    sorted_disallowed = sorted(list(sub_disallowed)) if isinstance(sub_disallowed, (list, set, tuple)) else sub_disallowed
+                    constraint_lines.append(f"Prohibited Tools: {sorted_disallowed}")
+                prompt_with_tools = "\n".join(constraint_lines) + "\n\n" + subagent_prompt
+
             if hasattr(sdk, "AgentDefinition"):
-                try:
-                    agent_def = sdk.AgentDefinition(
-                        description=subagent_desc,
-                        prompt=subagent_prompt,
-                        model="inherit",
-                        tools=sub_tools,
-                        disallowed_tools=sub_disallowed,
-                    )
-                except TypeError:
-                    agent_def = sdk.AgentDefinition(description=subagent_desc, prompt=subagent_prompt, model="inherit")
+                agent_def = sdk.AgentDefinition(
+                    description=subagent_desc,
+                    prompt=prompt_with_tools,
+                    model="inherit",
+                )
             else:
                 agent_def = {
                     "description": subagent_desc,
-                    "prompt": subagent_prompt,
+                    "prompt": prompt_with_tools,
                     "model": "inherit",
-                    "tools": sub_tools,
-                    "disallowed_tools": sub_disallowed,
                 }
 
             parent_tools = ["task"]
