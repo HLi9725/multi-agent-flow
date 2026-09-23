@@ -833,7 +833,7 @@ def test_cursor_sdk_readonly_role_tool_isolation(tmp_path):
     """Verify Reviewer and QA agents are issued disallowed_tools and read-only tools on dispatch via AgentOptions."""
     adapter = CursorSdkAdapter(is_real_host=False, default_model="composer-2.5", sdk_module=fake_cursor_sdk)
 
-    # Reviewer dispatch: read-only tools ["read", "grep"], disallowed ["edit", "shell"]
+    # Reviewer dispatch: parent has tools=["task"], disallowed contains edit, shell, read, grep, write; subagent is flow-reviewer
     req_rev = AgentRequest(
         session_id="sess_rev_tools",
         prompt="review code",
@@ -842,11 +842,17 @@ def test_cursor_sdk_readonly_role_tool_isolation(tmp_path):
     )
     handle_rev = adapter.dispatch_agent(req_rev)
     agent_rev = adapter._validate_handle(handle_rev)["agent"]
-    assert agent_rev.disallowed_tools == ["edit", "shell"]
-    assert agent_rev.tools == ["read", "grep"]
-    adapter.wait_for_result(handle_rev)
+    assert "edit" in agent_rev.disallowed_tools
+    assert "shell" in agent_rev.disallowed_tools
+    assert "read" in agent_rev.disallowed_tools
+    assert "grep" in agent_rev.disallowed_tools
+    assert "write" in agent_rev.disallowed_tools
+    assert agent_rev.tools == ["task"]
+    assert "flow-reviewer" in agent_rev.agents
+    res_rev = adapter.wait_for_result(handle_rev)
+    assert res_rev.status == AgentStatus.SUCCESS
 
-    # QA dispatch: text-only (tools=[]), disallowed ["edit", "shell"]
+    # QA dispatch: parent has tools=["task"], disallowed contains edit, shell, read, grep, write; subagent is flow-qa
     req_qa = AgentRequest(
         session_id="sess_qa_tools",
         prompt="test code",
@@ -855,9 +861,15 @@ def test_cursor_sdk_readonly_role_tool_isolation(tmp_path):
     )
     handle_qa = adapter.dispatch_agent(req_qa)
     agent_qa = adapter._validate_handle(handle_qa)["agent"]
-    assert agent_qa.disallowed_tools == ["edit", "shell"]
-    assert agent_qa.tools == []
-    adapter.wait_for_result(handle_qa)
+    assert "edit" in agent_qa.disallowed_tools
+    assert "shell" in agent_qa.disallowed_tools
+    assert "read" in agent_qa.disallowed_tools
+    assert "grep" in agent_qa.disallowed_tools
+    assert "write" in agent_qa.disallowed_tools
+    assert agent_qa.tools == ["task"]
+    assert "flow-qa" in agent_qa.agents
+    res_qa = adapter.wait_for_result(handle_qa)
+    assert res_qa.status == AgentStatus.SUCCESS
 
     # Unknown tool names reject with BadRequestError at AgentOptions and Agent.create
     with pytest.raises(fake_cursor_sdk.BadRequestError) as exc_opt:
@@ -873,7 +885,7 @@ def test_cursor_sdk_strict_signatures_rejects_client_kwargs(tmp_path):
     """Verify that Agent.create, Agent.resume, and agent.send strictly reject invalid arguments."""
     with pytest.raises(TypeError) as exc1:
         fake_cursor_sdk.Agent.create("composer-2.5", client=object())
-    assert "unexpected keyword argument 'client'" in str(exc1.value)
+    assert "unexpected keyword argument" in str(exc1.value) and "client" in str(exc1.value)
 
     with pytest.raises(TypeError) as exc2:
         fake_cursor_sdk.Agent.resume("ag_123", client=object())
@@ -901,6 +913,229 @@ def test_cursor_sdk_strict_signatures_rejects_client_kwargs(tmp_path):
     with pytest.raises(TypeError) as exc5:
         ag.send("message", disallowed_tools=["edit"])
     assert "unexpected keyword argument" in str(exc5.value)
+
+
+def test_cursor_sdk_role_mapping_normal_and_managed(tmp_path):
+    """Verify role resolution under normal and production_runner_managed modes."""
+    adapter = CursorSdkAdapter(is_real_host=False, default_model="composer-2.5", sdk_module=fake_cursor_sdk)
+
+    # 1. Normal mappings (8+ roles)
+    normal_expectations = {
+        "DEV": "flow-dev",
+        "BUILDER": "flow-dev",
+        "REVIEWER": "flow-reviewer",
+        "QA": "flow-qa",
+        "ARCHITECT": "flow-architect",
+        "PM": "flow-pm",
+        "DOCS": "flow-docs",
+        "DEVOPS": "flow-devops",
+        "FRONTEND": "flow-frontend",
+    }
+    for role, expected_agent in normal_expectations.items():
+        assert adapter._resolve_target_agent(role, {}) == expected_agent
+
+    # 2. Production runner managed mode (only BUILDER, REVIEWER, QA permitted)
+    managed_ctx = {"production_runner_managed": True}
+    assert adapter._resolve_target_agent("BUILDER", managed_ctx) == "flow-runner-builder"
+    assert adapter._resolve_target_agent("REVIEWER", managed_ctx) == "flow-runner-reviewer"
+    assert adapter._resolve_target_agent("QA", managed_ctx) == "flow-runner-qa"
+
+    # Managed mode Fail-Closed on any other role
+    for role in ["DEV", "ARCHITECT", "PM", "DOCS", "DEVOPS", "FRONTEND", "UNKNOWN"]:
+        with pytest.raises(AgentNotSupportedError, match="not supported under production_runner_managed mode"):
+            adapter._resolve_target_agent(role, managed_ctx)
+
+    # Normal mode rejects completely unknown role
+    with pytest.raises(AgentNotSupportedError, match="not supported by CursorSdkAdapter"):
+        adapter._resolve_target_agent("NONEXISTENT_ROLE", {})
+
+
+def test_cursor_sdk_parent_agent_has_only_task_tool_and_single_agent(tmp_path):
+    """Verify parent agent has only 'task' tool, disallowed prohibited tools, and exactly one registered subagent."""
+    adapter = CursorSdkAdapter(is_real_host=False, default_model="composer-2.5", sdk_module=fake_cursor_sdk)
+
+    req = AgentRequest(
+        session_id="sess_parent_gating",
+        prompt="execute work",
+        role="BUILDER",
+        workspace_dir=str(tmp_path),
+        extra_context={"production_runner_managed": True},
+    )
+    handle = adapter.dispatch_agent(req)
+    agent = adapter._validate_handle(handle)["agent"]
+
+    # Parent Agent must ONLY have 'task' tool
+    assert agent.tools == ["task"]
+    # Parent Agent must have disallowed edit, shell, read, grep, write
+    for tool in ["edit", "shell", "read", "grep", "write"]:
+        assert tool in agent.disallowed_tools
+
+    # Parent Agent must register exactly ONE subagent
+    assert isinstance(agent.agents, dict)
+    assert len(agent.agents) == 1
+    assert "flow-runner-builder" in agent.agents
+
+    sub_def = agent.agents["flow-runner-builder"]
+    assert hasattr(sub_def, "description")
+    assert hasattr(sub_def, "prompt")
+    assert sub_def.description
+    assert sub_def.prompt
+    assert sub_def.model == "inherit"
+
+    res = adapter.wait_for_result(handle)
+    assert res.status == AgentStatus.SUCCESS
+
+
+def test_cursor_sdk_task_call_gate_enforcement(tmp_path):
+    """Verify invocation gate asserts exactly one valid task tool call and zero prohibited tools."""
+    adapter = CursorSdkAdapter(is_real_host=False, default_model="composer-2.5", sdk_module=fake_cursor_sdk)
+
+    # Case A: 0 task calls -> FAILED (Parent answered directly)
+    fake_cursor_sdk.FakeCursorSdkState.set_next_tool_calls([])
+    req_zero = AgentRequest(
+        session_id="sess_gate_zero",
+        prompt="work",
+        role="BUILDER",
+        workspace_dir=str(tmp_path),
+    )
+    h_zero = adapter.dispatch_agent(req_zero)
+    res_zero = adapter.wait_for_result(h_zero)
+    assert res_zero.status == AgentStatus.FAILED
+    assert "no 'task' tool call was made" in res_zero.error_message
+
+    # Case B: Multiple task calls -> FAILED
+    fake_cursor_sdk.FakeCursorSdkState.set_next_tool_calls([
+        {"tool": "task", "subagent": "flow-dev"},
+        {"tool": "task", "subagent": "flow-dev"},
+    ])
+    req_multi = AgentRequest(
+        session_id="sess_gate_multi",
+        prompt="work",
+        role="BUILDER",
+        workspace_dir=str(tmp_path),
+    )
+    h_multi = adapter.dispatch_agent(req_multi)
+    res_multi = adapter.wait_for_result(h_multi)
+    assert res_multi.status == AgentStatus.FAILED
+    assert "expected exactly one 'task' tool call, but got 2" in res_multi.error_message
+
+    # Case C: Wrong subagent called -> FAILED
+    fake_cursor_sdk.FakeCursorSdkState.set_next_tool_calls([
+        {"tool": "task", "subagent": "flow-qa"},
+    ])
+    req_wrong = AgentRequest(
+        session_id="sess_gate_wrong",
+        prompt="work",
+        role="BUILDER",
+        workspace_dir=str(tmp_path),
+    )
+    h_wrong = adapter.dispatch_agent(req_wrong)
+    res_wrong = adapter.wait_for_result(h_wrong)
+    assert res_wrong.status == AgentStatus.FAILED
+    assert "expected subagent 'flow-dev', but called 'flow-qa'" in res_wrong.error_message
+
+    # Case D: Prohibited tool called -> FAILED
+    fake_cursor_sdk.FakeCursorSdkState.set_next_tool_calls([
+        {"tool": "edit", "args": {"file": "evil.py"}},
+        {"tool": "task", "subagent": "flow-dev"},
+    ])
+    req_prohibited = AgentRequest(
+        session_id="sess_gate_prohibited",
+        prompt="work",
+        role="BUILDER",
+        workspace_dir=str(tmp_path),
+    )
+    h_prohibited = adapter.dispatch_agent(req_prohibited)
+    res_prohibited = adapter.wait_for_result(h_prohibited)
+    assert res_prohibited.status == AgentStatus.FAILED
+    assert "violated tool restriction gate: used prohibited tool(s) ['edit']" in res_prohibited.error_message
+
+    # Case E: Exactly 1 matching task call -> SUCCESS
+    fake_cursor_sdk.FakeCursorSdkState.set_next_tool_calls([
+        {"tool": "task", "subagent": "flow-dev"},
+    ])
+    req_ok = AgentRequest(
+        session_id="sess_gate_ok",
+        prompt="work",
+        role="BUILDER",
+        workspace_dir=str(tmp_path),
+    )
+    h_ok = adapter.dispatch_agent(req_ok)
+    fake_cursor_sdk.FakeCursorSdkState.set_next_tool_calls([
+        {"tool": "task", "subagent": "flow-dev"},
+    ])
+    res_ok = adapter.wait_for_result(h_ok)
+    assert res_ok.status == AgentStatus.SUCCESS
+
+
+def test_cursor_sdk_resume_recarries_agents_and_task_tool(tmp_path):
+    """Verify that resuming via Agent.resume recarries agents and task tool constraints."""
+    adapter = CursorSdkAdapter(is_real_host=False, default_model="composer-2.5", sdk_module=fake_cursor_sdk)
+
+    # Initial turn
+    req1 = AgentRequest(
+        session_id="sess_init_gate",
+        prompt="first",
+        role="BUILDER",
+        workspace_dir=str(tmp_path),
+        extra_context={"production_runner_managed": True},
+    )
+    h1 = adapter.dispatch_agent(req1)
+    ag1 = adapter._validate_handle(h1)["agent"]
+    orig_id = ag1.agent_id
+    adapter.wait_for_result(h1)
+
+    # Resumed turn
+    req2 = AgentRequest(
+        session_id="sess_resume_gate",
+        prompt="second",
+        role="BUILDER",
+        workspace_dir=str(tmp_path),
+        extra_context={
+            "production_runner_managed": True,
+            "resume_agent_id": orig_id,
+        },
+    )
+    h2 = adapter.dispatch_agent(req2)
+    ag2 = adapter._validate_handle(h2)["agent"]
+    assert ag2.agent_id == orig_id
+    assert ag2.tools == ["task"]
+    for tool in ["edit", "shell", "read", "grep", "write"]:
+        assert tool in ag2.disallowed_tools
+    assert "flow-runner-builder" in ag2.agents
+
+    res2 = adapter.wait_for_result(h2)
+    assert res2.status == AgentStatus.SUCCESS
+
+
+def test_cursor_sdk_missing_or_corrupt_agent_markdown_fails_closed(tmp_path):
+    """Verify missing agent markdown or invalid frontmatter triggers Fail-Closed AgentNotSupportedError."""
+    adapter = CursorSdkAdapter(is_real_host=False, default_model="composer-2.5", sdk_module=fake_cursor_sdk)
+
+    # 1. Nonexistent agent id
+    with pytest.raises(AgentNotSupportedError, match="Subagent markdown definition.*does not exist.*Fail-Closed"):
+        adapter._load_subagent_definition(str(tmp_path), "flow-nonexistent-agent")
+
+    # 2. Corrupt markdown: missing frontmatter
+    corrupt_dir = tmp_path / ".cursor" / "agents"
+    corrupt_dir.mkdir(parents=True)
+    bad_md1 = corrupt_dir / "bad1.md"
+    bad_md1.write_text("Just plain text without yaml frontmatter", encoding="utf-8")
+    with pytest.raises(AgentNotSupportedError, match="missing YAML frontmatter header"):
+        adapter._load_subagent_definition(str(tmp_path), "bad1")
+
+    # 3. Missing name in frontmatter
+    bad_md2 = corrupt_dir / "bad2.md"
+    bad_md2.write_text("---\ndescription: some desc\n---\nPrompt body", encoding="utf-8")
+    with pytest.raises(AgentNotSupportedError, match="missing required 'name' field"):
+        adapter._load_subagent_definition(str(tmp_path), "bad2")
+
+    # 4. Missing prompt body
+    bad_md3 = corrupt_dir / "bad3.md"
+    bad_md3.write_text("---\nname: bad3\ndescription: some desc\n---\n   \n", encoding="utf-8")
+    with pytest.raises(AgentNotSupportedError, match="Subagent body prompt.*is empty"):
+        adapter._load_subagent_definition(str(tmp_path), "bad3")
+
 
 
 def test_runner_resume_wires_builder_session_id_to_extra_context(mock_repo, tmp_path, monkeypatch):

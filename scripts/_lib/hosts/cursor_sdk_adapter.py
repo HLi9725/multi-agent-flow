@@ -14,8 +14,27 @@ import time
 from types import MappingProxyType
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 import uuid
+import yaml
 
 logger = logging.getLogger("cursor_sdk_adapter")
+
+ROLE_AGENT_MAP: Dict[str, str] = {
+    "DEV": "flow-dev",
+    "BUILDER": "flow-dev",
+    "REVIEWER": "flow-reviewer",
+    "QA": "flow-qa",
+    "ARCHITECT": "flow-architect",
+    "PM": "flow-pm",
+    "DOCS": "flow-docs",
+    "DEVOPS": "flow-devops",
+    "FRONTEND": "flow-frontend",
+}
+
+RUNNER_MANAGED_AGENT_MAP: Dict[str, str] = {
+    "BUILDER": "flow-runner-builder",
+    "REVIEWER": "flow-runner-reviewer",
+    "QA": "flow-runner-qa",
+}
 
 from ..core.agent_schema import (
     AgentCancelledError,
@@ -129,6 +148,95 @@ class CursorSdkAdapter(BaseHostAdapter):
             )
         return str(model).strip()
 
+    def _resolve_target_agent(self, role: str, extra_context: Any) -> str:
+        """Resolve role to specialized Cursor subagent ID."""
+        role_upper = (role or "").upper().strip()
+        is_managed = False
+        if isinstance(extra_context, Mapping):
+            val = extra_context.get("production_runner_managed")
+            if val is True or str(val).lower() in ("true", "1", "yes"):
+                is_managed = True
+
+        if is_managed:
+            if role_upper not in RUNNER_MANAGED_AGENT_MAP:
+                raise AgentNotSupportedError(
+                    f"Role '{role}' is not supported under production_runner_managed mode. "
+                    f"Only {sorted(list(RUNNER_MANAGED_AGENT_MAP.keys()))} are permitted."
+                )
+            return RUNNER_MANAGED_AGENT_MAP[role_upper]
+
+        if role_upper not in ROLE_AGENT_MAP:
+            raise AgentNotSupportedError(
+                f"Role '{role}' is not supported by CursorSdkAdapter. Known roles: {sorted(list(ROLE_AGENT_MAP.keys()))}"
+            )
+        return ROLE_AGENT_MAP[role_upper]
+
+    def _load_subagent_definition(self, workspace_dir: str, agent_id: str) -> Tuple[str, str, str]:
+        """
+        Load subagent name, description, and body prompt from .cursor/agents/{agent_id}.md.
+        Enforces Fail-Closed verification on file presence and frontmatter integrity.
+        """
+        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+        candidate_paths = [
+            os.path.join(workspace_dir, ".cursor", "agents", f"{agent_id}.md"),
+            os.path.join(repo_root, ".cursor", "agents", f"{agent_id}.md"),
+        ]
+        try:
+            from ... import paths as _paths
+            candidate_paths.append(os.path.join(_paths.project_root(), ".cursor", "agents", f"{agent_id}.md"))
+            candidate_paths.append(os.path.join(_paths.skill_root(), ".cursor", "agents", f"{agent_id}.md"))
+        except Exception:
+            pass
+
+        target_file = None
+        for p in candidate_paths:
+            if p and os.path.isfile(p):
+                target_file = p
+                break
+
+        if not target_file:
+            raise AgentNotSupportedError(
+                f"Subagent markdown definition for '{agent_id}' does not exist at .cursor/agents/{agent_id}.md (Fail-Closed)."
+            )
+
+        try:
+            with open(target_file, "r", encoding="utf-8") as f:
+                content = f.read()
+        except Exception as exc:
+            raise AgentNotSupportedError(f"Failed to read subagent definition '{target_file}': {exc}") from exc
+
+        if not content.startswith("---"):
+            raise AgentNotSupportedError(
+                f"Subagent definition '{target_file}' is missing YAML frontmatter header (Fail-Closed)."
+            )
+
+        parts = content.split("---", 2)
+        if len(parts) < 3:
+            raise AgentNotSupportedError(
+                f"Subagent definition '{target_file}' has incomplete frontmatter structure (Fail-Closed)."
+            )
+
+        try:
+            fm = yaml.safe_load(parts[1])
+        except Exception as exc:
+            raise AgentNotSupportedError(f"Subagent definition '{target_file}' has invalid YAML frontmatter: {exc}") from exc
+
+        if not isinstance(fm, dict):
+            raise AgentNotSupportedError(f"Subagent frontmatter in '{target_file}' is not a valid dictionary mapping.")
+
+        name = fm.get("name")
+        desc = fm.get("description")
+        if not name or not str(name).strip():
+            raise AgentNotSupportedError(f"Subagent frontmatter in '{target_file}' is missing required 'name' field.")
+        if not desc or not str(desc).strip():
+            raise AgentNotSupportedError(f"Subagent frontmatter in '{target_file}' is missing required 'description' field.")
+
+        prompt_body = parts[2].strip()
+        if not prompt_body:
+            raise AgentNotSupportedError(f"Subagent body prompt in '{target_file}' is empty (Fail-Closed).")
+
+        return str(name).strip(), str(desc).strip(), prompt_body
+
     def _validate_handle(self, handle: AgentHandle, include_history: bool = True) -> Dict[str, Any]:
         """Validate handle ownership and authenticity using constant-time comparisons."""
         if not isinstance(handle, AgentHandle):
@@ -208,17 +316,17 @@ class CursorSdkAdapter(BaseHostAdapter):
                 cwd=workspace_dir,
             )
 
-            tools: Optional[List[str]] = None
-            disallowed_tools: Optional[List[str]] = None
-            if role == "REVIEWER":
-                tools = ["read", "grep"]
-                disallowed_tools = ["edit", "shell"]
-            elif role == "QA":
-                tools = []
-                disallowed_tools = ["edit", "shell"]
-            elif role == "BUILDER":
-                tools = None
-                disallowed_tools = None
+            subagent_id = self._resolve_target_agent(role, request.extra_context)
+            subagent_name, subagent_desc, subagent_prompt = self._load_subagent_definition(workspace_dir, subagent_id)
+
+            if hasattr(sdk, "AgentDefinition"):
+                agent_def = sdk.AgentDefinition(description=subagent_desc, prompt=subagent_prompt, model="inherit")
+            else:
+                agent_def = {"description": subagent_desc, "prompt": subagent_prompt, "model": "inherit"}
+
+            parent_tools = ["task"]
+            parent_disallowed_tools = ["edit", "shell", "read", "grep", "write"]
+            parent_agents = {subagent_name: agent_def}
 
             resume_id = (
                 request.extra_context.get("resume_agent_id")
@@ -228,7 +336,13 @@ class CursorSdkAdapter(BaseHostAdapter):
             if resume_id and hasattr(sdk.Agent, "resume"):
                 resume_opts = None
                 if hasattr(sdk, "AgentOptions"):
-                    resume_opts = sdk.AgentOptions(api_key=api_key)
+                    resume_opts = sdk.AgentOptions(
+                        api_key=api_key,
+                        local=local_opts,
+                        agents=parent_agents,
+                        tools=parent_tools,
+                        disallowed_tools=parent_disallowed_tools,
+                    )
                 if resume_opts is not None:
                     try:
                         agent = sdk.Agent.resume(str(resume_id), options=resume_opts)
@@ -242,8 +356,9 @@ class CursorSdkAdapter(BaseHostAdapter):
                         model=model,
                         api_key=api_key,
                         local=local_opts,
-                        tools=tools,
-                        disallowed_tools=disallowed_tools,
+                        tools=parent_tools,
+                        disallowed_tools=parent_disallowed_tools,
+                        agents=parent_agents,
                     )
                     try:
                         agent = sdk.Agent.create(agent_options)
@@ -252,26 +367,36 @@ class CursorSdkAdapter(BaseHostAdapter):
                             model=model,
                             api_key=api_key,
                             local=local_opts,
-                            tools=tools,
-                            disallowed_tools=disallowed_tools,
+                            tools=parent_tools,
+                            disallowed_tools=parent_disallowed_tools,
+                            agents=parent_agents,
                         )
                 else:
                     agent = sdk.Agent.create(
                         model=model,
                         api_key=api_key,
                         local=local_opts,
-                        tools=tools,
-                        disallowed_tools=disallowed_tools,
+                        tools=parent_tools,
+                        disallowed_tools=parent_disallowed_tools,
+                        agents=parent_agents,
                     )
+
+            parent_prompt = (
+                f"You are an orchestration dispatcher for role '{subagent_name}'.\n"
+                f"You MUST use the 'task' tool to invoke subagent '{subagent_name}' exactly once with the task description below.\n"
+                f"You are strictly prohibited from implementing code changes, reviewing code, running tests, or making judgments yourself.\n"
+                f"Return the exact, verbatim output produced by the subagent '{subagent_name}' without modification.\n\n"
+                f"Task Description:\n{request.prompt}"
+            )
 
             send_opts = sdk.SendOptions() if hasattr(sdk, "SendOptions") else None
             if send_opts is not None:
                 try:
-                    run = agent.send(request.prompt, options=send_opts)
+                    run = agent.send(parent_prompt, options=send_opts)
                 except TypeError:
-                    run = agent.send(request.prompt)
+                    run = agent.send(parent_prompt)
             else:
-                run = agent.send(request.prompt)
+                run = agent.send(parent_prompt)
         except Exception as exc:
             self._handle_dispatch_error(exc)
             raise
@@ -300,6 +425,7 @@ class CursorSdkAdapter(BaseHostAdapter):
                 "request": request,
                 "model": model,
                 "agent_id": canonical_agent_id,
+                "expected_subagent": subagent_name,
                 "created_at": time.time(),
                 "completed": False,
                 "result": None,
@@ -427,19 +553,86 @@ class CursorSdkAdapter(BaseHostAdapter):
                 is_real_host=self._is_real_host,
             )
         else:
-            res = AgentResult(
-                session_id=handle.session_id,
-                status=AgentStatus.SUCCESS,
-                output=output_text,
-                partial_results=(
-                    {
-                        "invocation_id": run_id,
-                        "host_invocation_id": run_id,
-                        "agent_id": agent_id,
-                    },
-                ),
-                is_real_host=self._is_real_host,
-            )
+            # Gate: Extract task tool calls and verify subagent execution
+            expected_subagent = session_data.get("expected_subagent")
+            tool_calls = getattr(run_result, "tool_calls", None)
+            if tool_calls is None:
+                tool_calls = getattr(run, "tool_calls", None)
+
+            task_calls: List[str] = []
+            prohibited_tool_calls: List[str] = []
+            for tc in (tool_calls or []):
+                tc_name = ""
+                tc_args = {}
+                if isinstance(tc, dict):
+                    tc_name = tc.get("tool") or tc.get("name") or tc.get("tool_name") or ""
+                    tc_args = tc.get("args") or tc.get("arguments") or tc
+                elif hasattr(tc, "tool"):
+                    tc_name = getattr(tc, "tool", "")
+                    tc_args = getattr(tc, "args", {}) or {}
+                elif hasattr(tc, "name"):
+                    tc_name = getattr(tc, "name", "")
+                    tc_args = getattr(tc, "arguments", {}) or getattr(tc, "args", {}) or {}
+
+                if str(tc_name).lower() == "task":
+                    target_sub = (
+                        tc_args.get("subagent")
+                        or tc_args.get("subagent_name")
+                        or tc_args.get("subagent_type")
+                        or tc_args.get("agent")
+                        or tc_args.get("agent_name")
+                        or tc_args.get("name")
+                        or tc_args.get("type")
+                        or ""
+                    )
+                    task_calls.append(str(target_sub).strip())
+                else:
+                    prohibited_tool_calls.append(str(tc_name))
+
+            gate_error = None
+            if prohibited_tool_calls:
+                gate_error = (
+                    f"Parent agent violated tool restriction gate: used prohibited tool(s) {prohibited_tool_calls}. "
+                    "Only 'task' tool is allowed."
+                )
+            elif len(task_calls) == 0:
+                gate_error = (
+                    f"Parent agent failed invocation gate: no 'task' tool call was made to '{expected_subagent}'. "
+                    "Parent Agent answered directly without executing the designated subagent."
+                )
+            elif len(task_calls) > 1:
+                gate_error = (
+                    f"Parent agent failed invocation gate: expected exactly one 'task' tool call, but got {len(task_calls)}."
+                )
+            elif task_calls[0] != expected_subagent:
+                gate_error = (
+                    f"Parent agent failed invocation gate: expected subagent '{expected_subagent}', "
+                    f"but called '{task_calls[0]}'."
+                )
+
+            if gate_error:
+                res = AgentResult(
+                    session_id=handle.session_id,
+                    status=AgentStatus.FAILED,
+                    output="",
+                    error_message=gate_error,
+                    is_real_host=self._is_real_host,
+                )
+            else:
+                res = AgentResult(
+                    session_id=handle.session_id,
+                    status=AgentStatus.SUCCESS,
+                    output=output_text,
+                    partial_results=(
+                        {
+                            "invocation_id": run_id,
+                            "host_invocation_id": run_id,
+                            "agent_id": agent_id,
+                            "subagent": expected_subagent,
+                        },
+                    ),
+                    is_real_host=self._is_real_host,
+                )
 
         with self._lock:
             session_data["completed"] = True

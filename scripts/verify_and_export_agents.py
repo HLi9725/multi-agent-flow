@@ -52,9 +52,9 @@ RUNNER_BUILDER_ID = RUNNER_MANAGED_AGENT_IDS["BUILDER"]
 
 
 def serialize_runner_builder(platform_key, subagent_spec):
-    """Antigravity-only managed Builder profile with no terminal capability."""
+    """Managed Builder profile with no terminal capability."""
     tools = [tool for tool in PLATFORM_TOOLS.get(platform_key, DEFAULT_TOOLS)
-             if tool.lower() != "run_command"]
+             if tool.lower() not in ("run_command", "bash")]
     body = """# Production Runner 托管 Builder
 
 这是 flow-dev 的 Runner 专用执行配置，不是第九个业务角色。
@@ -531,7 +531,7 @@ def export_platform_assets(platforms_config, active_platforms, global_mode=False
                     "# yy-flow Cursor 对话自主多专家流转编排规约 (Autonomous Orchestrator)\n\n"
                     "当用户在 Cursor 会话中提出任务、需求、缺陷修复或功能开发请求时，当前主 Agent 自动担任全局编排主控 (Autonomous Orchestrator)，遵循本规约无人值守自主推进全流程。\n\n"
                     "## 一、核心原则：中枢调度与自主推进\n"
-                    "1. 中枢受控调度 (Hub-and-Spoke)：Cursor 当前子代理机制不支持 P2P 点对点自主转交。主 Agent 必须作为唯一的中枢调度器，按照看板状态机顺序串行派发任务给对应专家子代理（或以专家身份执行），严禁跳过审查与测试节点。\n"
+                    "1. 中枢受控调度 (Hub-and-Spoke)：Cursor 当前子代理机制不支持 P2P 点对点自主转交。主 Agent 必须作为唯一的中枢调度器，按照看板状态机顺序通过子代理工具按名称启动对应专家子代理（`flow-*`），严禁在当前主对话窗口直接扮演角色，严禁跳过审查与测试节点。\n"
                     "2. 闭环推进不中断 (Autonomous Continuation)：除非遇到不可解决的冲突、致命报错或最终需要人类用户验收，主 Agent 必须自动连续执行各阶段动作，严禁在中间阶段向人类询问“是否继续”。\n\n"
                     "## 二、任务分级与开工门禁\n"
                     "- L0 咨询/只读排查：无需建卡，直接回答或使用只读工具分析。\n"
@@ -601,7 +601,7 @@ def export_platform_assets(platforms_config, active_platforms, global_mode=False
         # Managed execution profiles are not additional business roles. They
         # exist only on Antigravity surfaces, where headless terminal calls may
         # be elevated before a user can approve them.
-        if p_key in ("antigravity", "antigravity_cli"):
+        if p_key in ("antigravity", "antigravity_cli", "cursor"):
             managed_contents = {
                 RUNNER_BUILDER_ID: serialize_runner_builder(p_key, subagent_spec or {}),
             }

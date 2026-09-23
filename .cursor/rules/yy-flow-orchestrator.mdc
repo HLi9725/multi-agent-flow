@@ -6,110 +6,23 @@ alwaysApply: true
 
 # yy-flow Cursor 对话自主多专家流转编排规约 (Autonomous Orchestrator)
 
-当用户在 Cursor 会话中提出任务、需求、缺陷修复或功能开发请求时，当前主 Agent 自动担任**全局编排主控 (Autonomous Orchestrator)**，遵循本规约无人值守自主推进全流程。
-
----
+当用户在 Cursor 会话中提出任务、需求、缺陷修复或功能开发请求时，当前主 Agent 自动担任全局编排主控 (Autonomous Orchestrator)，遵循本规约无人值守自主推进全流程。
 
 ## 一、核心原则：中枢调度与自主推进
+1. 中枢受控调度 (Hub-and-Spoke)：Cursor 当前子代理机制不支持 P2P 点对点自主转交。主 Agent 必须作为唯一的中枢调度器，按照看板状态机顺序通过子代理工具按名称启动对应专家子代理（`flow-*`），严禁在当前主对话窗口直接扮演角色，严禁跳过审查与测试节点。
+2. 闭环推进不中断 (Autonomous Continuation)：除非遇到不可解决的冲突、致命报错或最终需要人类用户验收，主 Agent 必须自动连续执行各阶段动作，严禁在中间阶段向人类询问“是否继续”。
 
-1. **中枢受控调度 (Hub-and-Spoke)**：
-   - Cursor 当前子代理机制不支持 P2P 点对点自主转交。
-   - 主 Agent 必须作为唯一的中枢调度器，按照看板状态机顺序串行派发任务给对应专家子代理（或以专家身份执行），严禁跳过审查与测试节点。
-2. **闭环推进不中断 (Autonomous Continuation)**：
-   - 除非遇到不可解决的冲突、致命报错或最终需要人类用户验收，主 Agent 必须自动连续执行各阶段动作，严禁在中间阶段（如开发完成后、审查完成后）向人类询问“是否继续”。
-
----
-
-## 二、任务分级、角色推导与开工门禁
-
-- **L0 咨询/只读排查**：无需建卡，直接回答或使用只读工具分析。
-- **L1/L2 研发任务**（代码变更、Bug 修复、新功能、重构、文档编写、运维脚本）：**强制开工门禁**：
-  1. **按需求领域动态识别分工角色与任务类型**：
-     - 后端/通用业务逻辑开发：任务类型 `A` 类，开发负责人 `李开发` (`@flow-dev`)
-     - 前端页面/组件/样式开发：任务类型 `A` 类，开发负责人 `马前端` (`@flow-frontend`)
-     - 架构设计/重构方案：任务类型 `B` 类，负责人 `钱架构` (`@flow-architect`)
-     - 文档编写/接口规约：任务类型 `C` 类，负责人 `李文通` (`@flow-docs`)
-     - 运维脚本/CI/环境部署：任务类型 `D` 类，负责人 `吕改特` (`@flow-devops`)
-  2. 检查 `user_data/board.json` 是否已有对应进行中卡片。
-  3. 若无卡片，必须首先通过 CLI 自动建卡：
-     ```bash
-     python scripts/quick_task.py create --name "<任务名称>" --role PM --assignee <负责人> --type <任务类型> --force
-     ```
-  4. 获取新建任务 ID（如 `T0027`），并将其推进至【进行中】：
-     ```bash
-     python scripts/transition_task.py --role DEV --from-status 待开始 --to-status 进行中 --task-id <TASK_ID> --assignee <负责人>
-     ```
-
----
+## 二、任务分级与开工门禁
+- L0 咨询/只读排查：无需建卡，直接回答或使用只读工具分析。
+- L1/L2 研发任务（代码变更、Bug 修复、新功能、重构）：强制开工门禁：
+  1. 动态识别任务类型与责任人：后端/通用为 A 类/李开发，前端为 A 类/马前端，架构为 B 类/钱架构，文档为 C 类/李文通，运维为 D 类/吕改特；
+  2. 检查 `user_data/board.json` 是否已有对应卡片；若无卡片通过 CLI 建卡：
+     `python scripts/quick_task.py create --name "<任务名称>" --role PM --assignee <负责人> --type <类型> --force`
+  3. 获取新建任务 ID，并推进至【进行中】：
+     `python scripts/transition_task.py --role DEV --from-status 待开始 --to-status 进行中 --task-id <TASK_ID> --assignee <负责人>`
 
 ## 三、标准流转流水线
-
-### 步骤 1：开发实现 (DEV / FRONTEND / DOCS / DEVOPS)
-- **执行角色**：按建卡分派的专业子代理（如 `@flow-dev`、`@flow-frontend` 等）
-- **职责**：
-  - 严格依据需求修改代码或增加测试用例。
-  - 保留原有注释与文档，不得无故修改工作区外文件。
-  - 完成修改后，使用 `git diff` 确认变更干净且符合预期。
-
-### 步骤 2：代码与安全性审查 (REVIEWER)
-- **状态流转**：
-  ```bash
-  python scripts/transition_task.py --role DEV --from-status 进行中 --to-status 审查中 --task-id <TASK_ID> --assignee 周审查
-  ```
-- **执行角色**：`@flow-reviewer` (周审查，只读隔离)
-- **职责**：
-  - 执行敏感凭据核验：`python scripts/check_secrets.py`
-  - 只读审查 `git diff`，核查边界、异常处理及代码风格。
-  - **若审查发现缺陷（打回）**：流转至合法状态【已退回】（严禁使用不存在的“被打回”状态）并退回原开发负责人：
-    ```bash
-    python scripts/transition_task.py --role REVIEWER --from-status 审查中 --to-status 已退回 --task-id <TASK_ID> --assignee <原开发负责人> --remarks "DEF-<TASK_ID>-01: <审查缺陷描述>"
-    ```
-    原负责人接手并重新流转至【进行中】：
-    ```bash
-    python scripts/transition_task.py --role DEV --from-status 已退回 --to-status 进行中 --task-id <TASK_ID> --assignee <原开发负责人>
-    ```
-    修复后重新提交审查。
-  - 若审查 PASS：进入步骤 3。
-
-### 步骤 3：测试验证与验收矩阵核验 (QA)
-- **状态流转**：
-  ```bash
-  python scripts/transition_task.py --role REVIEWER --from-status 审查中 --to-status 测试中 --task-id <TASK_ID> --assignee 章测试
-  ```
-- **执行角色**：`@flow-qa` (章测试，只读隔离)
-- **职责**：
-  - 运行单元测试与集成测试（如 `pytest`）。
-  - 核验验收标准矩阵（正向覆盖与反向防御场景）。
-  - **若测试未通过（打回）**：流转至合法状态【已退回】（严禁使用不存在的“被打回”状态）并退回原开发负责人：
-    ```bash
-    python scripts/transition_task.py --role QA --from-status 测试中 --to-status 已退回 --task-id <TASK_ID> --assignee <原开发负责人> --remarks "DEF-<TASK_ID>-02: <测试失败详情>"
-    ```
-    原负责人接手并重新流转至【进行中】：
-    ```bash
-    python scripts/transition_task.py --role DEV --from-status 已退回 --to-status 进行中 --task-id <TASK_ID> --assignee <原开发负责人>
-    ```
-    修复后重新提交测试。
-  - 若测试 PASS：进入步骤 4。
-
-### 步骤 4：完工交付 (PM)
-- **状态流转**：
-  ```bash
-  python scripts/transition_task.py --role QA --from-status 测试中 --to-status 已完成 --task-id <TASK_ID> --assignee 严经理 --end-time "<YYYY-MM-DD HH:MM:SS>"
-  ```
-- **执行角色**：`@flow-pm` (严经理)
-- **职责**：
-  - 核查任务交付物完整性。
-  - 输出结构化交付总结（变更摘要、测试结果、任务卡最终状态）。
-  - **注意**：流转至【已完成】后即停止自动流转，保留最终状态给用户人工进行【已验收】核验：
-    ```bash
-    python scripts/transition_task.py --role PM --from-status 已完成 --to-status 已验收 --task-id <TASK_ID> --assignee 严经理
-    ```
-
----
-
-## 四、铁律与防呆约束
-
-1. **状态流转必须由脚本校验执行**：严禁手动篡改 `board.json`。
-2. **终态不可逆**：处于 `已验收` 的卡片不可重新打开或修改；新改动必须建立新卡片。
-3. **合法打回状态**：打回目标状态必须为 **`已退回`**，禁止编造不存在的状态。
-4. **只读角色严格受控**：周审查 (REVIEWER) 与章测试 (QA) 绝不执行文件修改或代码写入。
+1. 开发实现：由分派的专家子代理实施修改并确认 diff；
+2. 代码审查 (REVIEWER - @flow-reviewer)：状态推至【审查中】；运行 `python scripts/check_secrets.py`，只读审查 diff；若有缺陷通过 `transition_task.py` 退回至合法状态【已退回】（禁止使用不存在的状态），PASS 则流转至【测试中】；
+3. 测试验证 (QA - @flow-qa)：运行 `pytest`，核验验收矩阵；若失败同样退回至【已退回】，PASS 则流转至【已完成】；
+4. 完工交付 (PM - @flow-pm)：核验交付物并总结，停在【已完成】等待用户人工进行【已验收】核验。

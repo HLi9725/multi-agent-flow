@@ -60,7 +60,14 @@ class BadRequestError(CursorAgentError):
         super().__init__(message, is_retryable=False, code=kwargs.get("code", "bad_request"), status_code=400)
 
 
-VALID_TOOLS = {"read", "grep", "shell", "edit"}
+VALID_TOOLS = {"read", "grep", "shell", "edit", "task", "write"}
+
+
+@dataclass
+class AgentDefinition:
+    description: str
+    prompt: str
+    model: str = "inherit"
 
 
 @dataclass
@@ -76,6 +83,7 @@ class AgentOptions:
     local: Optional[LocalAgentOptions] = None
     tools: Optional[List[str]] = None
     disallowed_tools: Optional[List[str]] = None
+    agents: Optional[Dict[str, AgentDefinition]] = None
 
     def __post_init__(self) -> None:
         if self.tools is not None:
@@ -103,6 +111,7 @@ class RunResult:
     result: Optional[str] = None
     duration_ms: Optional[int] = None
     usage: Optional[Dict[str, Any]] = None
+    tool_calls: Optional[List[Dict[str, Any]]] = None
 
 
 class FakeCursorSdkState:
@@ -113,6 +122,7 @@ class FakeCursorSdkState:
     _next_error: Optional[Exception] = None
     _next_create_error: Optional[Exception] = None
     _next_refuse_cancel: bool = False
+    _next_tool_calls: Optional[List[Dict[str, Any]]] = None
     _on_send_hook: Optional[Callable[[str, "Agent"], None]] = None
     _runs: Dict[str, "Run"] = {}
     _agents: Dict[str, "Agent"] = {}
@@ -125,6 +135,7 @@ class FakeCursorSdkState:
             cls._next_error = None
             cls._next_create_error = None
             cls._next_refuse_cancel = False
+            cls._next_tool_calls = None
             cls._on_send_hook = None
             cls._runs.clear()
             cls._agents.clear()
@@ -152,6 +163,11 @@ class FakeCursorSdkState:
             cls._next_refuse_cancel = refuse
 
     @classmethod
+    def set_next_tool_calls(cls, tool_calls: Optional[List[Dict[str, Any]]]) -> None:
+        with cls._lock:
+            cls._next_tool_calls = tool_calls
+
+    @classmethod
     def set_on_send_hook(cls, hook: Optional[Callable[[str, "Agent"], None]]) -> None:
         with cls._lock:
             cls._on_send_hook = hook
@@ -167,6 +183,7 @@ class Run:
         error: Optional[CursorAgentError] = None,
         delay_seconds: float = 0.0,
         refuse_cancel: bool = False,
+        tool_calls: Optional[List[Dict[str, Any]]] = None,
     ):
         self.id = run_id
         self.agent_id = agent_id
@@ -175,6 +192,7 @@ class Run:
         self.error = error
         self.delay_seconds = delay_seconds
         self.refuse_cancel = refuse_cancel
+        self.tool_calls = list(tool_calls) if tool_calls is not None else []
         self.is_cancelled = False
         FakeCursorSdkState._runs[run_id] = self
 
@@ -189,11 +207,11 @@ class Run:
             elapsed = 0.0
             while elapsed < self.delay_seconds:
                 if self.is_cancelled:
-                    return RunResult(status="cancelled", result=None)
+                    return RunResult(status="cancelled", result=None, tool_calls=list(self.tool_calls))
                 time.sleep(step)
                 elapsed += step
         if self.is_cancelled:
-            return RunResult(status="cancelled", result=None)
+            return RunResult(status="cancelled", result=None, tool_calls=list(self.tool_calls))
         with FakeCursorSdkState._lock:
             if FakeCursorSdkState._next_error is not None:
                 err = FakeCursorSdkState._next_error
@@ -208,6 +226,7 @@ class Run:
                     result=resp,
                     duration_ms=120,
                     usage={"prompt_tokens": 10, "completion_tokens": 20},
+                    tool_calls=list(self.tool_calls),
                 )
         if self.error is not None:
             raise self.error
@@ -216,7 +235,9 @@ class Run:
             result=self.result,
             duration_ms=120,
             usage={"prompt_tokens": 10, "completion_tokens": 20},
+            tool_calls=list(self.tool_calls),
         )
+
 
     def cancel(self) -> None:
         if not self.refuse_cancel:
@@ -242,6 +263,7 @@ class Agent:
         api_key: Optional[str] = None,
         tools: Optional[List[str]] = None,
         disallowed_tools: Optional[List[str]] = None,
+        agents: Optional[Dict[str, AgentDefinition]] = None,
     ):
         self.agent_id = agent_id
         self.model = model
@@ -250,6 +272,7 @@ class Agent:
         self.is_closed = False
         self.tools = tools
         self.disallowed_tools = disallowed_tools
+        self.agents = agents or {}
         FakeCursorSdkState._agents[agent_id] = self
 
     def close(self) -> None:
@@ -270,12 +293,13 @@ class Agent:
         local: Optional[LocalAgentOptions] = None,
         tools: Optional[List[str]] = None,
         disallowed_tools: Optional[List[str]] = None,
+        agents: Optional[Dict[str, AgentDefinition]] = None,
         **kwargs: Any,
     ) -> "Agent":
-        if "client" in kwargs and kwargs["client"] is not None:
+        if kwargs:
             raise TypeError(
-                "Agent.create() got an unexpected keyword argument 'client'. "
-                "Pass api_key directly to Agent.create(options=AgentOptions(...) or model=..., api_key=..., local=...)."
+                f"Agent.create() got unexpected keyword argument(s): {list(kwargs.keys())}. "
+                "Pass options directly to Agent.create(options=AgentOptions(...))."
             )
         with FakeCursorSdkState._lock:
             if FakeCursorSdkState._next_create_error is not None:
@@ -288,6 +312,7 @@ class Agent:
         effective_local = local
         effective_tools = tools
         effective_disallowed_tools = disallowed_tools
+        effective_agents = agents
 
         if isinstance(options, AgentOptions):
             effective_model = options.model or effective_model
@@ -295,6 +320,7 @@ class Agent:
             effective_local = options.local or effective_local
             effective_tools = options.tools if options.tools is not None else effective_tools
             effective_disallowed_tools = options.disallowed_tools if options.disallowed_tools is not None else effective_disallowed_tools
+            effective_agents = options.agents if options.agents is not None else effective_agents
         elif isinstance(options, str):
             effective_model = options
 
@@ -322,6 +348,7 @@ class Agent:
             api_key=effective_api_key,
             tools=effective_tools,
             disallowed_tools=effective_disallowed_tools,
+            agents=effective_agents,
         )
 
     @classmethod
@@ -339,14 +366,34 @@ class Agent:
         if options is not None and not isinstance(options, AgentOptions):
             raise TypeError(f"options must be an instance of AgentOptions, got {type(options).__name__}")
         api_key = options.api_key if options else None
+        agents = options.agents if options else None
+        tools = options.tools if options else None
+        disallowed_tools = options.disallowed_tools if options else None
+        local = options.local if options else None
         with FakeCursorSdkState._lock:
             if agent_id in FakeCursorSdkState._agents:
                 agent = FakeCursorSdkState._agents[agent_id]
                 agent.is_closed = False
                 if api_key:
                     agent.api_key = api_key
+                if agents is not None:
+                    agent.agents = agents
+                if tools is not None:
+                    agent.tools = tools
+                if disallowed_tools is not None:
+                    agent.disallowed_tools = disallowed_tools
+                if local is not None:
+                    agent.local = local
                 return agent
-        return cls(agent_id=agent_id, model="resumed-model", api_key=api_key)
+        return cls(
+            agent_id=agent_id,
+            model="resumed-model",
+            api_key=api_key,
+            tools=tools,
+            disallowed_tools=disallowed_tools,
+            agents=agents,
+            local=local,
+        )
 
     def send(self, message: str, options: Optional[SendOptions] = None, **kwargs: Any) -> Run:
         if kwargs:
@@ -362,18 +409,35 @@ class Agent:
             status = FakeCursorSdkState._next_status
             err = FakeCursorSdkState._next_error
             refuse_cancel = FakeCursorSdkState._next_refuse_cancel
+            custom_tool_calls = FakeCursorSdkState._next_tool_calls
             # Clear one-shot errors
             FakeCursorSdkState._next_error = None
             FakeCursorSdkState._next_refuse_cancel = False
+            FakeCursorSdkState._next_tool_calls = None
 
         hook_result = None
         if hook:
             hook_result = hook(message, self)
 
         run_id = f"run_{uuid.uuid4().hex[:12]}"
+        if custom_tool_calls is not None:
+            effective_tool_calls = list(custom_tool_calls)
+        elif self.agents:
+            subagent_name = list(self.agents.keys())[0]
+            effective_tool_calls = [{"tool": "task", "subagent": subagent_name, "prompt": message}]
+        else:
+            effective_tool_calls = []
+
         if err is not None:
             if isinstance(err, CursorAgentError):
-                return Run(run_id=run_id, agent_id=self.agent_id, status="error", error=err, refuse_cancel=refuse_cancel)
+                return Run(
+                    run_id=run_id,
+                    agent_id=self.agent_id,
+                    status="error",
+                    error=err,
+                    refuse_cancel=refuse_cancel,
+                    tool_calls=effective_tool_calls,
+                )
             raise err
 
         if hook_result is not None:
@@ -382,7 +446,14 @@ class Agent:
             text_result = resp
         else:
             text_result = f"Mock execution complete for {self.agent_id}"
-        return Run(run_id=run_id, agent_id=self.agent_id, status=status, result=text_result, refuse_cancel=refuse_cancel)
+        return Run(
+            run_id=run_id,
+            agent_id=self.agent_id,
+            status=status,
+            result=text_result,
+            refuse_cancel=refuse_cancel,
+            tool_calls=effective_tool_calls,
+        )
 
     @classmethod
     def get_run(cls, run_id: str, client: Optional[CursorClient] = None) -> Run:
