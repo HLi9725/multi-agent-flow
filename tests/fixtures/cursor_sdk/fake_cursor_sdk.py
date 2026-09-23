@@ -66,7 +66,7 @@ class ToolNotAllowedError(BadRequestError):
         super().__init__(message, code=kwargs.get("code", "tool_not_allowed"), **kwargs)
 
 
-VALID_TOOLS = {"read", "grep", "glob", "shell", "edit", "task"}
+VALID_TOOLS = {"read", "grep", "glob", "shell", "edit", "task", "mcp"}
 
 CURSOR_SESSION_TO_SDK_TOOL_MAP: Dict[str, str] = {
     "read": "read",
@@ -102,6 +102,31 @@ try:
     from scripts._lib.hosts.cursor_sdk_adapter import resolve_subagent_tool_policy
 except ImportError:
     from _lib.hosts.cursor_sdk_adapter import resolve_subagent_tool_policy
+
+
+def _project_sources_enabled(local: Any) -> bool:
+    sources = getattr(local, "setting_sources", None) or []
+    normalized = {str(item).strip().lower() for item in sources}
+    return "project" in normalized or "all" in normalized
+
+
+def discover_subagents_from_local(local: Any) -> Dict[str, AgentDefinition]:
+    """Load file subagents only when setting_sources includes project or all, from cwd and dirs."""
+    if not _project_sources_enabled(local):
+        return {}
+    roots: List[str] = []
+    cwd = getattr(local, "cwd", None)
+    if cwd:
+        roots.append(cwd)
+    for extra in getattr(local, "dirs", None) or []:
+        if extra and extra not in roots:
+            roots.append(extra)
+    discovered: Dict[str, AgentDefinition] = {}
+    for root in roots:
+        for name, sub_def in discover_subagents_from_dir(root).items():
+            if name not in discovered:
+                discovered[name] = sub_def
+    return discovered
 
 
 def discover_subagents_from_dir(cwd: Optional[str]) -> Dict[str, AgentDefinition]:
@@ -160,6 +185,7 @@ def discover_subagents_from_dir(cwd: Optional[str]) -> Dict[str, AgentDefinition
 class LocalAgentOptions:
     cwd: str
     setting_sources: Optional[List[str]] = None
+    dirs: Optional[List[str]] = None
 
 
 @dataclass
@@ -424,8 +450,9 @@ class Agent:
                     setattr(adef, "from_file", False)
                 self.agents[aname] = adef
         else:
-            cwd = (local.cwd if local else None) or os.getcwd()
-            self.agents = discover_subagents_from_dir(cwd)
+            # File discovery is not used. dirs does not load subagents, and project
+            # setting sources would also load the target repo's rules and MCP.
+            self.agents = {}
         FakeCursorSdkState._agents[agent_id] = self
 
     def is_tool_allowed(self, tool: str, subagent: Optional[str] = None) -> bool:
@@ -637,6 +664,12 @@ class Agent:
                 elif m_type == "tool_call":
                     tool_name = getattr(msg, "name", None)
                     args = getattr(msg, "args", {}) or {}
+                    if tool_name and not self.is_tool_allowed(tool_name):
+                        err_msg = f"Tool '{tool_name}' is not permitted for this agent"
+                        setattr(msg, "status", "error")
+                        setattr(msg, "error", err_msg)
+                        tool_violation_error = err_msg
+                        continue
                     if tool_name == "task":
                         sub_name = args.get("subagent") or args.get("subagent_name") or getattr(msg, "subagent", None)
                         if sub_name:

@@ -180,7 +180,6 @@ def test_cursor_sdk_adapter_dispatch_and_identity_mapping(tmp_path):
         role="BUILDER",
         workspace_dir=str(tmp_path),
     )
-    FakeCursorSdkState.set_next_tool_calls([{"tool": "task", "subagent": "flow-dev"}])
     FakeCursorSdkState.set_next_response("Builder output text")
     handle = adapter.dispatch_agent(req)
 
@@ -467,7 +466,6 @@ def test_runner_full_e2e_with_cursor_sdk(mock_repo, tmp_path, monkeypatch):
             m_cand = re.search(r"- candidate_commit: '([^']+)'", prompt)
             m_sess = re.search(r"- session_id: '([^']+)'", prompt)
             m_req = re.search(r"- review_request_id: '([^']+)'", prompt)
-            FakeCursorSdkState.set_next_tool_calls([{"tool": "task", "subagent": "flow-runner-reviewer"}])
             return json.dumps({
                 "task_id": m_task.group(1) if m_task else "T0099",
                 "baseline_commit": m_base.group(1) if m_base else head_sha,
@@ -480,7 +478,6 @@ def test_runner_full_e2e_with_cursor_sdk(mock_repo, tmp_path, monkeypatch):
             })
 
         if "independent QA gate" in prompt or "Acceptance criteria hash:" in prompt:
-            FakeCursorSdkState.set_next_tool_calls([{"tool": "task", "subagent": "flow-runner-qa"}])
             return json.dumps({
                 "decision": "PASS",
                 "acceptance_coverage": [{
@@ -502,7 +499,6 @@ def test_runner_full_e2e_with_cursor_sdk(mock_repo, tmp_path, monkeypatch):
         feature_file = os.path.join(cwd, "feature.py")
         with open(feature_file, "w", encoding="utf-8") as f:
             f.write("def dummy(): return True\n")
-        FakeCursorSdkState.set_next_tool_calls([{"tool": "task", "subagent": "flow-runner-builder"}])
         return "Builder successfully added feature."
 
     FakeCursorSdkState.set_on_send_hook(sdk_hook)
@@ -573,7 +569,6 @@ def test_runner_mixed_host_cursor_builder_with_other_hosts(mock_repo, tmp_path, 
             m_cand = re.search(r"- candidate_commit: '([^']+)'", prompt)
             m_sess = re.search(r"- session_id: '([^']+)'", prompt)
             m_req = re.search(r"- review_request_id: '([^']+)'", prompt)
-            FakeCursorSdkState.set_next_tool_calls([{"tool": "task", "subagent": "flow-runner-reviewer"}])
             return json.dumps({
                 "task_id": m_task.group(1) if m_task else "T0099",
                 "baseline_commit": m_base.group(1) if m_base else head_sha,
@@ -588,7 +583,6 @@ def test_runner_mixed_host_cursor_builder_with_other_hosts(mock_repo, tmp_path, 
         feature_file = os.path.join(cwd, "feature_mixed.py")
         with open(feature_file, "w", encoding="utf-8") as f:
             f.write("def dummy(): return True\n")
-        FakeCursorSdkState.set_next_tool_calls([{"tool": "task", "subagent": "flow-runner-builder"}])
         return "Builder implemented feature"
 
     FakeCursorSdkState.set_on_send_hook(sdk_hook)
@@ -696,7 +690,7 @@ def test_runner_mixed_host_cursor_builder_with_other_hosts(mock_repo, tmp_path, 
 
 
 def test_cursor_sdk_real_api_signatures_and_agent_id(tmp_path, monkeypatch):
-    """Verify Agent.create receives api_key directly, agent.agent_id is canonical, and setting_sources is not empty []."""
+    """Verify Agent.create receives api_key directly and does not enable project setting sources."""
     monkeypatch.setenv("CURSOR_API_KEY", "real_style_api_key_xyz")
     adapter = CursorSdkAdapter(is_real_host=True, default_model="composer-2.5", sdk_module=fake_cursor_sdk)
 
@@ -706,7 +700,6 @@ def test_cursor_sdk_real_api_signatures_and_agent_id(tmp_path, monkeypatch):
         role="BUILDER",
         workspace_dir=str(tmp_path),
     )
-    FakeCursorSdkState.set_next_tool_calls([{"tool": "task", "subagent": "flow-dev"}])
     handle = adapter.dispatch_agent(req)
     session_data = adapter._validate_handle(handle)
     agent = session_data["agent"]
@@ -716,6 +709,9 @@ def test_cursor_sdk_real_api_signatures_and_agent_id(tmp_path, monkeypatch):
     assert agent.api_key == "real_style_api_key_xyz"
     assert agent.local.cwd == str(tmp_path.resolve())
     assert agent.local.setting_sources is None
+    assert not agent.local.dirs
+    assert not agent.agents
+    assert not (tmp_path / ".cursor").exists()
     res = adapter.wait_for_result(handle)
     assert res.status == AgentStatus.SUCCESS
     assert agent.is_closed is True  # Resource cleanup called
@@ -785,7 +781,6 @@ def test_cursor_sdk_resume_existing_session(tmp_path):
     session_data1 = adapter._validate_handle(handle1)
     original_agent = session_data1["agent"]
     orig_agent_id = original_agent.agent_id
-    FakeCursorSdkState.set_next_tool_calls([{"tool": "task", "subagent": "flow-dev"}])
     adapter.wait_for_result(handle1)
     assert original_agent.is_closed is True
 
@@ -806,7 +801,6 @@ def test_cursor_sdk_resume_existing_session(tmp_path):
 
     assert resumed_agent.agent_id == orig_agent_id
     assert resumed_agent.is_closed is False
-    FakeCursorSdkState.set_next_tool_calls([{"tool": "task", "subagent": "flow-dev"}])
     res2 = adapter.wait_for_result(handle2)
     assert res2.status == AgentStatus.SUCCESS
     assert resumed_agent.is_closed is True
@@ -832,7 +826,6 @@ def test_cursor_sdk_custom_api_key_env_propagation(tmp_path, monkeypatch):
             "cursor_api_key_env": "MY_SPECIAL_CURSOR_KEY",
         },
     )
-    FakeCursorSdkState.set_next_tool_calls([{"tool": "task", "subagent": "flow-dev"}])
     handle = adapter.dispatch_agent(req)
     session_data = adapter._validate_handle(handle)
     agent = session_data["agent"]
@@ -846,8 +839,6 @@ def test_cursor_sdk_readonly_role_tool_isolation(tmp_path):
     """Verify Reviewer and QA agents are issued disallowed_tools and read-only tools on dispatch via AgentOptions."""
     adapter = CursorSdkAdapter(is_real_host=False, default_model="composer-2.5", sdk_module=fake_cursor_sdk)
 
-    # Reviewer dispatch: parent has tools=["task"], disallowed contains edit, shell, read, grep; subagent is flow-runner-reviewer
-    FakeCursorSdkState.set_next_tool_calls([{"tool": "task", "subagent": "flow-runner-reviewer"}])
     req_rev = AgentRequest(
         session_id="sess_rev_tools",
         prompt="review code",
@@ -859,31 +850,26 @@ def test_cursor_sdk_readonly_role_tool_isolation(tmp_path):
     agent_rev = adapter._validate_handle(handle_rev)["agent"]
     assert "edit" in agent_rev.disallowed_tools
     assert "shell" in agent_rev.disallowed_tools
-    assert "read" in agent_rev.disallowed_tools
+    assert "read" not in agent_rev.disallowed_tools
     assert "grep" in agent_rev.disallowed_tools
     assert "glob" in agent_rev.disallowed_tools
     assert "write" not in agent_rev.disallowed_tools
-    assert agent_rev.tools == ["task"]
-    assert "flow-runner-reviewer" in agent_rev.agents
-    rev_sub = agent_rev.agents["flow-runner-reviewer"]
-    assert rev_sub.tools == ["read"]
-    assert rev_sub.disallowed_tools == ["edit", "glob", "grep", "shell"]
+    assert "mcp" in agent_rev.disallowed_tools
+    assert not agent_rev.agents
+    assert agent_rev.tools == ["read"]
 
-    # Verify actual tool permission enforcement and rejection
-    assert agent_rev.is_tool_allowed("read", subagent="flow-runner-reviewer") is True
-    assert agent_rev.is_tool_allowed("edit", subagent="flow-runner-reviewer") is False
-    assert agent_rev.is_tool_allowed("shell", subagent="flow-runner-reviewer") is False
-    assert agent_rev.is_tool_allowed("grep", subagent="flow-runner-reviewer") is False
-    assert agent_rev.is_tool_allowed("glob", subagent="flow-runner-reviewer") is False
+    assert agent_rev.is_tool_allowed("read") is True
+    assert agent_rev.is_tool_allowed("edit") is False
+    assert agent_rev.is_tool_allowed("shell") is False
+    assert agent_rev.is_tool_allowed("grep") is False
+    assert agent_rev.is_tool_allowed("glob") is False
     for prohibited in ["edit", "shell", "grep", "glob"]:
         with pytest.raises(fake_cursor_sdk.ToolNotAllowedError):
-            agent_rev.execute_tool(prohibited, subagent="flow-runner-reviewer")
+            agent_rev.execute_tool(prohibited)
 
     res_rev = adapter.wait_for_result(handle_rev)
     assert res_rev.status == AgentStatus.SUCCESS
 
-    # QA dispatch: parent has tools=["task"], disallowed contains edit, shell, read, grep, glob; subagent is flow-runner-qa
-    FakeCursorSdkState.set_next_tool_calls([{"tool": "task", "subagent": "flow-runner-qa"}])
     req_qa = AgentRequest(
         session_id="sess_qa_tools",
         prompt="test code",
@@ -899,17 +885,14 @@ def test_cursor_sdk_readonly_role_tool_isolation(tmp_path):
     assert "grep" in agent_qa.disallowed_tools
     assert "glob" in agent_qa.disallowed_tools
     assert "write" not in agent_qa.disallowed_tools
-    assert agent_qa.tools == ["task"]
-    assert "flow-runner-qa" in agent_qa.agents
-    qa_sub = agent_qa.agents["flow-runner-qa"]
-    assert qa_sub.tools == []
-    assert qa_sub.disallowed_tools == ["edit", "glob", "grep", "read", "shell"]
+    assert "mcp" in agent_qa.disallowed_tools
+    assert not agent_qa.agents
+    assert agent_qa.tools == []
 
-    # Verify actual QA tool permission enforcement and rejection
     for prohibited in ["read", "edit", "shell", "grep", "glob"]:
-        assert agent_qa.is_tool_allowed(prohibited, subagent="flow-runner-qa") is False
+        assert agent_qa.is_tool_allowed(prohibited) is False
         with pytest.raises(fake_cursor_sdk.ToolNotAllowedError):
-            agent_qa.execute_tool(prohibited, subagent="flow-runner-qa")
+            agent_qa.execute_tool(prohibited)
 
     res_qa = adapter.wait_for_result(handle_qa)
     assert res_qa.status == AgentStatus.SUCCESS
@@ -1013,66 +996,46 @@ def test_cursor_sdk_parent_agent_has_only_task_tool_and_single_agent(tmp_path):
         workspace_dir=str(tmp_path),
         extra_context={"production_runner_managed": True},
     )
-    FakeCursorSdkState.set_next_tool_calls([{"tool": "task", "subagent": "flow-runner-builder"}])
     handle = adapter.dispatch_agent(req)
     agent = adapter._validate_handle(handle)["agent"]
 
-    # Parent Agent must ONLY have 'task' tool
-    assert agent.tools == ["task"]
-    # Parent Agent must have disallowed edit, shell, read, grep, glob (no write)
-    for tool in ["edit", "shell", "read", "grep", "glob"]:
-        assert tool in agent.disallowed_tools
+    assert agent.tools == ["edit", "glob", "grep", "read"]
+    assert "shell" in agent.disallowed_tools
+    assert "task" in agent.disallowed_tools
+    assert "mcp" in agent.disallowed_tools
     assert "write" not in agent.disallowed_tools
+    assert not agent.agents
+    assert agent.local.setting_sources is None
+    assert not (tmp_path / ".cursor").exists()
 
-    # Parent Agent registers subagent discovered from .cursor/agents/*.md
-    assert isinstance(agent.agents, dict)
-    assert len(agent.agents) == 1
-    assert "flow-runner-builder" in agent.agents
-
-    sub_def = agent.agents["flow-runner-builder"]
-    assert hasattr(sub_def, "description")
-    assert hasattr(sub_def, "prompt")
-    assert sub_def.description
-    assert sub_def.prompt
-    assert sub_def.tools == ["edit", "glob", "grep", "read"]
-    assert sub_def.disallowed_tools == ["shell"]
-
-    # Verify tool permission enforcement on Builder subagent
-    assert agent.is_tool_allowed("glob", subagent="flow-runner-builder") is True
-    assert agent.is_tool_allowed("grep", subagent="flow-runner-builder") is True
-    assert agent.is_tool_allowed("read", subagent="flow-runner-builder") is True
-    assert agent.is_tool_allowed("edit", subagent="flow-runner-builder") is True
-    assert agent.is_tool_allowed("shell", subagent="flow-runner-builder") is False
-
+    assert agent.is_tool_allowed("glob") is True
+    assert agent.is_tool_allowed("edit") is True
+    assert agent.is_tool_allowed("shell") is False
     with pytest.raises(fake_cursor_sdk.ToolNotAllowedError):
-        agent.execute_tool("shell", subagent="flow-runner-builder")
+        agent.execute_tool("shell")
 
     res = adapter.wait_for_result(handle)
     assert res.status == AgentStatus.SUCCESS
-    # Verify subagent execution was recorded in fake SDK
-    executed = fake_cursor_sdk.FakeCursorSdkState.get_executed_subagents()
-    assert len(executed) == 1
-    assert executed[0]["subagent_name"] == "flow-runner-builder"
 
 
 def test_cursor_sdk_task_call_gate_enforcement(tmp_path):
-    """Verify invocation gate asserts exactly one valid task tool call and zero prohibited tools from messages stream."""
+    """Verify the role allowlist rejects tools that are not declared in the markdown file."""
     adapter = CursorSdkAdapter(is_real_host=False, default_model="composer-2.5", sdk_module=fake_cursor_sdk)
 
-    # Case A: 0 task calls -> FAILED (Parent answered directly)
+    # Case A: text only, no tool call -> SUCCESS
     fake_cursor_sdk.FakeCursorSdkState.set_next_tool_calls([])
     req_zero = AgentRequest(
         session_id="sess_gate_zero",
         prompt="work",
         role="BUILDER",
         workspace_dir=str(tmp_path),
+        extra_context={"production_runner_managed": True},
     )
     h_zero = adapter.dispatch_agent(req_zero)
     res_zero = adapter.wait_for_result(h_zero)
-    assert res_zero.status == AgentStatus.FAILED
-    assert "no 'task' tool call was made" in res_zero.error_message
+    assert res_zero.status == AgentStatus.SUCCESS
 
-    # Case B: Multiple task calls -> FAILED
+    # Case B: task is not in the builder file allowlist -> FAILED
     fake_cursor_sdk.FakeCursorSdkState.set_next_tool_calls([
         {"tool": "task", "subagent": "flow-dev"},
         {"tool": "task", "subagent": "flow-dev"},
@@ -1086,7 +1049,7 @@ def test_cursor_sdk_task_call_gate_enforcement(tmp_path):
     h_multi = adapter.dispatch_agent(req_multi)
     res_multi = adapter.wait_for_result(h_multi)
     assert res_multi.status == AgentStatus.FAILED
-    assert "expected exactly one 'task' tool call, but got 2" in res_multi.error_message
+    assert "prohibited tool(s) ['task']" in res_multi.error_message
 
     # Case C: Wrong subagent called -> FAILED
     fake_cursor_sdk.FakeCursorSdkState.set_next_tool_calls([
@@ -1101,7 +1064,7 @@ def test_cursor_sdk_task_call_gate_enforcement(tmp_path):
     h_wrong = adapter.dispatch_agent(req_wrong)
     res_wrong = adapter.wait_for_result(h_wrong)
     assert res_wrong.status == AgentStatus.FAILED
-    assert "expected subagent 'flow-dev', but called 'flow-qa'" in res_wrong.error_message
+    assert "prohibited tool(s) ['task']" in res_wrong.error_message
 
     # Case D: Prohibited tool called -> FAILED
     fake_cursor_sdk.FakeCursorSdkState.set_next_tool_calls([
@@ -1117,11 +1080,11 @@ def test_cursor_sdk_task_call_gate_enforcement(tmp_path):
     h_prohibited = adapter.dispatch_agent(req_prohibited)
     res_prohibited = adapter.wait_for_result(h_prohibited)
     assert res_prohibited.status == AgentStatus.FAILED
-    assert "violated tool restriction gate: used prohibited tool(s) ['edit']" in res_prohibited.error_message
+    assert "prohibited tool(s)" in res_prohibited.error_message
 
-    # Case E: Exactly 1 matching task call via messages stream -> SUCCESS
+    # Case E: edit is declared for the unmanaged builder file -> SUCCESS
     fake_cursor_sdk.FakeCursorSdkState.set_next_tool_calls([
-        {"tool": "task", "subagent": "flow-dev"},
+        {"tool": "edit", "args": {"file": "app.py"}},
     ])
     req_ok = AgentRequest(
         session_id="sess_gate_ok",
@@ -1149,7 +1112,6 @@ def test_cursor_sdk_resume_recarries_agents_and_task_tool(tmp_path):
     h1 = adapter.dispatch_agent(req1)
     ag1 = adapter._validate_handle(h1)["agent"]
     orig_id = ag1.agent_id
-    FakeCursorSdkState.set_next_tool_calls([{"tool": "task", "subagent": "flow-runner-builder"}])
     adapter.wait_for_result(h1)
 
     # Resumed turn
@@ -1166,13 +1128,13 @@ def test_cursor_sdk_resume_recarries_agents_and_task_tool(tmp_path):
     h2 = adapter.dispatch_agent(req2)
     ag2 = adapter._validate_handle(h2)["agent"]
     assert ag2.agent_id == orig_id
-    assert ag2.tools == ["task"]
-    for tool in ["edit", "shell", "read", "grep"]:
-        assert tool in ag2.disallowed_tools
+    assert ag2.tools == ["edit", "glob", "grep", "read"]
+    assert "shell" in ag2.disallowed_tools
+    assert "mcp" in ag2.disallowed_tools
     assert "write" not in ag2.disallowed_tools
-    assert "flow-runner-builder" in ag2.agents
+    assert not ag2.agents
+    assert ag2.local.setting_sources is None
 
-    FakeCursorSdkState.set_next_tool_calls([{"tool": "task", "subagent": "flow-runner-builder"}])
     res2 = adapter.wait_for_result(h2)
     assert res2.status == AgentStatus.SUCCESS
 
@@ -1402,13 +1364,12 @@ def test_cursor_sdk_subagent_tool_rejection_and_inline_override(tmp_path, monkey
         extra_context={"production_runner_managed": True, "cursor_model": "composer-2.5"},
     )
     FakeCursorSdkState.set_next_messages([
-        fake_cursor_sdk.SDKMessage("tool_call", name="task", args={"subagent": "flow-runner-reviewer"}),
-        fake_cursor_sdk.SDKMessage("tool_call", name="edit", subagent="flow-runner-reviewer", args={"path": "app.py"}),
+        fake_cursor_sdk.SDKMessage("tool_call", name="edit", args={"path": "app.py"}),
     ])
     handle_rev = adapter.dispatch_agent(rev_req)
     result_rev = adapter.wait_for_result(handle_rev)
     assert result_rev.status == AgentStatus.FAILED
-    assert "tool restriction gate violated" in result_rev.error_message or "Tool 'edit' is not permitted" in result_rev.error_message
+    assert "prohibited tool(s) ['edit']" in result_rev.error_message
 
     # 2. QA attempting prohibited tool 'read' fails through adapter gate
     qa_req = AgentRequest(
@@ -1419,13 +1380,12 @@ def test_cursor_sdk_subagent_tool_rejection_and_inline_override(tmp_path, monkey
         extra_context={"production_runner_managed": True, "cursor_model": "composer-2.5"},
     )
     FakeCursorSdkState.set_next_messages([
-        fake_cursor_sdk.SDKMessage("tool_call", name="task", args={"subagent": "flow-runner-qa"}),
-        fake_cursor_sdk.SDKMessage("tool_call", name="read", subagent="flow-runner-qa", args={"path": "app.py"}),
+        fake_cursor_sdk.SDKMessage("tool_call", name="read", args={"path": "app.py"}),
     ])
     handle_qa = adapter.dispatch_agent(qa_req)
     result_qa = adapter.wait_for_result(handle_qa)
     assert result_qa.status == AgentStatus.FAILED
-    assert "tool restriction gate violated" in result_qa.error_message or "Tool 'read' is not permitted" in result_qa.error_message
+    assert "prohibited tool(s) ['read']" in result_qa.error_message
 
     # 3. Reviewer using authorized 'read' tool succeeds through adapter
     rev_ok_req = AgentRequest(
@@ -1436,8 +1396,7 @@ def test_cursor_sdk_subagent_tool_rejection_and_inline_override(tmp_path, monkey
         extra_context={"production_runner_managed": True, "cursor_model": "composer-2.5"},
     )
     FakeCursorSdkState.set_next_messages([
-        fake_cursor_sdk.SDKMessage("tool_call", name="task", args={"subagent": "flow-runner-reviewer"}),
-        fake_cursor_sdk.SDKMessage("tool_call", name="read", subagent="flow-runner-reviewer", args={"path": "app.py"}),
+        fake_cursor_sdk.SDKMessage("tool_call", name="read", args={"path": "app.py"}),
         fake_cursor_sdk.SDKMessage("assistant", text='{"decision": "PASS", "defects": [], "summary": "Looks good"}'),
     ])
     handle_rev_ok = adapter.dispatch_agent(rev_ok_req)
@@ -1454,44 +1413,21 @@ def test_cursor_sdk_subagent_tool_rejection_and_inline_override(tmp_path, monkey
         extra_context={"production_runner_managed": True, "cursor_model": "composer-2.5"},
     )
     FakeCursorSdkState.set_next_messages([
-        fake_cursor_sdk.SDKMessage("tool_call", name="task", args={"subagent": "flow-runner-builder"}),
-        fake_cursor_sdk.SDKMessage("tool_call", name="glob", subagent="flow-runner-builder", args={"pattern": "*.py"}),
-        fake_cursor_sdk.SDKMessage("tool_call", name="edit", subagent="flow-runner-builder", args={"path": "app.py"}),
+        fake_cursor_sdk.SDKMessage("tool_call", name="glob", args={"pattern": "*.py"}),
+        fake_cursor_sdk.SDKMessage("tool_call", name="edit", args={"path": "app.py"}),
         fake_cursor_sdk.SDKMessage("assistant", text="Implemented feature successfully"),
     ])
     handle_bld = adapter.dispatch_agent(builder_ok_req)
     result_bld = adapter.wait_for_result(handle_bld)
     assert result_bld.status == AgentStatus.SUCCESS
 
-    # 5. Verify the adapter did NOT pass inline agents to Agent.create (subagent was loaded from file)
     session_data = adapter._session_history.get(handle_rev_ok.invocation_token)
     assert session_data is not None
     created_agent = session_data["agent"]
-    rev_def = created_agent.agents.get("flow-runner-reviewer")
-    assert rev_def is not None
-    assert getattr(rev_def, "from_file", False) is True
-    assert getattr(rev_def, "tools", None) == ["read"]
-
-    # 6. Inline override verification: demonstrates why the adapter must NEVER pass inline agents
-    inline_def = fake_cursor_sdk.AgentDefinition(
-        description="Inline reviewer without tools",
-        prompt="Review code",
-        model="inherit",
-    )
-    agent_inline = fake_cursor_sdk.Agent.create(
-        options=fake_cursor_sdk.AgentOptions(
-            model="composer-2.5",
-            local=fake_cursor_sdk.LocalAgentOptions(cwd=str(tmp_path)),
-            tools=["task"],
-            disallowed_tools=["edit", "glob", "grep", "read", "shell"],
-            agents={"flow-runner-reviewer": inline_def},
-        )
-    )
-    # Inline definition has overwritten flow-runner-reviewer, losing tool isolation
-    assert agent_inline.is_tool_allowed("edit", subagent="flow-runner-reviewer") is True
-    assert agent_inline.is_tool_allowed("shell", subagent="flow-runner-reviewer") is True
-    assert agent_inline.is_tool_allowed("grep", subagent="flow-runner-reviewer") is True
-    assert agent_inline.is_tool_allowed("glob", subagent="flow-runner-reviewer") is True
+    assert created_agent.tools == ["read"]
+    assert not created_agent.agents
+    assert created_agent.local.setting_sources is None
+    assert not created_agent.local.dirs
 
 
 

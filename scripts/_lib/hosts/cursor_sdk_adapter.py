@@ -36,7 +36,7 @@ RUNNER_MANAGED_AGENT_MAP: Dict[str, str] = {
     "QA": "flow-runner-qa",
 }
 
-VALID_SDK_TOOLS: Set[str] = {"read", "grep", "glob", "shell", "edit", "task"}
+VALID_SDK_TOOLS: Set[str] = {"read", "grep", "glob", "shell", "edit", "task", "mcp"}
 
 CURSOR_SESSION_TO_SDK_TOOL_MAP: Dict[str, str] = {
     "read": "read",
@@ -86,11 +86,10 @@ def resolve_subagent_tool_policy(
     enable_write_tools: Optional[bool] = None,
 ) -> Tuple[Optional[List[str]], Optional[List[str]]]:
     """
-    Canonical Single Source of Truth for Subagent tool isolation policy.
-    Maps session/markdown tool names to SDK tool names and calculates:
-        (allowed_tools, disallowed_tools)
+    Map the tool list declared in a subagent markdown file to SDK tool names.
+    The file list is the only allowlist. Role names do not add or remove tools.
     """
-    name_lower = (agent_id_or_name or "").lower().strip()
+    del agent_id_or_name  # The markdown tools list is authoritative; the name is not a second policy.
 
     mapped_tools: Set[str] = set()
     if isinstance(raw_tools, list):
@@ -99,37 +98,15 @@ def resolve_subagent_tool_policy(
             sdk_tool = CURSOR_SESSION_TO_SDK_TOOL_MAP.get(normalized)
             if sdk_tool and sdk_tool in VALID_SDK_TOOLS:
                 mapped_tools.add(sdk_tool)
-
-    sub_tools: Optional[List[str]] = None
-    sub_disallowed_tools: Optional[List[str]] = None
-
-    if "runner-qa" in name_lower:
-        sub_tools = []
-        sub_disallowed_tools = sorted(list(VALID_SDK_TOOLS - {"task"}))
-    elif "qa" in name_lower:
-        sub_tools = sorted(list(mapped_tools - {"edit", "shell"}))
-        sub_disallowed_tools = ["edit", "shell"]
-    elif "runner-reviewer" in name_lower:
-        sub_tools = ["read"]
-        sub_disallowed_tools = sorted(["edit", "glob", "grep", "shell"])
-    elif "reviewer" in name_lower or enable_write_tools is False:
-        sub_tools = sorted(list(mapped_tools - {"edit", "shell"}))
-        sub_disallowed_tools = ["edit", "shell"]
-    elif "runner-builder" in name_lower:
-        sub_tools = sorted(list((mapped_tools | {"read", "edit", "grep", "glob"}) - {"shell", "task"}))
-        sub_disallowed_tools = ["shell"]
     else:
-        if isinstance(raw_tools, list):
-            sub_tools = sorted(list(mapped_tools))
-            sub_disallowed_tools = sorted(list((VALID_SDK_TOOLS - {"task"}) - set(sub_tools)))
-        elif enable_write_tools is False:
-            sub_tools = sorted(list((VALID_SDK_TOOLS - {"task"}) - {"edit", "shell"}))
-            sub_disallowed_tools = ["edit", "shell"]
-        else:
-            sub_tools = sorted(list(VALID_SDK_TOOLS - {"task"}))
-            sub_disallowed_tools = []
+        mapped_tools = set(VALID_SDK_TOOLS)
 
-    return sub_tools, sub_disallowed_tools
+    if enable_write_tools is False:
+        mapped_tools -= {"edit", "shell"}
+    mapped_tools.discard("task")
+
+    disallowed = sorted(VALID_SDK_TOOLS - mapped_tools)
+    return sorted(mapped_tools), disallowed
 
 
 class CursorSdkAdapter(BaseHostAdapter):
@@ -244,7 +221,7 @@ class CursorSdkAdapter(BaseHostAdapter):
 
     def _load_subagent_definition(
         self, workspace_dir: str, agent_id: str
-    ) -> Tuple[str, str, str, Optional[List[str]], Optional[List[str]]]:
+    ) -> Tuple[str, str, str, Optional[List[str]], Optional[List[str]], str]:
         """
         Load subagent name, description, body prompt, tools, and disallowed_tools from .cursor/agents/{agent_id}.md.
         Enforces Fail-Closed verification on file presence and frontmatter integrity,
@@ -272,16 +249,6 @@ class CursorSdkAdapter(BaseHostAdapter):
             raise AgentNotSupportedError(
                 f"Subagent markdown definition for '{agent_id}' does not exist at .cursor/agents/{agent_id}.md (Fail-Closed)."
             )
-
-        ws_agent_file = os.path.join(workspace_dir, ".cursor", "agents", f"{agent_id}.md")
-        if not os.path.isfile(ws_agent_file) and target_file and target_file != ws_agent_file:
-            try:
-                os.makedirs(os.path.dirname(ws_agent_file), exist_ok=True)
-                import shutil
-                shutil.copyfile(target_file, ws_agent_file)
-                target_file = ws_agent_file
-            except Exception:
-                pass
 
         try:
             with open(target_file, "r", encoding="utf-8") as f:
@@ -325,7 +292,7 @@ class CursorSdkAdapter(BaseHostAdapter):
             agent_id, raw_tools=raw_tools, enable_write_tools=enable_write_tools
         )
 
-        return str(name).strip(), str(desc).strip(), prompt_body, sub_tools, sub_disallowed_tools
+        return str(name).strip(), str(desc).strip(), prompt_body, sub_tools, sub_disallowed_tools, target_file
 
     def _validate_handle(self, handle: AgentHandle, include_history: bool = True) -> Dict[str, Any]:
         """Validate handle ownership and authenticity using constant-time comparisons."""
@@ -402,23 +369,23 @@ class CursorSdkAdapter(BaseHostAdapter):
         token = secrets.token_urlsafe(32)
 
         try:
-            local_opts = sdk.LocalAgentOptions(
-                cwd=workspace_dir,
-            )
-
             subagent_id = self._resolve_target_agent(role, request.extra_context)
-            subagent_name, subagent_desc, subagent_prompt, sub_tools, sub_disallowed = self._load_subagent_definition(workspace_dir, subagent_id)
-
-            # Official Cursor SDK automatically discovers subagents defined in .cursor/agents/*.md.
-            # Passing a same-named inline AgentDefinition overrides the file definition and strips
-            # tools/disallowed_tools because official AgentDefinition lacks tool restriction fields.
-            # Do NOT pass inline agents for file-based subagents; let Cursor SDK natively discover them.
+            (
+                subagent_name,
+                _subagent_desc,
+                subagent_prompt,
+                sub_tools,
+                sub_disallowed,
+                _source_file,
+            ) = self._load_subagent_definition(workspace_dir, subagent_id)
+            # Do not set setting_sources or dirs. Project settings would load every
+            # .cursor/agents file plus the target repo's rules and MCP, and dirs does not
+            # discover subagents. The role runs as this agent, with the file's tool
+            # allowlist applied at create time so disallowed tools are not offered.
+            local_opts = sdk.LocalAgentOptions(cwd=workspace_dir)
             parent_agents = None
-            if isinstance(request.extra_context, Mapping) and "agents" in request.extra_context:
-                parent_agents = request.extra_context.get("agents")
-
-            parent_tools = ["task"]
-            parent_disallowed_tools = ["edit", "glob", "grep", "read", "shell"]
+            parent_tools = list(sub_tools or [])
+            parent_disallowed_tools = list(sub_disallowed or [])
 
             resume_id = (
                 request.extra_context.get("resume_agent_id")
@@ -474,10 +441,7 @@ class CursorSdkAdapter(BaseHostAdapter):
                     )
 
             parent_prompt = (
-                f"You are an orchestration dispatcher for role '{subagent_name}'.\n"
-                f"You MUST use the 'task' tool to invoke subagent '{subagent_name}' exactly once with the task description below.\n"
-                f"You are strictly prohibited from implementing code changes, reviewing code, running tests, or making judgments yourself.\n"
-                f"Return the exact, verbatim output produced by the subagent '{subagent_name}' without modification.\n\n"
+                f"{subagent_prompt}\n\n"
                 f"Task Description:\n{request.prompt}"
             )
 
@@ -606,6 +570,11 @@ class CursorSdkAdapter(BaseHostAdapter):
                 if status in ("started", "") or not call_id:
                     seen_tool_invocations.add(tool_name)
 
+                if tool_name and sub_tools_set is not None:
+                    if tool_name not in sub_tools_set:
+                        parent_prohibited_calls.append(tool_name)
+                    continue
+
                 if tool_name == "task":
                     target_sub = (
                         _get_val(args, "subagent", "subagent_name", "subagent_type", "agent", "name", "type", default="")
@@ -683,6 +652,14 @@ class CursorSdkAdapter(BaseHostAdapter):
         if session_data.get("completed") and session_data.get("result") is not None:
             return session_data["result"]
 
+        return self._wait_for_result_locked(handle, session_data, timeout_seconds)
+
+    def _wait_for_result_locked(
+        self,
+        handle: AgentHandle,
+        session_data: Dict[str, Any],
+        timeout_seconds: Optional[float],
+    ) -> AgentResult:
         run = session_data["run"]
         agent = session_data["agent"]
         timeout = timeout_seconds if timeout_seconds is not None else self._default_timeout_seconds
@@ -703,6 +680,20 @@ class CursorSdkAdapter(BaseHostAdapter):
                         if m_iter is not None:
                             for msg in m_iter:
                                 collected_messages.append(msg)
+                                _, parent_bad, sub_bad = self._extract_gate_events(
+                                    collected_messages,
+                                    run,
+                                    None,
+                                    expected_subagent=session_data.get("expected_subagent"),
+                                    expected_subagent_tools=session_data.get("expected_subagent_tools"),
+                                    expected_subagent_disallowed=session_data.get("expected_subagent_disallowed"),
+                                )
+                                if parent_bad or sub_bad:
+                                    try:
+                                        run.cancel()
+                                    except Exception:
+                                        pass
+                                    break
                     except Exception as m_exc:
                         logger.warning(f"Error consuming run.messages(): {m_exc}")
                 res = run.wait()
@@ -782,7 +773,24 @@ class CursorSdkAdapter(BaseHostAdapter):
             expected_subagent_disallowed=expected_disallowed,
         )
 
-        if status_str == "cancelled":
+        if subagent_violations or prohibited_tool_calls:
+            if subagent_violations:
+                err_detail = (
+                    f"Subagent '{expected_subagent}' tool restriction gate violated: "
+                    f"{'; '.join(subagent_violations)}"
+                )
+            else:
+                err_detail = (
+                    f"Agent violated the role tool allowlist: used prohibited tool(s) {prohibited_tool_calls}."
+                )
+            res = AgentResult(
+                session_id=handle.session_id,
+                status=AgentStatus.FAILED,
+                output="",
+                error_message=err_detail,
+                is_real_host=self._is_real_host,
+            )
+        elif status_str == "cancelled":
             res = AgentResult(
                 session_id=handle.session_id,
                 status=AgentStatus.CANCELLED,
@@ -814,7 +822,6 @@ class CursorSdkAdapter(BaseHostAdapter):
                 is_real_host=self._is_real_host,
             )
         else:
-            # Gate: Extract task tool calls and verify subagent execution from messages stream
             gate_error = None
             if subagent_violations:
                 gate_error = (
@@ -822,22 +829,7 @@ class CursorSdkAdapter(BaseHostAdapter):
                 )
             elif prohibited_tool_calls:
                 gate_error = (
-                    f"Parent agent violated tool restriction gate: used prohibited tool(s) {prohibited_tool_calls}. "
-                    "Only 'task' tool is allowed."
-                )
-            elif len(task_calls) == 0:
-                gate_error = (
-                    f"Parent agent failed invocation gate: no 'task' tool call was made to '{expected_subagent}'. "
-                    "Parent Agent answered directly without executing the designated subagent."
-                )
-            elif len(task_calls) > 1:
-                gate_error = (
-                    f"Parent agent failed invocation gate: expected exactly one 'task' tool call, but got {len(task_calls)}."
-                )
-            elif task_calls[0] != expected_subagent:
-                gate_error = (
-                    f"Parent agent failed invocation gate: expected subagent '{expected_subagent}', "
-                    f"but called '{task_calls[0]}'."
+                    f"Agent violated the role tool allowlist: used prohibited tool(s) {prohibited_tool_calls}."
                 )
 
             if gate_error:
