@@ -1,7 +1,15 @@
-# Multi-Agent Flow 技能包一键化 SOP 初始化脚本 (Windows PowerShell 强物理凭据版)
+﻿# Multi-Agent Flow 技能包一键化 SOP 初始化脚本 (Windows PowerShell 强物理凭据版)
 # 数据根解析与 init_skill.sh 同链: YY_FLOW_PROJECT_ROOT 环境变量 > legacy(skill 内含
 # user_data/board.json) > 当前目录。共享安装下数据落宿主项目根。
 $ErrorActionPreference = "Stop"
+
+function Invoke-RequiredPython {
+    param([Parameter(Mandatory = $true)][string[]]$Arguments)
+    & python @Arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "初始化失败：python $($Arguments[0]) 退出码 $LASTEXITCODE"
+    }
+}
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $SkillRoot = Resolve-Path "$ScriptDir\.."
@@ -23,13 +31,13 @@ Write-Host "  技能根 (SKILL_ROOT): $SkillRoot" -ForegroundColor Cyan
 Write-Host "==============================================================================" -ForegroundColor Cyan
 
 Write-Host "[SECURITY]  [Step 1/7] 强执行敏感凭据泄露安全扫描 (check_secrets.py)..." -ForegroundColor Yellow
-python "$ScriptDir\check_secrets.py"
+Invoke-RequiredPython @("$ScriptDir\check_secrets.py")
 
 Write-Host "[SECURITY]  [Step 2/7] 动态 Agent 环境探测、官方文档实时查证与 Subagent 强规范落盘..." -ForegroundColor Yellow
-python "$ScriptDir\verify_and_export_agents.py"
+Invoke-RequiredPython @("$ScriptDir\verify_and_export_agents.py")
 
 Write-Host "[SCAN]  [Step 3/7] 自动代码物理扫描工程基础设施、依赖文件与语言技术栈配置 (只读预检)..." -ForegroundColor Yellow
-python "$ScriptDir\auto_scan_stack.py"
+Invoke-RequiredPython @("$ScriptDir\auto_scan_stack.py")
 
 Write-Host "[CONFIG]  [Step 4/7] 初始化宿主数据资产目录 user_data/ 并生成工作流与架构配置..." -ForegroundColor Yellow
 $UserDataDir = "$DataRoot\user_data"
@@ -73,7 +81,7 @@ if (Test-Path "$SkillRoot\.git") {
 Write-Host "[DOCS]  [Step 5/7] 项目工程文档骨架建立树与原项目历史文档只读隔离归档..." -ForegroundColor Yellow
 # docs 是项目交付物 → 落项目根（.yy-flow 布局下为 DataRoot 上一级；legacy 下即 DataRoot）
 $DocsRoot = Join-Path (Split-Path $DataRoot -Parent) "docs"
-if (-not (Split-Path $DataRoot -Leaf) -eq ".yy-flow") {
+if ((Split-Path $DataRoot -Leaf) -ne ".yy-flow") {
     $DocsRoot = Join-Path $DataRoot "docs"
 }
 $DocsDirs = @(
@@ -94,13 +102,13 @@ foreach ($dir in $DocsDirs) {
     }
 }
 
-python "$ScriptDir\migrate_legacy_docs.py"
+Invoke-RequiredPython @("$ScriptDir\migrate_legacy_docs.py")
 
 Write-Host "[SYNC]  [Step 6/7] 专家团队技术栈同步（导出时合并至各平台 Subagent）..." -ForegroundColor Yellow
-python "$ScriptDir\update_agent_tech_stacks.py"
+Invoke-RequiredPython @("$ScriptDir\update_agent_tech_stacks.py")
 
 Write-Host "[PM]  [Step 7/7] 物理生成项目架构全景鉴定基线工单 (AUTO 自动编号) 并唤起 PM 调度..." -ForegroundColor Yellow
-python "$ScriptDir\quick_task.py" create --name "项目技术架构全景鉴定与选型定版" --role PM --assignee 钱架构 --type B
+Invoke-RequiredPython @("$ScriptDir\quick_task.py", "create", "--name", "项目技术架构全景鉴定与选型定版", "--role", "PM", "--assignee", "钱架构", "--type", "B")
 
 Write-Host "==============================================================================" -ForegroundColor Cyan
 Write-Host "[SUCCESS]  [SOP 7 步全量就绪] multi-agent-flow 物理初始化顺利完成！" -ForegroundColor Cyan

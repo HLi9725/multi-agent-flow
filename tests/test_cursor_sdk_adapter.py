@@ -1637,8 +1637,3 @@ def test_live_e2e_execution_terminal_state_and_cleanup(monkeypatch):
         from scripts.run_cursor_sdk_live_e2e import _safe_rmtree
         _safe_rmtree(created_fixtures[3])
         assert not os.path.exists(created_fixtures[3])
-
-
-
-
-
