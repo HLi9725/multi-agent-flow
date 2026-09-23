@@ -10,7 +10,7 @@ import os
 
 
 class TaskStatus(str, Enum):
-    """任务生命周期状态枚举 (9 态)"""
+    """任务生命周期状态枚举（共 9 种状态）"""
     TODO = "待开始"
     IN_PROGRESS = "进行中"
     IN_REVIEW = "审查中"
