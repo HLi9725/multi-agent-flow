@@ -7,7 +7,7 @@ Used for deterministic, zero-network unit testing and Runner integration testing
 from dataclasses import dataclass, field
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Union
 import uuid
 
 
@@ -60,6 +60,9 @@ class BadRequestError(CursorAgentError):
         super().__init__(message, is_retryable=False, code=kwargs.get("code", "bad_request"), status_code=400)
 
 
+VALID_TOOLS = {"read", "grep", "shell", "edit"}
+
+
 @dataclass
 class LocalAgentOptions:
     cwd: str
@@ -69,12 +72,29 @@ class LocalAgentOptions:
 @dataclass
 class AgentOptions:
     model: Optional[str] = None
+    api_key: Optional[str] = None
+    local: Optional[LocalAgentOptions] = None
+    tools: Optional[List[str]] = None
+    disallowed_tools: Optional[List[str]] = None
+
+    def __post_init__(self) -> None:
+        if self.tools is not None:
+            for t in self.tools:
+                if t not in VALID_TOOLS:
+                    raise BadRequestError(
+                        f"Unknown tool '{t}'. Valid tools are: {sorted(list(VALID_TOOLS))}"
+                    )
+        if self.disallowed_tools is not None:
+            for t in self.disallowed_tools:
+                if t not in VALID_TOOLS:
+                    raise BadRequestError(
+                        f"Unknown tool '{t}'. Valid tools are: {sorted(list(VALID_TOOLS))}"
+                    )
 
 
 @dataclass
 class SendOptions:
-    tools: Optional[List[Any]] = None
-    disallowed_tools: Optional[List[str]] = None
+    pass
 
 
 @dataclass
@@ -210,14 +230,16 @@ class Agent:
         model: str,
         local: Optional[LocalAgentOptions] = None,
         api_key: Optional[str] = None,
+        tools: Optional[List[str]] = None,
+        disallowed_tools: Optional[List[str]] = None,
     ):
         self.agent_id = agent_id
         self.model = model
         self.local = local
         self.api_key = api_key
         self.is_closed = False
-        self.tools = None
-        self.disallowed_tools = None
+        self.tools = tools
+        self.disallowed_tools = disallowed_tools
         FakeCursorSdkState._agents[agent_id] = self
 
     def close(self) -> None:
@@ -232,25 +254,65 @@ class Agent:
     @classmethod
     def create(
         cls,
-        model: str,
+        options: Optional[Union[AgentOptions, str]] = None,
+        model: Optional[str] = None,
         api_key: Optional[str] = None,
         local: Optional[LocalAgentOptions] = None,
+        tools: Optional[List[str]] = None,
+        disallowed_tools: Optional[List[str]] = None,
         **kwargs: Any,
     ) -> "Agent":
         if "client" in kwargs and kwargs["client"] is not None:
             raise TypeError(
                 "Agent.create() got an unexpected keyword argument 'client'. "
-                "Pass api_key directly to Agent.create(model=..., api_key=..., local=...)."
+                "Pass api_key directly to Agent.create(options=AgentOptions(...) or model=..., api_key=..., local=...)."
             )
         with FakeCursorSdkState._lock:
             if FakeCursorSdkState._next_create_error is not None:
                 err = FakeCursorSdkState._next_create_error
                 FakeCursorSdkState._next_create_error = None
                 raise err
-        if not model or not str(model).strip():
+
+        effective_model = model
+        effective_api_key = api_key
+        effective_local = local
+        effective_tools = tools
+        effective_disallowed_tools = disallowed_tools
+
+        if isinstance(options, AgentOptions):
+            effective_model = options.model or effective_model
+            effective_api_key = options.api_key or effective_api_key
+            effective_local = options.local or effective_local
+            effective_tools = options.tools if options.tools is not None else effective_tools
+            effective_disallowed_tools = options.disallowed_tools if options.disallowed_tools is not None else effective_disallowed_tools
+        elif isinstance(options, str):
+            effective_model = options
+
+        if not effective_model or not str(effective_model).strip():
             raise ConfigurationError("Agent model must be specified.")
+
+        if effective_tools is not None:
+            for t in effective_tools:
+                if t not in VALID_TOOLS:
+                    raise BadRequestError(
+                        f"Unknown tool '{t}'. Valid tools are: {sorted(list(VALID_TOOLS))}"
+                    )
+        if effective_disallowed_tools is not None:
+            for t in effective_disallowed_tools:
+                if t not in VALID_TOOLS:
+                    raise BadRequestError(
+                        f"Unknown tool '{t}'. Valid tools are: {sorted(list(VALID_TOOLS))}"
+                    )
+
         agent_id = f"ag_{uuid.uuid4().hex[:12]}"
-        return cls(agent_id=agent_id, model=model, local=local, api_key=api_key)
+        return cls(
+            agent_id=agent_id,
+            model=effective_model,
+            local=effective_local,
+            api_key=effective_api_key,
+            tools=effective_tools,
+            disallowed_tools=effective_disallowed_tools,
+        )
 
     @classmethod
     def resume(
@@ -271,9 +333,14 @@ class Agent:
                 return agent
         return cls(agent_id=agent_id, model="resumed-model", api_key=api_key)
 
-    def send(self, prompt: str, **kwargs: Any) -> Run:
-        self.tools = kwargs.get("tools")
-        self.disallowed_tools = kwargs.get("disallowed_tools")
+    def send(self, message: str, options: Optional[SendOptions] = None, **kwargs: Any) -> Run:
+        if kwargs:
+            raise TypeError(
+                f"Agent.send() got unexpected keyword argument(s): {list(kwargs.keys())}. "
+                "Official signature is send(message, options=SendOptions(...))."
+            )
+        if options is not None and not isinstance(options, SendOptions):
+            raise TypeError(f"options must be an instance of SendOptions, got {type(options).__name__}")
         with FakeCursorSdkState._lock:
             hook = FakeCursorSdkState._on_send_hook
             resp = FakeCursorSdkState._next_response
@@ -284,7 +351,7 @@ class Agent:
 
         hook_result = None
         if hook:
-            hook_result = hook(prompt, self)
+            hook_result = hook(message, self)
 
         run_id = f"run_{uuid.uuid4().hex[:12]}"
         if err is not None:

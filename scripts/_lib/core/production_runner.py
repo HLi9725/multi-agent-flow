@@ -1361,6 +1361,14 @@ class ProductionRunner:
                     bool(current_request.extra_context.get("pre_granted_approval")),
                 )
                 handle = adapter.dispatch_agent(current_request)
+                if role == "BUILDER" and hasattr(adapter, "get_agent_id"):
+                    try:
+                        h_agent_id = adapter.get_agent_id(handle)
+                        if h_agent_id and getattr(checkpoint, "builder_session_id", None) != h_agent_id:
+                            checkpoint = replace(checkpoint, builder_session_id=h_agent_id)
+                            self.checkpoint_store.save_checkpoint(checkpoint)
+                    except Exception:
+                        pass
                 with self._lock:
                     self._active_handles[task_id] = handle
                 result = self._wait_for_result_cancellable(
@@ -2985,6 +2993,20 @@ class ProductionRunner:
                             )
                         )
                         sess_builder = builder_request.session_id
+                        host_agent_id = None
+                        if hasattr(builder_adapter, "get_agent_id"):
+                            try:
+                                host_agent_id = builder_adapter.get_agent_id(builder_handle)
+                            except Exception:
+                                host_agent_id = None
+                        if not host_agent_id and builder_result and builder_result.partial_results:
+                            for pr in builder_result.partial_results:
+                                if isinstance(pr, dict) and pr.get("agent_id"):
+                                    host_agent_id = str(pr["agent_id"])
+                                    break
+                        if host_agent_id:
+                            checkpoint = replace(checkpoint, builder_session_id=host_agent_id)
+                            self.checkpoint_store.save_checkpoint(checkpoint)
 
                         worktree_unchanged = (
                             self._get_git_commit(worktree_dir) == builder_pre_head
@@ -3308,7 +3330,7 @@ class ProductionRunner:
                     review_cycle=review_cycle,
                     qa_cycle=qa_cycle,
                     total_attempts=total_attempts,
-                    builder_session_id=sess_builder,
+                    builder_session_id=checkpoint.builder_session_id or sess_builder,
                     builder_invocation_id=inv_builder,
                     evidence_ids=tuple(evidence_ids),
                     approval_reason=None,

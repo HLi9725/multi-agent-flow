@@ -205,6 +205,18 @@ class CursorSdkAdapter(BaseHostAdapter):
                 cwd=workspace_dir,
             )
 
+            tools: Optional[List[str]] = None
+            disallowed_tools: Optional[List[str]] = None
+            if role == "REVIEWER":
+                tools = ["read", "grep"]
+                disallowed_tools = ["edit", "shell"]
+            elif role == "QA":
+                tools = []
+                disallowed_tools = ["edit", "shell"]
+            elif role == "BUILDER":
+                tools = None
+                disallowed_tools = None
+
             resume_id = (
                 request.extra_context.get("resume_agent_id")
                 or (request.session_id if request.extra_context.get("is_resume") else None)
@@ -213,21 +225,41 @@ class CursorSdkAdapter(BaseHostAdapter):
             if resume_id and hasattr(sdk.Agent, "resume"):
                 agent = sdk.Agent.resume(agent_id=str(resume_id), api_key=api_key)
             else:
-                agent = sdk.Agent.create(
-                    model=model,
-                    api_key=api_key,
-                    local=local_opts,
-                )
+                if hasattr(sdk, "AgentOptions"):
+                    agent_options = sdk.AgentOptions(
+                        model=model,
+                        api_key=api_key,
+                        local=local_opts,
+                        tools=tools,
+                        disallowed_tools=disallowed_tools,
+                    )
+                    try:
+                        agent = sdk.Agent.create(agent_options)
+                    except TypeError:
+                        agent = sdk.Agent.create(
+                            model=model,
+                            api_key=api_key,
+                            local=local_opts,
+                            tools=tools,
+                            disallowed_tools=disallowed_tools,
+                        )
+                else:
+                    agent = sdk.Agent.create(
+                        model=model,
+                        api_key=api_key,
+                        local=local_opts,
+                        tools=tools,
+                        disallowed_tools=disallowed_tools,
+                    )
 
-            # Execution-level tool isolation for strictly read-only roles
-            send_kwargs: Dict[str, Any] = {}
-            if role in ("REVIEWER", "QA"):
-                send_kwargs["disallowed_tools"] = [
-                    "Edit", "Write", "Bash", "Terminal", "run_command", "replace_file_content", "write_to_file"
-                ]
-                send_kwargs["tools"] = [] if role == "QA" else ["Read", "view_file"]
-
-            run = agent.send(prompt=request.prompt, **send_kwargs)
+            send_opts = sdk.SendOptions() if hasattr(sdk, "SendOptions") else None
+            if send_opts is not None:
+                try:
+                    run = agent.send(request.prompt, options=send_opts)
+                except TypeError:
+                    run = agent.send(request.prompt)
+            else:
+                run = agent.send(request.prompt)
         except Exception as exc:
             self._handle_dispatch_error(exc)
             raise
@@ -238,6 +270,7 @@ class CursorSdkAdapter(BaseHostAdapter):
             )
         canonical_agent_id = str(agent.agent_id)
         session_id = request.session_id.strip() if request.session_id and request.session_id.strip() else canonical_agent_id
+        run_id = str(getattr(run, "id", f"run_{uuid.uuid4().hex[:8]}"))
         handle = AgentHandle(
             session_id=session_id,
             host_id=self.adapter_id,
@@ -262,6 +295,14 @@ class CursorSdkAdapter(BaseHostAdapter):
 
         return handle
 
+    def get_agent_id(self, handle: AgentHandle) -> Optional[str]:
+        """Retrieve the canonical Cursor agent_id for a given handle."""
+        with self._lock:
+            data = self._running_sessions.get(handle.invocation_token) or self._session_history.get(handle.invocation_token)
+            if data:
+                return data.get("agent_id")
+        return None
+
     def _handle_dispatch_error(self, exc: Exception) -> None:
         """Map SDK errors during dispatch to typed framework exceptions."""
         exc_name = type(exc).__name__
@@ -270,6 +311,8 @@ class CursorSdkAdapter(BaseHostAdapter):
             raise AgentNotSupportedError(f"Cursor authentication failed: {msg}") from exc
         if "Configuration" in exc_name:
             raise AgentNotSupportedError(f"Cursor configuration error: {msg}") from exc
+        if "BadRequest" in exc_name:
+            raise AgentNotSupportedError(f"Cursor bad request error: {msg}") from exc
 
     def wait_for_result(
         self,
@@ -303,6 +346,8 @@ class CursorSdkAdapter(BaseHostAdapter):
             name=f"cursor_sdk_wait_{run_id}",
             daemon=True,
         )
+        with self._lock:
+            session_data["worker"] = worker
         worker.start()
         worker.join(timeout=timeout)
 
@@ -317,7 +362,14 @@ class CursorSdkAdapter(BaseHostAdapter):
                     agent.close()
                 except Exception:
                     pass
-            worker.join(timeout=0.2)
+            # Bounded grace join: check repeatedly up to 2.0s to ensure thread exits cleanly
+            grace_deadline = time.monotonic() + 2.0
+            while worker.is_alive() and time.monotonic() < grace_deadline:
+                worker.join(timeout=0.05)
+            if worker.is_alive():
+                logger.warning(
+                    f"Cursor SDK worker thread {worker.name} did not exit after grace period following run.cancel()"
+                )
             raise AgentTimeoutError(f"Cursor SDK run timed out after {timeout} seconds")
 
         if run_exc_holder:
@@ -453,6 +505,10 @@ class CursorSdkAdapter(BaseHostAdapter):
                 agent.close()
             except Exception:
                 pass
+
+        worker = session_data.get("worker")
+        if worker is not None and worker.is_alive():
+            worker.join(timeout=1.0)
 
         with self._lock:
             session_data["completed"] = True

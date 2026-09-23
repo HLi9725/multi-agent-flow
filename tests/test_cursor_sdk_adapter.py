@@ -193,10 +193,11 @@ def test_cursor_sdk_adapter_dispatch_and_identity_mapping(tmp_path):
 
     assert res.status == AgentStatus.SUCCESS
     assert res.output == "Builder output text"
-    assert res.session_id == "sess_dispatch_01"
+    assert res.session_id == handle.session_id
     assert len(res.partial_results) == 1
     assert res.partial_results[0]["invocation_id"].startswith("run_")
     assert res.partial_results[0]["agent_id"].startswith("ag_")
+    assert adapter.get_agent_id(handle) == res.partial_results[0]["agent_id"]
 
 
 def test_cursor_sdk_adapter_cancel_and_idempotence(tmp_path):
@@ -829,10 +830,10 @@ def test_cursor_sdk_custom_api_key_env_propagation(tmp_path, monkeypatch):
 
 
 def test_cursor_sdk_readonly_role_tool_isolation(tmp_path):
-    """Verify Reviewer and QA agents are issued disallowed_tools and read-only tools on dispatch."""
+    """Verify Reviewer and QA agents are issued disallowed_tools and read-only tools on dispatch via AgentOptions."""
     adapter = CursorSdkAdapter(is_real_host=False, default_model="composer-2.5", sdk_module=fake_cursor_sdk)
 
-    # Reviewer dispatch
+    # Reviewer dispatch: read-only tools ["read", "grep"], disallowed ["edit", "shell"]
     req_rev = AgentRequest(
         session_id="sess_rev_tools",
         prompt="review code",
@@ -841,13 +842,11 @@ def test_cursor_sdk_readonly_role_tool_isolation(tmp_path):
     )
     handle_rev = adapter.dispatch_agent(req_rev)
     agent_rev = adapter._validate_handle(handle_rev)["agent"]
-    assert agent_rev.disallowed_tools == [
-        "Edit", "Write", "Bash", "Terminal", "run_command", "replace_file_content", "write_to_file"
-    ]
-    assert agent_rev.tools == ["Read", "view_file"]
+    assert agent_rev.disallowed_tools == ["edit", "shell"]
+    assert agent_rev.tools == ["read", "grep"]
     adapter.wait_for_result(handle_rev)
 
-    # QA dispatch
+    # QA dispatch: text-only (tools=[]), disallowed ["edit", "shell"]
     req_qa = AgentRequest(
         session_id="sess_qa_tools",
         prompt="test code",
@@ -856,15 +855,22 @@ def test_cursor_sdk_readonly_role_tool_isolation(tmp_path):
     )
     handle_qa = adapter.dispatch_agent(req_qa)
     agent_qa = adapter._validate_handle(handle_qa)["agent"]
-    assert agent_qa.disallowed_tools == [
-        "Edit", "Write", "Bash", "Terminal", "run_command", "replace_file_content", "write_to_file"
-    ]
+    assert agent_qa.disallowed_tools == ["edit", "shell"]
     assert agent_qa.tools == []
     adapter.wait_for_result(handle_qa)
 
+    # Unknown tool names reject with BadRequestError at AgentOptions and Agent.create
+    with pytest.raises(fake_cursor_sdk.BadRequestError) as exc_opt:
+        fake_cursor_sdk.AgentOptions(model="composer-2.5", tools=["Edit"])
+    assert "Unknown tool 'Edit'" in str(exc_opt.value)
+
+    with pytest.raises(fake_cursor_sdk.BadRequestError) as exc_create:
+        fake_cursor_sdk.Agent.create("composer-2.5", disallowed_tools=["Bash"])
+    assert "Unknown tool 'Bash'" in str(exc_create.value)
+
 
 def test_cursor_sdk_strict_signatures_rejects_client_kwargs(tmp_path):
-    """Verify that Agent.create and Agent.resume strictly reject 'client' argument with TypeError."""
+    """Verify that Agent.create, Agent.resume, and agent.send strictly reject invalid arguments."""
     with pytest.raises(TypeError) as exc1:
         fake_cursor_sdk.Agent.create("composer-2.5", client=object())
     assert "unexpected keyword argument 'client'" in str(exc1.value)
@@ -873,9 +879,22 @@ def test_cursor_sdk_strict_signatures_rejects_client_kwargs(tmp_path):
         fake_cursor_sdk.Agent.resume("ag_123", client=object())
     assert "unexpected keyword argument 'client'" in str(exc2.value)
 
+    # agent.send() must reject extra keyword arguments like prompt=, tools=, disallowed_tools=
+    ag = fake_cursor_sdk.Agent.create("composer-2.5")
+    with pytest.raises(TypeError):
+        ag.send(prompt="do something")
+
+    with pytest.raises(TypeError) as exc4:
+        ag.send("message", tools=["read"])
+    assert "unexpected keyword argument" in str(exc4.value)
+
+    with pytest.raises(TypeError) as exc5:
+        ag.send("message", disallowed_tools=["edit"])
+    assert "unexpected keyword argument" in str(exc5.value)
+
 
 def test_runner_resume_wires_builder_session_id_to_extra_context(mock_repo, tmp_path, monkeypatch):
-    """Verify ProductionRunner injects resume_agent_id into extra_context when resuming from checkpoint."""
+    """Verify ProductionRunner injects Cursor canonical agent_id into resume_agent_id when resuming from checkpoint."""
     monkeypatch.setenv("CURSOR_API_KEY", "mock_key_test_123")
     repo_dir, head_sha = mock_repo
     # Overwrite board.json with executable acceptance criteria
@@ -920,8 +939,8 @@ def test_runner_resume_wires_builder_session_id_to_extra_context(mock_repo, tmp_
     from scripts._lib.core.production_runner import _execution_spec_snapshot
     snapshot = _execution_spec_snapshot(spec)
 
-    # Manually create a checkpoint with a builder_session_id in BUILDING state
-    prior_session_id = "sess_prior_builder_12345"
+    # Manually create a checkpoint with a canonical Cursor agent_id (ag_...) in BUILDING state
+    prior_cursor_agent_id = "ag_canonical_cursor_session_12345"
     ckpt = RunnerCheckpoint(
         task_id="T0099",
         project_id="test-proj",
@@ -932,7 +951,7 @@ def test_runner_resume_wires_builder_session_id_to_extra_context(mock_repo, tmp_
         review_cycle=0,
         qa_cycle=0,
         total_attempts=1,
-        builder_session_id=prior_session_id,
+        builder_session_id=prior_cursor_agent_id,
         worktree_path=str(repo_dir),
         execution_options={
             "builder_adapter_id": "cursor_sdk",
@@ -968,8 +987,31 @@ def test_runner_resume_wires_builder_session_id_to_extra_context(mock_repo, tmp_
     assert len(dispatched_requests) >= 1
     builder_req = dispatched_requests[0]
     assert builder_req.role == "BUILDER"
-    assert builder_req.extra_context.get("resume_agent_id") == prior_session_id
+    # Must equal canonical Cursor agent_id, not internal Runner prefix sess_builder_runner_...
+    assert builder_req.extra_context.get("resume_agent_id") == prior_cursor_agent_id
+    assert builder_req.extra_context.get("resume_agent_id").startswith("ag_")
     assert builder_req.extra_context.get("is_resume") is True
+
+
+def test_cursor_sdk_timeout_thread_fully_joined(tmp_path):
+    """Verify that when a timeout occurs, run.cancel is called and worker thread is cleanly joined."""
+    adapter = CursorSdkAdapter(is_real_host=False, default_model="composer-2.5", sdk_module=fake_cursor_sdk)
+    req = AgentRequest(
+        session_id="sess_timeout_join",
+        prompt="hang",
+        role="BUILDER",
+        workspace_dir=str(tmp_path),
+    )
+    handle = adapter.dispatch_agent(req)
+    session_data = adapter._running_sessions[handle.invocation_token]
+    run = session_data["run"]
+    run.delay_seconds = 2.0
+    with pytest.raises(AgentTimeoutError):
+        adapter.wait_for_result(handle, timeout_seconds=0.1)
+
+    worker = session_data.get("worker")
+    assert worker is not None
+    assert not worker.is_alive()
 
 
 
