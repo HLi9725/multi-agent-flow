@@ -60,7 +60,7 @@ class BadRequestError(CursorAgentError):
         super().__init__(message, is_retryable=False, code=kwargs.get("code", "bad_request"), status_code=400)
 
 
-VALID_TOOLS = {"read", "grep", "shell", "edit", "task", "write"}
+VALID_TOOLS = {"read", "grep", "shell", "edit", "task"}
 
 
 @dataclass
@@ -68,6 +68,22 @@ class AgentDefinition:
     description: str
     prompt: str
     model: str = "inherit"
+    tools: Optional[List[str]] = None
+    disallowed_tools: Optional[List[str]] = None
+
+    def __post_init__(self) -> None:
+        if self.tools is not None:
+            for t in self.tools:
+                if t not in VALID_TOOLS:
+                    raise BadRequestError(
+                        f"Unknown tool '{t}'. Valid tools are: {sorted(list(VALID_TOOLS))}"
+                    )
+        if self.disallowed_tools is not None:
+            for t in self.disallowed_tools:
+                if t not in VALID_TOOLS:
+                    raise BadRequestError(
+                        f"Unknown tool '{t}'. Valid tools are: {sorted(list(VALID_TOOLS))}"
+                    )
 
 
 @dataclass
@@ -105,13 +121,24 @@ class SendOptions:
     pass
 
 
+class SDKMessage:
+    """Represents a message or event in official cursor-sdk run.messages() stream."""
+    def __init__(self, msg_type: str, **kwargs: Any):
+        self.type = msg_type
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+    def __repr__(self) -> str:
+        attrs = {k: v for k, v in self.__dict__.items() if k != "type"}
+        return f"SDKMessage(type={self.type!r}, {attrs})"
+
+
 @dataclass
 class RunResult:
     status: str  # finished, error, cancelled, expired
     result: Optional[str] = None
     duration_ms: Optional[int] = None
     usage: Optional[Dict[str, Any]] = None
-    tool_calls: Optional[List[Dict[str, Any]]] = None
 
 
 class FakeCursorSdkState:
@@ -122,7 +149,9 @@ class FakeCursorSdkState:
     _next_error: Optional[Exception] = None
     _next_create_error: Optional[Exception] = None
     _next_refuse_cancel: bool = False
+    _next_messages: Optional[List[Any]] = None
     _next_tool_calls: Optional[List[Dict[str, Any]]] = None
+    _executed_subagents: List[Dict[str, Any]] = []
     _on_send_hook: Optional[Callable[[str, "Agent"], None]] = None
     _runs: Dict[str, "Run"] = {}
     _agents: Dict[str, "Agent"] = {}
@@ -135,7 +164,9 @@ class FakeCursorSdkState:
             cls._next_error = None
             cls._next_create_error = None
             cls._next_refuse_cancel = False
+            cls._next_messages = None
             cls._next_tool_calls = None
+            cls._executed_subagents.clear()
             cls._on_send_hook = None
             cls._runs.clear()
             cls._agents.clear()
@@ -163,9 +194,34 @@ class FakeCursorSdkState:
             cls._next_refuse_cancel = refuse
 
     @classmethod
+    def set_next_messages(cls, messages: Optional[List[Any]]) -> None:
+        with cls._lock:
+            cls._next_messages = messages
+
+    @classmethod
     def set_next_tool_calls(cls, tool_calls: Optional[List[Dict[str, Any]]]) -> None:
         with cls._lock:
-            cls._next_tool_calls = tool_calls
+            if tool_calls is None:
+                cls._next_messages = None
+            else:
+                msgs = []
+                for tc in tool_calls:
+                    tool_name = tc.get("tool") or tc.get("name") or ""
+                    cid = f"call_{uuid.uuid4().hex[:8]}"
+                    if str(tool_name).lower() == "task":
+                        sub = tc.get("subagent") or tc.get("subagent_name") or ""
+                        msgs.append(SDKMessage("tool_call", name="task", status="started", args=tc, id=cid))
+                        msgs.append(SDKMessage("task", subagent=sub, status="completed", text=f"Subagent {sub} executed"))
+                        msgs.append(SDKMessage("tool_call", name="task", status="completed", id=cid))
+                    else:
+                        msgs.append(SDKMessage("tool_call", name=tool_name, status="started", args=tc.get("args", {}), id=cid))
+                        msgs.append(SDKMessage("tool_call", name=tool_name, status="completed", id=cid))
+                cls._next_messages = msgs
+
+    @classmethod
+    def get_executed_subagents(cls) -> List[Dict[str, Any]]:
+        with cls._lock:
+            return list(cls._executed_subagents)
 
     @classmethod
     def set_on_send_hook(cls, hook: Optional[Callable[[str, "Agent"], None]]) -> None:
@@ -183,7 +239,7 @@ class Run:
         error: Optional[CursorAgentError] = None,
         delay_seconds: float = 0.0,
         refuse_cancel: bool = False,
-        tool_calls: Optional[List[Dict[str, Any]]] = None,
+        messages: Optional[List[Any]] = None,
     ):
         self.id = run_id
         self.agent_id = agent_id
@@ -192,9 +248,15 @@ class Run:
         self.error = error
         self.delay_seconds = delay_seconds
         self.refuse_cancel = refuse_cancel
-        self.tool_calls = list(tool_calls) if tool_calls is not None else []
+        self._messages = list(messages) if messages is not None else []
         self.is_cancelled = False
         FakeCursorSdkState._runs[run_id] = self
+
+    def messages(self):
+        for m in self._messages:
+            if self.is_cancelled:
+                break
+            yield m
 
     def wait(self, *args: Any, **kwargs: Any) -> RunResult:
         if args or kwargs:
@@ -207,11 +269,11 @@ class Run:
             elapsed = 0.0
             while elapsed < self.delay_seconds:
                 if self.is_cancelled:
-                    return RunResult(status="cancelled", result=None, tool_calls=list(self.tool_calls))
+                    return RunResult(status="cancelled", result=None)
                 time.sleep(step)
                 elapsed += step
         if self.is_cancelled:
-            return RunResult(status="cancelled", result=None, tool_calls=list(self.tool_calls))
+            return RunResult(status="cancelled", result=None)
         with FakeCursorSdkState._lock:
             if FakeCursorSdkState._next_error is not None:
                 err = FakeCursorSdkState._next_error
@@ -226,7 +288,6 @@ class Run:
                     result=resp,
                     duration_ms=120,
                     usage={"prompt_tokens": 10, "completion_tokens": 20},
-                    tool_calls=list(self.tool_calls),
                 )
         if self.error is not None:
             raise self.error
@@ -235,7 +296,6 @@ class Run:
             result=self.result,
             duration_ms=120,
             usage={"prompt_tokens": 10, "completion_tokens": 20},
-            tool_calls=list(self.tool_calls),
         )
 
 
@@ -409,10 +469,11 @@ class Agent:
             status = FakeCursorSdkState._next_status
             err = FakeCursorSdkState._next_error
             refuse_cancel = FakeCursorSdkState._next_refuse_cancel
-            custom_tool_calls = FakeCursorSdkState._next_tool_calls
+            custom_messages = FakeCursorSdkState._next_messages
             # Clear one-shot errors
             FakeCursorSdkState._next_error = None
             FakeCursorSdkState._next_refuse_cancel = False
+            FakeCursorSdkState._next_messages = None
             FakeCursorSdkState._next_tool_calls = None
 
         hook_result = None
@@ -420,13 +481,46 @@ class Agent:
             hook_result = hook(message, self)
 
         run_id = f"run_{uuid.uuid4().hex[:12]}"
-        if custom_tool_calls is not None:
-            effective_tool_calls = list(custom_tool_calls)
-        elif self.agents:
-            subagent_name = list(self.agents.keys())[0]
-            effective_tool_calls = [{"tool": "task", "subagent": subagent_name, "prompt": message}]
+        if hook_result is not None:
+            text_result = hook_result
+        elif resp is not None:
+            text_result = resp
         else:
-            effective_tool_calls = []
+            text_result = f"Mock execution complete for {self.agent_id}"
+
+        if custom_messages is not None:
+            effective_messages = list(custom_messages)
+            if not any(getattr(m, "type", None) == "assistant" for m in effective_messages):
+                effective_messages.append(SDKMessage("assistant", text=text_result))
+        elif self.agents:
+            subagent_name = None
+            for name in self.agents.keys():
+                if f"'{name}'" in message or f'"{name}"' in message or name in message:
+                    subagent_name = name
+                    break
+            if not subagent_name:
+                subagent_name = list(self.agents.keys())[0]
+
+            subagent_def = self.agents.get(subagent_name)
+            with FakeCursorSdkState._lock:
+                FakeCursorSdkState._executed_subagents.append({
+                    "subagent_name": subagent_name,
+                    "agent_id": self.agent_id,
+                    "prompt": message,
+                    "subagent_def": subagent_def,
+                })
+
+            cid = f"call_{uuid.uuid4().hex[:8]}"
+            effective_messages = [
+                SDKMessage("tool_call", name="task", status="started", args={"subagent": subagent_name, "prompt": message}, id=cid),
+                SDKMessage("task", subagent=subagent_name, status="completed", text=f"Subagent {subagent_name} executed"),
+                SDKMessage("tool_call", name="task", status="completed", id=cid),
+                SDKMessage("assistant", text=text_result),
+            ]
+        else:
+            effective_messages = [
+                SDKMessage("assistant", text=text_result),
+            ]
 
         if err is not None:
             if isinstance(err, CursorAgentError):
@@ -436,23 +530,17 @@ class Agent:
                     status="error",
                     error=err,
                     refuse_cancel=refuse_cancel,
-                    tool_calls=effective_tool_calls,
+                    messages=effective_messages,
                 )
             raise err
 
-        if hook_result is not None:
-            text_result = hook_result
-        elif resp is not None:
-            text_result = resp
-        else:
-            text_result = f"Mock execution complete for {self.agent_id}"
         return Run(
             run_id=run_id,
             agent_id=self.agent_id,
             status=status,
             result=text_result,
             refuse_cancel=refuse_cancel,
-            tool_calls=effective_tool_calls,
+            messages=effective_messages,
         )
 
     @classmethod

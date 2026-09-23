@@ -15,11 +15,11 @@ alwaysApply: true
 ## 二、任务分级与开工门禁
 - L0 咨询/只读排查：无需建卡，直接回答或使用只读工具分析。
 - L1/L2 研发任务（代码变更、Bug 修复、新功能、重构）：强制开工门禁：
-  1. 动态识别任务类型与责任人：后端/通用为 A 类/李开发，前端为 A 类/马前端，架构为 B 类/钱架构，文档为 C 类/李文通，运维为 D 类/吕改特；
+  1. 动态识别任务类型与责任人：后端/通用为 A 类/李开发 (--role DEV)，前端为 A 类/马前端 (--role FRONTEND)，架构为 B 类/钱架构 (--role ARCHITECT)，文档为 C 类/李文通 (--role DOCS)，运维为 D 类/吕改特 (--role DEVOPS)；
   2. 检查 `user_data/board.json` 是否已有对应卡片；若无卡片通过 CLI 建卡：
      `python scripts/quick_task.py create --name "<任务名称>" --role PM --assignee <负责人> --type <类型> --force`
-  3. 获取新建任务 ID，并推进至【进行中】：
-     `python scripts/transition_task.py --role DEV --from-status 待开始 --to-status 进行中 --task-id <TASK_ID> --assignee <负责人>`
+  3. 获取新建任务 ID，并推进至【进行中】（注意：--role 必须使用对应承接角色的代码，如 DEV/FRONTEND/ARCHITECT/DOCS/DEVOPS，严禁全用 DEV）：
+     `python scripts/transition_task.py --role <对应承接角色> --from-status 待开始 --to-status 进行中 --task-id <TASK_ID> --assignee <负责人>`
 
 ## 三、标准流转流水线
 1. 开发实现：由分派的专家子代理实施修改并确认 diff；
