@@ -2755,7 +2755,18 @@ class ProductionRunner:
             # STAGE 1: CODEX BUILDER
             # ==========================================
             if not skip_builder:
-                sess_builder = f"sess_builder_runner_{task_id.lower()}_{int(time.time()*1000)}"
+                is_builder_resume = bool(
+                    existing_checkpoint
+                    and existing_checkpoint.builder_session_id
+                    and (
+                        existing_checkpoint.state in (RunnerState.BUILDING.value, RunnerState.NEEDS_USER_INPUT.value)
+                        or spec.recover_partial_builder_changes
+                    )
+                )
+                if is_builder_resume:
+                    sess_builder = str(existing_checkpoint.builder_session_id)
+                else:
+                    sess_builder = f"sess_builder_runner_{task_id.lower()}_{int(time.time()*1000)}"
                 builder_attempt = candidate_generation + 1
 
                 checkpoint = replace(
@@ -2878,7 +2889,10 @@ class ProductionRunner:
                         "approve_for_me": pre_granted_approval,
                         "enforce_host_config_safety": True,
                         "cursor_model": spec.cursor_model,
+                        "cursor_api_key_env": spec.cursor_api_key_env,
                         "cursor_runtime": spec.cursor_runtime,
+                        "resume_agent_id": (sess_builder if is_builder_resume else None),
+                        "is_resume": is_builder_resume,
                     },
                 )
                 self._emit_progress(
@@ -3486,6 +3500,7 @@ class ProductionRunner:
                         "pre_granted_approval": pre_granted_approval,
                         "enforce_host_config_safety": True,
                         "cursor_model": spec.cursor_model,
+                        "cursor_api_key_env": spec.cursor_api_key_env,
                         "cursor_runtime": spec.cursor_runtime,
                     },
                 )
@@ -4299,6 +4314,7 @@ class ProductionRunner:
                     "pre_granted_approval": pre_granted_approval,
                     "enforce_host_config_safety": True,
                     "cursor_model": spec.cursor_model,
+                    "cursor_api_key_env": spec.cursor_api_key_env,
                     "cursor_runtime": spec.cursor_runtime,
                 },
             )

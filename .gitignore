@@ -27,7 +27,8 @@ logs/
 草稿箱/
 .agents/
 .claude/
-.cursor/
+.cursor/*
+!.cursor/rules/
 .codex/
 
 # System Store Files

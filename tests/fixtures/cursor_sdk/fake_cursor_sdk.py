@@ -149,9 +149,20 @@ class Run:
         self.is_cancelled = False
         FakeCursorSdkState._runs[run_id] = self
 
-    def wait(self, timeout: Optional[float] = None) -> RunResult:
+    def wait(self, *args: Any, **kwargs: Any) -> RunResult:
+        if args or kwargs:
+            raise TypeError(
+                f"Run.wait() takes 1 positional argument but {1 + len(args) + len(kwargs)} were given "
+                "(official cursor-sdk Run.wait does not accept timeout parameter; timeout must be enforced externally)"
+            )
         if self.delay_seconds > 0:
-            time.sleep(min(self.delay_seconds, timeout or self.delay_seconds))
+            step = 0.05
+            elapsed = 0.0
+            while elapsed < self.delay_seconds:
+                if self.is_cancelled:
+                    return RunResult(status="cancelled", result=None)
+                time.sleep(step)
+                elapsed += step
         if self.is_cancelled:
             return RunResult(status="cancelled", result=None)
         with FakeCursorSdkState._lock:
@@ -187,6 +198,10 @@ class CursorClient:
     def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key
 
+    @classmethod
+    def launch_bridge(cls, api_key: Optional[str] = None, **kwargs: Any) -> "CursorClient":
+        return cls(api_key=api_key)
+
 
 class Agent:
     def __init__(
@@ -194,21 +209,39 @@ class Agent:
         agent_id: str,
         model: str,
         local: Optional[LocalAgentOptions] = None,
-        client: Optional[CursorClient] = None,
+        api_key: Optional[str] = None,
     ):
-        self.id = agent_id
+        self.agent_id = agent_id
         self.model = model
         self.local = local
-        self.client = client
+        self.api_key = api_key
+        self.is_closed = False
+        self.tools = None
+        self.disallowed_tools = None
         FakeCursorSdkState._agents[agent_id] = self
+
+    def close(self) -> None:
+        self.is_closed = True
+
+    def __enter__(self) -> "Agent":
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.close()
 
     @classmethod
     def create(
         cls,
         model: str,
+        api_key: Optional[str] = None,
         local: Optional[LocalAgentOptions] = None,
-        client: Optional[CursorClient] = None,
+        **kwargs: Any,
     ) -> "Agent":
+        if "client" in kwargs and kwargs["client"] is not None:
+            raise TypeError(
+                "Agent.create() got an unexpected keyword argument 'client'. "
+                "Pass api_key directly to Agent.create(model=..., api_key=..., local=...)."
+            )
         with FakeCursorSdkState._lock:
             if FakeCursorSdkState._next_create_error is not None:
                 err = FakeCursorSdkState._next_create_error
@@ -217,17 +250,30 @@ class Agent:
         if not model or not str(model).strip():
             raise ConfigurationError("Agent model must be specified.")
         agent_id = f"ag_{uuid.uuid4().hex[:12]}"
-        return cls(agent_id=agent_id, model=model, local=local, client=client)
+        return cls(agent_id=agent_id, model=model, local=local, api_key=api_key)
 
     @classmethod
-    def resume(cls, agent_id: str, client: Optional[CursorClient] = None) -> "Agent":
+    def resume(
+        cls,
+        agent_id: str,
+        api_key: Optional[str] = None,
+        **kwargs: Any,
+    ) -> "Agent":
+        if "client" in kwargs and kwargs["client"] is not None:
+            raise TypeError(
+                "Agent.resume() got an unexpected keyword argument 'client'. "
+                "Pass api_key directly to Agent.resume(agent_id=..., api_key=...)."
+            )
         with FakeCursorSdkState._lock:
             if agent_id in FakeCursorSdkState._agents:
-                return FakeCursorSdkState._agents[agent_id]
-        # Return reconstructed agent representation
-        return cls(agent_id=agent_id, model="resumed-model", client=client)
+                agent = FakeCursorSdkState._agents[agent_id]
+                agent.is_closed = False
+                return agent
+        return cls(agent_id=agent_id, model="resumed-model", api_key=api_key)
 
     def send(self, prompt: str, **kwargs: Any) -> Run:
+        self.tools = kwargs.get("tools")
+        self.disallowed_tools = kwargs.get("disallowed_tools")
         with FakeCursorSdkState._lock:
             hook = FakeCursorSdkState._on_send_hook
             resp = FakeCursorSdkState._next_response
@@ -243,7 +289,7 @@ class Agent:
         run_id = f"run_{uuid.uuid4().hex[:12]}"
         if err is not None:
             if isinstance(err, CursorAgentError):
-                return Run(run_id=run_id, agent_id=self.id, status="error", error=err)
+                return Run(run_id=run_id, agent_id=self.agent_id, status="error", error=err)
             raise err
 
         if hook_result is not None:
@@ -251,8 +297,8 @@ class Agent:
         elif resp is not None:
             text_result = resp
         else:
-            text_result = f"Mock execution complete for {self.id}"
-        return Run(run_id=run_id, agent_id=self.id, status=status, result=text_result)
+            text_result = f"Mock execution complete for {self.agent_id}"
+        return Run(run_id=run_id, agent_id=self.agent_id, status=status, result=text_result)
 
     @classmethod
     def get_run(cls, run_id: str, client: Optional[CursorClient] = None) -> Run:

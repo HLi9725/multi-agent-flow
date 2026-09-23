@@ -155,7 +155,7 @@ class CursorSdkAdapter(BaseHostAdapter):
                 raise AgentInvalidHandleError("Stored session has no valid handle")
             if not secrets.compare_digest(handle.invocation_token, stored_handle.invocation_token):
                 raise AgentInvalidHandleError("Handle invocation token mismatch")
-            if handle.session_id != stored_handle.session_id:
+            if not secrets.compare_digest(handle.session_id or "", stored_handle.session_id or ""):
                 raise AgentInvalidHandleError("Handle session_id mismatch")
             return session_data
 
@@ -186,10 +186,16 @@ class CursorSdkAdapter(BaseHostAdapter):
         model = self._resolve_model(request)
         sdk = self._get_sdk()
 
-        api_key = os.environ.get(self.api_key_env_var)
+        api_key_env = self.api_key_env_var
+        if isinstance(request.extra_context, Mapping):
+            custom_env = request.extra_context.get("cursor_api_key_env")
+            if custom_env and str(custom_env).strip():
+                api_key_env = str(custom_env).strip()
+
+        api_key = os.environ.get(api_key_env)
         if self._is_real_host and not api_key:
             raise AgentNotSupportedError(
-                f"Cursor API key environment variable '{self.api_key_env_var}' is not set or empty."
+                f"Cursor API key environment variable '{api_key_env}' is not set or empty."
             )
 
         token = secrets.token_urlsafe(32)
@@ -197,20 +203,41 @@ class CursorSdkAdapter(BaseHostAdapter):
         try:
             local_opts = sdk.LocalAgentOptions(
                 cwd=workspace_dir,
-                setting_sources=[],
             )
-            client = sdk.CursorClient(api_key=api_key) if api_key else None
-            agent = sdk.Agent.create(
-                model=model,
-                local=local_opts,
-                client=client,
-            )
-            run = agent.send(prompt=request.prompt)
+
+            resume_id = (
+                request.extra_context.get("resume_agent_id")
+                or (request.session_id if request.extra_context.get("is_resume") else None)
+            ) if isinstance(request.extra_context, Mapping) else None
+
+            if resume_id and hasattr(sdk.Agent, "resume"):
+                agent = sdk.Agent.resume(agent_id=str(resume_id), api_key=api_key)
+            else:
+                agent = sdk.Agent.create(
+                    model=model,
+                    api_key=api_key,
+                    local=local_opts,
+                )
+
+            # Execution-level tool isolation for strictly read-only roles
+            send_kwargs: Dict[str, Any] = {}
+            if role in ("REVIEWER", "QA"):
+                send_kwargs["disallowed_tools"] = [
+                    "Edit", "Write", "Bash", "Terminal", "run_command", "replace_file_content", "write_to_file"
+                ]
+                send_kwargs["tools"] = [] if role == "QA" else ["Read", "view_file"]
+
+            run = agent.send(prompt=request.prompt, **send_kwargs)
         except Exception as exc:
             self._handle_dispatch_error(exc)
             raise
 
-        session_id = request.session_id.strip() if request.session_id and request.session_id.strip() else str(agent.id)
+        if not hasattr(agent, "agent_id") or not getattr(agent, "agent_id"):
+            raise AgentNotSupportedError(
+                "Cursor SDK Agent does not expose required 'agent_id' attribute. Verify official cursor-sdk version."
+            )
+        canonical_agent_id = str(agent.agent_id)
+        session_id = request.session_id.strip() if request.session_id and request.session_id.strip() else canonical_agent_id
         handle = AgentHandle(
             session_id=session_id,
             host_id=self.adapter_id,
@@ -227,7 +254,7 @@ class CursorSdkAdapter(BaseHostAdapter):
                 "run": run,
                 "request": request,
                 "model": model,
-                "agent_id": str(agent.id),
+                "agent_id": canonical_agent_id,
                 "created_at": time.time(),
                 "completed": False,
                 "result": None,
@@ -249,7 +276,7 @@ class CursorSdkAdapter(BaseHostAdapter):
         handle: AgentHandle,
         timeout_seconds: Optional[float] = None,
     ) -> AgentResult:
-        """Wait for Run completion, enforce timeouts, map SDK error hierarchy, and extract result."""
+        """Wait for Run completion, enforce thread timeouts, map SDK error hierarchy, and extract result."""
         session_data = self._validate_handle(handle, include_history=True)
         if session_data.get("completed") and session_data.get("result") is not None:
             return session_data["result"]
@@ -259,12 +286,54 @@ class CursorSdkAdapter(BaseHostAdapter):
         timeout = timeout_seconds if timeout_seconds is not None else self._default_timeout_seconds
 
         run_id = getattr(run, "id", f"run_{uuid.uuid4().hex[:8]}")
-        agent_id = getattr(agent, "id", handle.session_id)
+        agent_id = getattr(agent, "agent_id", handle.session_id)
 
-        try:
-            run_result = run.wait(timeout=timeout)
-        except Exception as exc:
-            return self._finalize_run_exception(handle, session_data, run, agent, exc)
+        run_result_holder: List[Any] = []
+        run_exc_holder: List[Exception] = []
+
+        def _wait_target():
+            try:
+                res = run.wait()
+                run_result_holder.append(res)
+            except Exception as e:
+                run_exc_holder.append(e)
+
+        worker = threading.Thread(
+            target=_wait_target,
+            name=f"cursor_sdk_wait_{run_id}",
+            daemon=True,
+        )
+        worker.start()
+        worker.join(timeout=timeout)
+
+        if worker.is_alive():
+            # Timed out! Proactively cancel run and close agent to interrupt socket/subprocess
+            try:
+                run.cancel()
+            except Exception:
+                pass
+            if agent is not None and hasattr(agent, "close") and callable(agent.close):
+                try:
+                    agent.close()
+                except Exception:
+                    pass
+            worker.join(timeout=0.2)
+            raise AgentTimeoutError(f"Cursor SDK run timed out after {timeout} seconds")
+
+        if run_exc_holder:
+            return self._finalize_run_exception(handle, session_data, run, agent, run_exc_holder[0])
+
+        if not run_result_holder:
+            raise AgentTimeoutError(f"Cursor SDK run produced no result within {timeout} seconds")
+
+        run_result = run_result_holder[0]
+
+        # Ensure agent resources are closed upon completion
+        if agent is not None and hasattr(agent, "close") and callable(agent.close):
+            try:
+                agent.close()
+            except Exception:
+                pass
 
         status_str = getattr(run_result, "status", "finished").lower()
         output_text = getattr(run_result, "result", "") or ""
@@ -375,6 +444,13 @@ class CursorSdkAdapter(BaseHostAdapter):
         if run is not None:
             try:
                 run.cancel()
+            except Exception:
+                pass
+
+        agent = session_data.get("agent")
+        if agent is not None and hasattr(agent, "close") and callable(agent.close):
+            try:
+                agent.close()
             except Exception:
                 pass
 

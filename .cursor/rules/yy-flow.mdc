@@ -1,0 +1,16 @@
+---
+description: yy-flow 多专家协同研发工作流规则
+globs: ["*"]
+alwaysApply: true
+---
+# YY-Flow Multi-Agent Workflow
+
+在 Cursor 会话中开发或解决任务时，主 Agent 必须担任调度中枢，遵循以下流转闭环：
+1. L1/L2 研发任务强制开工门禁：通过 `python scripts/quick_task.py create` 建立任务卡，并推至【进行中】；
+2. 串行调度对应专家子代理（`.cursor/agents/`）：
+   - 开发实现：`@flow-dev` (李开发)
+   - 凭证扫描与审查：`@flow-reviewer` (周审查，只读)
+   - 测试验证与矩阵覆盖：`@flow-qa` (章测试，只读)
+   - 交付与验收推进：`@flow-pm` (严经理)
+3. 状态落库必须经由 `python scripts/transition_task.py` 严格校验；
+4. 详见 `.cursor/rules/yy-flow-orchestrator.mdc` 与 `skills/multi-agent-flow/SKILL.md`。

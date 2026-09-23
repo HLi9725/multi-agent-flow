@@ -684,4 +684,294 @@ def test_runner_mixed_host_cursor_builder_with_other_hosts(mock_repo, tmp_path, 
     FakeCursorSdkState.reset()
 
 
+def test_cursor_sdk_real_api_signatures_and_agent_id(tmp_path, monkeypatch):
+    """Verify Agent.create receives api_key directly, agent.agent_id is canonical, and setting_sources is not empty []."""
+    monkeypatch.setenv("CURSOR_API_KEY", "real_style_api_key_xyz")
+    adapter = CursorSdkAdapter(is_real_host=True, default_model="composer-2.5", sdk_module=fake_cursor_sdk)
+
+    req = AgentRequest(
+        session_id="sess_real_api_01",
+        prompt="verify api signatures",
+        role="BUILDER",
+        workspace_dir=str(tmp_path),
+    )
+    handle = adapter.dispatch_agent(req)
+    session_data = adapter._validate_handle(handle)
+    agent = session_data["agent"]
+
+    assert hasattr(agent, "agent_id")
+    assert agent.agent_id.startswith("ag_")
+    assert agent.api_key == "real_style_api_key_xyz"
+    assert agent.local.cwd == str(tmp_path.resolve())
+    assert agent.local.setting_sources is None  # Does NOT strip rules/context with []
+
+    res = adapter.wait_for_result(handle)
+    assert res.status == AgentStatus.SUCCESS
+    assert agent.is_closed is True  # Resource cleanup called
+
+
+def test_cursor_sdk_agent_close_on_cancellation(tmp_path):
+    """Verify agent.close() is called upon run cancellation to terminate subprocesses."""
+    adapter = CursorSdkAdapter(is_real_host=False, default_model="composer-2.5", sdk_module=fake_cursor_sdk)
+
+    req = AgentRequest(
+        session_id="sess_cancel_cleanup",
+        prompt="cancel test",
+        role="BUILDER",
+        workspace_dir=str(tmp_path),
+    )
+    handle = adapter.dispatch_agent(req)
+    session_data = adapter._validate_handle(handle)
+    agent = session_data["agent"]
+    assert agent.is_closed is False
+
+    ok = adapter.cancel_agent(handle)
+    assert ok is True
+    assert agent.is_closed is True
+
+
+def test_cursor_sdk_thread_level_timeout_enforcement(tmp_path):
+    """Verify that thread-level timeout cancels run and raises AgentTimeoutError when wait() takes no args."""
+    adapter = CursorSdkAdapter(
+        is_real_host=False,
+        default_model="composer-2.5",
+        default_timeout_seconds=0.1,
+        sdk_module=fake_cursor_sdk,
+    )
+
+    req = AgentRequest(
+        session_id="sess_timeout_01",
+        prompt="sleep test",
+        role="BUILDER",
+        workspace_dir=str(tmp_path),
+    )
+    handle = adapter.dispatch_agent(req)
+    session_data = adapter._validate_handle(handle)
+    run = session_data["run"]
+    agent = session_data["agent"]
+    run.delay_seconds = 2.0  # simulate long operation
+
+    with pytest.raises(AgentTimeoutError) as exc_info:
+        adapter.wait_for_result(handle, timeout_seconds=0.1)
+
+    assert "timed out after 0.1 seconds" in str(exc_info.value)
+    assert run.is_cancelled is True
+    assert agent.is_closed is True
+
+
+def test_cursor_sdk_resume_existing_session(tmp_path):
+    """Verify Agent.resume is called instead of Agent.create when resuming an existing agent session."""
+    adapter = CursorSdkAdapter(is_real_host=False, default_model="composer-2.5", sdk_module=fake_cursor_sdk)
+
+    # Initial dispatch
+    req1 = AgentRequest(
+        session_id="sess_initial",
+        prompt="first turn",
+        role="BUILDER",
+        workspace_dir=str(tmp_path),
+    )
+    handle1 = adapter.dispatch_agent(req1)
+    session_data1 = adapter._validate_handle(handle1)
+    original_agent = session_data1["agent"]
+    orig_agent_id = original_agent.agent_id
+    adapter.wait_for_result(handle1)
+    assert original_agent.is_closed is True
+
+    # Resumed turn referencing original agent
+    req2 = AgentRequest(
+        session_id="sess_resumed",
+        prompt="second turn resuming original",
+        role="BUILDER",
+        workspace_dir=str(tmp_path),
+        extra_context={
+            "cursor_model": "composer-2.5",
+            "resume_agent_id": orig_agent_id,
+        },
+    )
+    handle2 = adapter.dispatch_agent(req2)
+    session_data2 = adapter._validate_handle(handle2)
+    resumed_agent = session_data2["agent"]
+
+    assert resumed_agent.agent_id == orig_agent_id
+    assert resumed_agent.is_closed is False
+    res2 = adapter.wait_for_result(handle2)
+    assert res2.status == AgentStatus.SUCCESS
+    assert resumed_agent.is_closed is True
+
+
+def test_cursor_sdk_custom_api_key_env_propagation(tmp_path, monkeypatch):
+    """Verify cursor_api_key_env in extra_context takes precedence over default CURSOR_API_KEY."""
+    monkeypatch.setenv("MY_SPECIAL_CURSOR_KEY", "special_token_98765")
+    adapter = CursorSdkAdapter(
+        is_real_host=True,
+        default_model="composer-2.5",
+        api_key_env_var="CURSOR_API_KEY",  # default, but not set in env
+        sdk_module=fake_cursor_sdk,
+    )
+
+    req = AgentRequest(
+        session_id="sess_custom_key",
+        prompt="custom env test",
+        role="BUILDER",
+        workspace_dir=str(tmp_path),
+        extra_context={
+            "cursor_model": "composer-2.5",
+            "cursor_api_key_env": "MY_SPECIAL_CURSOR_KEY",
+        },
+    )
+    handle = adapter.dispatch_agent(req)
+    session_data = adapter._validate_handle(handle)
+    agent = session_data["agent"]
+    assert agent.api_key == "special_token_98765"
+
+    res = adapter.wait_for_result(handle)
+    assert res.status == AgentStatus.SUCCESS
+
+
+def test_cursor_sdk_readonly_role_tool_isolation(tmp_path):
+    """Verify Reviewer and QA agents are issued disallowed_tools and read-only tools on dispatch."""
+    adapter = CursorSdkAdapter(is_real_host=False, default_model="composer-2.5", sdk_module=fake_cursor_sdk)
+
+    # Reviewer dispatch
+    req_rev = AgentRequest(
+        session_id="sess_rev_tools",
+        prompt="review code",
+        role="REVIEWER",
+        workspace_dir=str(tmp_path),
+    )
+    handle_rev = adapter.dispatch_agent(req_rev)
+    agent_rev = adapter._validate_handle(handle_rev)["agent"]
+    assert agent_rev.disallowed_tools == [
+        "Edit", "Write", "Bash", "Terminal", "run_command", "replace_file_content", "write_to_file"
+    ]
+    assert agent_rev.tools == ["Read", "view_file"]
+    adapter.wait_for_result(handle_rev)
+
+    # QA dispatch
+    req_qa = AgentRequest(
+        session_id="sess_qa_tools",
+        prompt="test code",
+        role="QA",
+        workspace_dir=str(tmp_path),
+    )
+    handle_qa = adapter.dispatch_agent(req_qa)
+    agent_qa = adapter._validate_handle(handle_qa)["agent"]
+    assert agent_qa.disallowed_tools == [
+        "Edit", "Write", "Bash", "Terminal", "run_command", "replace_file_content", "write_to_file"
+    ]
+    assert agent_qa.tools == []
+    adapter.wait_for_result(handle_qa)
+
+
+def test_cursor_sdk_strict_signatures_rejects_client_kwargs(tmp_path):
+    """Verify that Agent.create and Agent.resume strictly reject 'client' argument with TypeError."""
+    with pytest.raises(TypeError) as exc1:
+        fake_cursor_sdk.Agent.create("composer-2.5", client=object())
+    assert "unexpected keyword argument 'client'" in str(exc1.value)
+
+    with pytest.raises(TypeError) as exc2:
+        fake_cursor_sdk.Agent.resume("ag_123", client=object())
+    assert "unexpected keyword argument 'client'" in str(exc2.value)
+
+
+def test_runner_resume_wires_builder_session_id_to_extra_context(mock_repo, tmp_path, monkeypatch):
+    """Verify ProductionRunner injects resume_agent_id into extra_context when resuming from checkpoint."""
+    monkeypatch.setenv("CURSOR_API_KEY", "mock_key_test_123")
+    repo_dir, head_sha = mock_repo
+    # Overwrite board.json with executable acceptance criteria
+    board_file = repo_dir / "user_data" / "board.json"
+    board_file.write_text(json.dumps([{
+        "id": "T0099", "name": "Cursor Resume Test", "status": "待开始", "type": "A",
+        "owner": "李开发", "handler": "李开发", "updated_at": "1.0",
+        "process": "需求: 断点续跑支持。\n验收标准:\n- resume_agent_id 正确传入 extra_context",
+    }], ensure_ascii=False), encoding="utf-8")
+    data_root = tmp_path / "data_resume_check"
+    data_root.mkdir()
+
+    dispatched_requests = []
+
+    class CapturingCursorAdapter(CursorSdkAdapter):
+        def dispatch_agent(self, request):
+            dispatched_requests.append(request)
+            return super().dispatch_agent(request)
+
+    reg = AdapterRegistry()
+    cap_adapter = CapturingCursorAdapter(is_real_host=True, sdk_module=fake_cursor_sdk)
+    reg.register(cap_adapter, create_cursor_sdk_manifest())
+
+    evidence_store = EvidenceStore(root_dir=str(data_root / "evidence"))
+    evidence_gate = EvidenceGate(store=evidence_store, project_root=str(repo_dir))
+    checkpoint_store = RunnerCheckpointStore(data_root=str(data_root), project_root=str(repo_dir), project_id="test-proj")
+
+    from scripts._lib.core.task_spec_loader import load_task_execution_spec
+    spec = load_task_execution_spec(
+        project_root=str(repo_dir),
+        task_id="T0099",
+        authority_root=str(repo_dir),
+        overrides={
+            "builder_adapter_id": "cursor_sdk",
+            "reviewer_adapter_id": "cursor_sdk",
+            "qa_adapter_id": "cursor_sdk",
+            "cursor_model": "composer-2.5",
+            "cursor_api_key_env": "CURSOR_API_KEY",
+            "cursor_runtime": "local",
+        },
+    )
+    from scripts._lib.core.production_runner import _execution_spec_snapshot
+    snapshot = _execution_spec_snapshot(spec)
+
+    # Manually create a checkpoint with a builder_session_id in BUILDING state
+    prior_session_id = "sess_prior_builder_12345"
+    ckpt = RunnerCheckpoint(
+        task_id="T0099",
+        project_id="test-proj",
+        state=RunnerState.BUILDING.value,
+        current_role="BUILDER",
+        candidate_commit=head_sha,
+        candidate_generation=0,
+        review_cycle=0,
+        qa_cycle=0,
+        total_attempts=1,
+        builder_session_id=prior_session_id,
+        worktree_path=str(repo_dir),
+        execution_options={
+            "builder_adapter_id": "cursor_sdk",
+            "reviewer_adapter_id": "cursor_sdk",
+            "qa_adapter_id": "cursor_sdk",
+            "cursor_model": "composer-2.5",
+            "cursor_api_key_env": "CURSOR_API_KEY",
+            "cursor_runtime": "local",
+        },
+        execution_spec_snapshot=snapshot,
+    )
+    checkpoint_store.save_checkpoint(ckpt)
+
+    # Resume the task
+    runner = ProductionRunner(
+        registry=reg,
+        evidence_store=evidence_store,
+        evidence_gate=evidence_gate,
+        checkpoint_store=checkpoint_store,
+    )
+
+    # Intercept builder run to check extra_context and stop early
+    def fail_after_builder(prompt, agent):
+        return "builder done"
+    fake_cursor_sdk.FakeCursorSdkState.set_on_send_hook(fail_after_builder)
+
+    runner.resume(
+        project_root=str(repo_dir),
+        task_id="T0099",
+        authority_root=str(repo_dir),
+    )
+
+    assert len(dispatched_requests) >= 1
+    builder_req = dispatched_requests[0]
+    assert builder_req.role == "BUILDER"
+    assert builder_req.extra_context.get("resume_agent_id") == prior_session_id
+    assert builder_req.extra_context.get("is_resume") is True
+
+
+
+
 
