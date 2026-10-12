@@ -197,16 +197,24 @@ class CodexCliAdapter(BaseHostAdapter):
                     f"Unauthorized or dangerous sandbox mode '{requested_sandbox}'. "
                     f"Allowed whitelist: {sorted(ALLOWED_SANDBOX_MODES)}"
                 )
-            if role in ("REVIEWER", "QA") and requested_sandbox != "read-only":
+            if role in ("REVIEWER", "QA", "VERIFIER") and requested_sandbox != "read-only":
                 raise AgentNotSupportedError(
                     f"Role '{role}' is strictly read-only; cannot request writable sandbox '{requested_sandbox}'"
                 )
+            if role not in ("BUILDER", "DEV", "FRONTEND", "ARCHITECT", "DOCS", "DEVOPS", "PM", "REVIEWER", "QA", "VERIFIER"):
+                raise AgentNotSupportedError(
+                    f"Role '{role}' is unknown and cannot receive a writable sandbox."
+                )
             sandbox_mode = requested_sandbox
         else:
-            if role in ("REVIEWER", "QA"):
+            if role in ("REVIEWER", "QA", "VERIFIER"):
                 sandbox_mode = "read-only"
-            else:
+            elif role in ("BUILDER", "DEV", "FRONTEND", "ARCHITECT", "DOCS", "DEVOPS", "PM"):
                 sandbox_mode = self._default_sandbox_mode
+            else:
+                raise AgentNotSupportedError(
+                    f"Role '{role}' is unknown and cannot receive a writable sandbox."
+                )
 
         approval_policy = self._default_approval_policy
         is_auto_approval = False
@@ -220,12 +228,12 @@ class CodexCliAdapter(BaseHostAdapter):
                 is_auto_approval = True
 
         git_common_dir = None
-        if role not in ("REVIEWER", "QA") and sandbox_mode == "workspace-write":
+        if role not in ("REVIEWER", "QA", "VERIFIER") and sandbox_mode == "workspace-write":
             git_common_dir = _resolve_git_common_dir(request.workspace_dir)
 
         if is_auto_approval:
             # DEF-T0050-7: REVIEWER cannot use --approve-for-me because it implies workspace-write
-            if role in ("REVIEWER", "QA"):
+            if role in ("REVIEWER", "QA", "VERIFIER"):
                 raise AgentNotSupportedError(
                     f"Role '{role}' is strictly read-only and cannot use '--approve-for-me' (which forces workspace-write)"
                 )

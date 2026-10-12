@@ -32,6 +32,7 @@ class RunnerState(str, Enum):
     BUILDING = "BUILDING"
     REVIEWING = "REVIEWING"
     QA_TESTING = "QA_TESTING"
+    VERIFYING = "VERIFYING"
     COMPLETION_PENDING = "COMPLETION_PENDING"
     REJECTION_PENDING = "REJECTION_PENDING"
     PENDING_USER_ACCEPTANCE = "PENDING_USER_ACCEPTANCE"
@@ -324,6 +325,9 @@ class TaskExecutionSpec:
     allow_merge_main: bool = False
     allow_auto_accept: bool = False
     allow_release: bool = False
+    workflow_profile: Optional[str] = None
+    workflow_policy_payload: Optional[Mapping[str, Any]] = None
+    workflow_downgrade_authorization: Optional[str] = None
 
     def __post_init__(self):
         if not self.task_id:
@@ -410,6 +414,8 @@ class TaskExecutionSpec:
             "allow_merge_main": self.allow_merge_main,
             "allow_auto_accept": self.allow_auto_accept,
             "allow_release": self.allow_release,
+            "workflow_profile": self.workflow_profile,
+            "workflow_downgrade_authorization": self.workflow_downgrade_authorization,
         }
 
 
@@ -441,6 +447,8 @@ class RunnerCheckpoint:
     approval_attempts: int = 0
     approval_diagnostics: Mapping[str, Any] = field(default_factory=dict)
     host_attempt_history: Tuple[Dict[str, Any], ...] = field(default_factory=tuple)
+    verifier_session_id: Optional[str] = None
+    verifier_invocation_id: Optional[str] = None
     confirmation_request_id: Optional[str] = None
     defects_history: Tuple[Dict[str, Any], ...] = field(default_factory=tuple)
     approval_reason: Optional[str] = None
@@ -475,6 +483,8 @@ class RunnerCheckpoint:
             "reviewer_invocation_id": self.reviewer_invocation_id,
             "qa_session_id": self.qa_session_id,
             "qa_invocation_id": self.qa_invocation_id,
+            "verifier_session_id": self.verifier_session_id,
+            "verifier_invocation_id": self.verifier_invocation_id,
             "evidence_ids": list(self.evidence_ids),
             "execution_options": dict(self.execution_options),
             "execution_spec_snapshot": dict(self.execution_spec_snapshot),
@@ -511,6 +521,8 @@ class RunnerCheckpoint:
             reviewer_invocation_id=data.get("reviewer_invocation_id"),
             qa_session_id=data.get("qa_session_id"),
             qa_invocation_id=data.get("qa_invocation_id"),
+            verifier_session_id=data.get("verifier_session_id"),
+            verifier_invocation_id=data.get("verifier_invocation_id"),
             evidence_ids=tuple(data.get("evidence_ids", [])),
             execution_options=dict(data.get("execution_options", {})),
             execution_spec_snapshot=dict(data.get("execution_spec_snapshot", {})),

@@ -105,7 +105,20 @@ def build_context(role: str, action: str = "general") -> str:
     else:
         context_output.append("- 严格遵守【状态与处理人原子绑定】原则。")
 
-    return "\n".join(context_output)
+    try:
+        from _lib.core.rule_source import RuleSourceError, load_rule_bundle
+    except ImportError:
+        from scripts._lib.core.rule_source import RuleSourceError, load_rule_bundle
+    try:
+        bundle = load_rule_bundle(role_upper, action=action, host=os.environ.get("YY_FLOW_HOST", "cursor"), profile_id=os.environ.get("YY_FLOW_PROFILE", "standard"))
+    except RuleSourceError as exc:
+        raise SystemExit(str(exc))
+    context_output.append("## 4. 按需加载的完整规则")
+    context_output.append(bundle)
+    rendered = "\n".join(context_output)
+    if "公共安全规则" not in rendered:
+        raise SystemExit("安全规则未完整进入上下文，拒绝启动")
+    return rendered
 
 def main():
     parser = argparse.ArgumentParser(description="动态角色 Prompt 上下文裁剪合成器")

@@ -80,6 +80,7 @@ class TaskExecutionSession:
     qa_adapter_id: Optional[str] = None
     confirmation_request_id: Optional[str] = None
     last_evidence_id: Optional[str] = None
+    workflow_policy: Optional[Dict[str, Any]] = None
     history: List[Dict[str, Any]] = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
@@ -99,6 +100,7 @@ class Orchestrator:
         evidence_store: Optional[EvidenceStore] = None,
         evidence_gate: Optional[EvidenceGate] = None,
         project_root: Optional[str] = None,
+        workflow_policy: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.registry = registry
         self.evidence_store = evidence_store
@@ -108,6 +110,7 @@ class Orchestrator:
         )
         self._lock = threading.RLock()
         self._sessions: Dict[str, TaskExecutionSession] = {}
+        self.workflow_policy = dict(workflow_policy) if workflow_policy else None
 
     def _normalize_current_os(self) -> str:
         plat = sys.platform.lower()
@@ -158,6 +161,7 @@ class Orchestrator:
         builder_session_id: str,
         builder_invocation_id: str,
         builder_adapter_id: str,
+        workflow_policy: Optional[Dict[str, Any]] = None,
     ) -> TaskExecutionSession:
         """Start or re-activate the Builder role on a task."""
         with self._lock:
@@ -170,6 +174,8 @@ class Orchestrator:
             if not builder_invocation_id or not builder_invocation_id.strip():
                 raise ValueError("builder_invocation_id cannot be empty")
 
+            if workflow_policy is None:
+                workflow_policy = self.workflow_policy
             existing = self._sessions.get(task_id)
             if existing:
                 if existing.state not in (
@@ -197,6 +203,8 @@ class Orchestrator:
                 existing.builder_session_id = builder_session_id
                 existing.builder_invocation_id = builder_invocation_id
                 existing.builder_adapter_id = builder_adapter_id
+                if workflow_policy is not None:
+                    existing.workflow_policy = dict(workflow_policy)
                 existing.confirmation_request_id = None
                 existing.updated_at = time.time()
                 existing.history.append({
@@ -224,6 +232,7 @@ class Orchestrator:
                 builder_session_id=builder_session_id,
                 builder_invocation_id=builder_invocation_id,
                 builder_adapter_id=builder_adapter_id,
+                workflow_policy=dict(workflow_policy) if workflow_policy else None,
             )
             session.history.append({
                 "action": "START_BUILDER",
@@ -246,6 +255,10 @@ class Orchestrator:
             if not session:
                 raise OrchestrationStateError(f"No active session for task '{handover.task_id}'")
 
+            if (session.workflow_policy or {}).get("profile_id") == "lite":
+                raise OrchestrationGateError(
+                    "Lite profile cannot submit to Reviewer; dispatch an independent Verifier."
+                )
             if session.state != OrchestrationState.BUILDING:
                 # Idempotency check
                 if session.state == OrchestrationState.REVIEWING and session.candidate_commit == handover.candidate_commit:

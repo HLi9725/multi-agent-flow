@@ -34,6 +34,7 @@ RUNNER_MANAGED_AGENT_MAP: Dict[str, str] = {
     "BUILDER": "flow-runner-builder",
     "REVIEWER": "flow-runner-reviewer",
     "QA": "flow-runner-qa",
+    "VERIFIER": "flow-runner-verifier",
 }
 
 VALID_SDK_TOOLS: Set[str] = {"read", "grep", "glob", "shell", "edit", "task", "mcp"}

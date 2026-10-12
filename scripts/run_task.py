@@ -109,6 +109,10 @@ def _overrides_from_args(args):
         overrides["cursor_api_key_env"] = args.cursor_api_key_env
     if getattr(args, "cursor_runtime", None):
         overrides["cursor_runtime"] = args.cursor_runtime
+    if getattr(args, "profile", None):
+        overrides["workflow_profile"] = args.profile
+    if getattr(args, "downgrade_authorization", None):
+        overrides["workflow_downgrade_authorization"] = args.downgrade_authorization
     return overrides
 
 
@@ -273,6 +277,8 @@ def main():
     )
     p_start.set_defaults(func=cmd_start)
     p_start.add_argument("--restart-cancelled", action="store_true", help="Archive a cancelled run and start a new run of the same task")
+    p_start.add_argument("--profile", default=None, choices=["standard", "lite", "docs-short", "auto"], help="Workflow profile. Omit to keep Standard-equivalent behavior")
+    p_start.add_argument("--downgrade-authorization", default=None, help="Explicit authorization required to downgrade a frozen profile")
     _add_host_retry_args(p_start)
     _add_cursor_args(p_start)
 
@@ -320,6 +326,8 @@ def main():
         choices=["branch", "inherit", "share"],
         help="Override persisted workspace mode (checkpoint worktree is still authoritative)",
     )
+    p_resume.add_argument("--profile", default=None, choices=["standard", "lite", "docs-short", "auto"], help="Requested profile on resume. Downgrade requires authorization")
+    p_resume.add_argument("--downgrade-authorization", default=None, help="Explicit authorization required to downgrade a frozen profile")
     p_resume.set_defaults(func=cmd_resume)
     _add_host_retry_args(p_resume)
     _add_cursor_args(p_resume)

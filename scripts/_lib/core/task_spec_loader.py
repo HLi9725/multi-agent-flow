@@ -15,7 +15,7 @@ import os
 import re
 import subprocess
 import sys
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 _SCRIPTS_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if _SCRIPTS_ROOT not in sys.path:
@@ -279,6 +279,23 @@ def _find_non_executable_criteria(
     return tuple(invalid)
 
 
+def _workflow_payload_override(overrides: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    payload = overrides.get("workflow_policy")
+    if isinstance(payload, Mapping):
+        return dict(payload)
+    return None
+
+
+def _workflow_profile_override(overrides: Mapping[str, Any]) -> Optional[str]:
+    explicit = overrides.get("workflow_profile")
+    if explicit:
+        return str(explicit)
+    payload = _workflow_payload_override(overrides)
+    if payload and payload.get("profile_id"):
+        return str(payload["profile_id"])
+    return None
+
+
 def load_task_execution_spec(
     project_root: str,
     task_id: str,
@@ -439,6 +456,12 @@ def load_task_execution_spec(
         allow_merge_main=bool(ov.get("allow_merge_main", False)),
         allow_auto_accept=bool(ov.get("allow_auto_accept", False)),
         allow_release=bool(ov.get("allow_release", False)),
+        workflow_profile=_workflow_profile_override(ov),
+        workflow_policy_payload=_workflow_payload_override(ov),
+        workflow_downgrade_authorization=(
+            str(ov.get("workflow_downgrade_authorization")).strip()
+            if ov.get("workflow_downgrade_authorization") else None
+        ),
     )
     return spec
 

@@ -293,3 +293,33 @@ class EvidenceGate:
                  raise EvidenceGateError("Evidence rejected: Missing confirmed_at.")
 
         return True
+
+    def validate_lite_verifier(
+        self,
+        evidence_id: str,
+        ctx: EvidenceValidationContext,
+        *,
+        builder_session_id: str,
+        require_pass: bool = True,
+    ) -> bool:
+        """Lite completion gate. Reviewer/QA evidence cannot satisfy it."""
+        self.validate_evidence(evidence_id, ctx)
+        record = self.store.read(evidence_id)
+        meta = record.metadata
+        if meta.actor_role != "VERIFIER":
+            raise EvidenceGateError("Evidence rejected: Lite gate requires actor_role VERIFIER.")
+        session_id = str(meta.host_session_id or "")
+        if "verifier" not in session_id.lower():
+            raise EvidenceGateError("Evidence rejected: Verifier session is not distinguishable.")
+        if builder_session_id and session_id == builder_session_id:
+            raise EvidenceGateError("Evidence rejected: Verifier invocation matches Builder.")
+        if meta.extra.get("workflow_profile_id") != "lite":
+            raise EvidenceGateError("Evidence rejected: workflow profile is not lite.")
+        decision = meta.extra.get("verifier_decision")
+        if decision not in ("PASS", "FAIL"):
+            raise EvidenceGateError("Evidence rejected: Verifier decision is missing.")
+        if require_pass and decision != "PASS":
+            raise EvidenceGateError("Evidence rejected: Verifier decision is not PASS.")
+        if not require_pass and decision == "PASS":
+            raise EvidenceGateError("Evidence rejected: failure gate received PASS.")
+        return True

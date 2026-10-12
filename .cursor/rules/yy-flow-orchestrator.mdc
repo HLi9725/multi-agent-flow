@@ -9,7 +9,7 @@ alwaysApply: true
 当用户在 Cursor 会话中提出任务、需求、缺陷修复或功能开发请求时，当前主 Agent 自动担任全局编排主控 (Autonomous Orchestrator)，遵循本规约无人值守自主推进全流程。
 
 ## 一、核心原则：中枢调度与自主推进
-1. 中枢受控调度 (Hub-and-Spoke)：Cursor 当前子代理机制不支持 P2P 点对点自主转交。主 Agent 必须作为唯一的中枢调度器，按照看板状态机顺序通过子代理工具按名称启动对应专家子代理（`flow-*`），严禁在当前主对话窗口直接扮演角色，严禁跳过审查与测试节点。
+1. 中枢受控调度 (Hub-and-Spoke)：Cursor 当前子代理机制不支持 P2P 点对点自主转交。主 Agent 必须作为唯一的中枢调度器，按照已固化的工作流 Profile 通过子代理工具按名称启动对应专家子代理（`flow-*`），严禁在当前主对话窗口直接扮演角色。Standard 不得跳过独立审查与测试。Lite 使用独立 Verifier，不得伪造审查或测试。文档短链必须先通过必要检查。
 2. 闭环推进不中断 (Autonomous Continuation)：除非遇到不可解决的冲突、致命报错或最终需要人类用户验收，主 Agent 必须自动连续执行各阶段动作，严禁在中间阶段向人类询问“是否继续”。
 
 ## 二、任务分级与开工门禁
@@ -22,7 +22,15 @@ alwaysApply: true
   3. 获取新建任务 ID，并推进至【进行中】（注意：--role 必须使用对应承接角色的代码，如 DEV/FRONTEND/ARCHITECT/DOCS/DEVOPS，严禁全用 DEV）：
      `python .yy-flow/skill/scripts/transition_task.py --role <对应承接角色> --from-status 待开始 --to-status 进行中 --task-id <TASK_ID> --assignee <负责人>`（在 Skill 仓库内使用 `python scripts/transition_task.py`）
 
-## 三、标准流转流水线
+## 三、按 Profile 流转
+开工前根据实际 diff 固化策略。无配置或 `standard` 时走下面的 Standard。权限、资金、隐私、数据库迁移、生产部署按文件内容识别，不能因项目小、文件少、标题、标签或用户声称降为 Lite。风险升级后停止轻量路径并重新计划。
+
+1. Standard：开发实现后进入【审查中】。审查运行 `python scripts/check_secrets.py`，失败退回【已退回】，通过后进入【测试中】。QA 运行 `pytest`，通过后进入【已完成】。PM 停在【已完成】等待用户人工【已验收】。
+2. Lite：开发 + 独立 Verifier。Verifier 调用必须与 Builder 区分，使用专属证据。无证据或失败不能完成，不得伪造 Reviewer/QA 证据。
+3. 文档短链：秘密扫描与文档元数据/路径约束通过后，低风险文档从【进行中】到【已完成】。实际改动若含高风险，不得短链。
+4. 用户验收在所有 Profile 下都留给真实用户。任何角色不得代验收。
+
+## 四、Standard 流水线明细
 1. 开发实现：由分派的专家子代理实施修改并确认 diff；
 2. 代码审查 (REVIEWER - @flow-reviewer)：状态推至【审查中】；运行项目级 `python .yy-flow/skill/scripts/check_secrets.py`（Skill 仓库内用 `python scripts/check_secrets.py`），只读审查 diff；若有缺陷通过项目级 `transition_task.py` 退回至合法状态【已退回】（禁止使用不存在的状态），PASS 则流转至【测试中】；
 3. 测试验证 (QA - @flow-qa)：运行 `pytest`，核验验收矩阵；若失败同样退回至【已退回】，PASS 则流转至【已完成】；

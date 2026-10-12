@@ -5,6 +5,7 @@
 并在导出后执行本地格式断言 (Fail-Closed: 解析失败/角色不齐全即 exit(1))。
 """
 
+import json
 import os
 import shutil
 import sys
@@ -48,8 +49,34 @@ RUNNER_MANAGED_AGENT_IDS = {
     "BUILDER": "flow-runner-builder",
     "REVIEWER": "flow-runner-reviewer",
     "QA": "flow-runner-qa",
+    "VERIFIER": "flow-runner-verifier",
 }
 RUNNER_BUILDER_ID = RUNNER_MANAGED_AGENT_IDS["BUILDER"]
+
+
+def attach_rule_source(content: str) -> str:
+    """Stamp the shared rule-source version and the full safety text onto an export."""
+    from _lib.core.rule_source import RuleSourceError, load_safety_text, source_version
+    try:
+        version = source_version()
+        safety = load_safety_text()
+    except RuleSourceError as exc:
+        raise SystemExit(str(exc))
+    if not safety.strip() or safety.strip() not in (content + safety):
+        raise SystemExit("导出缺少完整安全规则")
+    appendix = f"\n\n## 规则源版本\n{version}\n\n{safety}\n"
+    if 'developer_instructions = """' in content:
+        if "rule_source_version" not in content:
+            content = f'rule_source_version = "{version}"\n' + content
+        closing = content.rfind('"""')
+        stamped = content[:closing] + appendix.replace('"""', '\\"\\"\\"') + content[closing:]
+    else:
+        if content.startswith("---\n") and "rule_source_version:" not in content.split("---", 2)[1]:
+            content = content.replace("---\n", f"---\nrule_source_version: \"{version}\"\n", 1)
+        stamped = content + appendix
+    if safety.strip() not in stamped:
+        raise SystemExit("静态导出截断了安全规则")
+    return stamped
 
 
 def serialize_runner_builder(platform_key, subagent_spec):
@@ -73,7 +100,7 @@ def serialize_runner_builder(platform_key, subagent_spec):
         "enable_write_tools": True,
         "subagent": True,
     }, allow_unicode=True, sort_keys=False)
-    return f"---\n{fm}---\n\n{body}"
+    return attach_rule_source(f"---\n{fm}---\n\n{body}")
 
 
 def serialize_runner_readonly_role(platform_key, role_code, role_data):
@@ -156,7 +183,41 @@ def serialize_runner_readonly_role(platform_key, role_code, role_data):
         "enable_write_tools": False,
         "subagent": True,
     }, allow_unicode=True, sort_keys=False)
-    return f"---\n{fm}---\n\n{body}"
+    return attach_rule_source(f"---\n{fm}---\n\n{body}")
+
+
+def serialize_runner_verifier(platform_key):
+    """Read-only Lite Verifier. It is not Reviewer, QA, or a writable Builder."""
+    body = """# Production Runner 托管 VERIFIER
+
+这是 Lite 的独立只读验证配置，不是 Reviewer、QA 或 Builder，也不是第九个业务角色。
+
+- 只能只读查看 Runner 指定的候选差异。
+- 不得修改文件，不得调用终端、Git 或测试命令。
+- 不得伪造 Reviewer 或 QA Evidence。
+- 失败或证据不足时返回 FAIL，不能把任务标成完成。
+"""
+    if platform_key == "codex":
+        safe_body = body.replace('"""', '\\"\\"\\"')
+        toml_content = f'''name = "flow-runner-verifier"
+description = "yy-flow Production Runner 专用只读 Verifier"
+developer_instructions = """
+{safe_body}
+"""
+'''
+        return attach_rule_source(toml_content)
+    tools = [
+        tool for tool in PLATFORM_TOOLS.get(platform_key, DEFAULT_TOOLS)
+        if tool.lower() in {"view_file", "read"}
+    ]
+    fm = yaml.dump({
+        "name": RUNNER_MANAGED_AGENT_IDS["VERIFIER"],
+        "description": "yy-flow Production Runner 专用只读 Verifier",
+        "tools": tools,
+        "enable_write_tools": False,
+        "subagent": True,
+    }, allow_unicode=True, sort_keys=False)
+    return attach_rule_source(f"---\n{fm}---\n\n{body}")
 
 
 def _as_bullets(value):
@@ -377,7 +438,7 @@ developer_instructions = \"\"\"
 {safe_instructions}
 \"\"\"
 """
-        return toml_content
+        return attach_rule_source(toml_content)
 
     # 3. 格式 B: 标准 Markdown + YAML Frontmatter 格式
     if use_frontmatter:
@@ -391,9 +452,9 @@ developer_instructions = \"\"\"
         # 移除 None
         fm_dict = {k: v for k, v in fm_dict.items() if v is not None}
         fm_yaml = yaml.dump(fm_dict, allow_unicode=True, sort_keys=False)
-        return f"---\n{fm_yaml}---\n\n{sop_prompt}"
+        return attach_rule_source(f"---\n{fm_yaml}---\n\n{sop_prompt}")
     else:
-        return sop_prompt
+        return attach_rule_source(sop_prompt)
 
 def verify_exported_agent(out_abs_path, fmt):
     """
@@ -564,9 +625,15 @@ def export_platform_assets(platforms_config, active_platforms, global_mode=False
         # Managed execution profiles are not additional business roles. They
         # exist only on Antigravity surfaces, where headless terminal calls may
         # be elevated before a user can approve them.
-        if p_key in ("antigravity", "antigravity_cli", "cursor"):
+        managed_contents = None
+        if p_key == "codex":
+            managed_contents = {
+                RUNNER_MANAGED_AGENT_IDS["VERIFIER"]: serialize_runner_verifier(p_key),
+            }
+        elif p_key in ("antigravity", "antigravity_cli", "cursor"):
             managed_contents = {
                 RUNNER_BUILDER_ID: serialize_runner_builder(p_key, subagent_spec or {}),
+                RUNNER_MANAGED_AGENT_IDS["VERIFIER"]: serialize_runner_verifier(p_key),
             }
             for yaml_file, role_code in (("04-reviewer.yaml", "REVIEWER"), ("05-qa.yaml", "QA")):
                 with open(os.path.join(AGENTS_DIR, yaml_file), "r", encoding="utf-8") as fp:
@@ -574,6 +641,7 @@ def export_platform_assets(platforms_config, active_platforms, global_mode=False
                 managed_contents[RUNNER_MANAGED_AGENT_IDS[role_code]] = serialize_runner_readonly_role(
                     p_key, role_code, managed_role_data
                 )
+        if managed_contents:
             for managed_id, managed_content in managed_contents.items():
                 runner_rel = pattern.format(agent_id=managed_id)
                 runner_abs = os.path.expanduser(runner_rel) if global_mode else os.path.join(TARGET_PROJECT_DIR, runner_rel)
@@ -635,6 +703,20 @@ def main():
         print("[FAILED] 全局模式未探测到任何已安装的 Agent 宿主（各平台用户级目录均不存在）！")
         print("         请先安装至少一个宿主（Claude Code / Codex / Antigravity），或用项目级模式。")
         print("==============================================================================")
+        sys.exit(1)
+
+    snapshot_path = os.path.join(PROJECT_ROOT, "rules", "contract-snapshot.json")
+    if os.path.isfile(snapshot_path):
+        from _lib.core.workflow_policy import compare_contract
+        with open(snapshot_path, "r", encoding="utf-8") as handle:
+            recorded_contract = json.load(handle)
+        drift = compare_contract(recorded_contract)
+        if drift:
+            for item in drift:
+                print(f"[ERROR] 契约漂移，拒绝静默覆盖: {item}")
+            sys.exit(1)
+    else:
+        print("[ERROR] 缺少 rules/contract-snapshot.json，拒绝在没有契约基线时继续导出")
         sys.exit(1)
 
     if missing_agents or verify_failures or (exportable and total_exported == 0):

@@ -51,15 +51,86 @@ def validate_managed_transition(data_root, task_id, source, target, evidence_id=
         ('测试中', '已完成'): ('QA', 'TESTING', 'PENDING_USER_ACCEPTANCE'),
         ('已完成', '已验收'): ('PM', 'PENDING_USER_ACCEPTANCE', 'ACCEPTED'),
     }
-    if (source, target) not in protected:
-        return
     matches = glob.glob(os.path.join(data_root, 'runner_checkpoints', '*', task_id + '.json'))
     if not matches:
+        try:
+            from .workflow_policy import load_policy_file
+        except ImportError:
+            from workflow_policy import load_policy_file
+        policy = load_policy_file(data_root, task_id) or {}
+        if policy.get('profile_id') in ('lite', 'docs-short') and (source, target) == ('进行中', '已完成'):
+            raise EvidenceGateError('轻量完成缺少已绑定的 Runner 证据，不能放行。')
         return  # Existing non-Runner single-role workflows keep their contract.
     if len(matches) != 1:
         raise EvidenceGateError('Ambiguous Runner checkpoint; select the correct project data root.')
     with open(matches[0], encoding='utf-8') as handle:
         checkpoint = RunnerCheckpoint.from_dict(json.load(handle))
+    policy = dict(checkpoint.execution_options.get('workflow_policy') or {})
+    if (source, target) == ('进行中', '已完成') and policy.get('profile_id') == 'lite':
+        if checkpoint.state in ('CANCELLED', 'APPROVAL_REQUIRED', 'FAILED', 'NEEDS_USER_INPUT'):
+            raise EvidenceGateError('Runner is paused or cancelled; resume through Runner before advancing.')
+        if not evidence_id or evidence_id not in checkpoint.evidence_ids:
+            raise EvidenceGateError('Lite completion requires persisted Verifier evidence.')
+        root = checkpoint.execution_spec_snapshot.get('project_root')
+        if not root:
+            raise EvidenceGateError('Legacy checkpoint needs Runner resume/migration before transition.')
+        store = EvidenceStore(os.path.join(root, 'user_data', 'runner_evidence'))
+        record = store.read(evidence_id)
+        if record.result_commit != checkpoint.candidate_commit:
+            raise EvidenceGateError('Lite evidence result_commit is not the current candidate.')
+        if record.metadata.host_session_id == checkpoint.builder_session_id:
+            raise EvidenceGateError('Lite Verifier session matches Builder.')
+        from .agent_schema import AgentHandle, HostCapabilities
+        caps = {}
+        for name in HostCapabilities.__dataclass_fields__:
+            if name == 'extra':
+                continue
+            key = 'capability_' + name
+            if key not in record.metadata.extra:
+                raise EvidenceGateError('Lite verifier evidence is missing recorded capabilities.')
+            caps[name] = record.metadata.extra[key]
+        EvidenceGate(store, root).validate_lite_verifier(
+            evidence_id,
+            EvidenceValidationContext(
+                project_id=checkpoint.project_id,
+                task_id=checkpoint.task_id,
+                actor_role='VERIFIER',
+                transition_from=record.metadata.transition_from,
+                transition_to=record.metadata.transition_to,
+                baseline_commit=record.baseline_commit,
+                result_commit=checkpoint.candidate_commit,
+                expected_invocation_id=record.metadata.host_invocation_id,
+                expected_adapter=record.metadata.adapter,
+                expected_workspace_mode=record.metadata.workspace_mode,
+                expected_evidence_type=record.evidence_type,
+                host_handle=AgentHandle(
+                    record.metadata.host_session_id,
+                    record.metadata.host_id,
+                    is_real_host=bool(record.metadata.is_real_host),
+                ),
+                expected_capabilities=HostCapabilities(**caps),
+            ),
+            builder_session_id=checkpoint.builder_session_id or '',
+            require_pass=True,
+        )
+        return
+    if (source, target) == ('进行中', '已完成') and policy.get('profile_id') == 'docs-short':
+        if checkpoint.state in ('CANCELLED', 'APPROVAL_REQUIRED', 'FAILED', 'NEEDS_USER_INPUT'):
+            raise EvidenceGateError('Runner is paused or cancelled; resume through Runner before advancing.')
+        if not evidence_id or evidence_id not in checkpoint.evidence_ids:
+            raise EvidenceGateError('Docs short-chain completion requires persisted check evidence.')
+        root = checkpoint.execution_spec_snapshot.get('project_root')
+        if not root:
+            raise EvidenceGateError('Legacy checkpoint needs Runner resume/migration before transition.')
+        store = EvidenceStore(os.path.join(root, 'user_data', 'runner_evidence'))
+        record = store.read(evidence_id)
+        if record.result_commit != checkpoint.candidate_commit or record.metadata.actor_role != 'DOCS_CHECK':
+            raise EvidenceGateError('Docs evidence is not bound to the current candidate.')
+        if record.metadata.extra.get('verifier_decision') != 'PASS':
+            raise EvidenceGateError('Docs evidence did not pass the required checks.')
+        return
+    if (source, target) not in protected:
+        return
     if checkpoint.state in ('CANCELLED', 'APPROVAL_REQUIRED', 'FAILED', 'NEEDS_USER_INPUT'):
         raise EvidenceGateError('Runner is paused or cancelled; resume through Runner before advancing.')
     if not evidence_id or evidence_id not in checkpoint.evidence_ids:

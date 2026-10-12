@@ -183,6 +183,7 @@ RUNNER_MANAGED_AGENT_MAP: Dict[str, str] = {
     "BUILDER": "flow-runner-builder",
     "REVIEWER": "flow-runner-reviewer",
     "QA": "flow-runner-qa",
+    "VERIFIER": "flow-runner-verifier",
 }
 
 # 5-Tier Permission Categories
@@ -686,6 +687,11 @@ class AntigravityAdapter(BaseHostAdapter):
         All option flags must precede `--print` in agy CLI syntax.
         """
         role = (request.role or "").upper().strip()
+        known_roles = set(ROLE_AGENT_MAP) | set(RUNNER_MANAGED_AGENT_MAP)
+        if role not in known_roles:
+            raise AgentNotSupportedError(
+                f"Role '{role}' is unknown and cannot receive a writable sandbox."
+            )
         requested_mode = None
         if isinstance(request.extra_context, Mapping):
             requested_mode = request.extra_context.get("mode")
@@ -695,13 +701,13 @@ class AntigravityAdapter(BaseHostAdapter):
                 raise AgentNotSupportedError(
                     f"Unauthorized execution mode '{requested_mode}'. Allowed whitelist: {sorted(ALLOWED_EXECUTION_MODES)}"
                 )
-            if role in ("REVIEWER", "QA") and requested_mode != "plan":
+            if role in ("REVIEWER", "QA", "VERIFIER") and requested_mode != "plan":
                 raise AgentNotSupportedError(
                     f"Role '{role}' is strictly read-only; cannot request writable execution mode '{requested_mode}'"
                 )
             exec_mode = requested_mode
         else:
-            if role in ("REVIEWER", "QA"):
+            if role in ("REVIEWER", "QA", "VERIFIER"):
                 exec_mode = "plan"
             else:
                 exec_mode = "accept-edits"

@@ -58,7 +58,7 @@ class TestGlobalExport:
         # 用户级 subagent 导出（Claude Code 支持 user_pattern）
         agents_dir = fake_home / ".gemini/config" / "agents"
         exported = list(agents_dir.glob("flow-*.md"))
-        assert len(exported) == 11
+        assert len(exported) == 12
         runner_builder = (agents_dir / "flow-runner-builder.md").read_text(encoding="utf-8")
         assert "run_command" not in runner_builder.split("---", 2)[1]
         for managed_name in ("flow-runner-reviewer.md", "flow-runner-qa.md"):

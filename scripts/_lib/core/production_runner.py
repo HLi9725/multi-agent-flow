@@ -1145,9 +1145,14 @@ def create_default_registry(context_id: str = "prod_runner") -> AdapterRegistry:
     return reg
 
 
+def independent_review_allowed(policy: Optional[Mapping[str, Any]]) -> bool:
+    """Lite stops before the independent Reviewer stage. Missing policy stays Standard."""
+    return not (isinstance(policy, Mapping) and policy.get("profile_id") == "lite")
+
+
 def _execution_options_from_spec(spec: TaskExecutionSpec) -> Dict[str, Any]:
     """Persist effective runtime choices so resume cannot silently change hosts or gates."""
-    return {
+    options = {
         "builder_adapter_id": spec.builder_adapter_id,
         "reviewer_adapter_id": spec.reviewer_adapter_id,
         "qa_adapter_id": spec.qa_adapter_id,
@@ -1168,6 +1173,15 @@ def _execution_options_from_spec(spec: TaskExecutionSpec) -> Dict[str, Any]:
         "cursor_api_key_env": spec.cursor_api_key_env,
         "cursor_runtime": spec.cursor_runtime,
     }
+    if spec.workflow_policy_payload:
+        payload = dict(spec.workflow_policy_payload)
+        options["workflow_policy"] = payload
+        options["workflow_profile"] = spec.workflow_profile or payload.get("profile_id")
+    elif spec.workflow_profile:
+        options["workflow_profile"] = spec.workflow_profile
+    if spec.workflow_downgrade_authorization:
+        options["workflow_downgrade_authorization"] = spec.workflow_downgrade_authorization
+    return options
 
 
 def _execution_spec_snapshot(spec: TaskExecutionSpec) -> Dict[str, Any]:
@@ -1472,6 +1486,7 @@ class ProductionRunner:
                 "BUILDER": "builder_session_id",
                 "REVIEWER": "reviewer_session_id",
                 "QA": "qa_session_id",
+                "VERIFIER": "verifier_session_id",
             }[role]
             checkpoint = replace(
                 checkpoint,
@@ -1659,12 +1674,15 @@ class ProductionRunner:
                 done.set()
 
         timeout_seconds = max(0.001, float(timeout_seconds))
+        session_name = handle.session_id.lower()
         role = (
-            "REVIEWER" if "reviewer" in handle.session_id.lower()
-            else "QA" if "qa" in handle.session_id.lower()
+            "VERIFIER" if "verifier" in session_name
+            else "REVIEWER" if "reviewer" in session_name
+            else "QA" if "qa" in session_name
             else "BUILDER"
         )
         state = {
+            "VERIFIER": RunnerState.VERIFYING.value,
             "REVIEWER": RunnerState.REVIEWING.value,
             "QA": RunnerState.QA_TESTING.value,
             "BUILDER": RunnerState.BUILDING.value,
@@ -2549,6 +2567,13 @@ class ProductionRunner:
             self.checkpoint_store.initialize_checkpoint(checkpoint, restart_cancelled=restart_cancelled)
         else:
             self.checkpoint_store.save_checkpoint(checkpoint)
+        from .lightweight_profile import apply_lightweight, bind_workflow_policy
+        checkpoint, spec, policy_block = bind_workflow_policy(self, spec, checkpoint, worktree_dir)
+        if policy_block is not None:
+            return policy_block
+        orchestrator.workflow_policy = (
+            dict(spec.workflow_policy_payload) if spec.workflow_policy_payload else None
+        )
         self._emit_progress(
             task_id=task_id,
             state=RunnerState.WORKTREE_READY.value,
@@ -3339,6 +3364,30 @@ class ProductionRunner:
                     updated_at=time.time(),
                 )
                 self.checkpoint_store.save_checkpoint(checkpoint)
+                light = apply_lightweight(
+                    self,
+                    spec=spec,
+                    checkpoint=checkpoint,
+                    worktree=worktree_dir,
+                    candidate_commit=candidate_commit,
+                    evidence_ids=evidence_ids,
+                    total_attempts=total_attempts,
+                    board_status=current_board_status,
+                    builder_session_id=sess_builder,
+                    pre_granted_approval=pre_granted_approval,
+                )
+                if light is not None:
+                    action, payload = light
+                    if action == "return":
+                        return payload
+                    checkpoint = payload["checkpoint"]
+                    evidence_ids = payload["evidence_ids"]
+                    current_board_status = payload["board"]
+                    total_attempts = payload["total_attempts"]
+                    start_role = "BUILDER"
+                    skip_builder = False
+                    skip_reviewer = False
+                    continue
 
                 # 状态机推进: 进行中 -> 审查中 (DEV)
                 if current_board_status == "进行中":
@@ -3363,9 +3412,57 @@ class ProductionRunner:
                 skip_builder = False
 
             # ==========================================
+            if skip_builder and candidate_commit:
+                saved_policy = checkpoint.execution_options.get("workflow_policy") or {}
+                if saved_policy.get("profile_id") in ("lite", "docs-short"):
+                    light = apply_lightweight(
+                        self,
+                        spec=spec,
+                        checkpoint=checkpoint,
+                        worktree=worktree_dir,
+                        candidate_commit=candidate_commit,
+                        evidence_ids=evidence_ids,
+                        total_attempts=total_attempts,
+                        board_status=current_board_status,
+                        builder_session_id=checkpoint.builder_session_id or "",
+                        pre_granted_approval=pre_granted_approval,
+                    )
+                    if light is not None:
+                        action, payload = light
+                        if action == "return":
+                            return payload
+                        checkpoint = payload["checkpoint"]
+                        evidence_ids = payload["evidence_ids"]
+                        current_board_status = payload["board"]
+                        total_attempts = payload["total_attempts"]
+                        start_role = "BUILDER"
+                        skip_builder = False
+                        skip_reviewer = False
+                        continue
+
             # STAGE 2: ANTIGRAVITY REVIEWER
             # ==========================================
             if not skip_reviewer:
+                saved_policy = dict(checkpoint.execution_options.get("workflow_policy") or {})
+                if not independent_review_allowed(saved_policy):
+                    pause_message = "Lite 不得进入独立审查，请使用 Verifier。"
+                    checkpoint = replace(
+                        checkpoint,
+                        state=RunnerState.NEEDS_USER_INPUT.value,
+                        current_role="VERIFIER",
+                        last_error=pause_message,
+                        updated_at=time.time(),
+                    )
+                    self.checkpoint_store.save_checkpoint(checkpoint)
+                    return RunnerResult(
+                        False,
+                        RunnerState.NEEDS_USER_INPUT.value,
+                        task_id,
+                        candidate_commit=candidate_commit,
+                        candidate_generation=candidate_generation,
+                        evidence_ids=tuple(evidence_ids),
+                        message=pause_message,
+                    )
                 if review_cycle >= spec.max_review_cycles:
                     pause_message = (
                         f"Reviewer retry budget already exhausted ({review_cycle}/"

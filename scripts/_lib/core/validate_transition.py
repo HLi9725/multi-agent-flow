@@ -5,8 +5,13 @@
 """
 import sys
 import os
+import json
 import argparse
 from typing import List, Dict
+
+_SCRIPTS_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if _SCRIPTS_ROOT not in sys.path:
+    sys.path.insert(0, _SCRIPTS_ROOT)
 
 from enums import TaskStatus, TaskType, RoleEnum, normalize_role
 
@@ -103,6 +108,12 @@ ROLE_BASE_PERMISSIONS: Dict[str, List[str]] = {
         "已阻塞 -> 进行中",
         "已阻塞 -> 已完成",
         "已阻塞 -> 已退回"
+    ],
+    "VERIFIER": [
+        "进行中 -> 已退回",
+        "进行中 -> 已阻塞",
+        "已阻塞 -> 进行中",
+        "已阻塞 -> 已退回"
     ]
 }
 
@@ -145,7 +156,7 @@ def validate_delegation_authority(current_role: str, delegated_by: str) -> bool:
     return False
 
 
-def validate(role: str, from_status: str, to_status: str, assignee: str, end_time: str, active_dev_count: int, task_type: str = "A", task_name: str = "", max_parallel: int = 3, remarks: str = "", special_types: List[str] = None, delegated_by: str = "", delegation_reason: str = "") -> bool:
+def validate(role: str, from_status: str, to_status: str, assignee: str, end_time: str, active_dev_count: int, task_type: str = "A", task_name: str = "", max_parallel: int = 3, remarks: str = "", special_types: List[str] = None, delegated_by: str = "", delegation_reason: str = "", workflow_policy: Dict = None, changed_files: List[Dict] = None, evidence_root: str = "", evidence_id: str = "", candidate_commit: str = "", builder_session_id: str = "") -> bool:
     # 0. 提权代行白名单硬校验 (Fail-Closed)
     if not validate_delegation_authority(role, delegated_by):
         return False
@@ -157,6 +168,51 @@ def validate(role: str, from_status: str, to_status: str, assignee: str, end_tim
 
     allowed_list = list(ROLE_BASE_PERMISSIONS.get(role_upper, []))
     is_hotfix = bool(task_name and "[HOTFIX]" in task_name.upper())
+    try:
+        from .workflow_policy import merge_policy
+    except ImportError:
+        from workflow_policy import merge_policy
+    policy = merge_policy(workflow_policy, remarks or "")
+    profile_id = str((policy or {}).get("profile_id") or "")
+    risk_level = str((policy or {}).get("risk_level") or "")
+    try:
+        from .workflow_policy import PolicyError, assess_docs, scan_risk, verify_verifier_evidence
+    except ImportError:
+        from workflow_policy import PolicyError, assess_docs, scan_risk, verify_verifier_evidence
+    files = list(changed_files or [])
+    fresh_signals = scan_risk(files) if files else []
+    if fresh_signals:
+        risk_level = "high"
+    lite_complete = False
+    docs_complete = False
+    if transition_key == "进行中 -> 已完成" and profile_id == "lite" and role_upper == "VERIFIER":
+        lookup_id = evidence_id or str((policy or {}).get("verifier_evidence_id") or "")
+        if not files:
+            print("[REJECT 策略拦截] Lite 完成前必须重扫当前 diff。")
+            return False
+        if fresh_signals:
+            print("[REJECT 策略拦截] 最新 diff 为高风险，停止轻量路径并重新计划。")
+            return False
+        if not evidence_root or not lookup_id or not candidate_commit:
+            print("[REJECT 策略拦截] Lite 完成必须读取绑定当前候选的 Verifier 证据。")
+            return False
+        from _lib.core.evidence_store import EvidenceStore
+        try:
+            record = EvidenceStore(evidence_root).read(lookup_id)
+            verify_verifier_evidence(record, candidate=candidate_commit, builder_session_id=builder_session_id)
+        except (PolicyError, Exception) as evidence_error:
+            print(f"[REJECT 策略拦截] Verifier 证据无效: {evidence_error}")
+            return False
+        lite_complete = True
+    if transition_key == "进行中 -> 已完成" and profile_id == "docs-short" and role_upper in ("DEV", "DOCS", "FRONTEND"):
+        if not files:
+            print("[REJECT 策略拦截] 文档短链完成前必须重扫当前 diff。")
+            return False
+        docs_ok, doc_errors = assess_docs(files)
+        if fresh_signals or not docs_ok:
+            print("[REJECT 策略拦截] 文档短链重扫未通过: " + "; ".join(doc_errors or ["高风险"]))
+            return False
+        docs_complete = True
 
     # 0. 终态不可逆流拦截：已处于终态【已验收】或【已取消】的任务，禁止任何状态修改
     if from_status in ["已验收", "已取消"] and from_status != to_status:
@@ -175,9 +231,24 @@ def validate(role: str, from_status: str, to_status: str, assignee: str, end_tim
     # 特权类任务 (默认 B 架构, C 文档, D 运维, G 环境搭建): 解锁 DEV/FRONTEND 直接推至 "已完成"
     if role_upper in ["DEV", "FRONTEND"] and type_upper in direct_types:
         allowed_list.append("进行中 -> 已完成")
+    if lite_complete or docs_complete:
+        allowed_list.append("进行中 -> 已完成")
+
+    if profile_id == "lite" and transition_key in ("进行中 -> 审查中", "审查中 -> 测试中"):
+        print("[REJECT 策略拦截] Lite 任务不能进入独立审查或测试；请使用 Verifier。")
+        return False
+    if profile_id == "docs-short" and transition_key == "进行中 -> 已完成" and not docs_complete:
+        print("[REJECT 策略拦截] 文档短链尚未通过对当前 diff 的必要检查。")
+        return False
+    if profile_id == "lite" and transition_key == "进行中 -> 已完成" and not lite_complete:
+        print("[REJECT 策略拦截] Lite 完成需要可区分的 Verifier PASS 证据，且内容不能为高风险。")
+        return False
+    if profile_id == "standard" and role_upper == "VERIFIER":
+        print("[REJECT 策略拦截] Standard 不能使用 Lite Verifier 报告推进。")
+        return False
 
     # A 类 (常规代码开发) 任务各执行角色强行推已完成判断为违规越权 (HOTFIX 豁免)
-    if role_upper in ["DEV", "FRONTEND", "REVIEWER", "QA", "ARCHITECT"] and type_upper == "A" and transition_key == "进行中 -> 已完成" and not is_hotfix:
+    if role_upper in ["DEV", "FRONTEND", "REVIEWER", "QA", "ARCHITECT", "VERIFIER"] and type_upper == "A" and transition_key == "进行中 -> 已完成" and not is_hotfix and not lite_complete and not docs_complete:
         print(f"[REJECT 越权拦截] {role_upper} 角色在 A 类 (常规代码开发) 任务中禁止直接推动至 '已完成'！必须先提交审查 (审查中 -> 测试中)！")
         return False
 
@@ -210,7 +281,8 @@ def validate(role: str, from_status: str, to_status: str, assignee: str, end_tim
         ROLE_SELF_NAMES = {
             "REVIEWER": ["REVIEWER", "周审查", "REVIEWER_USER"],
             "QA": ["QA", "章测试", "QA_USER"],
-            "PM": ["PM", "严经理", "PM_USER"]
+            "PM": ["PM", "严经理", "PM_USER"],
+            "VERIFIER": ["VERIFIER", "验证"]
         }
         forbidden_names = ROLE_SELF_NAMES.get(role_upper, [role_upper])
         if assignee.strip().upper() in [f.upper() for f in forbidden_names]:
@@ -252,6 +324,8 @@ def validate(role: str, from_status: str, to_status: str, assignee: str, end_tim
 
 
 def main():
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description="看板状态流转预检脚本")
     parser.add_argument("--role", required=True, help="操作人角色代码 (如 DEV, REVIEWER, PM)")
     parser.add_argument("--from-status", required=True, help="原状态")
@@ -265,9 +339,25 @@ def main():
     parser.add_argument("--max-parallel", type=int, default=3, help="角色允许的最大并发上限")
     parser.add_argument("--delegated-by", default="", help="提权代行来源角色 (如 PM/USER)")
     parser.add_argument("--delegation-reason", default="", help="提权代行理由")
+    parser.add_argument("--policy-file", default="", help="已固化的策略文件，备注不能代替它")
+    parser.add_argument("--evidence-root", default="", help="EvidenceStore 目录")
+    parser.add_argument("--evidence-id", default="", help="完成时要读取的证据编号")
+    parser.add_argument("--candidate-commit", default="", help="当前候选 SHA")
+    parser.add_argument("--builder-session", default="", help="Builder 会话，Verifier 不得相同")
+    parser.add_argument("--change-root", default="", help="--change-file 的相对根目录")
+    parser.add_argument("--change-file", action="append", default=[], help="完成前重扫的相对路径")
 
     args = parser.parse_args()
 
+    policy = None
+    if args.policy_file:
+        with open(args.policy_file, "r", encoding="utf-8") as handle:
+            policy = json.load(handle)
+    changed = []
+    for path in (args.change_file or []):
+        full = os.path.join(args.change_root, path) if args.change_root and not os.path.isabs(path) else path
+        with open(full, "r", encoding="utf-8") as handle:
+            changed.append({"path": path.replace("\\", "/"), "content": handle.read()})
     success = validate(
         role=args.role,
         from_status=args.from_status,
@@ -281,6 +371,12 @@ def main():
         remarks=args.remarks,
         delegated_by=args.delegated_by,
         delegation_reason=args.delegation_reason,
+        workflow_policy=policy,
+        evidence_root=args.evidence_root,
+        evidence_id=args.evidence_id,
+        candidate_commit=args.candidate_commit,
+        builder_session_id=args.builder_session,
+        changed_files=changed,
     )
 
     if not success:

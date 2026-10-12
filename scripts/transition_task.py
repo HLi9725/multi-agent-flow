@@ -367,6 +367,21 @@ def _transition_task_pipeline_impl(
             return False
 
         # 5. 强制运行防护门控 (并发上限与 HOTFIX 特权透传，未通过则直接抛错中断！)
+        workflow_policy = None
+        completion = {}
+        if task_id:
+            try:
+                from _lib.core.workflow_policy import completion_context, load_policy_file
+                data_root = paths.resolve_data_root()
+                workflow_policy = load_policy_file(data_root, task_id)
+                completion = completion_context(data_root, task_id)
+                if completion.get("policy"):
+                    workflow_policy = completion["policy"]
+            except Exception as policy_error:
+                if type(policy_error).__name__ in ("PolicyError", "JSONDecodeError"):
+                    logger.error("[FAILED]  工作流策略无效: %s", policy_error, extra=extra_log)
+                    return False
+                workflow_policy = None
         is_valid = validate(
             role=current_role,
             from_status=from_status,
@@ -380,6 +395,12 @@ def _transition_task_pipeline_impl(
             remarks=remarks or "",
             delegated_by=delegated_by or "",
             delegation_reason=delegation_reason or "",
+            workflow_policy=workflow_policy,
+            changed_files=completion.get("changed_files") or None,
+            evidence_root=completion.get("evidence_root") or "",
+            evidence_id=runner_evidence_id or "",
+            candidate_commit=completion.get("candidate_commit") or "",
+            builder_session_id=completion.get("builder_session_id") or "",
         )
 
         if not is_valid:
