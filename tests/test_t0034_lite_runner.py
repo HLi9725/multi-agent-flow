@@ -3,6 +3,8 @@
 import json
 import os
 import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 import yaml
@@ -123,18 +125,20 @@ def _pass_report(prompt):
 
 
 def _install_hosts(monkeypatch, repo, builder_text, verifier_output):
-    state = {"builder_calls": 0, "verifier_calls": 0, "prompts": []}
+    state = {"builder_calls": 0, "verifier_calls": 0, "prompts": [], "builder_prompts": []}
 
     def detect(self):
         return _caps()
 
     def codex_dispatch(self, request):
+        state["builder_prompts"].append(request.prompt)
         return _handle(request, "codex_cli")
 
     def codex_wait(self, handle, timeout_seconds=None):
         state["builder_calls"] += 1
         name = f"calc_{state['builder_calls']}.py"
-        (repo / name).write_text(builder_text, encoding="utf-8")
+        text = builder_text(state) if callable(builder_text) else builder_text
+        (repo / name).write_text(text, encoding="utf-8")
         subprocess.run(["git", "add", name], cwd=repo, check=True, capture_output=True)
         subprocess.run(
             ["git", "commit", "-m", f"feat: add calc {state['builder_calls']}"],
@@ -582,3 +586,351 @@ def test_lite_failing_controlled_test_does_not_dispatch_verifier(tmp_path, monke
     assert checkpoint.state != RunnerState.PENDING_USER_ACCEPTANCE.value
     blob = json.dumps(list(checkpoint.defects_history), ensure_ascii=False)
     assert "测试" in blob or "exit" in blob or "pytest" in (checkpoint.last_error or "")
+
+
+def _replace_test(repo, source, message):
+    (repo / "test_app.py").write_text(source, encoding="utf-8")
+    _git(repo, "add", "test_app.py")
+    _git(repo, "commit", "-m", message)
+
+
+def _count_pytest(monkeypatch):
+    from scripts._lib.core import lightweight_profile as profile
+
+    seen = []
+    real = profile._run_lite_command
+
+    def wrapped(argv, cwd, timeout):
+        if any("pytest" in str(part) for part in argv):
+            seen.append(subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=cwd, text=True).strip())
+        return real(argv, cwd, timeout)
+
+    monkeypatch.setattr(profile, "_run_lite_command", wrapped)
+    return seen
+
+
+def test_def15_classifier_keeps_assertion_failures_out_of_environment_pause():
+    from scripts._lib.core.lightweight_profile import _lite_command_failure_kind
+
+    assert _lite_command_failure_kind(
+        "python -m pytest -q", 2,
+        "E   ModuleNotFoundError: No module named 'pytest'\n",
+    ) == "environment"
+    assert _lite_command_failure_kind(
+        "python -m pytest -q", 1,
+        "E   ModuleNotFoundError: No module named 'requests'\n",
+    ) == "environment"
+    assert _lite_command_failure_kind(
+        "python -m pytest -q", 1,
+        "E   ConnectionRefusedError: [Errno 111] connection refused\nFAILED test_app.py::test_app\n",
+    ) == "environment"
+    assert _lite_command_failure_kind(
+        "python -m pytest -q", 1,
+        "E   TimeoutError: timed out\nFAILED test_app.py::test_app\n",
+    ) == "environment"
+    assert _lite_command_failure_kind(
+        "python -m pytest -q", 1,
+        "socket.gaierror: [Errno -2] Name or service not known\n",
+    ) == "environment"
+    assert _lite_command_failure_kind(
+        "python -m pytest -q", 1,
+        "python is not recognized as an internal or external command\n",
+    ) == "environment"
+    assert _lite_command_failure_kind(
+        "python -m pytest -q", 124, "Runner command timed out\n",
+    ) == "environment"
+    asserted = (
+        "E       AssertionError: assert 'connection refused' == 'handled'\n"
+        "E        +  where 'connection refused' = ModuleNotFoundError\n"
+        "FAILED test_app.py::test_app - AssertionError: assert 'connection refused' == 'handled'\n"
+        "test_app.py:4: AssertionError\n"
+    )
+    assert _lite_command_failure_kind("python -m pytest -q", 1, asserted) == "business"
+    assert _lite_command_failure_kind(
+        "python -m pytest -q", 1,
+        "FAILED test_app.py::test_app - AssertionError: assert 1 == 2\ntest_app.py:3: AssertionError\n",
+    ) == "business"
+
+
+def test_def14_missing_dependency_pauses_check_and_resume_rechecks_same_candidate(tmp_path, monkeypatch):
+    repo = _prepare_repo(tmp_path, "T9114")
+    _replace_test(
+        repo,
+        "import missing_module_t0034_env\n\ndef test_app():\n    assert True\n",
+        "test: missing dependency",
+    )
+    checks = _count_pytest(monkeypatch)
+    hosts = _install_hosts(monkeypatch, repo, PURE, lambda state, handle: _pass_report(state["prompts"][-1]))
+    runner, store = _runner(repo)
+    result = runner.start(_spec(repo, "T9114", "lite"))
+    checkpoint = store.load_checkpoint("T9114")
+    assert result.success is False
+    assert (result.diagnostics or {}).get("failure_kind") == "environment"
+    assert result.state == RunnerState.NEEDS_USER_INPUT.value
+    assert checkpoint.current_role == "RUNNER"
+    assert checkpoint.current_role != "BUILDER"
+    assert checkpoint.candidate_commit
+    assert hosts["builder_calls"] == 1
+    assert hosts["verifier_calls"] == 0
+    assert _board_status(repo, "T9114") != "已退回"
+    assert len(checks) == 1
+    before = hosts["builder_calls"]
+    candidate = checkpoint.candidate_commit
+    resumed = runner.resume(str(repo), "T9114", authority_root=str(repo))
+    again = store.load_checkpoint("T9114")
+    assert hosts["builder_calls"] == before
+    assert len(checks) >= 2
+    assert checks[-1] == candidate
+    assert resumed.candidate_commit == candidate
+    assert again.current_role == "RUNNER"
+    assert again.state == RunnerState.NEEDS_USER_INPUT.value
+    assert (resumed.diagnostics or {}).get("failure_kind") == "environment"
+    assert _board_status(repo, "T9114") != "已退回"
+    assert hosts["verifier_calls"] == 0
+
+
+def test_def15_connection_failure_pauses_check_stage(tmp_path, monkeypatch):
+    repo = _prepare_repo(tmp_path, "T9115")
+    _replace_test(
+        repo,
+        "def test_app():\n"
+        "    import socket\n"
+        "    socket.create_connection(('127.0.0.1', 9), timeout=0.2)\n",
+        "test: closed local port",
+    )
+    hosts = _install_hosts(monkeypatch, repo, PURE, lambda state, handle: _pass_report(state["prompts"][-1]))
+    runner, store = _runner(repo)
+    result = runner.start(_spec(repo, "T9115", "lite"))
+    checkpoint = store.load_checkpoint("T9115")
+    assert hosts["builder_calls"] == 1
+    assert hosts["verifier_calls"] == 0
+    assert (result.diagnostics or {}).get("failure_kind") == "environment"
+    assert checkpoint.current_role == "RUNNER"
+    assert checkpoint.state == RunnerState.NEEDS_USER_INPUT.value
+    assert _board_status(repo, "T9115") != "已退回"
+    before = hosts["builder_calls"]
+    candidate = result.candidate_commit
+    resumed = runner.resume(str(repo), "T9115", authority_root=str(repo))
+    assert hosts["builder_calls"] == before
+    assert resumed.candidate_commit == candidate
+    assert (resumed.diagnostics or {}).get("failure_kind") == "environment"
+    assert store.load_checkpoint("T9115").current_role == "RUNNER"
+
+
+def test_def15_asserted_environment_text_returns_to_builder(tmp_path, monkeypatch):
+    repo = _prepare_repo(tmp_path, "T9117")
+    _replace_test(
+        repo,
+        "def test_app():\n"
+        "    assert 'connection refused' == 'handled'\n"
+        "    assert 'ModuleNotFoundError' == 'handled'\n",
+        "test: business assertion quotes environment text",
+    )
+    hosts = _install_hosts(monkeypatch, repo, PURE, lambda state, handle: _pass_report(state["prompts"][-1]))
+    runner, store = _runner(repo)
+    result = runner.start(_spec(repo, "T9117", "lite", max_total_attempts=2))
+    checkpoint = store.load_checkpoint("T9117")
+    assert hosts["builder_calls"] == 2
+    assert hosts["verifier_calls"] == 0
+    assert (result.diagnostics or {}).get("failure_kind") != "environment"
+    assert checkpoint.current_role != "RUNNER"
+    repair = hosts["builder_prompts"][1]
+    assert "AssertionError" in repair
+    assert "test_app.py" in repair
+    assert "test_app" in repair
+    assert "exit=" not in repair or "AssertionError" in repair
+
+
+def test_def16_assertion_diagnostics_reach_builder_and_recheck_precedes_verifier(tmp_path, monkeypatch):
+    repo = _prepare_repo(tmp_path, "T9118")
+    _replace_test(
+        repo,
+        "def test_app():\n"
+        "    leaked = 'postgres://user:password=supersecret@localhost/db'\n"
+        "    from pathlib import Path\n"
+        "    files = sorted(Path('.').glob('calc_*.py'))\n"
+        "    assert files\n"
+        "    namespace = {}\n"
+        "    exec(files[-1].read_text(encoding='utf-8'), namespace)\n"
+        "    assert namespace['add'](1, 2) == 3\n",
+        "test: check generated add",
+    )
+    checks = _count_pytest(monkeypatch)
+
+    def builder_text(state):
+        if state["builder_calls"] == 1:
+            return "def add(left, right):\n    return left - right\n"
+        return PURE
+
+    hosts = _install_hosts(
+        monkeypatch, repo, builder_text, lambda state, handle: _pass_report(state["prompts"][-1]),
+    )
+    runner, _store = _runner(repo)
+    result = runner.start(_spec(repo, "T9118", "lite"))
+    assert result.success, result.message
+    assert hosts["builder_calls"] == 2
+    assert hosts["verifier_calls"] == 1
+    assert len(checks) >= 2
+    assert checks[0] != checks[-1]
+    repair = hosts["builder_prompts"][1]
+    assert "AssertionError" in repair
+    assert "test_app.py" in repair
+    assert "FAILED" in repair or "test_app.py::test_app" in repair
+    assert "supersecret" not in repair
+    assert "postgres://" not in repair
+    assert "password=" not in repair
+    verifier_prompt = hosts["prompts"][0]
+    assert checks[-1] in verifier_prompt
+    assert checks[0] not in verifier_prompt
+
+
+def _bind_fake_hosts(repo, builder_text):
+    state = {"builder_calls": 0, "verifier_calls": 0, "prompts": [], "builder_prompts": []}
+
+    def detect(self):
+        return _caps()
+
+    def codex_dispatch(self, request):
+        state["builder_prompts"].append(request.prompt)
+        return _handle(request, "codex_cli")
+
+    def codex_wait(self, handle, timeout_seconds=None):
+        state["builder_calls"] += 1
+        name = f"calc_{state['builder_calls']}.py"
+        (repo / name).write_text(builder_text, encoding="utf-8")
+        subprocess.run(["git", "add", name], cwd=repo, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", f"feat: add calc {state['builder_calls']}"],
+            cwd=repo, check=True, capture_output=True,
+        )
+        return AgentResult(
+            session_id=handle.session_id,
+            status=AgentStatus.SUCCESS,
+            output="builder wrote a local function",
+            partial_results=({"invocation_id": f"inv_builder_{state['builder_calls']}"},),
+            is_real_host=True,
+        )
+
+    def ag_dispatch(self, request):
+        state["prompts"].append(request.prompt)
+        return _handle(request, "antigravity")
+
+    def ag_wait(self, handle, timeout_seconds=None):
+        state["verifier_calls"] += 1
+        return AgentResult(
+            session_id=handle.session_id,
+            status=AgentStatus.SUCCESS,
+            output=_pass_report(state["prompts"][-1]),
+            partial_results=({"invocation_id": f"inv_verifier_{state['verifier_calls']}"},),
+            is_real_host=True,
+        )
+
+    CodexCliAdapter.detect_capabilities = detect
+    CodexCliAdapter.dispatch_agent = codex_dispatch
+    CodexCliAdapter.wait_for_result = codex_wait
+    AntigravityAdapter.detect_capabilities = detect
+    AntigravityAdapter.dispatch_agent = ag_dispatch
+    AntigravityAdapter.wait_for_result = ag_wait
+    return state
+
+
+def child_main(mode, repo_s, task_id):
+    """Entry point for a fresh interpreter. Not a same-process function call."""
+    repo = Path(repo_s)
+    state = _bind_fake_hosts(repo, PURE)
+    runner, store = _runner(repo)
+    if mode == "pause":
+        result = runner.start(_spec(repo, task_id, "lite"))
+        checkpoint = store.load_checkpoint(task_id)
+        payload = {
+            "success": result.success,
+            "state": result.state,
+            "message": result.message,
+            "candidate": result.candidate_commit,
+            "role": None if checkpoint is None else checkpoint.current_role,
+            "ckpt_state": None if checkpoint is None else checkpoint.state,
+            "builder_calls": state["builder_calls"],
+            "verifier_calls": state["verifier_calls"],
+            "board": _board_status(repo, task_id),
+            "failure_kind": (result.diagnostics or {}).get("failure_kind"),
+        }
+    elif mode == "resume":
+        from scripts._lib.core import lightweight_profile as profile
+
+        calls = {"n": 0}
+        real = profile._run_lite_command
+
+        def wrapped(argv, cwd, timeout):
+            if any("pytest" in str(part) for part in argv):
+                calls["n"] += 1
+            return real(argv, cwd, timeout)
+
+        profile._run_lite_command = wrapped
+        result = runner.resume(str(repo), task_id, authority_root=str(repo))
+        checkpoint = store.load_checkpoint(task_id)
+        payload = {
+            "success": result.success,
+            "state": result.state,
+            "message": result.message,
+            "candidate": result.candidate_commit,
+            "role": None if checkpoint is None else checkpoint.current_role,
+            "builder_calls": state["builder_calls"],
+            "verifier_calls": state["verifier_calls"],
+            "check_calls": calls["n"],
+            "board": _board_status(repo, task_id),
+            "failure_kind": (result.diagnostics or {}).get("failure_kind"),
+        }
+    else:
+        raise SystemExit(f"unknown mode {mode}")
+    print("CHILD_RESULT " + json.dumps(payload, ensure_ascii=False))
+
+
+def _run_child(mode, repo, task_id):
+    project = Path(__file__).resolve().parents[1]
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from tests.test_t0034_lite_runner import child_main; "
+            f"child_main({mode!r}, {str(repo)!r}, {task_id!r})",
+        ],
+        cwd=str(project),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=180,
+    )
+    marker = "CHILD_RESULT "
+    line = next((item for item in reversed(completed.stdout.splitlines()) if item.startswith(marker)), "")
+    payload = json.loads(line[len(marker):]) if line else {}
+    payload["exit_code"] = completed.returncode
+    payload["stderr_tail"] = (completed.stderr or "")[-2500:]
+    payload["stdout_tail"] = (completed.stdout or "")[-1500:]
+    return payload
+
+
+def test_def14_cross_process_resume_reruns_checks_without_builder(tmp_path):
+    repo = _prepare_repo(tmp_path, "T9116")
+    _replace_test(
+        repo,
+        "import missing_module_t0034_cross\n\ndef test_app():\n    assert True\n",
+        "test: cross process missing dependency",
+    )
+    first = _run_child("pause", repo, "T9116")
+    assert first["exit_code"] == 0, first.get("stderr_tail")
+    assert first["builder_calls"] == 1
+    assert first["verifier_calls"] == 0
+    assert first["failure_kind"] == "environment"
+    assert first["role"] == "RUNNER"
+    assert first["board"] != "已退回"
+    assert first["candidate"]
+    second = _run_child("resume", repo, "T9116")
+    assert second["exit_code"] == 0, second.get("stderr_tail")
+    assert second["builder_calls"] == 0
+    assert second["check_calls"] >= 1
+    assert second["candidate"] == first["candidate"]
+    assert second["role"] == "RUNNER"
+    assert second["failure_kind"] == "environment"
+    assert second["board"] != "已退回"
+    assert second["verifier_calls"] == 0

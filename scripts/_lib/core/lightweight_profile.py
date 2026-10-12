@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import time
 from dataclasses import replace
@@ -28,6 +29,21 @@ from .workflow_policy import (
 
 class LiteEnvironmentError(RuntimeError):
     """A required Lite check could not run. This is not a candidate defect."""
+
+
+# Checkpoint role for a paused Lite check. Resume must retry the check, not Builder.
+LITE_CHECK_ROLE = "RUNNER"
+
+_ENVIRONMENT_SYMPTOM = re.compile(
+    r"(?i)(?:"
+    r"ModuleNotFoundError|No module named|ImportError while loading|"
+    r"command not found|is not recognized as|"
+    r"connection refused|connectex:|ConnectionRefusedError|WinError 10061|actively refused|"
+    r"temporary failure in name resolution|name or service not known|"
+    r"could not translate host name|getaddrinfo failed|nodename nor servname|"
+    r"TimeoutError|socket\.timeout"
+    r")"
+)
 
 
 def _git(worktree: str, args: Sequence[str]) -> str:
@@ -256,6 +272,52 @@ def _parse_verifier(
     return data
 
 
+def _is_business_assertion(output: str) -> bool:
+    """A named pytest assertion failure stays a candidate defect.
+
+    Environment words quoted inside AssertionError are the behavior under test.
+    """
+    return bool(
+        re.search(r"(?im)^FAILED\s+\S+", output or "")
+        and re.search(r"AssertionError", output or "")
+    )
+
+
+def _lite_command_failure_kind(command: str, exit_code: int, output: str) -> str:
+    """Classify one controlled command with the Runner's existing output rules.
+
+    ``pass`` is exit 0. ``environment`` pauses the check stage. ``business``
+    returns the original task to Builder. Exit code alone is not the rule.
+    """
+    from .production_runner import (
+        _is_known_test_infrastructure_failure,
+        _is_repairable_test_failure,
+    )
+
+    code = int(exit_code)
+    text = output or ""
+    if code == 0:
+        return "pass"
+    if code == 124 or _is_known_test_infrastructure_failure(code, text):
+        if _is_business_assertion(text) and code != 124:
+            return "business"
+        return "environment"
+    if _is_business_assertion(text):
+        return "business"
+    if _ENVIRONMENT_SYMPTOM.search(text):
+        return "environment"
+    if _is_repairable_test_failure(command, code, text):
+        return "business"
+    return "business"
+
+
+def _redact_check_output(runner, text: str) -> str:
+    try:
+        return runner.evidence_store._mask_text(text or "")
+    except Exception:
+        return "***MASKED***"
+
+
 def _run_lite_command(argv: Sequence[str], cwd: str, timeout: float) -> subprocess.CompletedProcess:
     try:
         return subprocess.run(
@@ -275,8 +337,24 @@ def _run_lite_command(argv: Sequence[str], cwd: str, timeout: float) -> subproce
         raise LiteEnvironmentError(f"命令无法执行，已暂停: {exc}") from exc
 
 
-def _collect_runner_checks(runner, spec, worktree: str, candidate: str) -> Dict[str, Any]:
-    """Run the existing diff gate, secret scan, and controlled tests before Verifier."""
+def _evidence_item(command: str, exit_code: int, output: str, stream: str, failure_kind: str) -> Dict[str, Any]:
+    return {
+        "command": command,
+        "exit_code": int(exit_code),
+        "output_excerpt": output[-12000:],
+        "output_truncated": len(output) > 12000,
+        "output_full": output,
+        "stream": stream,
+        "failure_kind": failure_kind,
+    }
+
+
+def _collect_runner_checks(runner, spec, worktree: str, candidate: str):
+    """Run the existing diff gate, secret scan, and controlled tests before Verifier.
+
+    Returns the canonical check object plus redacted command evidence. The
+    canonical object stays free of logs so Verifier citations do not change.
+    """
     from .production_runner import (
         _summarize_qa_command_output,
         _validate_qa_test_command,
@@ -288,7 +366,7 @@ def _collect_runner_checks(runner, spec, worktree: str, candidate: str) -> Dict[
         worktree,
         timeout,
     )
-    diff_output = (diff_proc.stdout or "") + (diff_proc.stderr or "")
+    diff_output = _redact_check_output(runner, (diff_proc.stdout or "") + (diff_proc.stderr or ""))
     diff_summary = _summarize_qa_command_output(diff_command, diff_proc.returncode, diff_output)["text"]
     scan = runner._run_reviewer_security_scan(
         worktree,
@@ -298,17 +376,36 @@ def _collect_runner_checks(runner, spec, worktree: str, candidate: str) -> Dict[
     )
     commands = tuple(spec.test_commands or (spec.test_command or "python -m pytest -q",))
     tests = []
+    evidence = [
+        _evidence_item(
+            diff_command,
+            int(diff_proc.returncode),
+            diff_output,
+            "diff",
+            "pass" if diff_proc.returncode == 0 else "business",
+        )
+    ]
+    scan_output = _redact_check_output(runner, str(scan.get("output_excerpt") or ""))
+    evidence.append(_evidence_item(
+        "check_secrets.py",
+        int(scan.get("exit_code")),
+        scan_output,
+        "scan",
+        "pass" if scan.get("passed") and int(scan.get("exit_code")) == 0 else "business",
+    ))
     for command in commands:
         valid, error, argv = _validate_qa_test_command(command, worktree)
         if not valid:
             raise LiteEnvironmentError(f"受控测试命令无法执行，已暂停: {error}")
         proc = _run_lite_command(argv, worktree, timeout)
-        output = (proc.stdout or "") + (proc.stderr or "")
+        output = _redact_check_output(runner, (proc.stdout or "") + (proc.stderr or ""))
+        kind = _lite_command_failure_kind(command, int(proc.returncode), output)
         tests.append({
             "command": command,
             "exit_code": int(proc.returncode),
             "summary": _summarize_qa_command_output(command, proc.returncode, output)["text"],
         })
+        evidence.append(_evidence_item(command, int(proc.returncode), output, "test", kind))
     payload = {
         "diff_check": {
             "command": diff_command,
@@ -323,7 +420,7 @@ def _collect_runner_checks(runner, spec, worktree: str, candidate: str) -> Dict[
         },
         "tests": tests,
     }
-    return _canonical_runner_checks(payload)
+    return _canonical_runner_checks(payload), evidence
 
 
 def apply_lightweight(
@@ -359,18 +456,33 @@ def apply_lightweight(
             runner, spec, checkpoint, policy, files, candidate_commit, evidence_ids, board_status,
         )
     try:
-        runner_checks = _collect_runner_checks(runner, spec, worktree, candidate_commit)
+        runner_checks, command_evidence = _collect_runner_checks(runner, spec, worktree, candidate_commit)
     except LiteEnvironmentError as exc:
-        return _pause_lite_environment(runner, checkpoint, spec, candidate_commit, str(exc))
+        return _pause_lite_environment(
+            runner, checkpoint, spec, candidate_commit, _redact_check_output(runner, str(exc)),
+        )
     except Exception as exc:
         return _pause_lite_environment(
             runner, checkpoint, spec, candidate_commit,
-            f"Lite 必要检查无法执行，已暂停: {exc}",
+            _redact_check_output(runner, f"Lite 必要检查无法执行，已暂停: {exc}"),
         )
+    environment = [item for item in command_evidence if item.get("failure_kind") == "environment"]
+    if environment:
+        from .production_runner import _compact_test_diagnostics
+        detail = "\n".join(
+            str(item.get("findings") or "") for item in _compact_test_diagnostics(environment)
+        ).strip()
+        summary = "; ".join(
+            f"{item.get('command')} exit={item.get('exit_code')}" for item in environment
+        )
+        message = "受控检查遇到执行环境问题，已暂停在检查阶段，未交给 Builder: " + summary
+        if detail:
+            message = f"{message}\n{detail[:2000]}"
+        return _pause_lite_environment(runner, checkpoint, spec, candidate_commit, message)
     if not runner_checks.get("all_passed"):
         return _fail_lite_checks(
             runner, spec, checkpoint, policy, candidate_commit, evidence_ids,
-            total_attempts, board_status, runner_checks,
+            total_attempts, board_status, runner_checks, command_evidence,
         )
     return _finish_lite(
         runner, spec, checkpoint, policy, worktree, candidate_commit, evidence_ids,
@@ -382,7 +494,8 @@ def _pause_lite_environment(runner, checkpoint, spec, candidate_commit: str, mes
     paused = replace(
         checkpoint,
         state=RunnerState.NEEDS_USER_INPUT.value,
-        current_role="BUILDER",
+        current_role=LITE_CHECK_ROLE,
+        candidate_commit=candidate_commit,
         last_error=message,
         updated_at=time.time(),
     )
@@ -408,20 +521,37 @@ def _check_failure_summary(runner_checks: Mapping[str, Any]) -> str:
 
 
 def _fail_lite_checks(
-    runner, spec, checkpoint, policy, candidate, evidence_ids, total_attempts, board_status, runner_checks,
+    runner, spec, checkpoint, policy, candidate, evidence_ids, total_attempts, board_status,
+    runner_checks, command_evidence=(),
 ):
     """Return a confirmed check failure to Builder. Do not ask the Verifier what it means."""
+    from .production_runner import _derive_command_failure_defects
+
     summary = _check_failure_summary(runner_checks)
+    diagnostics = [
+        {
+            "command": item.get("command"),
+            "exit_code": item.get("exit_code"),
+            "output_excerpt": item.get("output_excerpt") or "",
+            "output_truncated": bool(item.get("output_truncated")),
+        }
+        for item in command_evidence
+        if int(item.get("exit_code") or 0) != 0
+    ]
+    derived = _derive_command_failure_defects(spec.task_id, diagnostics)
+    if not derived:
+        derived = [{
+            "defect_id": f"DEF-{spec.task_id}-LITE-CHECK",
+            "severity": "P1",
+            "description": summary,
+        }]
     defects = list(checkpoint.defects_history)
     defects.append({
         "role": "RUNNER",
         "summary": summary,
         "candidate": candidate,
-        "defects": [{
-            "defect_id": f"DEF-{spec.task_id}-LITE-CHECK",
-            "severity": "P1",
-            "description": summary,
-        }],
+        "defects": derived,
+        "test_diagnostics": diagnostics,
     })
     policy = dict(policy)
     policy["open_defects"] = defects

@@ -2726,7 +2726,9 @@ class ProductionRunner:
             )
         ):
             start_role = "VERIFIER"
-        skip_builder = (start_role in ("REVIEWER", "QA", "VERIFIER") and candidate_commit is not None)
+        skip_builder = (
+            start_role in ("REVIEWER", "QA", "VERIFIER", "RUNNER") and candidate_commit is not None
+        )
         skip_reviewer = (start_role == "QA" and candidate_commit is not None)
 
         if existing_checkpoint is not None and start_role == "BUILDER" and current_board_status == "已退回":
@@ -2835,7 +2837,7 @@ class ProductionRunner:
 
                 if defects_history:
                     last_defect = defects_history[-1]
-                    if last_defect.get("role") == "QA" and not last_defect.get("test_diagnostics"):
+                    if last_defect.get("role") in ("QA", "RUNNER") and not last_defect.get("test_diagnostics"):
                         # Legacy checkpoints retained only exit codes. Reproduce
                         # the approved commands before asking a file-only Builder
                         # to repair an otherwise unobservable failure.
