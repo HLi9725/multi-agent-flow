@@ -174,6 +174,35 @@ def _is_pure_expr(node: ast.AST) -> bool:
     return False
 
 
+def _function_definition_is_pure(stmt: ast.FunctionDef) -> bool:
+    """Definition-time sites must be pure. A clean return body is not enough."""
+    if stmt.decorator_list:
+        return False
+    for param in getattr(stmt, "type_params", ()) or ():
+        if any(isinstance(child, ast.Call) for child in ast.walk(param)):
+            return False
+    arguments = stmt.args
+    defaults = list(arguments.defaults)
+    defaults.extend(item for item in arguments.kw_defaults if item is not None)
+    if any(not _is_pure_expr(default) for default in defaults):
+        return False
+    annotations = [
+        arg.annotation
+        for arg in (*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs)
+    ]
+    if arguments.vararg is not None:
+        annotations.append(arguments.vararg.annotation)
+    if arguments.kwarg is not None:
+        annotations.append(arguments.kwarg.annotation)
+    annotations.append(stmt.returns)
+    if any(annotation is not None and not _is_pure_expr(annotation) for annotation in annotations):
+        return False
+    if len(stmt.body) != 1 or not isinstance(stmt.body[0], ast.Return):
+        return False
+    value = stmt.body[0].value
+    return value is not None and _is_pure_expr(value)
+
+
 def _is_pure_python(content: str) -> bool:
     try:
         tree = ast.parse(content)
@@ -188,9 +217,7 @@ def _is_pure_python(content: str) -> bool:
             if not _is_pure_expr(stmt.value):
                 return False
         elif isinstance(stmt, ast.FunctionDef):
-            if stmt.decorator_list or len(stmt.body) != 1 or not isinstance(stmt.body[0], ast.Return):
-                return False
-            if stmt.body[0].value is None or not _is_pure_expr(stmt.body[0].value):
+            if not _function_definition_is_pure(stmt):
                 return False
         elif isinstance(stmt, ast.Expr):
             if not _is_pure_expr(stmt.value):

@@ -19,9 +19,10 @@ from scripts._lib.core.evidence_gate import EvidenceGate
 from scripts._lib.core.evidence_store import EvidenceStore
 from scripts._lib.core.production_runner import ProductionRunner
 from scripts._lib.core.runner_checkpoint_store import RunnerCheckpointStore
-from scripts._lib.core.runner_schema import RunnerState
+from scripts._lib.core.lightweight_profile import _parse_verifier
+from scripts._lib.core.runner_schema import RunnerCheckpoint, RunnerState
 from scripts._lib.core.task_spec_loader import load_task_execution_spec
-from scripts._lib.core.workflow_policy import select_profile
+from scripts._lib.core.workflow_policy import PolicyError, select_profile
 from scripts._lib.hosts.antigravity_adapter import AntigravityAdapter, create_antigravity_manifest
 from scripts._lib.hosts.codex_cli_adapter import CodexCliAdapter, create_codex_cli_manifest
 
@@ -71,7 +72,7 @@ def _prepare_repo(tmp_path, task_id):
         "owner": "李开发",
         "handler": "李开发",
         "updated_at": "1.0",
-        "process": "需求: 新增整数相加函数。\n验收标准: add(1, 2) 等于 3",
+        "process": "需求: 新增整数相加函数。\n验收标准:\n- add(1, 2) 等于 3\n- add(0, 0) 等于 0",
     }], ensure_ascii=False), encoding="utf-8")
     return repo
 
@@ -107,10 +108,16 @@ def _pass_report(prompt):
     body = prompt.split(marker, 1)[1].split("\nReturn JSON", 1)[0]
     checks = json.loads(body)
     sha = prompt.split("candidate_commit: ", 1)[1].split("\n", 1)[0].strip()
+    ac_hash = prompt.split("acceptance_criteria_hash: ", 1)[1].split("\n", 1)[0].strip()
+    items_raw = prompt.split("acceptance_criteria_items:\n", 1)[1].split("\nrunner_checks:", 1)[0]
+    items = json.loads(items_raw)
     return json.dumps({
         "decision": "PASS",
         "candidate_commit": sha,
-        "acceptance_coverage": [{"criterion_id": "AC-01", "status": "PASS"}],
+        "acceptance_criteria_hash": ac_hash,
+        "acceptance_coverage": [
+            {"criterion_id": item["criterion_id"], "status": "PASS"} for item in items
+        ],
         "runner_checks": checks,
     }, ensure_ascii=False)
 
@@ -181,20 +188,21 @@ def _runner(repo):
     ), store
 
 
-def _spec(repo, task_id, profile):
+def _spec(repo, task_id, profile, **extra):
+    overrides = {
+        "workspace_mode": "inherit",
+        "workflow_profile": profile,
+        "test_commands": ("python -m pytest -q test_app.py",),
+        "host_transient_max_retries": 0,
+        "host_transient_retry_base_seconds": 0,
+        "host_transient_retry_max_seconds": 0,
+        "builder_timeout_seconds": 60,
+        "reviewer_timeout_seconds": 60,
+        "qa_timeout_seconds": 90,
+    }
+    overrides.update(extra)
     return load_task_execution_spec(
-        str(repo), task_id, authority_root=str(repo),
-        overrides={
-            "workspace_mode": "inherit",
-            "workflow_profile": profile,
-            "test_commands": ("python -m pytest -q test_app.py",),
-            "host_transient_max_retries": 0,
-            "host_transient_retry_base_seconds": 0,
-            "host_transient_retry_max_seconds": 0,
-            "builder_timeout_seconds": 60,
-            "reviewer_timeout_seconds": 60,
-            "qa_timeout_seconds": 90,
-        },
+        str(repo), task_id, authority_root=str(repo), overrides=overrides,
     )
 
 
@@ -346,3 +354,231 @@ def test_can_access_return_true_blocks_lite_and_unclear_code_stays_standard():
     )
     assert kept.profile_id == "standard"
     assert kept.blocked is False
+
+
+_RUNNER_CHECKS = {
+    "diff_check": {"exit_code": 0, "passed": True, "summary": "clean"},
+    "security_scan": {"exit_code": 0, "passed": True, "summary": "clean"},
+    "tests": [{"command": "python -m pytest -q", "exit_code": 0, "summary": "1 passed"}],
+}
+_AC_HASH = "a" * 64
+
+
+def _verifier_pass(coverage, ac_hash=_AC_HASH, candidate="abc"):
+    return json.dumps({
+        "decision": "PASS",
+        "candidate_commit": candidate,
+        "acceptance_criteria_hash": ac_hash,
+        "acceptance_coverage": coverage,
+        "runner_checks": _RUNNER_CHECKS,
+    }, ensure_ascii=False)
+
+
+def _parse_pass(coverage, expected_ids=("AC-01", "AC-02"), ac_hash=_AC_HASH):
+    return _parse_verifier(
+        _verifier_pass(coverage, ac_hash=ac_hash),
+        candidate="abc",
+        runner_checks=_RUNNER_CHECKS,
+        acceptance_criteria_hash=ac_hash,
+        expected_criterion_ids=expected_ids,
+    )
+
+
+def test_made_up_duplicate_missing_and_unknown_coverage_cannot_pass():
+    with pytest.raises(PolicyError):
+        _parse_pass([{"criterion_id": "MADE_UP", "status": "PASS"}])
+    with pytest.raises(PolicyError):
+        _parse_pass([{"criterion_id": "AC-01", "status": "PASS"}])
+    with pytest.raises(PolicyError):
+        _parse_pass([
+            {"criterion_id": "AC-01", "status": "PASS"},
+            {"criterion_id": "AC-01", "status": "PASS"},
+        ])
+    with pytest.raises(PolicyError):
+        _parse_pass([
+            {"criterion_id": "AC-01", "status": "PASS"},
+            {"criterion_id": "AC-02", "status": "PASS"},
+            {"criterion_id": "MADE_UP", "status": "PASS"},
+        ])
+    with pytest.raises(PolicyError):
+        _parse_pass(
+            [{"criterion_id": "MADE_UP", "status": "PASS"}],
+            expected_ids=(),
+            ac_hash="",
+        )
+    with pytest.raises(PolicyError):
+        _parse_verifier(
+            _verifier_pass([
+                {"criterion_id": "AC-01", "status": "PASS"},
+                {"criterion_id": "AC-02", "status": "PASS"},
+            ]),
+            candidate="abc",
+            runner_checks=_RUNNER_CHECKS,
+            acceptance_criteria_hash="b" * 64,
+            expected_criterion_ids=("AC-01", "AC-02"),
+        )
+    parsed = _parse_pass([
+        {"criterion_id": "AC-02", "status": "PASS"},
+        {"criterion_id": "AC-01", "status": "PASS"},
+    ])
+    assert parsed["decision"] == "PASS"
+    assert parsed["acceptance_criteria_hash"] == _AC_HASH
+
+
+def test_lite_made_up_coverage_cannot_complete(tmp_path, monkeypatch):
+    repo = _prepare_repo(tmp_path, "T9110")
+
+    def verifier_output(state, handle):
+        prompt = state["prompts"][-1]
+        sha = prompt.split("candidate_commit: ", 1)[1].split("\n", 1)[0].strip()
+        checks = json.loads(prompt.split("runner_checks:\n", 1)[1].split("\nReturn JSON", 1)[0])
+        ac_hash = ""
+        if "acceptance_criteria_hash:" in prompt:
+            ac_hash = prompt.split("acceptance_criteria_hash: ", 1)[1].split("\n", 1)[0].strip()
+        return json.dumps({
+            "decision": "PASS",
+            "candidate_commit": sha,
+            "acceptance_criteria_hash": ac_hash,
+            "acceptance_coverage": [{"criterion_id": "MADE_UP", "status": "PASS"}],
+            "runner_checks": checks,
+        }, ensure_ascii=False)
+
+    hosts = _install_hosts(monkeypatch, repo, PURE, verifier_output)
+    runner, store = _runner(repo)
+    result = runner.start(_spec(repo, "T9110", "lite"))
+    assert result.success is False
+    assert result.state != RunnerState.PENDING_USER_ACCEPTANCE.value
+    assert not result.confirmation_request_id
+    assert _board_status(repo, "T9110") != "已完成"
+    assert store.load_checkpoint("T9110").state != RunnerState.PENDING_USER_ACCEPTANCE.value
+    prompt = hosts["prompts"][-1]
+    assert "acceptance_criteria_hash:" in prompt
+    assert "acceptance_criteria_items:" in prompt
+    assert "MADE_UP" not in prompt
+
+
+def test_new_candidate_rejects_previous_confirmation_request_id(tmp_path, monkeypatch):
+    repo = _prepare_repo(tmp_path, "T9111")
+    hosts = _install_hosts(monkeypatch, repo, PURE, lambda state, handle: _pass_report(state["prompts"][-1]))
+    runner, store = _runner(repo)
+    first = runner.start(_spec(repo, "T9111", "lite"))
+    assert first.success, first.message
+    old_id = first.confirmation_request_id
+    old_commit = first.candidate_commit
+    rejected = runner.reject(str(repo), "T9111", old_id, "验收发现结果不符", authority_root=str(repo))
+    assert rejected.success, rejected.message
+    assert store.load_checkpoint("T9111").confirmation_request_id in (None, "")
+    resumed = runner.resume(str(repo), "T9111", authority_root=str(repo))
+    assert resumed.success, resumed.message
+    assert resumed.state == RunnerState.PENDING_USER_ACCEPTANCE.value
+    assert resumed.candidate_commit != old_commit
+    assert resumed.confirmation_request_id
+    assert resumed.confirmation_request_id != old_id
+    denied_accept = runner.accept(str(repo), "T9111", old_id, authority_root=str(repo))
+    assert denied_accept.success is False
+    denied_reject = runner.reject(str(repo), "T9111", old_id, "旧编号不能再退回", authority_root=str(repo))
+    assert denied_reject.success is False
+    assert store.load_checkpoint("T9111").state == RunnerState.PENDING_USER_ACCEPTANCE.value
+    accepted = runner.accept(str(repo), "T9111", resumed.confirmation_request_id, authority_root=str(repo))
+    assert accepted.success, accepted.message
+    assert accepted.state == RunnerState.ACCEPTED.value
+    assert hosts["builder_calls"] >= 2
+
+
+def test_confirmation_id_reused_only_for_same_candidate_completion(tmp_path):
+    repo = _prepare_repo(tmp_path, "T9112")
+    runner, _store = _runner(repo)
+    spec = _spec(repo, "T9112", "lite")
+    sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    old_id = "conf_req_t9112_samecandidate"
+
+    def enter(state, candidate, stored_candidate):
+        checkpoint = RunnerCheckpoint(
+            task_id="T9112",
+            project_id=spec.project_id,
+            state=state,
+            current_role="VERIFIER",
+            candidate_commit=stored_candidate,
+            confirmation_request_id=old_id,
+        )
+        return runner._enter_user_acceptance(
+            spec,
+            checkpoint,
+            evidence_ids=(),
+            board_status="已完成",
+            transition_role="VERIFIER",
+            remarks="completion recovery",
+            success_message="waiting",
+            candidate_commit=candidate,
+        )
+
+    reused = enter("COMPLETION_PENDING", sha, sha)
+    assert reused.confirmation_request_id == old_id
+    other = "b" * 40
+    fresh = enter("COMPLETION_PENDING", other, sha)
+    assert fresh.success, fresh.message
+    assert fresh.confirmation_request_id != old_id
+    stale = enter("NEEDS_USER_INPUT", sha, sha)
+    assert stale.confirmation_request_id != old_id
+
+
+def test_default_argument_open_is_not_low_and_cannot_enter_lite():
+    pure = select_profile(
+        task_type="A",
+        requested="lite",
+        files=[{"path": "calc.py", "content": "def add(a, b=1):\n    return a + b\n"}],
+        requirement_hash="req",
+        acceptance_criteria_hash="ac",
+    )
+    assert pure.risk_level == "low"
+    assert pure.blocked is False
+    assert pure.profile_id == "lite"
+    samples = (
+        'def add(a, b=open("output.txt", "w")):\n    return a + b\n',
+        'def add(a, *, b=open("output.txt", "w")):\n    return a + b\n',
+        'def add(a: open("output.txt")):\n    return a\n',
+        'def add(a) -> open("output.txt"):\n    return a\n',
+        '@open("output.txt")\ndef add(a, b):\n    return a + b\n',
+    )
+    for source in samples:
+        opened = select_profile(
+            task_type="A",
+            requested="lite",
+            files=[{"path": "calc.py", "content": source}],
+            title="低风险",
+            user_claims_low_risk=True,
+            requirement_hash="req",
+            acceptance_criteria_hash="ac",
+        )
+        assert opened.risk_level == "unclear", source
+        assert opened.blocked is True, source
+        auto = select_profile(
+            task_type="A",
+            requested="auto",
+            files=[{"path": "calc.py", "content": source}],
+            title="低风险",
+            user_claims_low_risk=True,
+        )
+        assert auto.profile_id == "standard", source
+        assert auto.risk_level == "unclear", source
+
+
+def test_lite_failing_controlled_test_does_not_dispatch_verifier(tmp_path, monkeypatch):
+    repo = _prepare_repo(tmp_path, "T9113")
+    (repo / "test_app.py").write_text("def test_app():\n    assert False\n", encoding="utf-8")
+    _git(repo, "add", "test_app.py")
+    _git(repo, "commit", "-m", "test: record a failing check")
+    hosts = _install_hosts(monkeypatch, repo, PURE, lambda state, handle: _pass_report(state["prompts"][-1]))
+    runner, store = _runner(repo)
+    result = runner.start(_spec(repo, "T9113", "lite", max_total_attempts=1))
+    assert hosts["verifier_calls"] == 0
+    assert hosts["prompts"] == []
+    assert result.success is False
+    assert result.state != RunnerState.PENDING_USER_ACCEPTANCE.value
+    assert "协议" not in (result.message or "")
+    assert (result.diagnostics or {}).get("failure_kind") != "protocol"
+    assert _board_status(repo, "T9113") != "已完成"
+    checkpoint = store.load_checkpoint("T9113")
+    assert checkpoint.state != RunnerState.PENDING_USER_ACCEPTANCE.value
+    blob = json.dumps(list(checkpoint.defects_history), ensure_ascii=False)
+    assert "测试" in blob or "exit" in blob or "pytest" in (checkpoint.last_error or "")

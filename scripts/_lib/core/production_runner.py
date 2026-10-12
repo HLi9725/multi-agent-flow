@@ -3398,6 +3398,7 @@ class ProductionRunner:
                     evidence_ids = payload["evidence_ids"]
                     current_board_status = payload["board"]
                     total_attempts = payload["total_attempts"]
+                    defects_history = list(checkpoint.defects_history)
                     start_role = "BUILDER"
                     skip_builder = False
                     skip_reviewer = False
@@ -3445,6 +3446,7 @@ class ProductionRunner:
                         evidence_ids = payload["evidence_ids"]
                         current_board_status = payload["board"]
                         total_attempts = payload["total_attempts"]
+                        defects_history = list(checkpoint.defects_history)
                         start_role = "BUILDER"
                         skip_builder = False
                         skip_reviewer = False
@@ -5015,8 +5017,17 @@ class ProductionRunner:
         supply the confirmation id.
         """
         task_id = spec.task_id
-        confirmation_req_id = checkpoint.confirmation_request_id or (
-            f"conf_req_{task_id.lower()}_{uuid.uuid4().hex}"
+        entering_candidate = candidate_commit if candidate_commit is not None else checkpoint.candidate_commit
+        reuse_confirmation = (
+            checkpoint.state == RunnerState.COMPLETION_PENDING.value
+            and bool(checkpoint.confirmation_request_id)
+            and bool(entering_candidate)
+            and entering_candidate == checkpoint.candidate_commit
+        )
+        confirmation_req_id = (
+            checkpoint.confirmation_request_id
+            if reuse_confirmation
+            else f"conf_req_{task_id.lower()}_{uuid.uuid4().hex}"
         )
         elapsed = checkpoint.active_elapsed_seconds
         if start_wall_clock is not None:
@@ -5816,6 +5827,7 @@ class ProductionRunner:
         returned = replace(
             ckpt, state=RunnerState.NEEDS_USER_INPUT.value, current_role="BUILDER",
             defects_history=tuple(history), last_error=reason, updated_at=time.time(),
+            confirmation_request_id=None,
         )
         self.checkpoint_store.save_checkpoint(returned)
         return RunnerResult(True, RunnerState.NEEDS_USER_INPUT.value, task_id,
