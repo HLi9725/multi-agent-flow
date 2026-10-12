@@ -2,6 +2,7 @@
 """Versioned workflow profiles, independent from host managed-role config."""
 from __future__ import annotations
 
+import ast
 import copy
 import json
 import os
@@ -110,13 +111,40 @@ class PolicyDecision:
         }
 
 
+_AUTH_ALWAYS_ALLOW = re.compile(
+    r"(?ims)^[ \t]*def[ \t]+(can_access|has_permission|is_authorized|authorize|"
+    r"check_access|is_allowed|has_access|check_permission)\s*\([^)]*\)\s*:"
+    r"(.*?)(?=^[ \t]*def[ \t]+|\Z)"
+)
+
+
+def _material_blob(item: Mapping[str, str]) -> str:
+    return "\n".join((
+        str(item.get("path") or ""),
+        str(item.get("content") or ""),
+        str(item.get("diff") or ""),
+    ))
+
+
+def _permission_bypass(item: Mapping[str, str]) -> Optional[Dict[str, str]]:
+    """An authorization function that returns True is an explicit permission opening."""
+    blob = _material_blob(item)
+    match = _AUTH_ALWAYS_ALLOW.search(blob)
+    if match is None or not re.search(r"(?i)\breturn\s+True\b", match.group(2)):
+        return None
+    return {
+        "category": "permission",
+        "path": str(item.get("path") or ""),
+        "excerpt": " ".join(match.group(0).split())[:80],
+    }
+
+
 def scan_risk(materials: Iterable[Mapping[str, str]]) -> List[Dict[str, str]]:
     """Scan path and content. Titles, tags, file counts and user claims are not inputs."""
     signals: List[Dict[str, str]] = []
     for item in materials:
         path = str(item.get("path") or "")
-        content = str(item.get("content") or "")
-        blob = path + "\n" + content
+        blob = _material_blob(item)
         for name, pattern in RISK_PATTERNS:
             match = pattern.search(blob)
             if match:
@@ -125,7 +153,88 @@ def scan_risk(materials: Iterable[Mapping[str, str]]) -> List[Dict[str, str]]:
                     "path": path,
                     "excerpt": match.group(0)[:80],
                 })
+        bypass = _permission_bypass(item)
+        if bypass and bypass not in signals:
+            signals.append(bypass)
     return signals
+
+
+def _is_pure_expr(node: ast.AST) -> bool:
+    """Local arithmetic and data construction. Boolean gates are not computation."""
+    if isinstance(node, ast.Constant):
+        return not isinstance(node.value, bool) and isinstance(node.value, (int, float, str, bytes, type(None)))
+    if isinstance(node, ast.Name):
+        return True
+    if isinstance(node, ast.BinOp):
+        return _is_pure_expr(node.left) and _is_pure_expr(node.right)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        return _is_pure_expr(node.operand)
+    if isinstance(node, (ast.Tuple, ast.List)):
+        return all(_is_pure_expr(item) for item in node.elts)
+    return False
+
+
+def _is_pure_python(content: str) -> bool:
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return False
+    if not tree.body:
+        return False
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Assign):
+            if not stmt.targets or not all(isinstance(target, ast.Name) for target in stmt.targets):
+                return False
+            if not _is_pure_expr(stmt.value):
+                return False
+        elif isinstance(stmt, ast.FunctionDef):
+            if stmt.decorator_list or len(stmt.body) != 1 or not isinstance(stmt.body[0], ast.Return):
+                return False
+            if stmt.body[0].value is None or not _is_pure_expr(stmt.body[0].value):
+                return False
+        elif isinstance(stmt, ast.Expr):
+            if not _is_pure_expr(stmt.value):
+                return False
+        else:
+            return False
+    return True
+
+
+def _positively_low(files: Sequence[Mapping[str, str]]) -> bool:
+    """Low risk is a positive classification, never the absence of a keyword."""
+    if not files:
+        return False
+    paths = [str(item.get("path") or "") for item in files]
+    if all(path.endswith(".md") for path in paths):
+        ok, _errors = assess_docs(files)
+        return ok
+    if all(path.endswith(".py") for path in paths):
+        return all(_is_pure_python(str(item.get("content") or "")) for item in files)
+    return False
+
+
+def classify_change(
+    files: Optional[Sequence[Mapping[str, str]]] = None,
+    requirement_text: str = "",
+) -> tuple:
+    """Return high, low, unclear, or unspecified.
+
+    unspecified means there is no candidate to classify yet. It is not evidence
+    that the change is low risk.
+    """
+    materials: List[Dict[str, str]] = []
+    if requirement_text:
+        materials.append({"path": "", "content": requirement_text})
+    file_list = [dict(item) for item in (files or [])]
+    materials.extend(file_list)
+    signals = scan_risk(materials)
+    if signals:
+        return "high", signals
+    if not file_list:
+        return "unspecified", []
+    if _positively_low(file_list):
+        return "low", []
+    return "unclear", []
 
 
 def _secret_findings(text: str) -> List[str]:
@@ -172,7 +281,7 @@ def assess_docs(files: Sequence[Mapping[str, str]]) -> tuple:
                     errors.append(f"frontmatter 无法解析: {path}: {exc}")
                 if not isinstance(meta, dict) or not any(key in meta for key in ("title", "name", "type")):
                     errors.append(f"frontmatter 缺少文档元数据: {path}")
-        for desc in _secret_findings(content):
+        for desc in _secret_findings(content + "\n" + str(item.get("diff") or "")):
             errors.append(f"秘密扫描未通过: {path}: {desc}")
     return (len(errors) == 0), errors
 
@@ -217,12 +326,8 @@ def select_profile(
     budget_consumed: int = 0,
 ) -> PolicyDecision:
     """Choose a profile from content. Title, tags and user claims do not lower risk."""
-    materials: List[Dict[str, str]] = []
-    if requirement_text:
-        materials.append({"path": "", "content": requirement_text})
-    materials.extend({"path": str(item.get("path") or ""), "content": str(item.get("content") or "")} for item in (files or []))
-    signals = scan_risk(materials)
-    risk = "high" if signals else "low"
+    level, signals = classify_change(files, requirement_text)
+    risk = level
     ignored = []
     if title:
         ignored.append("title")
@@ -239,26 +344,41 @@ def select_profile(
     if requested_name in ("", "none"):
         requested_name = None
     if requested_name == "auto":
-        if risk == "high":
-            chosen = PROFILE_STANDARD
-            blocked = False
-            message = "内容含高风险信号，自动选择 Standard"
-        elif only_docs or task_type.upper() == "C":
+        if risk == "low" and (only_docs or task_type.upper() == "C") and only_docs:
             chosen = PROFILE_DOCS
             blocked = not docs_ok
             message = "低风险文档" if docs_ok else "文档必要检查未通过"
-        else:
+        elif risk == "low":
             chosen = PROFILE_LITE
             blocked = False
             message = "低风险代码选择 Lite"
+        elif risk == "high":
+            chosen = PROFILE_STANDARD
+            blocked = False
+            message = "内容含高风险信号，自动选择 Standard"
+        else:
+            chosen = PROFILE_STANDARD
+            blocked = False
+            message = "风险不明确，保持 Standard"
     elif requested_name == PROFILE_LITE:
         chosen = PROFILE_LITE
-        blocked = risk == "high"
-        message = "高风险改动不能使用 Lite，请重新计划" if blocked else "显式 Lite"
+        if risk == "high":
+            blocked = True
+            message = "高风险改动不能使用 Lite，请重新计划"
+        elif risk == "unclear":
+            blocked = True
+            message = "风险不明确，保持 Standard，不能使用 Lite"
+        else:
+            blocked = False
+            message = "显式 Lite"
     elif requested_name == PROFILE_DOCS:
         chosen = PROFILE_DOCS
-        blocked = risk == "high" or not docs_ok
-        message = "高风险或文档检查未通过，不能短链" if blocked else "文档短链"
+        if not list(files or []) and risk != "high":
+            blocked = False
+            message = "文档短链，候选生成后复验"
+        else:
+            blocked = risk in ("high", "unclear") or not docs_ok
+            message = "高风险或文档检查未通过，不能短链" if blocked else "文档短链"
     elif requested_name in (None, PROFILE_STANDARD):
         chosen = PROFILE_STANDARD
         blocked = False
@@ -373,20 +493,22 @@ def load_policy_file(data_root: str, task_id: str) -> Optional[Dict[str, Any]]:
 
 
 def evaluate_candidate_risk(policy: Mapping[str, Any], files: Sequence[Mapping[str, str]], requirement_text: str = "") -> Dict[str, Any]:
-    """Re-scan a candidate. High risk on a lightweight profile stops the path."""
-    materials = []
-    if requirement_text:
-        materials.append({"path": "", "content": requirement_text})
-    materials.extend(files)
-    signals = scan_risk(materials)
-    upgraded = bool(signals) and policy.get("profile_id") in (PROFILE_LITE, PROFILE_DOCS)
+    """Re-scan a candidate. Lightweight profiles continue only when risk is positively low."""
+    level, signals = classify_change(files, requirement_text)
+    lightweight = policy.get("profile_id") in (PROFILE_LITE, PROFILE_DOCS)
+    stop = lightweight and level != "low"
+    if level == "high":
+        message = "风险升级，停止轻量路径并重新计划"
+    elif stop:
+        message = "风险不明确，停止轻量路径并重新计划"
+    else:
+        message = ""
+    reported = "high" if level == "high" else ("low" if level == "low" else "unclear")
     return {
-        "risk_level": "high" if signals else "low",
+        "risk_level": reported,
         "risk_signals": signals,
-        "stop_for_replan": upgraded or (
-            policy.get("profile_id") == PROFILE_DOCS and bool(signals)
-        ),
-        "message": "风险升级，停止轻量路径并重新计划" if signals and policy.get("profile_id") != PROFILE_STANDARD else "",
+        "stop_for_replan": stop,
+        "message": message if lightweight else "",
     }
 
 

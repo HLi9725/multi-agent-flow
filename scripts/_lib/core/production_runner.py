@@ -2712,7 +2712,21 @@ class ProductionRunner:
                 if isinstance(stored_security_scan, Mapping):
                     qa_reviewer_security_scan = _plain_metadata_value(stored_security_scan)
                 start_role = "QA"
-        skip_builder = (start_role in ("REVIEWER", "QA") and candidate_commit is not None)
+        saved_policy = dict(checkpoint.execution_options.get("workflow_policy") or {})
+        if (
+            existing_checkpoint is not None
+            and candidate_commit
+            and saved_policy.get("profile_id") in ("lite", "docs-short")
+            and (
+                checkpoint.state == RunnerState.VERIFYING.value
+                or checkpoint.current_role == "VERIFIER"
+            )
+            and self._find_bound_evidence(
+                checkpoint, "BUILDER", candidate_commit, "REVIEWING", spec
+            )
+        ):
+            start_role = "VERIFIER"
+        skip_builder = (start_role in ("REVIEWER", "QA", "VERIFIER") and candidate_commit is not None)
         skip_reviewer = (start_role == "QA" and candidate_commit is not None)
 
         if existing_checkpoint is not None and start_role == "BUILDER" and current_board_status == "已退回":
@@ -3409,12 +3423,8 @@ class ProductionRunner:
                     )
                     self.checkpoint_store.save_checkpoint(checkpoint)
             else:
-                skip_builder = False
-
-            # ==========================================
-            if skip_builder and candidate_commit:
-                saved_policy = checkpoint.execution_options.get("workflow_policy") or {}
-                if saved_policy.get("profile_id") in ("lite", "docs-short"):
+                saved_policy = dict(checkpoint.execution_options.get("workflow_policy") or {})
+                if candidate_commit and saved_policy.get("profile_id") in ("lite", "docs-short"):
                     light = apply_lightweight(
                         self,
                         spec=spec,
@@ -3439,6 +3449,7 @@ class ProductionRunner:
                         skip_builder = False
                         skip_reviewer = False
                         continue
+                skip_builder = False
 
             # STAGE 2: ANTIGRAVITY REVIEWER
             # ==========================================
@@ -4945,42 +4956,103 @@ class ProductionRunner:
             # ==========================================
             # STAGE 4: USER ACCEPTANCE & COMPLETION
             # ==========================================
-            confirmation_req_id = f"conf_req_{task_id.lower()}_{uuid.uuid4().hex}"
-
-            checkpoint = replace(checkpoint,
-                task_id=task_id,
-                project_id=spec.project_id,
-                state=RunnerState.COMPLETION_PENDING.value,
-                current_role="QA",
+            return self._enter_user_acceptance(
+                spec,
+                checkpoint,
+                evidence_ids=evidence_ids,
+                board_status=current_board_status,
+                transition_role="QA",
+                remarks=(
+                    "2F-PROD通用自动编排Runner完成全流水线验证，候选提交: "
+                    f"{candidate_commit}，停在已完成待用户验收"
+                ),
+                success_message=(
+                    f"Production orchestration pipeline succeeded for {task_id}. "
+                    "State transitioned to 已完成 (PENDING_USER_ACCEPTANCE). "
+                    "Awaiting explicit user acceptance."
+                ),
                 candidate_commit=candidate_commit,
                 candidate_generation=candidate_generation,
                 review_cycle=review_cycle,
                 qa_cycle=qa_cycle,
                 total_attempts=total_attempts,
-                worktree_path=worktree_dir,
+                worktree_dir=worktree_dir,
                 worktree_branch=worktree_branch,
-                evidence_ids=tuple(evidence_ids),
-                execution_options=_execution_options_from_spec(spec),
-                execution_spec_snapshot=checkpoint.execution_spec_snapshot,
-                run_id=checkpoint.run_id,
-                approval_attempts=checkpoint.approval_attempts,
-                approval_diagnostics=checkpoint.approval_diagnostics,
-                active_elapsed_seconds=checkpoint.active_elapsed_seconds + (time.time() - start_wall_clock),
-                confirmation_request_id=confirmation_req_id,
                 defects_history=tuple(defects_history),
+                start_wall_clock=start_wall_clock,
+                diagnostics={
+                    "total_attempts": total_attempts,
+                    "review_cycles": review_cycle,
+                    "qa_cycles": qa_cycle,
+                    "candidate_commit": candidate_commit,
+                },
             )
-            # Write-ahead intent closes the crash window between board and
-            # checkpoint updates. Resume can deterministically reconcile it.
-            self.checkpoint_store.save_checkpoint(checkpoint)
-            # 通过合法状态机 transition_task.py 将任务流转至 已完成 (DEF-T0061-3)
+
+    def _enter_user_acceptance(
+        self,
+        spec: TaskExecutionSpec,
+        checkpoint: RunnerCheckpoint,
+        *,
+        evidence_ids: Sequence[str],
+        board_status: str,
+        transition_role: str,
+        remarks: str,
+        success_message: str,
+        candidate_commit: Optional[str] = None,
+        candidate_generation: Optional[int] = None,
+        review_cycle: Optional[int] = None,
+        qa_cycle: Optional[int] = None,
+        total_attempts: Optional[int] = None,
+        worktree_dir: Optional[str] = None,
+        worktree_branch: Optional[str] = None,
+        defects_history: Optional[Sequence[Mapping[str, Any]]] = None,
+        start_wall_clock: Optional[float] = None,
+        diagnostics: Optional[Mapping[str, Any]] = None,
+    ) -> RunnerResult:
+        """Write COMPLETION_PENDING with a server confirmation id, then wait for the user.
+
+        Lite, docs-short and Standard share this terminal. The model cannot
+        supply the confirmation id.
+        """
+        task_id = spec.task_id
+        confirmation_req_id = checkpoint.confirmation_request_id or (
+            f"conf_req_{task_id.lower()}_{uuid.uuid4().hex}"
+        )
+        elapsed = checkpoint.active_elapsed_seconds
+        if start_wall_clock is not None:
+            elapsed = checkpoint.active_elapsed_seconds + (time.time() - start_wall_clock)
+        checkpoint = replace(
+            checkpoint,
+            task_id=task_id,
+            project_id=spec.project_id,
+            state=RunnerState.COMPLETION_PENDING.value,
+            current_role=transition_role,
+            candidate_commit=candidate_commit if candidate_commit is not None else checkpoint.candidate_commit,
+            candidate_generation=checkpoint.candidate_generation if candidate_generation is None else candidate_generation,
+            review_cycle=checkpoint.review_cycle if review_cycle is None else review_cycle,
+            qa_cycle=checkpoint.qa_cycle if qa_cycle is None else qa_cycle,
+            total_attempts=checkpoint.total_attempts if total_attempts is None else total_attempts,
+            worktree_path=worktree_dir or checkpoint.worktree_path,
+            worktree_branch=worktree_branch if worktree_branch is not None else checkpoint.worktree_branch,
+            evidence_ids=tuple(evidence_ids),
+            execution_options=_execution_options_from_spec(spec),
+            execution_spec_snapshot=checkpoint.execution_spec_snapshot,
+            active_elapsed_seconds=elapsed,
+            confirmation_request_id=confirmation_req_id,
+            defects_history=tuple(defects_history) if defects_history is not None else checkpoint.defects_history,
+            last_error=None,
+            updated_at=time.time(),
+        )
+        self.checkpoint_store.save_checkpoint(checkpoint)
+        if board_status != "已完成":
             ok_trans, err_trans = self._do_state_transition(
                 spec.authority_root,
                 task_id=task_id,
-                role="QA",
-                from_status=current_board_status,
+                role=transition_role,
+                from_status=board_status,
                 to_status="已完成",
                 assignee="严经理",
-                remarks=f"2F-PROD通用自动编排Runner完成全流水线验证，候选提交: {candidate_commit}，停在已完成待用户验收",
+                remarks=remarks,
                 task_type=spec.task_type,
             )
             if not ok_trans:
@@ -4995,46 +5067,39 @@ class ProductionRunner:
                     success=False,
                     state=RunnerState.FAILED.value,
                     task_id=task_id,
-                    candidate_commit=candidate_commit,
-                    candidate_generation=candidate_generation,
+                    candidate_commit=checkpoint.candidate_commit,
+                    candidate_generation=checkpoint.candidate_generation,
                     evidence_ids=tuple(evidence_ids),
+                    confirmation_request_id=confirmation_req_id,
                     message=f"Failed to execute legal state transition to '已完成': {err_trans}",
                 )
-            # Do not advertise an acceptance request until the authoritative
-            # board has actually reached 已完成.
-            checkpoint = replace(
-                checkpoint,
-                state=RunnerState.PENDING_USER_ACCEPTANCE.value,
-                last_error=None,
-                updated_at=time.time(),
-            )
-            self.checkpoint_store.save_checkpoint(checkpoint)
-
-            self._emit_progress(
-                task_id=task_id,
-                state=RunnerState.PENDING_USER_ACCEPTANCE.value,
-                role="RUNNER",
-                event="pending_user_acceptance",
-                message="EvidenceGate passed; board is 已完成 and waiting for explicit user acceptance",
-                candidate_commit=candidate_commit,
-            )
-
-            return RunnerResult(
-                success=True,
-                state=RunnerState.PENDING_USER_ACCEPTANCE.value,
-                task_id=task_id,
-                candidate_commit=candidate_commit,
-                candidate_generation=candidate_generation,
-                evidence_ids=tuple(evidence_ids),
-                confirmation_request_id=confirmation_req_id,
-                message=f"Production orchestration pipeline succeeded for {task_id}. State transitioned to 已完成 (PENDING_USER_ACCEPTANCE). Awaiting explicit user acceptance.",
-                diagnostics={
-                    "total_attempts": total_attempts,
-                    "review_cycles": review_cycle,
-                    "qa_cycles": qa_cycle,
-                    "candidate_commit": candidate_commit,
-                },
-            )
+        checkpoint = replace(
+            checkpoint,
+            state=RunnerState.PENDING_USER_ACCEPTANCE.value,
+            confirmation_request_id=confirmation_req_id,
+            last_error=None,
+            updated_at=time.time(),
+        )
+        self.checkpoint_store.save_checkpoint(checkpoint)
+        self._emit_progress(
+            task_id=task_id,
+            state=RunnerState.PENDING_USER_ACCEPTANCE.value,
+            role="RUNNER",
+            event="pending_user_acceptance",
+            message="EvidenceGate passed; board is 已完成 and waiting for explicit user acceptance",
+            candidate_commit=checkpoint.candidate_commit,
+        )
+        return RunnerResult(
+            success=True,
+            state=RunnerState.PENDING_USER_ACCEPTANCE.value,
+            task_id=task_id,
+            candidate_commit=checkpoint.candidate_commit,
+            candidate_generation=checkpoint.candidate_generation,
+            evidence_ids=tuple(evidence_ids),
+            confirmation_request_id=confirmation_req_id,
+            message=success_message,
+            diagnostics=dict(diagnostics or {}),
+        )
 
     def get_status(self, project_root: str, task_id: str, authority_root: Optional[str] = None) -> Dict[str, Any]:
         """纯只读查询当前任务与 Checkpoint 状态（零写入、零锁、零 Host 调用）"""
@@ -5348,6 +5413,29 @@ class ProductionRunner:
                     return RunnerResult(False, ckpt.state, task_id,
                                         message=f'Completion recovery failed: {self._sanitize_diagnostic(error)}')
                 spec = replace(spec, status_at_read='已完成')
+            elif spec.status_at_read == "进行中":
+                policy = dict(ckpt.execution_options.get("workflow_policy") or {})
+                profile_id = policy.get("profile_id")
+                if profile_id == "lite":
+                    recovery_role = "VERIFIER"
+                elif profile_id == "docs-short":
+                    recovery_role = "DOCS" if str(spec.task_type).upper() == "C" else "DEV"
+                else:
+                    recovery_role = ""
+                if recovery_role:
+                    ok, error = self._do_state_transition(
+                        spec.authority_root, task_id, recovery_role,
+                        "进行中", "已完成", "严经理",
+                        "Recover interrupted lightweight completion", spec.task_type,
+                    )
+                    if not ok:
+                        return RunnerResult(
+                            False, ckpt.state, task_id,
+                            candidate_commit=ckpt.candidate_commit,
+                            confirmation_request_id=ckpt.confirmation_request_id,
+                            message=f"Completion recovery failed: {self._sanitize_diagnostic(error)}",
+                        )
+                    spec = replace(spec, status_at_read="已完成")
             if spec.status_at_read == "已完成":
                 ckpt = replace(
                     ckpt,
@@ -5380,6 +5468,38 @@ class ProductionRunner:
             interactive_approval_cb=interactive_approval_cb,
             existing_checkpoint=ckpt, pre_granted_approval=pre_granted_approval,
         )
+
+    def _lightweight_acceptance_problem(self, matching, checkpoint, profile_id: str) -> Optional[str]:
+        """Replay Lite or docs evidence. Reviewer and QA records are not a substitute."""
+        if profile_id == "lite":
+            builders = [r for r in matching if r.metadata.actor_role == "BUILDER"]
+            verifiers = [
+                r for r in matching
+                if r.metadata.actor_role == "VERIFIER"
+                and r.metadata.extra.get("verifier_decision") == "PASS"
+            ]
+            if not builders or not verifiers:
+                return "Acceptance EvidenceGate replay failed: Lite requires same-SHA Builder and Verifier PASS evidence."
+            builder = max(builders, key=lambda r: r.metadata.created_at)
+            verifier = max(verifiers, key=lambda r: r.metadata.created_at)
+            if builder.metadata.host_session_id == verifier.metadata.host_session_id:
+                return "Acceptance EvidenceGate replay failed: Verifier session matches Builder."
+            if builder.metadata.created_at > verifier.metadata.created_at:
+                return "Acceptance EvidenceGate replay failed: evidence order is invalid."
+            checks = verifier.metadata.extra.get("runner_checks") or {}
+            if not checks.get("all_passed"):
+                return "Acceptance EvidenceGate replay failed: Runner checks did not pass."
+            if verifier.metadata.extra.get("confirmation_request_id") not in (None, "", checkpoint.confirmation_request_id):
+                return "Acceptance EvidenceGate replay failed: confirmation id was not server-generated."
+            return None
+        docs = [
+            r for r in matching
+            if r.metadata.actor_role == "DOCS_CHECK"
+            and r.metadata.extra.get("verifier_decision") == "PASS"
+        ]
+        if not docs:
+            return "Acceptance EvidenceGate replay failed: docs short chain lacks check evidence."
+        return None
 
     def accept(
         self,
@@ -5474,42 +5594,49 @@ class ProductionRunner:
                 and record.metadata.task_id == task_id
                 and record.metadata.project_id == ckpt.project_id
             ]
-            builder_records = [r for r in matching if r.metadata.actor_role == "BUILDER" and r.metadata.transition_to == "REVIEWING"]
-            reviewer_records = [r for r in matching if r.metadata.actor_role == "REVIEWER" and r.metadata.transition_to == "TESTING"]
-            qa_records = [r for r in matching if r.metadata.actor_role == "QA" and r.metadata.transition_to == "PENDING_USER_ACCEPTANCE"]
-            if not builder_records or not reviewer_records or not qa_records:
-                return RunnerResult(False, ckpt.state, task_id, candidate_commit=candidate,
-                                    message="Acceptance EvidenceGate replay failed: missing same-SHA Builder, Reviewer PASS, or QA PASS evidence.")
-            builder_evi = max(builder_records, key=lambda r: r.metadata.created_at)
-            reviewer_evi = max(reviewer_records, key=lambda r: r.metadata.created_at)
-            qa_evi = max(qa_records, key=lambda r: r.metadata.created_at)
-            from .runner_transition_gate import replay_record
-            for record, actor, source, target in (
-                (builder_evi, 'BUILDER', 'BUILDING', 'REVIEWING'),
-                (reviewer_evi, 'REVIEWER', 'REVIEWING', 'TESTING'),
-                (qa_evi, 'QA', 'TESTING', 'PENDING_USER_ACCEPTANCE'),
-            ):
-                replay_record(self.evidence_store, record, ckpt, actor, source, target,
-                              commands=live_spec.test_commands or (live_spec.test_command or 'python -m pytest -q',))
-            if not (builder_evi.metadata.created_at <= reviewer_evi.metadata.created_at <= qa_evi.metadata.created_at):
-                return RunnerResult(False, ckpt.state, task_id, candidate_commit=candidate,
-                                    message="Acceptance EvidenceGate replay failed: evidence order is invalid.")
-            sessions = {
-                builder_evi.metadata.host_session_id,
-                reviewer_evi.metadata.host_session_id,
-                qa_evi.metadata.host_session_id,
-            }
-            qa_extra = qa_evi.metadata.extra
-            if (
-                len(sessions) != 3
-                or qa_extra.get("qa_decision") != "PASS"
-                or qa_extra.get("acceptance_criteria_hash") != live_spec.acceptance_criteria_hash
-                or any(code != 0 for code in tuple(qa_extra.get("test_exit_codes") or ()))
-                or int(qa_extra.get("uncovered_risk_count", 1)) != 0
-                or int(qa_extra.get("defect_count", 1)) != 0
-            ):
-                return RunnerResult(False, ckpt.state, task_id, candidate_commit=candidate,
-                                    message="Acceptance EvidenceGate replay failed: independent identity or QA semantic proof is invalid.")
+            policy = dict(ckpt.execution_options.get("workflow_policy") or {})
+            profile_id = str(policy.get("profile_id") or "standard")
+            if profile_id in ("lite", "docs-short"):
+                problem = self._lightweight_acceptance_problem(matching, ckpt, profile_id)
+                if problem:
+                    return RunnerResult(False, ckpt.state, task_id, candidate_commit=candidate, message=problem)
+            else:
+                builder_records = [r for r in matching if r.metadata.actor_role == "BUILDER" and r.metadata.transition_to == "REVIEWING"]
+                reviewer_records = [r for r in matching if r.metadata.actor_role == "REVIEWER" and r.metadata.transition_to == "TESTING"]
+                qa_records = [r for r in matching if r.metadata.actor_role == "QA" and r.metadata.transition_to == "PENDING_USER_ACCEPTANCE"]
+                if not builder_records or not reviewer_records or not qa_records:
+                    return RunnerResult(False, ckpt.state, task_id, candidate_commit=candidate,
+                                        message="Acceptance EvidenceGate replay failed: missing same-SHA Builder, Reviewer PASS, or QA PASS evidence.")
+                builder_evi = max(builder_records, key=lambda r: r.metadata.created_at)
+                reviewer_evi = max(reviewer_records, key=lambda r: r.metadata.created_at)
+                qa_evi = max(qa_records, key=lambda r: r.metadata.created_at)
+                from .runner_transition_gate import replay_record
+                for record, actor, source, target in (
+                    (builder_evi, 'BUILDER', 'BUILDING', 'REVIEWING'),
+                    (reviewer_evi, 'REVIEWER', 'REVIEWING', 'TESTING'),
+                    (qa_evi, 'QA', 'TESTING', 'PENDING_USER_ACCEPTANCE'),
+                ):
+                    replay_record(self.evidence_store, record, ckpt, actor, source, target,
+                                  commands=live_spec.test_commands or (live_spec.test_command or 'python -m pytest -q',))
+                if not (builder_evi.metadata.created_at <= reviewer_evi.metadata.created_at <= qa_evi.metadata.created_at):
+                    return RunnerResult(False, ckpt.state, task_id, candidate_commit=candidate,
+                                        message="Acceptance EvidenceGate replay failed: evidence order is invalid.")
+                sessions = {
+                    builder_evi.metadata.host_session_id,
+                    reviewer_evi.metadata.host_session_id,
+                    qa_evi.metadata.host_session_id,
+                }
+                qa_extra = qa_evi.metadata.extra
+                if (
+                    len(sessions) != 3
+                    or qa_extra.get("qa_decision") != "PASS"
+                    or qa_extra.get("acceptance_criteria_hash") != live_spec.acceptance_criteria_hash
+                    or any(code != 0 for code in tuple(qa_extra.get("test_exit_codes") or ()))
+                    or int(qa_extra.get("uncovered_risk_count", 1)) != 0
+                    or int(qa_extra.get("defect_count", 1)) != 0
+                ):
+                    return RunnerResult(False, ckpt.state, task_id, candidate_commit=candidate,
+                                        message="Acceptance EvidenceGate replay failed: independent identity or QA semantic proof is invalid.")
 
             user_evidence_id = f"evi_user_{task_id.lower()}_{int(time.time()*1000)}"
             confirmed_at = time.time()

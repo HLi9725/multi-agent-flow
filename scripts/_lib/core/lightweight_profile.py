@@ -47,7 +47,7 @@ def candidate_materials(worktree: str, baseline: str, candidate: str) -> List[Di
             content = _git(worktree, ["show", f"{candidate}:{name}"])
         except Exception:
             content = ""
-        files.append({"path": name, "content": content + "\n" + diff})
+        files.append({"path": name, "content": content, "diff": diff})
     if not files and diff.strip():
         files.append({"path": "", "content": diff})
     return files
@@ -150,7 +150,43 @@ def _head(worktree: str) -> str:
         return ""
 
 
-def _parse_verifier(text: str) -> Dict[str, Any]:
+def _canonical_runner_checks(checks: Mapping[str, Any]) -> Dict[str, Any]:
+    diff = checks.get("diff_check") if isinstance(checks.get("diff_check"), Mapping) else {}
+    scan = checks.get("security_scan") if isinstance(checks.get("security_scan"), Mapping) else {}
+    tests = []
+    for item in checks.get("tests") or []:
+        if not isinstance(item, Mapping):
+            raise PolicyError("schema mismatch")
+        tests.append({
+            "command": str(item.get("command") or ""),
+            "exit_code": int(item.get("exit_code")),
+            "summary": str(item.get("summary") or ""),
+        })
+    canonical = {
+        "diff_check": {
+            "exit_code": int(diff.get("exit_code")),
+            "passed": bool(diff.get("passed")),
+            "summary": str(diff.get("summary") or ""),
+        },
+        "security_scan": {
+            "exit_code": int(scan.get("exit_code")),
+            "passed": bool(scan.get("passed")),
+            "summary": str(scan.get("summary") or ""),
+        },
+        "tests": tests,
+    }
+    canonical["all_passed"] = bool(
+        canonical["diff_check"]["passed"]
+        and canonical["diff_check"]["exit_code"] == 0
+        and canonical["security_scan"]["passed"]
+        and canonical["security_scan"]["exit_code"] == 0
+        and canonical["tests"]
+        and all(item["exit_code"] == 0 for item in canonical["tests"])
+    )
+    return canonical
+
+
+def _parse_verifier(text: str, *, candidate: str, runner_checks: Mapping[str, Any]) -> Dict[str, Any]:
     raw = (text or "").strip()
     try:
         data = json.loads(raw)
@@ -165,7 +201,94 @@ def _parse_verifier(text: str) -> Dict[str, Any]:
             raise PolicyError("invalid json") from exc
     if not isinstance(data, dict) or data.get("decision") not in ("PASS", "FAIL"):
         raise PolicyError("schema mismatch")
+    if data.get("decision") == "FAIL":
+        return data
+    expected = _canonical_runner_checks(runner_checks)
+    coverage = data.get("acceptance_coverage")
+    cited = data.get("runner_checks")
+    if data.get("candidate_commit") != candidate:
+        raise PolicyError("schema mismatch")
+    if not isinstance(coverage, list) or not coverage:
+        raise PolicyError("schema mismatch")
+    if not all(
+        isinstance(item, Mapping)
+        and str(item.get("criterion_id") or "").strip()
+        and item.get("status") == "PASS"
+        for item in coverage
+    ):
+        raise PolicyError("schema mismatch")
+    if not isinstance(cited, Mapping):
+        raise PolicyError("schema mismatch")
+    try:
+        cited_canonical = _canonical_runner_checks(cited)
+    except (TypeError, ValueError, PolicyError) as exc:
+        raise PolicyError("schema mismatch") from exc
+    if cited_canonical != expected or not expected["all_passed"]:
+        raise PolicyError("schema mismatch")
+    data.pop("confirmation_request_id", None)
     return data
+
+
+def _collect_runner_checks(runner, spec, worktree: str, candidate: str) -> Dict[str, Any]:
+    """Run the existing diff gate, secret scan, and controlled tests before Verifier."""
+    from .production_runner import (
+        ProductionRunnerError,
+        _summarize_qa_command_output,
+        _validate_qa_test_command,
+    )
+    diff_command = f"git diff --check {spec.baseline_commit}..{candidate} --"
+    diff_proc = subprocess.run(
+        ["git", "diff", "--check", f"{spec.baseline_commit}..{candidate}", "--"],
+        cwd=worktree,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    diff_output = (diff_proc.stdout or "") + (diff_proc.stderr or "")
+    diff_summary = _summarize_qa_command_output(diff_command, diff_proc.returncode, diff_output)["text"]
+    scan = runner._run_reviewer_security_scan(
+        worktree,
+        spec.baseline_commit,
+        candidate,
+        timeout_seconds=float(spec.reviewer_timeout_seconds or 120),
+    )
+    commands = tuple(spec.test_commands or (spec.test_command or "python -m pytest -q",))
+    tests = []
+    for command in commands:
+        valid, error, argv = _validate_qa_test_command(command, worktree)
+        if not valid:
+            raise ProductionRunnerError(f"Lite controlled test command rejected: {error}")
+        proc = subprocess.run(
+            argv,
+            cwd=worktree,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=float(spec.qa_timeout_seconds or 120),
+        )
+        output = (proc.stdout or "") + (proc.stderr or "")
+        tests.append({
+            "command": command,
+            "exit_code": int(proc.returncode),
+            "summary": _summarize_qa_command_output(command, proc.returncode, output)["text"],
+        })
+    payload = {
+        "diff_check": {
+            "command": diff_command,
+            "exit_code": int(diff_proc.returncode),
+            "passed": diff_proc.returncode == 0,
+            "summary": diff_summary,
+        },
+        "security_scan": {
+            "exit_code": int(scan.get("exit_code")),
+            "passed": bool(scan.get("passed")),
+            "summary": f"exit_code={int(scan.get('exit_code'))}",
+        },
+        "tests": tests,
+    }
+    return _canonical_runner_checks(payload)
 
 
 def apply_lightweight(
@@ -188,7 +311,7 @@ def apply_lightweight(
     files = candidate_materials(worktree, spec.baseline_commit, candidate_commit)
     risk = evaluate_candidate_risk(policy, files, spec.requirement_text)
     if risk["stop_for_replan"] or risk["risk_level"] == "high":
-        message = "风险升级，停止轻量路径并重新计划"
+        message = str(risk.get("message") or "风险升级，停止轻量路径并重新计划")
         paused = replace(checkpoint, state=RunnerState.NEEDS_USER_INPUT.value, last_error=message, updated_at=time.time())
         runner.checkpoint_store.save_checkpoint(paused)
         return "return", RunnerResult(
@@ -200,9 +323,16 @@ def apply_lightweight(
         return _finish_docs(
             runner, spec, checkpoint, policy, files, candidate_commit, evidence_ids, board_status,
         )
+    try:
+        runner_checks = _collect_runner_checks(runner, spec, worktree, candidate_commit)
+    except Exception as exc:
+        message = f"Lite 必要检查无法执行: {exc}"
+        paused = replace(checkpoint, state=RunnerState.NEEDS_USER_INPUT.value, last_error=message, updated_at=time.time())
+        runner.checkpoint_store.save_checkpoint(paused)
+        return "return", RunnerResult(False, paused.state, spec.task_id, candidate_commit=candidate_commit, message=message)
     return _finish_lite(
         runner, spec, checkpoint, policy, worktree, candidate_commit, evidence_ids,
-        total_attempts, board_status, builder_session_id, pre_granted_approval,
+        total_attempts, board_status, builder_session_id, pre_granted_approval, runner_checks,
     )
 
 
@@ -252,33 +382,29 @@ def _finish_docs(runner, spec, checkpoint, policy, files, candidate_commit, evid
     policy = dict(policy)
     policy["checks_passed"] = True
     policy["verifier_evidence_id"] = ""
+    role = "DOCS" if spec.task_type.upper() == "C" else "DEV"
     spec, checkpoint = _remember(
         spec, checkpoint, policy,
         evidence_ids=tuple(evidence_ids),
-        state=RunnerState.COMPLETION_PENDING.value,
-        current_role="DOCS",
+        candidate_commit=candidate_commit,
+        current_role=role,
     )
     runner.checkpoint_store.save_checkpoint(checkpoint)
-    role = "DOCS" if spec.task_type.upper() == "C" else "DEV"
-    assignee = "严经理"
-    if board_status == "进行中":
-        ok_trans, err = runner._do_state_transition(
-            spec.authority_root, spec.task_id, role, "进行中", "已完成", assignee,
-            policy_token(policy) + " 文档必要检查通过", spec.task_type,
-        )
-        if not ok_trans:
-            return "return", RunnerResult(False, RunnerState.FAILED.value, spec.task_id, message=f"文档短链流转失败: {err}")
-    checkpoint = replace(checkpoint, state=RunnerState.PENDING_USER_ACCEPTANCE.value, last_error=None, updated_at=time.time())
-    runner.checkpoint_store.save_checkpoint(checkpoint)
-    return "return", RunnerResult(
-        True, checkpoint.state, spec.task_id, candidate_commit=candidate_commit,
-        evidence_ids=tuple(evidence_ids), message="文档短链检查通过，等待用户验收",
+    result = runner._enter_user_acceptance(
+        spec,
+        checkpoint,
+        evidence_ids=evidence_ids,
+        board_status=board_status,
+        transition_role=role,
+        remarks=policy_token(policy) + " 文档必要检查通过",
+        success_message="文档短链检查通过，等待用户验收",
     )
+    return "return", result
 
 
 def _finish_lite(
     runner, spec, checkpoint, policy, worktree, candidate_commit, evidence_ids,
-    total_attempts, board_status, builder_session_id, pre_granted_approval,
+    total_attempts, board_status, builder_session_id, pre_granted_approval, runner_checks,
 ):
     adapter = runner.registry.get(spec.reviewer_adapter_id)
     if adapter is None:
@@ -290,7 +416,15 @@ def _finish_lite(
             session_id = "sess_verifier_distinct_" + session_id
         prompt = (
             "You are the independent Lite Verifier, not the Builder, Reviewer, or QA. "
-            f"Return JSON with decision PASS or FAIL for candidate {candidate_commit}. "
+            "Do not invent confirmation_request_id and do not accept the task for the user. "
+            f"candidate_commit: {candidate_commit}\n"
+            "runner_checks:\n"
+            + json.dumps(runner_checks, ensure_ascii=False, sort_keys=True)
+            + "\nReturn JSON. FAIL needs decision FAIL. "
+            "PASS needs decision PASS, the same candidate_commit, a non-empty acceptance_coverage "
+            "array of {criterion_id, status PASS}, and runner_checks whose exit_code, passed and "
+            "summary values exactly match the Runner object above. "
+            "A report that only contains decision PASS is invalid. "
             "Do not claim to be Reviewer or QA."
         )
         request = AgentRequest(
@@ -311,6 +445,16 @@ def _finish_lite(
                 "cursor_runtime": spec.cursor_runtime,
             },
         )
+        checkpoint = replace(
+            checkpoint,
+            state=RunnerState.VERIFYING.value,
+            current_role="VERIFIER",
+            candidate_commit=candidate_commit,
+            evidence_ids=tuple(evidence_ids),
+            total_attempts=total_attempts,
+            updated_at=time.time(),
+        )
+        runner.checkpoint_store.save_checkpoint(checkpoint)
         try:
             handle, result, _request, checkpoint = runner._dispatch_with_transient_host_retries(
                 adapter=adapter,
@@ -336,7 +480,7 @@ def _finish_lite(
                 message="Verifier 等待授权，未扩大权限",
             )
         try:
-            parsed = _parse_verifier(result.output)
+            parsed = _parse_verifier(result.output, candidate=candidate_commit, runner_checks=runner_checks)
         except PolicyError:
             protocol_attempts += 1
             if protocol_attempts >= 2:
@@ -362,12 +506,12 @@ def _finish_lite(
             )
         return _pass_lite(
             runner, spec, checkpoint, policy, candidate_commit, evidence_ids,
-            board_status, builder_session_id, session_id, result, handle, adapter,
+            board_status, builder_session_id, session_id, result, handle, adapter, runner_checks,
         )
     return "return", RunnerResult(False, RunnerState.NEEDS_USER_INPUT.value, spec.task_id, message="Verifier 协议重试耗尽")
 
 
-def _verifier_evidence(spec, candidate, session_id, result, handle, adapter, decision, evidence_ids):
+def _verifier_evidence(spec, candidate, session_id, result, handle, adapter, decision, evidence_ids, runner_checks=None):
     caps = adapter.detect_capabilities()
     from .production_runner import _extract_capabilities_extra, _extract_real_invocation_id
     invocation = _extract_real_invocation_id(result, handle) or f"inv_verifier_{int(time.time() * 1000)}"
@@ -390,6 +534,8 @@ def _verifier_evidence(spec, candidate, session_id, result, handle, adapter, dec
             "workflow_profile_id": PROFILE_LITE,
             "verifier_decision": decision,
             "host_managed_profile": "flow-runner-verifier",
+            "candidate_commit": candidate,
+            "runner_checks": dict(runner_checks or {}),
         },
     )
     record = EvidenceRecord(
@@ -403,9 +549,9 @@ def _verifier_evidence(spec, candidate, session_id, result, handle, adapter, dec
     return evidence_id, record, invocation, caps
 
 
-def _pass_lite(runner, spec, checkpoint, policy, candidate, evidence_ids, board_status, builder_session_id, session_id, result, handle, adapter):
+def _pass_lite(runner, spec, checkpoint, policy, candidate, evidence_ids, board_status, builder_session_id, session_id, result, handle, adapter, runner_checks):
     evidence_id, record, invocation, caps = _verifier_evidence(
-        spec, candidate, session_id, result, handle, adapter, "PASS", evidence_ids,
+        spec, candidate, session_id, result, handle, adapter, "PASS", evidence_ids, runner_checks,
     )
     runner.evidence_store.append(record)
     try:
@@ -442,24 +588,20 @@ def _pass_lite(runner, spec, checkpoint, policy, candidate, evidence_ids, board_
         verifier_session_id=session_id,
         verifier_invocation_id=invocation,
         current_role="VERIFIER",
-        state=RunnerState.COMPLETION_PENDING.value,
         candidate_commit=candidate,
+        total_attempts=checkpoint.total_attempts,
     )
     runner.checkpoint_store.save_checkpoint(checkpoint)
-    if board_status == "进行中":
-        ok_trans, err = runner._do_state_transition(
-            spec.authority_root, spec.task_id, "VERIFIER", "进行中", "已完成", "严经理",
-            policy_token(policy) + f" Verifier PASS {evidence_id}", spec.task_type,
-        )
-        if not ok_trans:
-            return "return", RunnerResult(False, RunnerState.FAILED.value, spec.task_id, message=f"Lite 完成流转失败: {err}")
-    checkpoint = replace(checkpoint, state=RunnerState.PENDING_USER_ACCEPTANCE.value, last_error=None, updated_at=time.time())
-    runner.checkpoint_store.save_checkpoint(checkpoint)
-    return "return", RunnerResult(
-        True, checkpoint.state, spec.task_id, candidate_commit=candidate,
-        evidence_ids=tuple(evidence_ids),
-        message="Lite Verifier 通过，等待用户验收",
+    result_out = runner._enter_user_acceptance(
+        spec,
+        checkpoint,
+        evidence_ids=evidence_ids,
+        board_status=board_status,
+        transition_role="VERIFIER",
+        remarks=policy_token(policy) + f" Verifier PASS {evidence_id}",
+        success_message="Lite Verifier 通过，等待用户验收",
     )
+    return "return", result_out
 
 
 def _reject_lite(runner, spec, checkpoint, policy, candidate, evidence_ids, total_attempts, board_status, session_id, result, handle, adapter, parsed):

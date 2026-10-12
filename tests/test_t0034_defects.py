@@ -131,7 +131,7 @@ def test_def1_completion_reads_verifier_evidence(tmp_path):
         "profile_id": "lite", "risk_level": "low", "requirement_hash": REQ, "acceptance_criteria_hash": ACC,
         "verifier_evidence_id": "evi_verifier_real",
     }
-    files = [{"path": "app.py", "content": "def ready():\n    return True\n"}]
+    files = [{"path": "app.py", "content": "def add(left, right):\n    return left + right\n"}]
     assert validate(
         "VERIFIER", "进行中", "已完成", "严经理", "2026-10-12 12:00:00", 0,
         task_type="A", workflow_policy=policy, changed_files=files,

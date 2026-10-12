@@ -176,12 +176,12 @@ def validate(role: str, from_status: str, to_status: str, assignee: str, end_tim
     profile_id = str((policy or {}).get("profile_id") or "")
     risk_level = str((policy or {}).get("risk_level") or "")
     try:
-        from .workflow_policy import PolicyError, assess_docs, scan_risk, verify_verifier_evidence
+        from .workflow_policy import PolicyError, assess_docs, classify_change, verify_verifier_evidence
     except ImportError:
-        from workflow_policy import PolicyError, assess_docs, scan_risk, verify_verifier_evidence
+        from workflow_policy import PolicyError, assess_docs, classify_change, verify_verifier_evidence
     files = list(changed_files or [])
-    fresh_signals = scan_risk(files) if files else []
-    if fresh_signals:
+    change_level, fresh_signals = classify_change(files, "") if files else ("unspecified", [])
+    if change_level == "high" or fresh_signals:
         risk_level = "high"
     lite_complete = False
     docs_complete = False
@@ -190,8 +190,8 @@ def validate(role: str, from_status: str, to_status: str, assignee: str, end_tim
         if not files:
             print("[REJECT 策略拦截] Lite 完成前必须重扫当前 diff。")
             return False
-        if fresh_signals:
-            print("[REJECT 策略拦截] 最新 diff 为高风险，停止轻量路径并重新计划。")
+        if change_level != "low":
+            print("[REJECT 策略拦截] 最新 diff 不是可肯定的低风险，停止轻量路径并重新计划。")
             return False
         if not evidence_root or not lookup_id or not candidate_commit:
             print("[REJECT 策略拦截] Lite 完成必须读取绑定当前候选的 Verifier 证据。")

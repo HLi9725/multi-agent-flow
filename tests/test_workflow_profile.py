@@ -74,10 +74,27 @@ def test_docs_short_chain_rejects_secret_and_high_risk():
 
 
 def test_low_risk_code_selects_lite_and_standard_stays_full_chain():
-    lite = select_profile(
+    unclear = select_profile(
         task_type="A",
         requested="lite",
         files=[{"path": "app.py", "content": "def ready():\n    return True\n"}],
+        title="低风险",
+        user_claims_low_risk=True,
+        requirement_hash="req-lite",
+        acceptance_criteria_hash="ac-lite",
+    )
+    assert unclear.blocked is True
+    assert unclear.risk_level == "unclear"
+    assert unclear.risk_signals == []
+    assert select_profile(
+        task_type="A",
+        requested="auto",
+        files=[{"path": "app.py", "content": "def ready():\n    return True\n"}],
+    ).profile_id == "standard"
+    lite = select_profile(
+        task_type="A",
+        requested="lite",
+        files=[{"path": "app.py", "content": "def add(left, right):\n    return left + right\n"}],
         title="低风险",
         user_claims_low_risk=True,
         requirement_hash="req-lite",
