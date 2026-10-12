@@ -82,7 +82,7 @@ def test_docs_short_chain_after_required_checks():
 
 
 def test_docs_short_chain_rejects_secret_and_high_risk():
-    secret = DOC + "\n-----BEGIN PRIVATE KEY-----\n"
+    secret = DOC + "\n" + "-----BEGIN " + "PRIVATE KEY-----\n"
     decision = select_profile(task_type="C", requested="docs-short", files=[{"path": "docs/guide.md", "content": secret}])
     assert decision.blocked is True
     risky = DOC + "\npayment = 1\n"
