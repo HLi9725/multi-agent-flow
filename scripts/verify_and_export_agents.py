@@ -67,7 +67,9 @@ def attach_rule_source(content: str) -> str:
     appendix = f"\n\n## 规则源版本\n{version}\n\n{safety}\n"
     if 'developer_instructions = """' in content:
         if "rule_source_version" not in content:
-            content = f'rule_source_version = "{version}"\n' + content
+            # Codex rejects unknown top-level TOML fields. Keep provenance in
+            # a comment and in developer_instructions, not its host schema.
+            content = f'# rule_source_version = "{version}"\n' + content
         closing = content.rfind('"""')
         stamped = content[:closing] + appendix.replace('"""', '\\"\\"\\"') + content[closing:]
     else:
@@ -485,6 +487,8 @@ def verify_exported_agent(out_abs_path, fmt):
             return False, f"TOML 解析失败: {e}"
         if not data.get("name") or not data.get("description"):
             return False, "TOML 缺少 name/description 字段"
+        if "rule_source_version" in data:
+            return False, "Codex 不支持 rule_source_version 顶层字段；应使用注释"
         return True, ""
 
     # markdown + frontmatter

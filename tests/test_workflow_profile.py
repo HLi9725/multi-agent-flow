@@ -27,6 +27,29 @@ from _lib.core.workflow_policy import (
     select_profile,
 )
 from _lib.core.production_runner import _transient_host_failure_kind
+
+
+def test_first_builder_resume_defers_only_absent_candidate_risk():
+    from _lib.core.workflow_policy import select_profile, freeze_policy, resume_policy
+    frozen = freeze_policy(select_profile(
+        task_type="A", requested="lite", files=[], requirement_hash="r", acceptance_criteria_hash="a"
+    ), "T9000")
+    args = dict(requirement_hash="r", acceptance_criteria_hash="a", candidate_commit=None, files=[], budget_consumed=1)
+    assert not resume_policy(frozen, **args)["ok"]
+    assert resume_policy(frozen, **args, candidate_pending=True)["ok"]
+    assert not resume_policy(frozen, **{**args, "candidate_commit": "sha"}, candidate_pending=True)["ok"]
+    assert not resume_policy(frozen, **{**args, "acceptance_criteria_hash": "changed"}, candidate_pending=True)["ok"]
+    assert not resume_policy(frozen, **{**args, "files": [{"path": "auth.py", "content": "def can_access(): return True"}]}, candidate_pending=True)["ok"]
+
+
+def test_literal_function_docstring_does_not_raise_pure_computation_risk():
+    from _lib.core.workflow_policy import _is_pure_python
+    assert _is_pure_python('def add(a, b):\n    """Return the sum."""\n    return a + b\n')
+    dynamic = "def add(a, b):\n    f'{open(\"output.txt\", \"w\")}'\n    return a + b\n"
+    import ast
+    ast.parse(dynamic)  # The counterexample must be valid Python, not a syntax failure.
+    assert not _is_pure_python(dynamic)
+    assert not _is_pure_python('def add(a, b=open("output.txt", "w")):\n    "Doc"\n    return a + b\n')
 from build_agent_context import build_context
 
 
@@ -233,6 +256,22 @@ def test_rule_bundle_is_complete_and_static_host_matches():
     assert "不得用来消除已经存在的缺陷" in dynamic
     with pytest.raises(RuleSourceError):
         load_safety_text(os.path.join(ROOT, "tests"))
+
+
+def test_codex_export_provenance_does_not_extend_host_schema(tmp_path):
+    import tomllib
+    from verify_and_export_agents import attach_rule_source, verify_exported_agent
+    raw = 'name = "flow-dev"\ndescription = "Developer"\ndeveloper_instructions = """Read rules."""\n'
+    stamped = attach_rule_source(raw)
+    parsed = tomllib.loads(stamped)
+    assert set(parsed) == {"name", "description", "developer_instructions"}
+    assert source_version(ROOT) in parsed["developer_instructions"]
+    assert load_safety_text(ROOT).strip() in parsed["developer_instructions"]
+    path = tmp_path / "agent.toml"
+    path.write_text(stamped, encoding="utf-8")
+    assert verify_exported_agent(str(path), "codex_toml")[0]
+    path.write_text('rule_source_version = "invalid"\n' + raw, encoding="utf-8")
+    assert not verify_exported_agent(str(path), "codex_toml")[0]
 
 
 def test_contract_drift_refuses_silent_overwrite():

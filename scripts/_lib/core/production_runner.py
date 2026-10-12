@@ -126,7 +126,7 @@ _TRANSIENT_HOST_FAILURE_PATTERNS = (
     ("RATE_LIMIT", re.compile(r"(?:\b429\b|rate[ -]?limit|too many requests|resource_exhausted)", re.I)),
     ("BAD_GATEWAY", re.compile(r"\b502\b|bad gateway", re.I)),
     ("GATEWAY_TIMEOUT", re.compile(r"\b504\b|gateway timeout", re.I)),
-    ("TRANSIENT_NETWORK", re.compile(r"connection (?:reset|aborted)|temporar(?:y|ily) unavailable|i/o timeout", re.I)),
+    ("TRANSIENT_NETWORK", re.compile(r"connection (?:reset|aborted)|temporar(?:y|ily) unavailable|i/o timeout|Reconnecting\.{3}\s*\d+/\d+\s*\((?:request timed out|stream disconnected before completion:)", re.I)),
 )
 _NON_RETRYABLE_HOST_FAILURE_PATTERN = re.compile(
     r"permission|denied_actions|access denied|unauthori[sz]ed|forbidden|authentication|"
@@ -830,11 +830,11 @@ def _extract_capabilities_extra(caps: Any) -> Dict[str, Any]:
     return extra
 
 
-def _extract_real_invocation_id(result: AgentResult, handle: AgentHandle) -> Optional[str]:
-    """从 AgentResult / AgentHandle 中提取真实非空 Invocation ID (严格校验成功状态与会话一致性)"""
+def _extract_real_invocation_id(result: AgentResult, handle: AgentHandle, *, diagnostic_only: bool = False) -> Optional[str]:
+    """Extract bound identity; failed-turn identity is diagnostic only, never success Evidence."""
     if not isinstance(result, AgentResult) or not isinstance(handle, AgentHandle):
         return None
-    if result.status != AgentStatus.SUCCESS:
+    if result.status != AgentStatus.SUCCESS and not diagnostic_only:
         return None
     if result.session_id != handle.session_id:
         return None
@@ -1701,6 +1701,18 @@ class ProductionRunner:
             now = time.monotonic()
             if now >= next_progress:
                 elapsed = int(now - started_wait)
+                timing = self._run_timing.get(task_id)
+                if timing is not None:
+                    try:
+                        current = self.checkpoint_store.load_checkpoint(task_id)
+                        if current is not None:
+                            active = max(current.active_elapsed_seconds, timing[1] + max(0.0, time.time() - timing[0]))
+                            self.checkpoint_store.save_checkpoint(replace(
+                                current, active_elapsed_seconds=active, updated_at=time.time(),
+                            ))
+                    except Exception:
+                        adapter.cancel_agent(handle)
+                        raise
                 self._emit_progress(
                     task_id=task_id,
                     state=state,
@@ -2713,6 +2725,35 @@ class ProductionRunner:
                     qa_reviewer_security_scan = _plain_metadata_value(stored_security_scan)
                 start_role = "QA"
         saved_policy = dict(checkpoint.execution_options.get("workflow_policy") or {})
+        # Legacy Lite risk pauses retained BUILDER even after recording its
+        # candidate Evidence. Reconcile only this exact old pause and only with
+        # valid bound Evidence and no current/ambiguous rejection. User-supplied
+        # rejection text alone must never establish eligibility.
+        if (
+            existing_checkpoint is not None and candidate_commit
+            and saved_policy.get("profile_id") in ("lite", "docs-short")
+            and current_board_status == "进行中"
+            and checkpoint.current_role == "BUILDER"
+            and checkpoint.last_error in (
+                "风险不明确，停止轻量路径并重新计划",
+                "风险升级，停止轻量路径并重新计划",
+            )
+            and all(
+                (
+                    defect.get("role") == "USER_ACCEPTANCE"
+                    and type(defect.get("cycle")) is int
+                    and defect["cycle"] < checkpoint.candidate_generation
+                ) or (
+                    bool(defect.get("candidate") or defect.get("candidate_commit"))
+                    and (defect.get("candidate") or defect.get("candidate_commit")) != candidate_commit
+                )
+                for defect in checkpoint.defects_history
+            )
+            and self._find_bound_evidence(checkpoint, "BUILDER", candidate_commit, "REVIEWING", spec)
+        ):
+            start_role = "RUNNER"
+            checkpoint = replace(checkpoint, current_role="RUNNER")
+            self.checkpoint_store.save_checkpoint(checkpoint)
         if (
             existing_checkpoint is not None
             and candidate_commit
@@ -3182,6 +3223,7 @@ class ProductionRunner:
                     checkpoint = replace(
                         checkpoint, state=RunnerState.NEEDS_USER_INPUT.value,
                         current_role="BUILDER", last_error=pause_message,
+                        builder_invocation_id=_extract_real_invocation_id(builder_result, builder_handle, diagnostic_only=True),
                         updated_at=time.time(),
                     )
                     self.checkpoint_store.save_checkpoint(checkpoint)
@@ -3190,6 +3232,12 @@ class ProductionRunner:
                         state=RunnerState.NEEDS_USER_INPUT.value,
                         task_id=task_id,
                         message=pause_message,
+                        diagnostics={
+                            "failure_kind": _transient_host_failure_kind(builder_result) or "HOST_FAILURE",
+                            "host_invocation_id": checkpoint.builder_invocation_id,
+                            "host_event_count": len(builder_result.partial_results),
+                            "workspace_changed": not worktree_unchanged,
+                        },
                     )
                 if builder_result.session_id != builder_handle.session_id:
                     return RunnerResult(
@@ -5032,8 +5080,12 @@ class ProductionRunner:
             else f"conf_req_{task_id.lower()}_{uuid.uuid4().hex}"
         )
         elapsed = checkpoint.active_elapsed_seconds
-        if start_wall_clock is not None:
-            elapsed = checkpoint.active_elapsed_seconds + (time.time() - start_wall_clock)
+        timing = self._run_timing.get(task_id)
+        if timing is not None:
+            started_at, elapsed_base = timing
+            elapsed = max(elapsed, elapsed_base + max(0.0, time.time() - started_at))
+        elif start_wall_clock is not None:
+            elapsed += max(0.0, time.time() - start_wall_clock)
         checkpoint = replace(
             checkpoint,
             task_id=task_id,

@@ -294,6 +294,35 @@ def test_codex_cli_adapter_exit_zero_missing_canonical_identity_fails_closed(mon
     assert adapter.get_session_invocation_id(handle.session_id) is None
 
 
+def test_failed_turn_preserves_identity_without_becoming_success(monkeypatch):
+    adapter = CodexCliAdapter(is_real_host=True)
+
+    class FailedTurn:
+        pid = 12345
+        returncode = 0  # Terminal protocol failure wins even over process exit 0.
+
+        def communicate(self, timeout=None):
+            events = [
+                {"type": "thread.started", "thread_id": "real-thread"},
+                {"type": "item.completed", "item": {"id": "item_1", "type": "agent_message", "text": "partial"}},
+                {"type": "turn.failed", "error": {"message": "Reconnecting... 5/5 (request timed out)"}},
+            ]
+            return "\n".join(json.dumps(e) for e in events), ""
+
+        def poll(self):
+            return 0
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: FailedTurn())
+    handle = adapter.dispatch_agent(AgentRequest(
+        session_id="failed-turn", prompt="test", role="DEV", workspace_dir=os.path.abspath(".")
+    ))
+    result = adapter.wait_for_result(handle)
+    assert result.status == AgentStatus.FAILED
+    assert "request timed out" in result.error_message
+    assert adapter.get_session_thread_id(handle.session_id) == "real-thread"
+    assert adapter.get_session_invocation_id(handle.session_id) == "real-thread:item_1"
+
+
 def test_codex_cli_adapter_cancel_handle_ownership_validation():
     # DEF-T0050-12: cancel_agent must enforce identical handle ownership validation as wait_for_result
     adapter = CodexCliAdapter(is_real_host=True)
@@ -679,6 +708,30 @@ def test_codex_cli_real_executable_detection_and_help():
         assert "--sandbox" in proc_help.stdout
         assert "--json" in proc_help.stdout
         assert "--approve-for-me" in proc_help.stdout
+
+
+@pytest.mark.parametrize("events,expected_error", [
+    ([{"type": "error", "message": "Reconnecting... 1/5 (request timed out)"}, {"type": "turn.completed"}], None),
+    ([{"type": "error", "message": "Reconnecting... 1/5 (request timed out)"}], "Reconnecting"),
+    ([{"type": "turn.completed"}, {"type": "error", "message": "Reconnecting... 1/5 (request timed out)"}], "Reconnecting"),
+    ([{"type": "error", "message": "permission denied"}, {"type": "error", "message": "Reconnecting... 1/5 (request timed out)"}, {"type": "turn.completed"}], "permission denied"),
+    ([{"type": "turn.failed", "error": {"message": "terminal failure"}}, {"type": "turn.completed"}], "terminal failure"),
+    ([{"type": "error", "message": "unknown error"}, {"type": "turn.completed"}], "unknown error"),
+    ([{"type": "error", "message": "Reconnecting... 1/5 (stream disconnected before completion: forbidden)"}, {"type": "turn.completed"}], "forbidden"),
+    ([{"type": "error", "message": "Reconnecting... 1/5 (stream disconnected before completion: unauthorised)"}, {"type": "turn.completed"}], "unauthorised"),
+    ([{"type": "error", "message": "permission denied"}, {"type": "turn.failed", "error": {"message": "Reconnecting... 5/5 (request timed out)"}}], "permission denied"),
+    ([{"type": "error", "message": "Reconnecting... 1/5 (stream disconnected before completion: permission denied)"}, {"type": "turn.completed"}], "permission denied"),
+    ([{"type": "error", "message": "Reconnecting... 1/5 (stream disconnected before completion: 401 unauthorized)"}, {"type": "turn.completed"}], "unauthorized"),
+])
+def test_reconnect_recovery_requires_explicit_completion(events, expected_error):
+    adapter = CodexCliAdapter(is_real_host=False)
+    result = adapter._parse_jsonl_output("\n".join(json.dumps(e) for e in events), "")
+    assert result[1] == events
+    if expected_error is None:
+        assert result[2] is None
+    else:
+        assert expected_error in result[2]
+    assert result[4] is None  # Recovery must not manufacture host identity.
 
 
 def test_codex_qa_cannot_request_write_or_auto_approval(tmp_path):

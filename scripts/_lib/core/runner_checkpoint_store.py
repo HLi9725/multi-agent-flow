@@ -110,6 +110,14 @@ class RunnerCheckpointStore:
                     existing = json.load(existing_file)
                 if not initializing and existing.get('run_id', '') != checkpoint.run_id:
                     raise CheckpointStoreError('Stale run cannot overwrite a newer run.')
+                if not initializing:
+                    # Stage-local snapshots may predate a heartbeat. Elapsed
+                    # budget is monotonic within a run, including crash recovery.
+                    data['active_elapsed_seconds'] = max(
+                        float(data.get('active_elapsed_seconds') or 0),
+                        float(existing.get('active_elapsed_seconds') or 0),
+                    )
+                    payload = json.dumps(data, indent=2, ensure_ascii=False).encode('utf-8')
                 if not initializing and existing.get("state") == "CANCELLED" and checkpoint.state != "CANCELLED":
                     raise CheckpointStoreError(
                         f"Refusing to overwrite durable cancellation for {checkpoint.task_id}."

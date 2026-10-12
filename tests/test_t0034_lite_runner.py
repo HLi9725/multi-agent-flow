@@ -226,6 +226,10 @@ def test_lite_runner_reaches_completed_and_accepts_only_server_confirmation(tmp_
     assert result.confirmation_request_id.startswith("conf_req_t9101_")
     assert _board_status(repo, "T9101") == "已完成"
     checkpoint = store.load_checkpoint("T9101")
+    assert checkpoint.active_elapsed_seconds > 0
+    from dataclasses import replace
+    store.save_checkpoint(replace(checkpoint, active_elapsed_seconds=0))
+    assert store.load_checkpoint("T9101").active_elapsed_seconds == checkpoint.active_elapsed_seconds
     assert checkpoint.confirmation_request_id == result.confirmation_request_id
     assert not any(item.startswith("evi_reviewer_") or item.startswith("evi_qa_") for item in result.evidence_ids)
     wrong = runner.accept(str(repo), "T9101", "conf_req_wrong", authority_root=str(repo))
@@ -236,6 +240,42 @@ def test_lite_runner_reaches_completed_and_accepts_only_server_confirmation(tmp_
     assert accepted.success, accepted.message
     assert accepted.state == RunnerState.ACCEPTED.value
     assert _board_status(repo, "T9101") == "已验收"
+
+
+@pytest.mark.parametrize("partial_edit", [False, True])
+def test_first_builder_transport_failure_can_resume_without_candidate(tmp_path, monkeypatch, partial_edit):
+    repo = _prepare_repo(tmp_path, "T9118")
+    hosts = _install_hosts(monkeypatch, repo, PURE, lambda state, handle: _pass_report(state["prompts"][-1]))
+    successful_wait = CodexCliAdapter.wait_for_result
+
+    def interrupted(self, handle, timeout_seconds=None):
+        if partial_edit:
+            (repo / "calc_1.py").write_text(PURE, encoding="utf-8")
+        return AgentResult(
+            session_id=handle.session_id, status=AgentStatus.FAILED,
+            output="",
+            error_message="Reconnecting... 5/5 (request timed out)",
+            partial_results=({"invocation_id": "real_failed_turn"},), is_real_host=True,
+        )
+
+    monkeypatch.setattr(CodexCliAdapter, "wait_for_result", interrupted)
+    runner, store = _runner(repo)
+    failed = runner.start(_spec(repo, "T9118", "lite"))
+    assert failed.state == RunnerState.NEEDS_USER_INPUT.value
+    assert store.load_checkpoint("T9118").candidate_commit is None
+    assert store.load_checkpoint("T9118").builder_invocation_id == "real_failed_turn"
+    monkeypatch.setattr(CodexCliAdapter, "wait_for_result", successful_wait)
+    if partial_edit:
+        blocked = runner.resume(str(repo), "T9118", authority_root=str(repo))
+        assert not blocked.success
+        assert hosts["builder_calls"] == 0
+        assert (repo / "calc_1.py").read_text(encoding="utf-8") == PURE
+    resumed = runner.resume(str(repo), "T9118", authority_root=str(repo),
+                            overrides={"recover_partial_builder_changes": partial_edit})
+    assert resumed.success, resumed.message
+    assert resumed.state == RunnerState.PENDING_USER_ACCEPTANCE.value
+    assert hosts["builder_calls"] == 1
+    assert hosts["verifier_calls"] == 1
 
 
 def test_lite_runner_reject_returns_original_task_to_builder(tmp_path, monkeypatch):
@@ -650,6 +690,56 @@ def test_def15_classifier_keeps_assertion_failures_out_of_environment_pause():
         "python -m pytest -q", 1,
         "FAILED test_app.py::test_app - AssertionError: assert 1 == 2\ntest_app.py:3: AssertionError\n",
     ) == "business"
+
+
+@pytest.mark.parametrize("legacy_role", [False, True])
+def test_risk_pause_resumes_candidate_checks_without_rebuilding(tmp_path, monkeypatch, legacy_role):
+    from dataclasses import replace
+    from scripts._lib.core import lightweight_profile as profile
+    repo = _prepare_repo(tmp_path, "T9120")
+    hosts = _install_hosts(monkeypatch, repo, PURE, lambda state, handle: _pass_report(state["prompts"][-1]))
+    original = profile.evaluate_candidate_risk
+    monkeypatch.setattr(profile, "evaluate_candidate_risk", lambda *a, **kw: {
+        "stop_for_replan": True, "risk_level": "unknown", "risk_signals": [],
+        "message": "风险不明确，停止轻量路径并重新计划",
+    })
+    runner, store = _runner(repo)
+    result = runner.start(_spec(repo, "T9120", "lite"))
+    assert not result.success
+    cp = store.load_checkpoint("T9120")
+    assert cp.current_role == "RUNNER"
+    assert hosts["builder_calls"] == 1
+    if legacy_role:
+        store.save_checkpoint(replace(cp, current_role="BUILDER"))
+    monkeypatch.setattr(profile, "evaluate_candidate_risk", original)
+    result = runner.resume(str(repo), "T9120", authority_root=str(repo))
+    assert result.success, result.message
+    assert result.candidate_commit == cp.candidate_commit
+    assert hosts["builder_calls"] == 1
+    assert hosts["verifier_calls"] == 1
+
+
+@pytest.mark.parametrize("reclaimed", [False, True])
+def test_user_rejection_cannot_impersonate_legacy_risk_pause(tmp_path, monkeypatch, reclaimed):
+    repo = _prepare_repo(tmp_path, "T9121")
+    hosts = _install_hosts(monkeypatch, repo, PURE, lambda state, handle: _pass_report(state["prompts"][-1]))
+    runner, store = _runner(repo)
+    result = runner.start(_spec(repo, "T9121", "lite"))
+    assert result.success
+    rejected = runner.reject(str(repo), "T9121", result.confirmation_request_id,
+                             "风险不明确，停止轻量路径并重新计划", authority_root=str(repo))
+    assert rejected.success
+    if reclaimed:
+        ok, error = runner._do_state_transition(str(repo), "T9121", "DEV", "已退回", "进行中", "李开发", "领取修复", "A")
+        assert ok, error
+    resumed = runner.resume(str(repo), "T9121", authority_root=str(repo))
+    assert hosts["builder_calls"] == 2
+    assert resumed.success, resumed.message
+    # The fixture Builder writes a new candidate on every repair. Crucially,
+    # the rejected candidate is not simply checked and completed again.
+    assert resumed.candidate_commit != result.candidate_commit
+    assert resumed.confirmation_request_id != result.confirmation_request_id
+    assert hosts["verifier_calls"] == 2
 
 
 def test_def14_missing_dependency_pauses_check_and_resume_rechecks_same_candidate(tmp_path, monkeypatch):

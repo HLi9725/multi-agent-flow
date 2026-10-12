@@ -451,13 +451,13 @@ class CodexCliAdapter(BaseHostAdapter):
 
         # DEF-T0050-3, DEF-T0050-8, DEF-T0050-10: Bind canonical thread_id:item_id composite invocation identity
         meta_event = {
-            "thread_id": detected_thread_id if status == AgentStatus.SUCCESS else None,
+            "thread_id": detected_thread_id,
             "invocation_id": final_invocation_id,
             "sandbox_mode": session_data.get("sandbox_mode"),
             "approval_policy": session_data.get("approval_policy"),
             "usage": detected_usage,
             "exit_code": exit_code,
-            "host_identity_source": "openai_codex_host_thread_id" if status == AgentStatus.SUCCESS else None,
+            "host_identity_source": "openai_codex_host_thread_id" if detected_thread_id else None,
         }
 
         result = AgentResult(
@@ -471,7 +471,7 @@ class CodexCliAdapter(BaseHostAdapter):
 
         with self._lock:
             session_data["completed"] = True
-            session_data["thread_id"] = detected_thread_id if status == AgentStatus.SUCCESS else None
+            session_data["thread_id"] = detected_thread_id
             session_data["invocation_id"] = final_invocation_id
             session_data["usage"] = detected_usage
             session_data["result"] = result
@@ -591,6 +591,7 @@ class CodexCliAdapter(BaseHostAdapter):
         events: List[Dict[str, Any]] = []
         messages: List[str] = []
         error_msg: Optional[str] = None
+        reconnect_error: Optional[str] = None
         detected_thread_id: Optional[str] = None
         detected_item_id: Optional[str] = None
         detected_invocation_id: Optional[str] = None
@@ -659,7 +660,30 @@ class CodexCliAdapter(BaseHostAdapter):
                             if isinstance(item_content, str) and item_content.strip():
                                 messages.append(item_content)
                         elif ev_type == "error":
-                            error_msg = ev.get("message") or ev.get("error") or str(ev)
+                            detail = ev.get("message") or ev.get("error") or str(ev)
+                            if isinstance(detail, dict):
+                                detail = detail.get("message") or json.dumps(detail, ensure_ascii=True)
+                            detail = str(detail)
+                            # A reconnect notification is not a terminal turn failure.
+                            # Only a later explicit completion may discharge it; all
+                            # other errors remain sticky, including permission errors.
+                            if (
+                                re.fullmatch(r"Reconnecting\.{3}\s*\d+/\d+\s*\((?:request timed out|stream disconnected before completion:[^\r\n]*)\)", detail.strip())
+                                and not _is_host_permission_denial(detail)
+                                and not re.search(r"(?i)\b(?:401|403|unauthorized|unauthorised|forbidden|authentication|authorization|authorisation|invalid api key)\b", detail)
+                            ):
+                                reconnect_error = detail
+                            else:
+                                error_msg = "\n".join(filter(None, (error_msg, detail)))
+                        elif ev_type == "turn.completed":
+                            reconnect_error = None
+                        elif ev_type == "turn.failed":
+                            detail = ev.get("error")
+                            if isinstance(detail, dict):
+                                detail = detail.get("message") or json.dumps(detail, ensure_ascii=True)
+                            error_msg = "\n".join(filter(None, (
+                                error_msg, str(detail or ev.get("message") or "Codex turn failed")
+                            )))
                 except Exception:
                     # Non-JSON line from stdout
                     m_th = re.search(r'"thread_id"\s*:\s*"([^"]+)"', line)
@@ -688,7 +712,7 @@ class CodexCliAdapter(BaseHostAdapter):
         if not output_text and stderr:
             output_text = stderr.strip()
 
-        return output_text, events, error_msg, detected_thread_id, detected_invocation_id, detected_usage
+        return output_text, events, error_msg or reconnect_error, detected_thread_id, detected_invocation_id, detected_usage
 
 
 def create_codex_cli_manifest(

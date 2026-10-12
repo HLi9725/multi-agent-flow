@@ -276,6 +276,10 @@ def test_runner_wait_enforces_outer_deadline():
         ("HTTP 504 Gateway Timeout", "GATEWAY_TIMEOUT"),
         ("429 Too Many Requests: rate limit", "RATE_LIMIT"),
         ("connection reset by peer", "TRANSIENT_NETWORK"),
+        ("Reconnecting... 5/5 (request timed out)", "TRANSIENT_NETWORK"),
+        ("Reconnecting... 5/5 (stream disconnected before completion: os error 10061)", "TRANSIENT_NETWORK"),
+        ("AssertionError: request timed out", None),
+        ("permission denied: Reconnecting... 5/5 (request timed out)", None),
         ("429 RESOURCE_EXHAUSTED: quota exceeded", None),
         ("permission denied", None),
         ("invalid structured JSON", None),
@@ -301,6 +305,9 @@ def test_partial_builder_recovery_requires_proven_transient_builder_turn():
         last_error="API error (attempt 1): UNAVAILABLE (code 503): No capacity available",
     )
     assert _interrupted_builder_recovery_eligible(base) is True
+    assert _interrupted_builder_recovery_eligible(replace(
+        base, last_error="Builder execution failed with status: failed; Reconnecting... 5/5 (request timed out)"
+    )) is True
     assert _interrupted_builder_recovery_eligible(
         replace(base, current_role="REVIEWER")
     ) is False

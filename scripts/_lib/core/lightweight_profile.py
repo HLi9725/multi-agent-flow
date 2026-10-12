@@ -98,6 +98,7 @@ def bind_workflow_policy(runner: Any, spec: TaskExecutionSpec, checkpoint: Runne
             requested_profile=spec.workflow_profile,
             downgrade_authorization=spec.workflow_downgrade_authorization or "",
             open_defects=list(checkpoint.defects_history),
+            candidate_pending=(checkpoint.current_role == "BUILDER" and not checkpoint.candidate_commit),
         )
         if not decision.get("ok"):
             paused = replace(
@@ -440,6 +441,10 @@ def apply_lightweight(
     policy = _policy_of(spec, checkpoint)
     if not policy or policy.get("profile_id") not in (PROFILE_LITE, PROFILE_DOCS):
         return None
+    # Builder has already produced this candidate. Persist the check boundary
+    # before risk evaluation too, so a policy pause cannot repeat development.
+    checkpoint = replace(checkpoint, current_role=LITE_CHECK_ROLE)
+    runner.checkpoint_store.save_checkpoint(checkpoint)
     files = candidate_materials(worktree, spec.baseline_commit, candidate_commit)
     risk = evaluate_candidate_risk(policy, files, spec.requirement_text)
     if risk["stop_for_replan"] or risk["risk_level"] == "high":

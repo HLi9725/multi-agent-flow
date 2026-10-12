@@ -197,9 +197,16 @@ def _function_definition_is_pure(stmt: ast.FunctionDef) -> bool:
     annotations.append(stmt.returns)
     if any(annotation is not None and not _is_pure_expr(annotation) for annotation in annotations):
         return False
-    if len(stmt.body) != 1 or not isinstance(stmt.body[0], ast.Return):
+    body = stmt.body
+    # Only a literal leading docstring is inert; f-strings and other expression
+    # statements remain subject to conservative rejection.
+    if (body and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)):
+        body = body[1:]
+    if len(body) != 1 or not isinstance(body[0], ast.Return):
         return False
-    value = stmt.body[0].value
+    value = body[0].value
     return value is not None and _is_pure_expr(value)
 
 
@@ -550,6 +557,7 @@ def resume_policy(
     requested_profile: Optional[str] = None,
     downgrade_authorization: str = "",
     open_defects: Optional[Sequence[Mapping[str, Any]]] = None,
+    candidate_pending: bool = False,
 ) -> Dict[str, Any]:
     original_budget = int((frozen.get("budget") or {}).get("budget_consumed") or 0)
     consumed = max(original_budget, int(budget_consumed))
@@ -591,7 +599,9 @@ def resume_policy(
             "budget_consumed": consumed,
         }
     risk = evaluate_candidate_risk(frozen, files, "")
-    if risk["stop_for_replan"]:
+    # An interrupted first Builder has no immutable candidate yet. Only this
+    # explicit lifecycle state may defer scanning; completion still rescans.
+    if risk["stop_for_replan"] and not (candidate_pending and not candidate_commit and not files):
         return {
             "ok": False,
             "state": "NEEDS_USER_INPUT",
