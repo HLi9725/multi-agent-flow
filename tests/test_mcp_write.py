@@ -977,3 +977,164 @@ def test_audit_write_failure_does_not_report_success(tmp_path: Path, monkeypatch
     cards = json.loads(board.read_text(encoding="utf-8"))
     assert cards == []
     assert not (tmp_path / "mcp_audit" / "events.jsonl").exists()
+
+
+def test_domain_entry_sees_bound_project_root(tmp_path: Path) -> None:
+    from scripts._lib.mcp.registry import ProjectRecord
+    from scripts._lib.mcp.service import _call_in_project
+
+    root = tmp_path / "isolated-project"
+    root.mkdir()
+    project = ProjectRecord(
+        project_id="alpha",
+        display_name="alpha",
+        org_id="org-1",
+        data_root=str(root),
+        board_file=str(root / "board.json"),
+        evidence_root=str(root / "evidence"),
+        board_kind="offline",
+    )
+    import scripts.transition_task  # 装入领域入口使用的 paths 模块
+    import paths
+
+    seen: dict[str, str] = {}
+
+    def action() -> None:
+        seen["root"] = paths.resolve_data_root()
+        seen["locks"] = paths.locks_dir()
+
+    _call_in_project(project, action)
+    assert paths is not __import__("scripts.paths", fromlist=["paths"])
+    assert seen["root"] == str(root.resolve())
+    assert seen["locks"] == str((root / "user_data" / "locks").resolve())
+
+
+def test_legacy_adapters_reject_unknown_update_kwargs() -> None:
+    import inspect
+
+    from scripts._lib.boards.feishu_base_adapter import FeishuBaseAdapter
+    from scripts._lib.boards.github_projects_adapter import GitHubProjectsAdapter
+    from scripts._lib.boards.jira_adapter import JiraAdapter
+    from scripts.transition_task import invoke_update_record
+
+    for cls in (FeishuBaseAdapter, JiraAdapter, GitHubProjectsAdapter):
+        params = inspect.signature(cls.update_record).parameters
+        assert "expected_card_version" not in params
+        assert "locked_task_type" not in params
+
+    class OldAdapter:
+        def update_record(self, record_id, fields):
+            self.got = (record_id, dict(fields))
+            return True
+
+    adapter = OldAdapter()
+    assert invoke_update_record(
+        adapter,
+        "T0001",
+        {"status": "进行中"},
+        expected_card_version="version-1",
+        locked_task_type="A",
+    ) is True
+    assert adapter.got == ("T0001", {"status": "进行中"})
+
+
+def test_audit_failure_after_write_does_not_create_another_card(tmp_path: Path, monkeypatch) -> None:
+    import getpass
+
+    from scripts._lib.mcp.audit_store import AuditStore, AuditWriteError
+    from scripts._lib.mcp.registry import load_registry
+    from scripts._lib.mcp.service import handle_tool
+
+    registry_path, board = _prepare(tmp_path, {"alpha": ["read", "task.transition", "admin"]}, role="DEV")
+    registry = load_registry(str(registry_path))
+    audit = AuditStore(str(tmp_path / "mcp_audit"))
+    real_append = AuditStore.append
+
+    def fail_ok(self, *args, **kwargs):
+        if kwargs.get("code") == "OK" and kwargs.get("required"):
+            raise AuditWriteError()
+        return real_append(self, *args, **kwargs)
+
+    monkeypatch.setattr(AuditStore, "append", fail_ok)
+    arguments = {
+        "project_id": "alpha",
+        "idempotency_key": "audit-after-write",
+        "name": "写入后审计失败",
+        "type": "A",
+        "assignee": "李开发",
+    }
+    context = {"registry": registry, "audit": audit, "os_user": getpass.getuser()}
+    first = handle_tool("create_task", arguments, context)
+    assert first["isError"] is False, first["structured"]
+    task_id = first["structured"]["task_id"]
+    second = handle_tool("create_task", arguments, context)
+    assert second["isError"] is False, second["structured"]
+    assert second["structured"]["task_id"] == task_id
+    assert second["structured"]["replayed"] is True
+    cards = json.loads(board.read_text(encoding="utf-8"))
+    assert [item.get("id") for item in cards] == [task_id]
+
+
+def test_soft_delete_audit_failure_keeps_visible_result(tmp_path: Path, monkeypatch) -> None:
+    import getpass
+
+    from scripts._lib.mcp.audit_store import AuditStore, AuditWriteError
+    from scripts._lib.mcp.registry import load_registry
+    from scripts._lib.mcp.service import handle_tool, task_version
+
+    registry_path, board = _prepare(tmp_path, {"alpha": ["read", "task.transition", "admin"]}, role="DEV")
+    registry = load_registry(str(registry_path))
+    audit = AuditStore(str(tmp_path / "mcp_audit"))
+    context = {"registry": registry, "audit": audit, "os_user": getpass.getuser()}
+    created = handle_tool(
+        "create_task",
+        {
+            "project_id": "alpha",
+            "idempotency_key": "delete-audit-create",
+            "name": "隐藏后审计失败",
+            "type": "A",
+            "assignee": "李开发",
+        },
+        context,
+    )
+    assert created["isError"] is False, created["structured"]
+    task_id = created["structured"]["task_id"]
+    cards = json.loads(board.read_text(encoding="utf-8"))
+    version = task_version(next(item for item in cards if item.get("id") == task_id))
+    real_append = AuditStore.append
+
+    def fail_ok(self, *args, **kwargs):
+        if kwargs.get("code") == "OK" and kwargs.get("required"):
+            raise AuditWriteError()
+        return real_append(self, *args, **kwargs)
+
+    monkeypatch.setattr(AuditStore, "append", fail_ok)
+    hidden = handle_tool(
+        "soft_delete",
+        {
+            "project_id": "alpha",
+            "task_id": task_id,
+            "idempotency_key": "delete-audit-hide",
+            "expected_version": version,
+        },
+        context,
+    )
+    assert hidden["isError"] is False, hidden["structured"]
+    assert hidden["structured"]["is_deleted"] is True
+    cards = json.loads(board.read_text(encoding="utf-8"))
+    card = next(item for item in cards if item.get("id") == task_id)
+    assert card["is_deleted"] is True
+    assert card["status"] == "待开始"
+    again = handle_tool(
+        "soft_delete",
+        {
+            "project_id": "alpha",
+            "task_id": task_id,
+            "idempotency_key": "delete-audit-hide",
+            "expected_version": version,
+        },
+        context,
+    )
+    assert again["isError"] is False, again["structured"]
+    assert again["structured"]["replayed"] is True
+    assert again["structured"]["is_deleted"] is True

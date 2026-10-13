@@ -716,19 +716,24 @@ def _dispatch_write(
             decision.get("target") if isinstance(decision.get("target"), dict) else {},
         )
         task_id = str(payload.get("_task_id") or cleaned.get("task_id") or "")
+        body = _finalize(payload, registry, project.project_id)
         try:
             _audit("OK", task_id)
         except AuditWriteError:
-            _compensate_failed_audit(name, cleaned, payload, project)
-            ledger.fail(
+            ledger.complete(
                 principal_id=principal.principal_id,
                 tool=name,
                 key=cleaned["idempotency_key"],
                 digest=digest,
-                code="GATE_REJECTED",
+                result=body,
             )
-            raise error("GATE_REJECTED", details={"reason": "AUDIT"}) from None
-        body = _finalize(payload, registry, project.project_id)
+            return {
+                "_direct": True,
+                "_audited": True,
+                "_project_id": project.project_id,
+                "_task_id": task_id,
+                "body": body,
+            }
         ledger.complete(
             principal_id=principal.principal_id,
             tool=name,
@@ -752,18 +757,6 @@ def _dispatch_write(
         "_task_id": str(body.get("task_id") or cleaned.get("task_id") or ""),
         "body": body,
     }
-
-
-def _compensate_failed_audit(name: str, cleaned: Mapping[str, Any], payload: Mapping[str, Any], project: ProjectRecord) -> None:
-    task_id = str(payload.get("_task_id") or cleaned.get("task_id") or "")
-    if not task_id:
-        return
-    adapter = _adapter(project)
-    if name == "create_task":
-        adapter.discard_fresh_record(task_id)
-        return
-    if name == "transition_task":
-        adapter.update_record(task_id, {"status": str(cleaned.get("from_status") or "")})
 
 
 def _test_hold(context: Mapping[str, Any]) -> None:

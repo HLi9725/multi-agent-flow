@@ -170,6 +170,22 @@ def print_duplicate_protocol(task_name, hits):
         print(f"  [重复候选] {h['task_id']} {h['name']} ({h['level']})")
 
 
+def invoke_update_record(adapter, record_id, fields, expected_card_version="", locked_task_type=""):
+    """只把适配器实际声明的参数传下去。旧适配器不接受后来增加的关键字。"""
+    import inspect
+
+    kwargs = {}
+    try:
+        params = inspect.signature(adapter.update_record).parameters
+    except (TypeError, ValueError):
+        params = {}
+    if "expected_card_version" in params:
+        kwargs["expected_card_version"] = expected_card_version or ""
+    if "locked_task_type" in params:
+        kwargs["locked_task_type"] = str(locked_task_type or "")
+    return adapter.update_record(record_id, fields, **kwargs)
+
+
 def transition_task_pipeline(*args, **kwargs):
     dry_run = kwargs.get('dry_run', False)
     if len(args) > 11:
@@ -530,7 +546,8 @@ def _transition_task_pipeline_impl(
         orig_handler = (existing.get("fields", {}).get(handler_key) or existing.get("fields", {}).get("handler") if existing else None) or current_role
 
         try:
-            success = adapter.update_record(
+            success = invoke_update_record(
+                adapter,
                 resolved_record_id,
                 update_fields,
                 expected_card_version=expected_card_version or "",
