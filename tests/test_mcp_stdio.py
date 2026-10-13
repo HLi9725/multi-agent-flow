@@ -771,3 +771,47 @@ def test_newline_frame_errors_do_not_echo_original_bytes() -> None:
         read_message(io.BytesIO(b"Content-Length: 4\r\n\r\n1234"))
     assert str(caught.value) == ""
     assert "1234" not in str(caught.value)
+
+
+def test_open_stdin_answers_two_newline_rounds(tmp_path: Path) -> None:
+    registry = _registry(tmp_path)
+    env = os.environ.copy()
+    env.pop("YY_FLOW_MCP_REGISTRY", None)
+    env["YY_FLOW_PROJECT_ROOT"] = str(tmp_path)
+    proc = subprocess.Popen(
+        [sys.executable, str(SERVER), "stdio", "--registry", str(registry)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=str(tmp_path),
+        env=env,
+    )
+    assert proc.stdin is not None
+    assert proc.stdout is not None
+
+    def roundtrip(payload: dict) -> dict:
+        line = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n"
+        proc.stdin.write(line)
+        proc.stdin.flush()
+        box: dict = {}
+
+        def read() -> None:
+            box["line"] = proc.stdout.readline()
+
+        thread = threading.Thread(target=read)
+        thread.start()
+        thread.join(3)
+        assert not thread.is_alive(), "输入保持打开时没有在时限内响应"
+        return json.loads(box["line"].decode("utf-8"))
+
+    try:
+        first = roundtrip(_initialize_payload(1))
+        assert first["id"] == 1
+        assert first["result"]["protocolVersion"] == MCP_PROTOCOL_VERSION
+        second = roundtrip({"jsonrpc": "2.0", "id": 2, "method": "ping"})
+        assert second["id"] == 2
+        assert second["result"] == {}
+        assert proc.poll() is None
+    finally:
+        proc.kill()
+        proc.wait(timeout=5)

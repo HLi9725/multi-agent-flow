@@ -13,6 +13,10 @@ from ..core import file_lock
 from .redaction import RedactionRejected, fit_audit_line, mask_data
 
 
+class AuditWriteError(Exception):
+    """审计没有落盘。调用方不得把业务写入报告为成功。"""
+
+
 class AuditStore:
     def __init__(self, directory: str) -> None:
         self.directory = os.path.realpath(directory)
@@ -37,6 +41,7 @@ class AuditStore:
         task_id: str = "",
         arguments: Mapping[str, Any] | None = None,
         diagnostic: str = "",
+        required: bool = False,
     ) -> None:
         record: Dict[str, Any] = {
             "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -52,6 +57,8 @@ class AuditStore:
         try:
             with file_lock.acquire_lock(self._lock, blocking=True, timeout=5.0):
                 if not self._chain_intact():
+                    if required:
+                        raise AuditWriteError()
                     return
                 previous, seq = self._tail()
                 record["seq"] = seq + 1
@@ -69,7 +76,11 @@ class AuditStore:
                     handle.flush()
                     os.fsync(handle.fileno())
                 os.replace(temporary, self._tip)
+        except AuditWriteError:
+            raise
         except OSError:
+            if required:
+                raise AuditWriteError() from None
             return
 
     def _chain_intact(self) -> bool:

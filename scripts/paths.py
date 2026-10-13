@@ -27,9 +27,23 @@ data_root 优先级（高 → 低）：
 误判的失败模式是"数据落错目录"（可发现可迁移），绝不会跨项目串数据。
 """
 
+import contextvars
 import os
 
 _ENV_PROJECT_ROOT = "YY_FLOW_PROJECT_ROOT"
+_REQUEST_DATA_ROOT: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "yy_flow_request_data_root",
+    default="",
+)
+
+
+def bind_request_data_root(path: str):
+    """把本次请求的数据根绑定到当前上下文，不写入进程环境变量。"""
+    return _REQUEST_DATA_ROOT.set(os.path.abspath(path))
+
+
+def reset_request_data_root(token) -> None:
+    _REQUEST_DATA_ROOT.reset(token)
 
 _SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 
@@ -82,7 +96,13 @@ def resolve_data_root(explicit=None, env=None, cwd=None) -> str:
     if explicit:
         return os.path.abspath(explicit)
 
-    # 2. 环境变量
+    # 2. 当前请求上下文优先于进程环境变量。注入的 env 映射仍只看该映射。
+    if env is os.environ:
+        bound = _REQUEST_DATA_ROOT.get().strip()
+        if bound:
+            return os.path.abspath(bound)
+
+    # 3. 环境变量
     env_root = env.get(_ENV_PROJECT_ROOT, "").strip()
     if env_root:
         return os.path.abspath(env_root)

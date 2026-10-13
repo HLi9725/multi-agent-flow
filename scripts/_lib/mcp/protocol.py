@@ -183,6 +183,11 @@ def _read_length(stream: BinaryIO, prefix: bytes) -> int:
     return length
 
 
+def _read_one(stream: BinaryIO) -> bytes:
+    """一次只取一个字节。管道上的 read(n) 会一直等到 n 个字节或对端关闭。"""
+    return _read_exact_some(stream, 1)
+
+
 def _discard_rest_of_line(stream: BinaryIO, chunk: bytes = b"", newline_at: int = -1) -> None:
     if newline_at >= 0:
         _unread(stream, chunk[newline_at + 1 :])
@@ -190,7 +195,7 @@ def _discard_rest_of_line(stream: BinaryIO, chunk: bytes = b"", newline_at: int 
     pending = chunk
     while True:
         if not pending:
-            pending = _read_exact_some(stream, 4096)
+            pending = _read_one(stream)
             if not pending:
                 return
         found = pending.find(b"\n")
@@ -205,7 +210,7 @@ def _read_line(stream: BinaryIO, first: bytes) -> Dict[str, Any]:
         raise FrameError(FRAME_NEWLINE)
     data = bytearray(first)
     while True:
-        chunk = _read_exact_some(stream, 4096)
+        chunk = _read_one(stream)
         if not chunk:
             data.clear()
             raise FrameError(FRAME_NEWLINE)

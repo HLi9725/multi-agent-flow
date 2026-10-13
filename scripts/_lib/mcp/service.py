@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Mapping, Tuple
 from ..boards.offline_board_adapter import OfflineBoardAdapter
 from ..core.workflow_policy import PROFILE_STANDARD, PolicyError, load_policy_file
 from . import auth
-from .audit_store import AuditStore
+from .audit_store import AuditStore, AuditWriteError
 from .errors import McpError, error
 from .redaction import (
     RedactionRejected,
@@ -72,6 +72,8 @@ def handle_tool(name: str, arguments: Any, context: Mapping[str, Any]) -> Dict[s
             payload = _dispatch(name, arguments, registry, principal)
         if payload.get("_direct"):
             body = payload["body"]
+            if payload.get("_audited"):
+                return {"isError": False, "structured": body}
             audit.append(
                 principal_id=principal_id,
                 project_id=str(payload.get("_project_id") or ""),
@@ -676,6 +678,30 @@ def _dispatch_write(
         raise error("CONFLICT", details={"reason": "UNBOUND"})
     if decision["action"] == "in_progress":
         raise error("CONFLICT", details={"reason": "IN_PROGRESS"}, retryable=True)
+    audit: AuditStore = context["audit"]
+
+    def _audit(code: str, task_id: str) -> None:
+        audit.append(
+            principal_id=principal.principal_id,
+            project_id=project.project_id,
+            tool=name,
+            code=code,
+            task_id=task_id,
+            arguments=_argument_view(arguments),
+            required=True,
+        )
+
+    try:
+        _audit("PENDING", str(cleaned.get("task_id") or ""))
+    except AuditWriteError:
+        ledger.fail(
+            principal_id=principal.principal_id,
+            tool=name,
+            key=cleaned["idempotency_key"],
+            digest=digest,
+            code="GATE_REJECTED",
+        )
+        raise error("GATE_REJECTED", details={"reason": "AUDIT"}) from None
     _test_hold(context)
     try:
         payload = _execute_write(
@@ -689,6 +715,19 @@ def _dispatch_write(
             digest,
             decision.get("target") if isinstance(decision.get("target"), dict) else {},
         )
+        task_id = str(payload.get("_task_id") or cleaned.get("task_id") or "")
+        try:
+            _audit("OK", task_id)
+        except AuditWriteError:
+            _compensate_failed_audit(name, cleaned, payload, project)
+            ledger.fail(
+                principal_id=principal.principal_id,
+                tool=name,
+                key=cleaned["idempotency_key"],
+                digest=digest,
+                code="GATE_REJECTED",
+            )
+            raise error("GATE_REJECTED", details={"reason": "AUDIT"}) from None
         body = _finalize(payload, registry, project.project_id)
         ledger.complete(
             principal_id=principal.principal_id,
@@ -708,10 +747,23 @@ def _dispatch_write(
         raise
     return {
         "_direct": True,
+        "_audited": True,
         "_project_id": project.project_id,
         "_task_id": str(body.get("task_id") or cleaned.get("task_id") or ""),
         "body": body,
     }
+
+
+def _compensate_failed_audit(name: str, cleaned: Mapping[str, Any], payload: Mapping[str, Any], project: ProjectRecord) -> None:
+    task_id = str(payload.get("_task_id") or cleaned.get("task_id") or "")
+    if not task_id:
+        return
+    adapter = _adapter(project)
+    if name == "create_task":
+        adapter.discard_fresh_record(task_id)
+        return
+    if name == "transition_task":
+        adapter.update_record(task_id, {"status": str(cleaned.get("from_status") or "")})
 
 
 def _test_hold(context: Mapping[str, Any]) -> None:
@@ -839,7 +891,7 @@ def _transition_task(cleaned: Mapping[str, Any], project: ProjectRecord, princip
                 from_status=str(cleaned["from_status"]),
                 to_status=str(cleaned["to_status"]),
                 assignee=str(cleaned["assignee"]),
-                task_type=str(cleaned["task_type"]),
+                task_type=_stored_task_type(project, str(cleaned["task_id"]), str(cleaned["task_type"])),
                 end_time=cleaned.get("end_time"),
                 remarks=cleaned.get("remarks"),
                 runner_evidence_id=cleaned.get("evidence_id"),
@@ -1211,7 +1263,20 @@ def _set_visibility(cleaned: Mapping[str, Any], project: ProjectRecord, deleted:
     }
 
 
+def _stored_task_type(project: ProjectRecord, task_id: str, requested: str) -> str:
+    card = _read_card(project, task_id) or {}
+    stored = str(card.get("type") or "").strip().upper()
+    if not stored:
+        stored = "A"
+    asked = str(requested or "").strip().upper()
+    if asked and asked != stored:
+        raise error("FORBIDDEN", details={"reason": "TASK_TYPE"})
+    return stored
+
+
 def _gate_reason(captured: str) -> str:
+    if "类型锁定" in captured:
+        return "TASK_TYPE"
     if "结束时间" in captured:
         return "END_TIME"
     if "并发超限" in captured:
@@ -1287,16 +1352,13 @@ def _request_digest(cleaned: Mapping[str, Any]) -> str:
 
 
 def _call_in_project(project: ProjectRecord, action):
-    key = "YY_FLOW_PROJECT_ROOT"
-    previous = os.environ.get(key)
-    os.environ[key] = project.data_root
+    from scripts import paths
+
+    token = paths.bind_request_data_root(project.data_root)
     try:
         return action()
     finally:
-        if previous is None:
-            os.environ.pop(key, None)
-        else:
-            os.environ[key] = previous
+        paths.reset_request_data_root(token)
 
 
 def note_missing_ids(audit: AuditStore, project_id: str, principal_id: str, count: int) -> None:

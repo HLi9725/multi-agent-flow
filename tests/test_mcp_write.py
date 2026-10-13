@@ -837,3 +837,143 @@ def test_soft_delete_hides_without_changing_status_and_restore_clears_flag(tmp_p
     assert card["status"] == "待开始"
     assert card["is_deleted"] is False
     assert card.get("restored_at")
+
+
+def test_concurrent_project_roots_stay_isolated() -> None:
+    import os
+    import threading
+    import time
+
+    from scripts import paths
+    from scripts._lib.mcp.registry import ProjectRecord
+    from scripts._lib.mcp.service import _call_in_project
+
+    def project(name: str) -> ProjectRecord:
+        return ProjectRecord(
+            project_id=name,
+            display_name=name,
+            org_id="org-1",
+            data_root=name + "-root",
+            board_file=name + "-board",
+            evidence_root=name + "-evidence",
+            board_kind="offline",
+        )
+
+    before = os.environ.get("YY_FLOW_PROJECT_ROOT")
+    barrier = threading.Barrier(2)
+    seen: dict[str, str] = {}
+
+    def run(name: str, record: ProjectRecord) -> None:
+        def action() -> None:
+            barrier.wait(timeout=5)
+            time.sleep(0.05)
+            seen[name] = paths.resolve_data_root()
+
+        _call_in_project(record, action)
+
+    alpha = project("alpha")
+    beta = project("beta")
+    threads = [
+        threading.Thread(target=run, args=("alpha", alpha)),
+        threading.Thread(target=run, args=("beta", beta)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(5)
+        assert not thread.is_alive()
+    assert seen["alpha"].endswith("alpha-root")
+    assert seen["beta"].endswith("beta-root")
+    assert seen["alpha"] != seen["beta"]
+    assert os.environ.get("YY_FLOW_PROJECT_ROOT") == before
+
+
+def test_model_task_type_cannot_skip_review(tmp_path: Path) -> None:
+    registry, board = _prepare(tmp_path, {"alpha": ["read", "task.transition"]}, role="DEV")
+    session = StdioSession(tmp_path, registry=registry)
+    try:
+        session.handshake()
+        created = _create(session, "type-lock-001", "类型锁定")
+        assert created["isError"] is False, created["structuredContent"]
+        task_id = created["structuredContent"]["task_id"]
+        version, status = _version(session, task_id)
+        assert status == "待开始"
+        moved = session.call(
+            "transition_task",
+            {
+                "project_id": "alpha",
+                "task_id": task_id,
+                "idempotency_key": "type-lock-go",
+                "expected_version": version,
+                "from_status": "待开始",
+                "to_status": "进行中",
+                "assignee": "李开发",
+                "task_type": "A",
+            },
+        )
+        assert moved["isError"] is False, moved["structuredContent"]
+        version, status = _version(session, task_id)
+        assert status == "进行中"
+        skipped = session.call(
+            "transition_task",
+            {
+                "project_id": "alpha",
+                "task_id": task_id,
+                "idempotency_key": "type-lock-skip",
+                "expected_version": version,
+                "from_status": "进行中",
+                "to_status": "已完成",
+                "assignee": "李开发",
+                "task_type": "B",
+                "end_time": "2026-10-13 16:40:00",
+            },
+        )
+        assert skipped["isError"] is True
+        assert skipped["structuredContent"]["details"]["reason"] == "TASK_TYPE"
+        _version_after, status_after = _version(session, task_id)
+        assert status_after == "进行中"
+    finally:
+        session.close()
+    cards = json.loads(board.read_text(encoding="utf-8"))
+    card = next(item for item in cards if item.get("id") == task_id)
+    assert card["type"] == "A"
+    assert card["status"] == "进行中"
+
+
+def test_audit_write_failure_does_not_report_success(tmp_path: Path, monkeypatch) -> None:
+    import builtins
+    import getpass
+    import os
+
+    from scripts._lib.mcp.audit_store import AuditStore
+    from scripts._lib.mcp.registry import load_registry
+    from scripts._lib.mcp.service import handle_tool
+
+    registry_path, board = _prepare(tmp_path, {"alpha": ["read", "task.transition"]}, role="DEV")
+    registry = load_registry(str(registry_path))
+    audit = AuditStore(str(tmp_path / "mcp_audit"))
+    real_open = builtins.open
+
+    def broken_open(file, mode="r", *args, **kwargs):
+        text = os.fspath(file)
+        if text.endswith("events.jsonl") and "a" in str(mode):
+            raise OSError("injected audit failure")
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", broken_open)
+    result = handle_tool(
+        "create_task",
+        {
+            "project_id": "alpha",
+            "idempotency_key": "audit-fail-001",
+            "name": "审计失败不应建卡",
+            "type": "A",
+            "assignee": "李开发",
+        },
+        {"registry": registry, "audit": audit, "os_user": getpass.getuser()},
+    )
+    assert result["isError"] is True
+    assert result["structured"]["details"]["reason"] == "AUDIT"
+    cards = json.loads(board.read_text(encoding="utf-8"))
+    assert cards == []
+    assert not (tmp_path / "mcp_audit" / "events.jsonl").exists()

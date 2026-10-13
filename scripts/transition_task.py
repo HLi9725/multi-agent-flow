@@ -305,6 +305,7 @@ def _transition_task_pipeline_impl(
                 "start_date": None,
                 "process": remarks or None,
                 "remarks": remarks or None,
+                "task_type": str(task_type or "A").strip().upper() or "A",
             }
             created_id = adapter.create_record(create_fields)
             if not created_id:
@@ -362,6 +363,17 @@ def _transition_task_pipeline_impl(
         # 4. 任务存在性检查（只读，前置）：确定目标记录与是否需要自动建单
         resolved_record_id = record_id or task_id
         existing = adapter_get(resolved_record_id) if resolved_record_id else None
+        if existing:
+            stored_fields = existing.get("fields") if isinstance(existing.get("fields"), dict) else {}
+            stored_type = str(stored_fields.get("type") or "").strip().upper()
+            requested_type = str(task_type or "").strip().upper()
+            if stored_type and requested_type and stored_type != requested_type:
+                print("[REJECT 类型锁定] 任务类型以看板记录为准，请求中的类型不能改变质量链。")
+                logger.error("[FAILED]  任务类型与看板记录不一致", extra=extra_log)
+                record_audit_event(task_id, current_role, from_status, to_status, assignee, False, "任务类型与记录不一致", delegated_by=delegated_by, delegation_reason=delegation_reason)
+                return False
+            if stored_type:
+                task_type = stored_type
 
         try:
             from _lib.core.runner_transition_gate import validate_managed_transition
@@ -464,6 +476,7 @@ def _transition_task_pipeline_impl(
                 "start_date": None,
                 "process": remarks or None,
                 "remarks": remarks or None,
+                "task_type": str(task_type or "A").strip().upper() or "A",
             }
             created_id = adapter.create_record(create_fields)
             if not created_id:
@@ -521,6 +534,7 @@ def _transition_task_pipeline_impl(
                 resolved_record_id,
                 update_fields,
                 expected_card_version=expected_card_version or "",
+                locked_task_type=str(task_type or ""),
             )
             if not success:
                 actual = str(getattr(adapter, "last_task_version", "") or "")

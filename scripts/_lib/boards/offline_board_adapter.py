@@ -81,6 +81,7 @@ KANBAN_FIELD_MAP: Dict[str, Optional[str]] = {
     "workpackage": "wp",
     "process_desc": "process",
     "remarks": "remarks",
+    "task_type": "type",
     "attachment": None,
 }
 
@@ -88,6 +89,7 @@ KANBAN_FIELD_MAP: Dict[str, Optional[str]] = {
 KANBAN_NATIVE_FIELDS = {
     "id", "name", "wbs", "status", "assignee", "handler", "creator", "est_hours", "act_hours",
     "start_date", "end_date", "stage", "wp", "process", "remarks", "pretask", "seq",
+    "type",
 }
 
 def _card_version(card: Dict[str, Any]) -> str:
@@ -297,7 +299,7 @@ class OfflineBoardAdapter:
                     return {"record_id": c.get("id"), "fields": c}
             return None
 
-    def update_record(self, record_id: str, fields: Dict[str, Any], expected_card_version: str = "") -> bool:
+    def update_record(self, record_id: str, fields: Dict[str, Any], expected_card_version: str = "", locked_task_type: str = "") -> bool:
         """更新指定任务的状态/处理人/描述等字段；记录不存在或企图篡改已验收终态核心状态时返回 False。"""
         with file_lock.acquire_lock(self.seq_lock_file, blocking=True, timeout=5.0):
             cards = self._read_cards()
@@ -308,6 +310,12 @@ class OfflineBoardAdapter:
                         if actual != expected_card_version:
                             self.last_task_version = actual
                             return False
+                    stored_type = str(c.get("type") or "").strip().upper()
+                    requested_type = str(locked_task_type or "").strip().upper()
+                    if stored_type and requested_type and stored_type != requested_type:
+                        self.last_task_version = _card_version(c)
+                        self.last_reject = "TYPE"
+                        return False
                     self.last_task_version = ""
                     # 防篡改硬拦截：在终态【已验收】或【已取消】时，禁止将其跨跃更新至非终态状态
                     translated = self._translate(fields)
@@ -327,6 +335,21 @@ class OfflineBoardAdapter:
                             c["act_hours"] = f"{mins} min"
                     return self._write_cards(cards)
             return False
+
+    def discard_fresh_record(self, record_id: str) -> bool:
+        """审计失败时撤回刚建且仍停在待开始的卡。已离开待开始的卡不删。"""
+        with file_lock.acquire_lock(self.seq_lock_file, blocking=True, timeout=5.0):
+            cards = self._read_cards()
+            kept = []
+            removed = False
+            for card in cards:
+                if str(card.get("id")) == str(record_id) and card.get("status") == "待开始":
+                    removed = True
+                    continue
+                kept.append(card)
+            if not removed:
+                return False
+            return self._write_cards(kept)
 
     @staticmethod
     def _calc_minutes(start_str: str, end_str: str) -> Optional[int]:
