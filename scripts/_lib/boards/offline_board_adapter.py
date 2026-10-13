@@ -90,6 +90,14 @@ KANBAN_NATIVE_FIELDS = {
     "start_date", "end_date", "stage", "wp", "process", "remarks", "pretask", "seq",
 }
 
+def _card_version(card: Dict[str, Any]) -> str:
+    try:
+        from scripts._lib.mcp.service import task_version
+    except ImportError:
+        from _lib.mcp.service import task_version
+    return task_version(card)
+
+
 _TASK_ID_RE = re.compile(r"^T(\d+)$")
 # 流程节点 ID（如 T0001-N03 / T0001-3）: 任务ID + 任务内单调递增节点序号
 _NODE_ID_RE = re.compile(r"\b(T\d+)-N?(\d+)\b")
@@ -289,12 +297,18 @@ class OfflineBoardAdapter:
                     return {"record_id": c.get("id"), "fields": c}
             return None
 
-    def update_record(self, record_id: str, fields: Dict[str, Any]) -> bool:
+    def update_record(self, record_id: str, fields: Dict[str, Any], expected_card_version: str = "") -> bool:
         """更新指定任务的状态/处理人/描述等字段；记录不存在或企图篡改已验收终态核心状态时返回 False。"""
         with file_lock.acquire_lock(self.seq_lock_file, blocking=True, timeout=5.0):
             cards = self._read_cards()
             for c in cards:
                 if str(c.get("id")) == str(record_id):
+                    if expected_card_version:
+                        actual = _card_version(c)
+                        if actual != expected_card_version:
+                            self.last_task_version = actual
+                            return False
+                    self.last_task_version = ""
                     # 防篡改硬拦截：在终态【已验收】或【已取消】时，禁止将其跨跃更新至非终态状态
                     translated = self._translate(fields)
                     curr_st = c.get("status")
@@ -398,6 +412,30 @@ class OfflineBoardAdapter:
             if not self._write_cards(cards):
                 return None
             return task_id
+
+    def set_visibility(self, record_id: str, deleted: bool, expected_card_version: str = "") -> Optional[Dict[str, Any]]:
+        """锁内只改可见性。status 保持不变。找不到返回 None。"""
+        with file_lock.acquire_lock(self.seq_lock_file, blocking=True, timeout=5.0):
+            cards = self._read_cards()
+            for card in cards:
+                if str(card.get("id")) != str(record_id):
+                    continue
+                if expected_card_version:
+                    actual = _card_version(card)
+                    if actual != expected_card_version:
+                        self.last_task_version = actual
+                        return {"conflict": True, "task_version": actual}
+                self.last_task_version = ""
+                already = bool(card.get("is_deleted"))
+                if already == bool(deleted):
+                    return {"conflict": False, "changed": False, "card": dict(card)}
+                card["is_deleted"] = bool(deleted)
+                if not deleted:
+                    card["restored_at"] = datetime.datetime.now().isoformat()
+                if not self._write_cards(cards):
+                    return {"conflict": False, "changed": False, "card": None}
+                return {"conflict": False, "changed": True, "card": dict(card)}
+            return None
 
     def append_remarks(self, record_id: str, remarks_field_name: str, new_text: str) -> bool:
         """原子级追加备注（打回缺陷信息等）；记录不存在返回 False。"""

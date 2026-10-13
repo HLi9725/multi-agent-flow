@@ -9,6 +9,7 @@ from typing import Any, BinaryIO, Dict, Mapping
 
 from scripts.enums import TaskStatus
 
+from .auth import resolve_stdio_principal
 from .errors import McpError, error
 from .protocol import FrameError, MCP_PROTOCOL_VERSION, encode_message, read_message
 from .schema import SCHEMA_VERSION, tool_specs
@@ -62,7 +63,7 @@ def _dispatch(message: Mapping[str, Any], session: _Session, context: Mapping[st
             return [_rpc_ok(request_id, {})]
         if method == "tools/list":
             _require_ready(session)
-            return [_rpc_ok(request_id, {"tools": tool_specs(TaskStatus.all_values())})]
+            return [_rpc_ok(request_id, {"tools": _visible_tools(context)})]
         if method == "tools/call":
             _require_ready(session)
             return [_rpc_ok(request_id, _call_tool(message, context))]
@@ -92,6 +93,18 @@ def _initialize(message: Mapping[str, Any], session: _Session, request_id: Any) 
             "serverInfo": {"name": _SERVER_NAME, "version": SCHEMA_VERSION},
         },
     )
+
+
+def _visible_tools(context: Mapping[str, Any]) -> list:
+    principal = resolve_stdio_principal(context["registry"], str(context.get("os_user") or ""))
+    if principal is None:
+        raise error("UNAUTHENTICATED")
+    if principal.disabled:
+        raise error("REVOKED")
+    scopes = set()
+    for granted in principal.grants.values():
+        scopes.update(granted)
+    return tool_specs(TaskStatus.all_values(), scopes)
 
 
 def _require_ready(session: _Session) -> None:

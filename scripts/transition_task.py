@@ -206,6 +206,9 @@ def _transition_task_pipeline_impl(
     force: bool = False,
     no_dup_check: bool = False,
     runner_evidence_id: Optional[str] = None,
+    expected_card_version: str = "",
+    version_state: Optional[Dict[str, Any]] = None,
+    created_state: Optional[Dict[str, Any]] = None,
 ) -> bool:
     resolved_task_id = task_id or "AUTO"
     extra_log = {"task_id": resolved_task_id}
@@ -310,6 +313,8 @@ def _transition_task_pipeline_impl(
                 return False
             logger.info(f" 任务 {created_id} 已建卡【待开始】(负责人: {effective_owner}, 处理人: {effective_assignee})", extra={"task_id": created_id})
             record_audit_event(created_id, current_role, "新建", "待开始", effective_assignee, True, "显式建单", delegated_by=delegated_by, delegation_reason=delegation_reason)
+            if created_state is not None:
+                created_state["task_id"] = created_id
             return True
 
         # 从配置与现有工单解析 task_name 与 max_parallel_tasks
@@ -512,8 +517,16 @@ def _transition_task_pipeline_impl(
         orig_handler = (existing.get("fields", {}).get(handler_key) or existing.get("fields", {}).get("handler") if existing else None) or current_role
 
         try:
-            success = adapter.update_record(resolved_record_id, update_fields)
+            success = adapter.update_record(
+                resolved_record_id,
+                update_fields,
+                expected_card_version=expected_card_version or "",
+            )
             if not success:
+                actual = str(getattr(adapter, "last_task_version", "") or "")
+                if actual and version_state is not None:
+                    version_state["conflict"] = True
+                    version_state["task_version"] = actual
                 logger.error("[FAILED]  物理 API 写入失败，硬阻断流转！", extra=extra_log)
                 record_audit_event(task_id, current_role, from_status, to_status, assignee, False, "看板状态 API 写入失败", delegated_by=delegated_by, delegation_reason=delegation_reason)
                 return False

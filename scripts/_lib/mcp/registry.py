@@ -33,6 +33,7 @@ class PrincipalRecord:
     org_id: str
     grants: Mapping[str, frozenset]
     disabled: bool = False
+    role: str = "DEV"
 
 
 @dataclass
@@ -175,12 +176,18 @@ def _parse_principal(item: Mapping[str, object]) -> PrincipalRecord:
             raise RegistryError("登记文件无法读取")
         grants[project_id] = frozenset(scopes)
     disabled = bool(item.get("disabled", False))
+    role = item.get("role", "DEV")
+    if not isinstance(role, str) or role.upper() not in {
+        "PM", "DEV", "FRONTEND", "REVIEWER", "QA", "DOCS", "DEVOPS", "ARCHITECT",
+    }:
+        raise RegistryError("登记文件无法读取")
     return PrincipalRecord(
         os_user=os_user.strip(),
         principal_id=principal_id.strip(),
         org_id=org_id.strip(),
         grants=grants,
         disabled=disabled,
+        role=role.upper(),
     )
 
 

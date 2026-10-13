@@ -16,6 +16,7 @@ class AuthContext:
     org_id: str
     grants: Mapping[str, frozenset]
     disabled: bool
+    role: str = "DEV"
 
 
 def current_os_user() -> str:
@@ -45,6 +46,7 @@ def _from_record(record: PrincipalRecord) -> AuthContext:
         org_id=record.org_id,
         grants=record.grants,
         disabled=record.disabled,
+        role=record.role,
     )
 
 

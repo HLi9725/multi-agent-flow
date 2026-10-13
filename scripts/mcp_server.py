@@ -54,6 +54,7 @@ def main(argv: list[str] | None = None) -> int:
         "registry": registry,
         "audit": AuditStore(audit_dir),
         "os_user": current_os_user(),
+        "acceptance_confirmed": os.environ.get("YY_FLOW_MCP_ACCEPTANCE_CONFIRMED") == "1",
     }
     serve(sys.stdin.buffer, sys.stdout.buffer, context)
     return 0

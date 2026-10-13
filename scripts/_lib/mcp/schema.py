@@ -17,6 +17,30 @@ PROJECT_ID_RE = re.compile(PROJECT_ID_PATTERN)
 TASK_ID_RE = re.compile(TASK_ID_PATTERN)
 
 READ_TOOL_NAMES = ("get_project", "get_task", "list_tasks", "get_status")
+WRITE_TOOL_NAMES = (
+    "create_task",
+    "submit_evidence",
+    "transition_task",
+    "request_acceptance",
+    "soft_delete",
+    "restore",
+)
+TOOL_SCOPE = {
+    "get_project": "read",
+    "get_task": "read",
+    "list_tasks": "read",
+    "get_status": "read",
+    "create_task": "task.transition",
+    "transition_task": "task.transition",
+    "submit_evidence": "evidence.submit",
+    "request_acceptance": "acceptance",
+    "soft_delete": "admin",
+    "restore": "admin",
+}
+IDEMPOTENCY_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$"
+VERSION_PATTERN = r"^[0-9a-f]{64}$"
+EVIDENCE_TYPES = ("task_start", "task_transition", "task_complete", "user_confirmation")
+TASK_TYPES = ("A", "B", "C", "D", "E", "F", "G")
 
 STRING_PARAM_MAX_BYTES = 8 * 1024
 TEXT_FIELD_MAX_BYTES = 4 * 1024
@@ -78,7 +102,7 @@ def _task_id_schema() -> Dict[str, Any]:
     return {"type": "string", "pattern": TASK_ID_PATTERN, "maxLength": 64}
 
 
-def tool_specs(status_enum: List[str]) -> List[Dict[str, Any]]:
+def tool_specs(status_enum: List[str], scopes: Any = None) -> List[Dict[str, Any]]:
     status_schema = {"type": "string", "enum": list(status_enum), "maxLength": 32}
     specs = [
         {
@@ -128,8 +152,127 @@ def tool_specs(status_enum: List[str]) -> List[Dict[str, Any]]:
                 ["project_id", "task_id"],
             ),
         },
+        {
+            "name": "create_task",
+            "description": "创建待开始任务卡",
+            "inputSchema": _object_schema(
+                {
+                    "project_id": _project_id_schema(),
+                    "idempotency_key": {"type": "string", "pattern": IDEMPOTENCY_PATTERN, "maxLength": 128},
+                    "name": {"type": "string", "maxLength": 200},
+                    "type": {"type": "string", "enum": list(TASK_TYPES), "maxLength": 8},
+                    "assignee": {"type": "string", "maxLength": 256},
+                    "stage": {"type": "string", "maxLength": 256},
+                    "wp": {"type": "string", "maxLength": 256},
+                    "wbs": {"type": "string", "maxLength": 256},
+                    "owner": {"type": "string", "maxLength": 256},
+                    "force_duplicate": {"type": "boolean"},
+                },
+                ["project_id", "idempotency_key", "name", "type", "assignee"],
+            ),
+        },
+        {
+            "name": "submit_evidence",
+            "description": "上传证据记录，不推进状态",
+            "inputSchema": _object_schema(
+                {
+                    "project_id": _project_id_schema(),
+                    "task_id": _task_id_schema(),
+                    "idempotency_key": {"type": "string", "pattern": IDEMPOTENCY_PATTERN, "maxLength": 128},
+                    "expected_version": {"type": "string", "pattern": VERSION_PATTERN, "maxLength": 64},
+                    "evidence_type": {"type": "string", "enum": list(EVIDENCE_TYPES), "maxLength": 64},
+                    "baseline_commit": {"type": "string", "maxLength": 128},
+                    "result_commit": {"type": "string", "maxLength": 128},
+                    "metadata": {"type": "object"},
+                    "artifacts": {"type": "array"},
+                },
+                [
+                    "project_id",
+                    "task_id",
+                    "idempotency_key",
+                    "expected_version",
+                    "evidence_type",
+                    "baseline_commit",
+                    "result_commit",
+                    "metadata",
+                    "artifacts",
+                ],
+            ),
+        },
+        {
+            "name": "transition_task",
+            "description": "按现有门禁推进任务状态",
+            "inputSchema": _object_schema(
+                {
+                    "project_id": _project_id_schema(),
+                    "task_id": _task_id_schema(),
+                    "idempotency_key": {"type": "string", "pattern": IDEMPOTENCY_PATTERN, "maxLength": 128},
+                    "expected_version": {"type": "string", "pattern": VERSION_PATTERN, "maxLength": 64},
+                    "from_status": status_schema,
+                    "to_status": status_schema,
+                    "assignee": {"type": "string", "maxLength": 256},
+                    "task_type": {"type": "string", "enum": list(TASK_TYPES), "maxLength": 8},
+                    "end_time": {"type": "string", "maxLength": 64},
+                    "remarks": {"type": "string", "maxLength": 4096},
+                    "evidence_id": {"type": "string", "maxLength": 64},
+                },
+                [
+                    "project_id",
+                    "task_id",
+                    "idempotency_key",
+                    "expected_version",
+                    "from_status",
+                    "to_status",
+                    "assignee",
+                    "task_type",
+                ],
+            ),
+        },
+        {
+            "name": "request_acceptance",
+            "description": "在独立授权下请求用户验收",
+            "inputSchema": _object_schema(
+                {
+                    "project_id": _project_id_schema(),
+                    "task_id": _task_id_schema(),
+                    "idempotency_key": {"type": "string", "pattern": IDEMPOTENCY_PATTERN, "maxLength": 128},
+                    "expected_version": {"type": "string", "pattern": VERSION_PATTERN, "maxLength": 64},
+                    "evidence_id": {"type": "string", "maxLength": 64},
+                },
+                ["project_id", "task_id", "idempotency_key", "expected_version", "evidence_id"],
+            ),
+        },
+        {
+            "name": "soft_delete",
+            "description": "软删除任务卡且不改变状态",
+            "inputSchema": _object_schema(
+                {
+                    "project_id": _project_id_schema(),
+                    "task_id": _task_id_schema(),
+                    "idempotency_key": {"type": "string", "pattern": IDEMPOTENCY_PATTERN, "maxLength": 128},
+                    "expected_version": {"type": "string", "pattern": VERSION_PATTERN, "maxLength": 64},
+                },
+                ["project_id", "task_id", "idempotency_key", "expected_version"],
+            ),
+        },
+        {
+            "name": "restore",
+            "description": "恢复软删除任务卡且不改变状态",
+            "inputSchema": _object_schema(
+                {
+                    "project_id": _project_id_schema(),
+                    "task_id": _task_id_schema(),
+                    "idempotency_key": {"type": "string", "pattern": IDEMPOTENCY_PATTERN, "maxLength": 128},
+                    "expected_version": {"type": "string", "pattern": VERSION_PATTERN, "maxLength": 64},
+                },
+                ["project_id", "task_id", "idempotency_key", "expected_version"],
+            ),
+        },
     ]
-    return specs
+    if scopes is None:
+        return specs
+    granted = set(scopes)
+    return [item for item in specs if TOOL_SCOPE[item["name"]] in granted]
 
 
 def _fail(reason: str, field: str | None = None) -> None:
@@ -189,5 +332,11 @@ def validate_arguments(spec: Mapping[str, Any], arguments: Mapping[str, Any]) ->
             _check_integer(key, value, prop)
         elif kind == "boolean":
             _check_boolean(key, value)
+        elif kind == "object":
+            if not isinstance(value, dict):
+                _fail("BAD_TYPE", key)
+        elif kind == "array":
+            if not isinstance(value, list):
+                _fail("BAD_TYPE", key)
         else:
             _fail("BAD_TYPE", key)

@@ -127,13 +127,16 @@ class _Capture:
 
 
 class StdioSession:
-    def __init__(self, tmp: Path, registry: Path | None = None, env_registry: bool = False) -> None:
+    def __init__(self, tmp: Path, registry: Path | None = None, env_registry: bool = False, env_extra: dict | None = None) -> None:
         self.tmp = tmp
         registry = registry or _registry(tmp)
         self.registry = registry
         env = os.environ.copy()
         env.pop("YY_FLOW_MCP_REGISTRY", None)
+        env.pop("YY_FLOW_MCP_ACCEPTANCE_CONFIRMED", None)
         env["YY_FLOW_PROJECT_ROOT"] = str(tmp)
+        if env_extra:
+            env.update(env_extra)
         command = [sys.executable, str(SERVER), "stdio"]
         if env_registry:
             env["YY_FLOW_MCP_REGISTRY"] = str(registry)
