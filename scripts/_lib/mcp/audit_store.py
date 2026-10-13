@@ -42,6 +42,7 @@ class AuditStore:
         arguments: Mapping[str, Any] | None = None,
         diagnostic: str = "",
         required: bool = False,
+        event_id: str = "",
     ) -> None:
         record: Dict[str, Any] = {
             "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -54,12 +55,19 @@ class AuditStore:
         }
         if diagnostic:
             record["diagnostic"] = diagnostic[:64]
+        if event_id:
+            record["event_id"] = event_id[:64]
         try:
             with file_lock.acquire_lock(self._lock, blocking=True, timeout=5.0):
                 if not self._chain_intact():
                     if required:
                         raise AuditWriteError()
                     return
+                if event_id and os.path.isfile(self._path):
+                    with open(self._path, "r", encoding="utf-8") as handle:
+                        for raw in handle:
+                            if raw.strip() and json.loads(raw).get("event_id") == event_id:
+                                return
                 previous, seq = self._tail()
                 record["seq"] = seq + 1
                 record["prev_sha256"] = previous
@@ -78,7 +86,7 @@ class AuditStore:
                 os.replace(temporary, self._tip)
         except AuditWriteError:
             raise
-        except OSError:
+        except (OSError, file_lock.LockBusyError):
             if required:
                 raise AuditWriteError() from None
             return

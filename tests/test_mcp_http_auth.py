@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import subprocess
@@ -359,7 +360,11 @@ def test_unauthenticated_expired_audience_and_bad_signature(tmp_path: Path) -> N
         assert json.loads(text)["error"]["data"]["code"] == "UNAUTHENTICATED"
 
         forged = _token(_claims(jti="forged-jti"))
-        forged = forged[:-1] + ("A" if forged[-1] != "A" else "B")
+        prefix, encoded_signature = forged.rsplit(".", 1)
+        signature = base64.urlsafe_b64decode(encoded_signature + "=" * (-len(encoded_signature) % 4))
+        changed_signature = bytes([signature[0] ^ 1]) + signature[1:]
+        assert changed_signature != signature
+        forged = prefix + "." + base64.urlsafe_b64encode(changed_signature).decode("ascii").rstrip("=")
         status, _, body = server.request(
             {"jsonrpc": "2.0", "id": 4, "method": "initialize", "params": {"protocolVersion": MCP_PROTOCOL_VERSION, "capabilities": {}, "clientInfo": {"name": "x", "version": "0"}}},
             token=forged,

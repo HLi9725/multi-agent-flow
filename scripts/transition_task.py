@@ -179,6 +179,10 @@ def invoke_update_record(adapter, record_id, fields, expected_card_version="", l
         params = inspect.signature(adapter.update_record).parameters
     except (TypeError, ValueError):
         params = {}
+    if expected_card_version and "expected_card_version" not in params:
+        raise ValueError("Adapter does not support conditional version writes")
+    if locked_task_type and "locked_task_type" not in params:
+        raise ValueError("Adapter does not support atomic task type locking")
     if "expected_card_version" in params:
         kwargs["expected_card_version"] = expected_card_version or ""
     if "locked_task_type" in params:
@@ -379,6 +383,7 @@ def _transition_task_pipeline_impl(
         # 4. 任务存在性检查（只读，前置）：确定目标记录与是否需要自动建单
         resolved_record_id = record_id or task_id
         existing = adapter_get(resolved_record_id) if resolved_record_id else None
+        stored_type = ""
         if existing:
             stored_fields = existing.get("fields") if isinstance(existing.get("fields"), dict) else {}
             stored_type = str(stored_fields.get("type") or "").strip().upper()
@@ -551,7 +556,7 @@ def _transition_task_pipeline_impl(
                 resolved_record_id,
                 update_fields,
                 expected_card_version=expected_card_version or "",
-                locked_task_type=str(task_type or ""),
+                locked_task_type=str(task_type or "") if stored_type else "",
             )
             if not success:
                 actual = str(getattr(adapter, "last_task_version", "") or "")

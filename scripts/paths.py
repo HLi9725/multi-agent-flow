@@ -28,51 +28,28 @@ data_root 优先级（高 → 低）：
 """
 
 import contextvars
+import hashlib
 import os
+import sys
+import types
 
 _ENV_PROJECT_ROOT = "YY_FLOW_PROJECT_ROOT"
-_REQUEST_DATA_ROOT: contextvars.ContextVar[str] = contextvars.ContextVar(
-    "yy_flow_request_data_root",
-    default="",
-)
-
-
-def _path_module_copies():
-    """同一文件可能同时以 paths 和 scripts.paths 装入。上下文必须写到每一份。"""
-    import sys
-
-    if "paths" not in sys.modules:
-        import importlib
-
-        try:
-            importlib.import_module("paths")
-        except ImportError:
-            pass
-    found = []
-    for name in ("paths", "scripts.paths"):
-        module = sys.modules.get(name)
-        if module is not None and module not in found and hasattr(module, "_REQUEST_DATA_ROOT"):
-            found.append(module)
-    current = sys.modules.get(__name__)
-    if current is not None and current not in found:
-        found.append(current)
-    return found
+# 按物理文件共享状态：即使另一导入名在首次请求中稍后加载，也取同一变量。
+# 不共享不同 Skill 安装的数据，不改进程环境变量或依赖导入顺序。
+_state_name = "_yy_flow_paths_" + hashlib.sha256(
+    os.path.normcase(os.path.realpath(__file__)).encode("utf-8")
+).hexdigest()
+_candidate_state = types.ModuleType(_state_name)
+_candidate_state.request_data_root = contextvars.ContextVar("yy_flow_request_data_root", default="")
+_REQUEST_DATA_ROOT = sys.modules.setdefault(_state_name, _candidate_state).request_data_root
 
 
 def bind_request_data_root(path: str):
     """把本次请求的数据根绑定到当前上下文，不写入进程环境变量。"""
-    absolute = os.path.abspath(path)
-    tokens = []
-    for module in _path_module_copies():
-        tokens.append((module, module._REQUEST_DATA_ROOT.set(absolute)))
-    return tuple(tokens)
+    return _REQUEST_DATA_ROOT.set(os.path.abspath(path))
 
 
 def reset_request_data_root(token) -> None:
-    if isinstance(token, tuple):
-        for module, item in reversed(token):
-            module._REQUEST_DATA_ROOT.reset(item)
-        return
     _REQUEST_DATA_ROOT.reset(token)
 
 _SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))

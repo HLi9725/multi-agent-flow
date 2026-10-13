@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Mapping, Tuple
 
 from ..boards.offline_board_adapter import OfflineBoardAdapter
 from ..core.workflow_policy import PROFILE_STANDARD, PolicyError, load_policy_file
+from ..core.file_lock import LockBusyError
 from . import auth
 from .audit_store import AuditStore, AuditWriteError
 from .errors import McpError, error
@@ -72,7 +73,7 @@ def handle_tool(name: str, arguments: Any, context: Mapping[str, Any]) -> Dict[s
             payload = _dispatch(name, arguments, registry, principal)
         if payload.get("_direct"):
             body = payload["body"]
-            if payload.get("_audited"):
+            if payload.get("_audit_handled") or payload.get("_audited"):
                 return {"isError": False, "structured": body}
             audit.append(
                 principal_id=principal_id,
@@ -669,6 +670,10 @@ def _dispatch_write(
     )
     if decision["action"] == "replay":
         body = dict(decision.get("result") or {})
+        if decision.get("audit_pending"):
+            return _settle_write_audit(name, cleaned, arguments, project, principal,
+                                       context["audit"], ledger, digest, body, replayed=True)
+        body["audit_status"] = "COMPLETE"
         body["replayed"] = True
         body["code"] = "IDEMPOTENCY_REPLAY"
         return {"_direct": True, "_project_id": project.project_id, "_task_id": str(body.get("task_id") or cleaned.get("task_id") or ""), "body": body}
@@ -703,6 +708,7 @@ def _dispatch_write(
         )
         raise error("GATE_REJECTED", details={"reason": "AUDIT"}) from None
     _test_hold(context)
+    business_applied = False
     try:
         payload = _execute_write(
             name,
@@ -715,48 +721,69 @@ def _dispatch_write(
             digest,
             decision.get("target") if isinstance(decision.get("target"), dict) else {},
         )
+        business_applied = True
         task_id = str(payload.get("_task_id") or cleaned.get("task_id") or "")
         body = _finalize(payload, registry, project.project_id)
+        # 持久化 APPLIED 后再补终态审计；任何后续故障都不能重执已应用的业务。
         try:
-            _audit("OK", task_id)
-        except AuditWriteError:
-            ledger.complete(
+            ledger.applied(principal_id=principal.principal_id, tool=name,
+                           key=cleaned["idempotency_key"], digest=digest, result=body)
+        except (OSError, LockBusyError):
+            # 已存在持久化 PENDING/target。只允许事实对账恢复，不能标记可重执失败。
+            response = dict(body)
+            response.update(code="APPLIED_LEDGER_PENDING", business_status="APPLIED",
+                            reconciliation_status="PENDING", audit_status="PENDING")
+            return {"_direct": True, "_audit_handled": True, "_audited": False,
+                    "_project_id": project.project_id, "_task_id": task_id, "body": response}
+    except McpError as exc:
+        if not business_applied:
+            ledger.fail(
                 principal_id=principal.principal_id,
                 tool=name,
                 key=cleaned["idempotency_key"],
                 digest=digest,
-                result=body,
+                code=exc.code,
             )
-            return {
-                "_direct": True,
-                "_audited": True,
-                "_project_id": project.project_id,
-                "_task_id": task_id,
-                "body": body,
-            }
-        ledger.complete(
-            principal_id=principal.principal_id,
-            tool=name,
-            key=cleaned["idempotency_key"],
-            digest=digest,
-            result=body,
-        )
-    except McpError as exc:
-        ledger.fail(
-            principal_id=principal.principal_id,
-            tool=name,
-            key=cleaned["idempotency_key"],
-            digest=digest,
-            code=exc.code,
-        )
         raise
-    return {
-        "_direct": True,
-        "_audited": True,
-        "_project_id": project.project_id,
-        "_task_id": str(body.get("task_id") or cleaned.get("task_id") or ""),
-        "body": body,
-    }
+    return _settle_write_audit(name, cleaned, arguments, project, principal,
+                               audit, ledger, digest, body)
+
+
+def _settle_write_audit(name, cleaned, arguments, project, principal, audit, ledger,
+                        digest, body, *, replayed=False):
+    """同键恢复补审计。业务结果与审计状态分开报告，终态事件可幂等追加。"""
+    task_id = str(body.get("task_id") or cleaned.get("task_id") or "")
+    event_id = hashlib.sha256(
+        f"{project.project_id}|{principal.principal_id}|{name}|{cleaned['idempotency_key']}|{digest}".encode("utf-8")
+    ).hexdigest()
+    response = dict(body)
+    completed = False
+    try:
+        audit.append(principal_id=principal.principal_id, project_id=project.project_id,
+                     tool=name, code="OK", task_id=task_id,
+                     arguments=_argument_view(arguments), required=True, event_id=event_id)
+    except AuditWriteError:
+        response.update(audit_status="PENDING", business_status="APPLIED",
+                        code="APPLIED_AUDIT_PENDING")
+        audited = False
+    else:
+        response["audit_status"] = "COMPLETE"
+        audited = True
+        try:
+            ledger.complete(principal_id=principal.principal_id, tool=name,
+                            key=cleaned["idempotency_key"], digest=digest,
+                            result=body, audit_event_id=event_id)
+        except (OSError, LockBusyError):
+            response.update(code="APPLIED_LEDGER_PENDING", business_status="APPLIED",
+                            reconciliation_status="PENDING")
+        else:
+            completed = True
+    if replayed:
+        response["replayed"] = True
+        if completed:
+            response["code"] = "IDEMPOTENCY_REPLAY"
+    return {"_direct": True, "_audit_handled": True, "_audited": audited,
+            "_project_id": project.project_id, "_task_id": task_id, "body": response}
 
 
 def _test_hold(context: Mapping[str, Any]) -> None:

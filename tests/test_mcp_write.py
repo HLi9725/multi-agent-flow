@@ -1028,13 +1028,12 @@ def test_legacy_adapters_reject_unknown_update_kwargs() -> None:
             return True
 
     adapter = OldAdapter()
-    assert invoke_update_record(
-        adapter,
-        "T0001",
-        {"status": "进行中"},
-        expected_card_version="version-1",
-        locked_task_type="A",
-    ) is True
+    import pytest
+    for conditions in ({"expected_card_version": "version-1"}, {"locked_task_type": "A"}):
+        with pytest.raises(ValueError):
+            invoke_update_record(adapter, "T0001", {"status": "进行中"}, **conditions)
+        assert not hasattr(adapter, "got")
+    assert invoke_update_record(adapter, "T0001", {"status": "进行中"}) is True
     assert adapter.got == ("T0001", {"status": "进行中"})
 
 
@@ -1066,11 +1065,14 @@ def test_audit_failure_after_write_does_not_create_another_card(tmp_path: Path, 
     context = {"registry": registry, "audit": audit, "os_user": getpass.getuser()}
     first = handle_tool("create_task", arguments, context)
     assert first["isError"] is False, first["structured"]
+    assert first["structured"]["audit_status"] == "PENDING"
+    assert first["structured"]["code"] == "APPLIED_AUDIT_PENDING"
     task_id = first["structured"]["task_id"]
     second = handle_tool("create_task", arguments, context)
     assert second["isError"] is False, second["structured"]
     assert second["structured"]["task_id"] == task_id
     assert second["structured"]["replayed"] is True
+    assert second["structured"]["audit_status"] == "PENDING"
     cards = json.loads(board.read_text(encoding="utf-8"))
     assert [item.get("id") for item in cards] == [task_id]
 
@@ -1121,6 +1123,7 @@ def test_soft_delete_audit_failure_keeps_visible_result(tmp_path: Path, monkeypa
     )
     assert hidden["isError"] is False, hidden["structured"]
     assert hidden["structured"]["is_deleted"] is True
+    assert hidden["structured"]["audit_status"] == "PENDING"
     cards = json.loads(board.read_text(encoding="utf-8"))
     card = next(item for item in cards if item.get("id") == task_id)
     assert card["is_deleted"] is True
@@ -1138,3 +1141,192 @@ def test_soft_delete_audit_failure_keeps_visible_result(tmp_path: Path, monkeypa
     assert again["isError"] is False, again["structured"]
     assert again["structured"]["replayed"] is True
     assert again["structured"]["is_deleted"] is True
+
+
+def test_cold_process_late_domain_import_and_nested_roots(tmp_path: Path) -> None:
+    import os
+    import subprocess
+    import sys
+
+    code = '''
+import json, sys, threading
+from types import SimpleNamespace
+from scripts._lib.mcp.service import _call_in_project
+assert "paths" not in sys.modules
+seen = {}
+errors = []
+barrier = threading.Barrier(2)
+def worker(name):
+    def action():
+        import scripts.transition_task as domain
+        from scripts import paths
+        barrier.wait(timeout=5)
+        seen[name] = [domain.paths.resolve_data_root(), domain.paths.locks_dir()]
+        def nested():
+            assert paths.resolve_data_root().endswith("nested")
+            assert domain.paths.resolve_data_root().endswith("nested")
+        _call_in_project(SimpleNamespace(data_root=sys.argv[1]+"/nested"), nested)
+        assert domain.paths.resolve_data_root().endswith(name)
+    _call_in_project(SimpleNamespace(data_root=sys.argv[1]+"/"+name), action)
+def checked_worker(name):
+    try:
+        worker(name)
+    except BaseException as exc:
+        errors.append(repr(exc))
+threads = [threading.Thread(target=checked_worker,args=(name,)) for name in ("alpha","beta")]
+for thread in threads: thread.start()
+for thread in threads:
+    thread.join(10)
+    assert not thread.is_alive()
+assert len(seen) == 2
+assert not errors, errors
+for name, pair in seen.items():
+    assert pair[0].endswith(name), pair
+    assert name in pair[1], pair
+print(json.dumps(seen))
+'''
+    env = os.environ.copy()
+    env.pop("YY_FLOW_PROJECT_ROOT", None)
+    result = subprocess.run([sys.executable, "-c", code, str(tmp_path)],
+                            cwd=Path(__file__).resolve().parents[1], env=env,
+                            capture_output=True, text=True, encoding="utf-8", timeout=20)
+    assert result.returncode == 0, result.stderr
+    assert set(json.loads(result.stdout)) == {"alpha", "beta"}
+
+
+def test_applied_audit_recovers_after_process_restart(tmp_path: Path, monkeypatch) -> None:
+    import getpass
+    import subprocess
+    import sys
+
+    from scripts._lib.mcp.audit_store import AuditStore, AuditWriteError
+    from scripts._lib.mcp.registry import load_registry
+    from scripts._lib.mcp.service import handle_tool
+
+    registry_path, board = _prepare(tmp_path, {"alpha": ["read", "task.transition"]}, role="DEV")
+    audit_dir = tmp_path / "restart-audit"
+    audit = AuditStore(str(audit_dir))
+    real_append = AuditStore.append
+    def fail_terminal(self, **kwargs):
+        if kwargs.get("event_id"):
+            raise AuditWriteError()
+        return real_append(self, **kwargs)
+    monkeypatch.setattr(AuditStore, "append", fail_terminal)
+    arguments = {"project_id": "alpha", "idempotency_key": "restart-audit-01",
+                 "name": "审计重启补记", "type": "A", "assignee": "李开发"}
+    context = {"registry": load_registry(str(registry_path)), "audit": audit, "os_user": getpass.getuser()}
+    first = handle_tool("create_task", arguments, context)
+    assert first["structured"]["audit_status"] == "PENDING"
+    task_id = first["structured"]["task_id"]
+    code = '''
+import getpass,json,sys
+from scripts._lib.mcp.audit_store import AuditStore
+from scripts._lib.mcp.registry import load_registry
+from scripts._lib.mcp.service import handle_tool
+ctx={"registry":load_registry(sys.argv[1]),"audit":AuditStore(sys.argv[2]),"os_user":getpass.getuser()}
+print(json.dumps(handle_tool("create_task",json.loads(sys.argv[3]),ctx)))
+'''
+    result = subprocess.run([sys.executable, "-c", code, str(registry_path), str(audit_dir),
+                             json.dumps(arguments)], cwd=Path(__file__).resolve().parents[1],
+                            capture_output=True, text=True, encoding="utf-8", timeout=20)
+    assert result.returncode == 0, result.stderr
+    recovered = json.loads(result.stdout)
+    assert not recovered["isError"]
+    assert recovered["structured"]["task_id"] == task_id
+    assert recovered["structured"]["audit_status"] == "COMPLETE"
+    assert recovered["structured"]["replayed"]
+    assert [c["id"] for c in json.loads(board.read_text(encoding="utf-8"))] == [task_id]
+    records = [json.loads(line) for line in Path(audit._path).read_text(encoding="utf-8").splitlines()]
+    assert len([r for r in records if r.get("event_id") and r["code"] == "OK"]) == 1
+
+
+def test_crash_after_terminal_audit_does_not_duplicate_audit(tmp_path: Path, monkeypatch) -> None:
+    import getpass
+    from scripts._lib.mcp.audit_store import AuditStore
+    from scripts._lib.mcp.idempotency import IdempotencyStore
+    from scripts._lib.mcp.registry import load_registry
+    from scripts._lib.mcp.service import handle_tool
+
+    registry_path, board = _prepare(tmp_path, {"alpha": ["read", "task.transition"]}, role="DEV")
+    audit = AuditStore(str(tmp_path / "terminal-crash"))
+    context = {"registry": load_registry(str(registry_path)), "audit": audit, "os_user": getpass.getuser()}
+    arguments = {"project_id": "alpha", "idempotency_key": "terminal-crash-01",
+                 "name": "终态审计后故障", "type": "A", "assignee": "李开发"}
+    with monkeypatch.context() as scoped:
+        def fail_completion(*args, **kwargs):
+            raise OSError("injected completion failure")
+        scoped.setattr(IdempotencyStore, "complete", fail_completion)
+        applied = handle_tool("create_task", arguments, context)
+        assert not applied["isError"]
+        assert applied["structured"]["code"] == "APPLIED_LEDGER_PENDING"
+        assert applied["structured"]["business_status"] == "APPLIED"
+        assert applied["structured"]["audit_status"] == "COMPLETE"
+    result = handle_tool("create_task", arguments, context)
+    assert result["structured"]["audit_status"] == "COMPLETE"
+    assert result["structured"]["replayed"]
+    assert len(json.loads(board.read_text(encoding="utf-8"))) == 1
+    records = [json.loads(line) for line in Path(audit._path).read_text(encoding="utf-8").splitlines()]
+    assert len([r for r in records if r.get("event_id")]) == 1
+
+
+def test_unreadable_or_corrupt_ledger_never_reexecutes(tmp_path: Path, monkeypatch) -> None:
+    import builtins
+    import getpass
+    import pytest
+    from scripts._lib.mcp.audit_store import AuditStore
+    from scripts._lib.mcp.idempotency import IdempotencyReadError
+    from scripts._lib.mcp.registry import load_registry
+    from scripts._lib.mcp.service import handle_tool
+
+    registry_path, board = _prepare(tmp_path, {"alpha": ["read", "task.transition"]}, role="DEV")
+    ctx = {"registry": load_registry(str(registry_path)),
+           "audit": AuditStore(str(tmp_path / "ledger-audit")), "os_user": getpass.getuser()}
+    arguments = {"project_id": "alpha", "idempotency_key": "ledger-read-01",
+                 "name": "账本不可读不重执行", "type": "A", "assignee": "李开发"}
+    first = handle_tool("create_task", arguments, ctx)
+    assert not first["isError"]
+    original = board.read_bytes()
+    real_open = builtins.open
+    def unreadable(file, mode="r", *args, **kwargs):
+        if str(file).endswith("alpha.jsonl") and mode == "r":
+            raise OSError("injected ledger read failure")
+        return real_open(file, mode, *args, **kwargs)
+    with monkeypatch.context() as scoped:
+        scoped.setattr(builtins, "open", unreadable)
+        with pytest.raises(IdempotencyReadError):
+            handle_tool("create_task", arguments, ctx)
+    assert board.read_bytes() == original
+    ledger_path = board.parent.parent / "mcp_idempotency" / "alpha.jsonl"
+    with ledger_path.open("a", encoding="utf-8") as handle:
+        handle.write("{partial-record\n")
+    with pytest.raises(IdempotencyReadError):
+        handle_tool("create_task", arguments, ctx)
+    assert board.read_bytes() == original
+
+
+def test_protocol_preserves_applied_status_on_ledger_completion_failure(tmp_path: Path, monkeypatch) -> None:
+    import getpass
+    from scripts._lib.mcp.audit_store import AuditStore
+    from scripts._lib.mcp.idempotency import IdempotencyStore
+    from scripts._lib.mcp.registry import load_registry
+    from scripts._lib.mcp.stdio_server import RpcSession, dispatch_rpc
+
+    registry_path, board = _prepare(tmp_path, {"alpha": ["read", "task.transition"]}, role="DEV")
+    context = {"registry": load_registry(str(registry_path)),
+               "audit": AuditStore(str(tmp_path / "protocol-audit")), "os_user": getpass.getuser()}
+    message = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+        "name": "create_task", "arguments": {"project_id": "alpha", "idempotency_key": "rpc-ledger-01",
+        "name": "协议保留已应用状态", "type": "A", "assignee": "李开发"}}}
+    session = RpcSession(announced=True, ready=True)
+    with monkeypatch.context() as scoped:
+        def fail_complete(*args, **kwargs):
+            raise OSError("injected ledger completion failure")
+        scoped.setattr(IdempotencyStore, "complete", fail_complete)
+        response = dispatch_rpc(message, session, context)[0]
+    assert "error" not in response
+    assert response["result"]["structuredContent"]["code"] == "APPLIED_LEDGER_PENDING"
+    assert response["result"]["structuredContent"]["business_status"] == "APPLIED"
+    recovered = dispatch_rpc(message, session, context)[0]
+    assert recovered["result"]["structuredContent"]["audit_status"] == "COMPLETE"
+    assert recovered["result"]["structuredContent"]["replayed"]
+    assert len(json.loads(board.read_text(encoding="utf-8"))) == 1

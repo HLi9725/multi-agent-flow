@@ -15,6 +15,10 @@ from .registry import ProjectRecord
 _PENDING_SECONDS = 60
 
 
+class IdempotencyReadError(OSError):
+    """账本不可读取时禁止把它当作空账本重新执行业务。"""
+
+
 class IdempotencyStore:
     def __init__(self, project: ProjectRecord) -> None:
         root = os.path.realpath(os.path.join(project.data_root, "mcp_idempotency"))
@@ -40,9 +44,10 @@ class IdempotencyStore:
                 return {"action": "execute", "target": dict(target or {})}
             same = latest.get("request_sha256") == digest
             state = latest.get("state")
-            if state == "completed":
+            if state in {"completed", "applied"}:
                 if same:
-                    return {"action": "replay", "result": latest.get("result") or {}}
+                    return {"action": "replay", "result": latest.get("result") or {},
+                            "audit_pending": state == "applied" or not latest.get("audit_event_id")}
                 return {"action": "conflict", "reason": "DIGEST"}
             if state == "failed":
                 if not same:
@@ -60,8 +65,10 @@ class IdempotencyStore:
                     result = latest.get("result") if isinstance(latest.get("result"), dict) else {}
                     if not result:
                         result = _replay_from_target(latest.get("target"))
-                    self._append(_completed(principal_id, tool, key, digest, result))
-                    return {"action": "replay", "result": result}
+                    applied = _completed(principal_id, tool, key, digest, result)
+                    applied["state"] = "applied"
+                    self._append(applied)
+                    return {"action": "replay", "result": result, "audit_pending": True}
                 if outcome == "mismatch":
                     return {"action": "conflict", "reason": "EVIDENCE"}
                 if outcome == "unbound":
@@ -94,9 +101,19 @@ class IdempotencyStore:
                 record["created_at"] = created_at
             self._append(record)
 
-    def complete(self, *, principal_id: str, tool: str, key: str, digest: str, result: Dict[str, Any]) -> None:
+    def applied(self, *, principal_id: str, tool: str, key: str, digest: str, result: Dict[str, Any]) -> None:
+        """业务事实已落盘；终态审计未确认，重试只能补审计不能重执业务。"""
         with file_lock.acquire_lock(self.lock_path, blocking=True, timeout=5.0):
-            self._append(_completed(principal_id, tool, key, digest, result))
+            record = _completed(principal_id, tool, key, digest, result)
+            record["state"] = "applied"
+            self._append(record)
+
+    def complete(self, *, principal_id: str, tool: str, key: str, digest: str, result: Dict[str, Any], audit_event_id: str = "") -> None:
+        with file_lock.acquire_lock(self.lock_path, blocking=True, timeout=5.0):
+            record = _completed(principal_id, tool, key, digest, result)
+            if audit_event_id:
+                record["audit_event_id"] = audit_event_id
+            self._append(record)
 
     def fail(self, *, principal_id: str, tool: str, key: str, digest: str, code: str) -> None:
         with file_lock.acquire_lock(self.lock_path, blocking=True, timeout=5.0):
@@ -122,18 +139,17 @@ class IdempotencyStore:
                     line = line.strip()
                     if not line:
                         continue
-                    try:
-                        item = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
+                    item = json.loads(line)
+                    if not isinstance(item, dict):
+                        raise ValueError("Invalid ledger record")
                     if (
                         item.get("principal_id") == principal_id
                         and item.get("tool") == tool
                         and item.get("idempotency_key") == key
                     ):
                         found = item
-        except OSError:
-            return None
+        except (OSError, UnicodeError, ValueError):
+            raise IdempotencyReadError("Idempotency ledger unavailable") from None
         return found
 
     def _append(self, record: Dict[str, Any]) -> None:

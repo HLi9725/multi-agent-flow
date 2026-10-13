@@ -336,21 +336,6 @@ class OfflineBoardAdapter:
                     return self._write_cards(cards)
             return False
 
-    def discard_fresh_record(self, record_id: str) -> bool:
-        """审计失败时撤回刚建且仍停在待开始的卡。已离开待开始的卡不删。"""
-        with file_lock.acquire_lock(self.seq_lock_file, blocking=True, timeout=5.0):
-            cards = self._read_cards()
-            kept = []
-            removed = False
-            for card in cards:
-                if str(card.get("id")) == str(record_id) and card.get("status") == "待开始":
-                    removed = True
-                    continue
-                kept.append(card)
-            if not removed:
-                return False
-            return self._write_cards(kept)
-
     @staticmethod
     def _calc_minutes(start_str: str, end_str: str) -> Optional[int]:
         """计算开始与结束时间之间的分钟差值（支持 ISO 8601 时区串与多种时间格式）"""
