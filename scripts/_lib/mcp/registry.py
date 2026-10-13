@@ -43,6 +43,8 @@ class Registry:
     projects: Dict[str, ProjectRecord] = field(default_factory=dict)
     principals: List[PrincipalRecord] = field(default_factory=list)
     cursor_key: bytes = b""
+    token_key: bytes = b""
+    token_audience: str = ""
 
     def get_project(self, project_id: str) -> ProjectRecord | None:
         return self.projects.get(project_id)
@@ -216,12 +218,21 @@ def load_registry(path: str) -> Registry:
     revision = data.get("server_revision")
     if not isinstance(revision, str) or not revision.strip():
         revision = "4.0.0"
+    token_key = b""
+    secret = data.get("token_secret")
+    if isinstance(secret, str) and secret.strip():
+        token_key = secret.encode("utf-8")
+    audience = data.get("token_audience")
+    if not isinstance(audience, str):
+        audience = ""
     return Registry(
         path=real,
         server_revision=revision.strip()[:64],
         projects=projects,
         principals=principals,
         cursor_key=_cursor_key(real, data),
+        token_key=token_key,
+        token_audience=audience.strip()[:128],
     )
 
 

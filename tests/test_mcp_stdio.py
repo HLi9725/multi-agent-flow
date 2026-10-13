@@ -441,7 +441,7 @@ def test_registry_env_and_refused_transports(tmp_path: Path) -> None:
         check=False,
     )
     assert http.returncode == 2
-    assert "HTTP 监听未在本批次启用" in http.stderr.decode("utf-8")
+    assert "缺少签名配置" in http.stderr.decode("utf-8")
     sdk = subprocess.run(
         [sys.executable, str(SERVER), "stdio", "--transport-backend", "sdk"],
         cwd=str(tmp_path),

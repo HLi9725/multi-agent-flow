@@ -34,6 +34,9 @@ _FORBIDDEN_KEYS = {
     "github_token",
     "invocation_token",
     "credentials",
+    "token_secret",
+    "signing_key",
+    "bearer",
 }
 
 

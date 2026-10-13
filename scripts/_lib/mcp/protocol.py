@@ -1,8 +1,11 @@
 # -*- coding: utf-8 -*-
-"""JSON-RPC 2.0 与 STDIO 帧。
+"""JSON-RPC 2.0、STDIO 帧与 Streamable HTTP 头常量。
 
-未对照当次 PyPI 版本号。协议版本字符串按架构第 7 节锁定。
-帧在核对官方 STDIO 章节前使用 Content-Length，核对后只改本文件。
+2026-10-13 已对照规范页
+https://modelcontextprotocol.io/specification/2025-11-25/basic/transports 。
+会话头与协议版本头只在本文件定义。协议版本字符串保持 2025-11-25。
+STDIO 帧仍是 4A 已测试的 Content-Length；本批不改帧，以免改变已交付的本地行为。
+PyPI 包名仍是 mcp，核对时的发行版本为 2.3.0。当前解释器没有装上该包，SDK 未启用。
 """
 
 from __future__ import annotations
@@ -11,6 +14,9 @@ import json
 from typing import Any, BinaryIO, Dict, Mapping
 
 MCP_PROTOCOL_VERSION = "2025-11-25"
+MCP_SESSION_HEADER = "MCP-Session-Id"
+MCP_PROTOCOL_HEADER = "MCP-Protocol-Version"
+MCP_HTTP_PATH = "/mcp"
 
 _MAX_HEADER = 256
 _MAX_BODY = 1024 * 1024

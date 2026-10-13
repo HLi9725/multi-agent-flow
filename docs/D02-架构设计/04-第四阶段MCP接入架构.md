@@ -356,13 +356,13 @@ STDIO 没有网络凭证。主体取启动进程的操作系统用户，经登�
 
 ### 9.1 协议锁定与官方 SDK 接入点
 
-协议版本锁定 MCP `2025-11-25`。Python 侧优先使用官方 PyPI 包 `mcp`。实施时必须核对 PyPI/spec，确认：
+协议版本锁定 MCP `2025-11-25`。Python 侧官方 PyPI 包名仍是 `mcp`。2026-10-13 对照 PyPI 与规范页 `https://modelcontextprotocol.io/specification/2025-11-25/basic/transports` 的结果：
 
-- 发行版名称是否仍为 `mcp`，以及当时的最低可用版本号；
-- Streamable HTTP 的端点、`Accept`、会话头名称、SSE 事件格式；
-- 服务器注册工具的导入路径。
+- 发行版名称仍为 `mcp`，当时的当前版本是 `2.3.0`，要求 Python >=3.10，说明支持 Streamable HTTP，并声明兼容更早的协议修订。
+- 端点是单一 `POST /mcp` 与 `GET /mcp`。POST 必须带同时包含 `application/json` 和 `text/event-stream` 的 `Accept`。会话头规范写法是 `MCP-Session-Id`，后续请求带 `MCP-Protocol-Version: 2025-11-25`。
+- 官方服务器入口在该版文档中位于 `mcp.server` / `mcp.server.mcpserver.MCPServer`。本仓库默认 `--transport-backend compat`。当前实施环境执行 `import mcp` 失败，SDK 后端未启用，也未安装到用户环境。不要把未导入成功写成已验证。
 
-核对完成前，代码里的版本常量保持字符串 `2025-11-25`，并在模块注释写明“未对照当次 PyPI 版本号”。不要把设计阶段的导入示例写成已经安装成功。
+代码里的协议版本字符串保持 `2025-11-25`。兼容层不依赖官方包，旧环境不安装 SDK 仍可使用 STDIO 与 compat HTTP。
 
 官方 SDK 接入点设计如下，供核对后填写真实导入：
 
@@ -375,7 +375,7 @@ STDIO 没有网络凭证。主体取启动进程的操作系统用户，经登�
 
 - JSON-RPC 2.0 请求、成功响应、错误响应、通知。
 - STDIO：按核对后的帧读取；在核对前按第 7 节的 Content-Length 帧实现，并加测试固定该帧。一旦 spec 核对结果不同，测试与帧一起改。
-- Streamable HTTP 最小集：单一路径 `POST /mcp` 接收 JSON-RPC；需要服务端消息时 `GET /mcp` 使用 `text/event-stream`；会话标识放在设计头 `Mcp-Session-Id`。这三个具体名称在实施时必须核对 PyPI/spec，核对后只允许改 `protocol.py` 的常量。
+- Streamable HTTP 最小集：单一路径 `POST /mcp` 与 `GET /mcp`。POST 的 `Accept` 必须同时包含 `application/json` 与 `text/event-stream`；本批工具调用可以回 `application/json` 单对象，缺 Accept 则拒绝。`GET /mcp` 在会话建立后返回短 `text/event-stream`（心跳或空事件）并结束，不长期挂起。会话头以规范为准，名为 `MCP-Session-Id`；协议版本头为 `MCP-Protocol-Version`。这两个常量只放在 `protocol.py`。HTTP 头匹配不区分大小写。
 - `initialize` 之后才能 `tools/call`。
 - 兼容层不实现完整采样、根目录、资源订阅。本阶段工具只有第 6 节列出的任务工具，不提供 resources 读磁盘。
 
@@ -426,7 +426,14 @@ Scope 不自动包含低级 scope。验收主体如果也要读任务，授权�
 
 审计行追加写。发现缺行或摘要断裂：服务对写工具 Fail-Closed，返回 `GATE_REJECTED`，`details.reason=AUDIT_GAP`，直到管理员修复副本。读工具可以继续。
 
-部署手册在 4C 实施时说明：数据目录位置、保留天数、谁可以持有 Bearer 签发权、本批不进入生产。手册本身是后续文档任务，不在本文展开操作步骤。
+部署手册在 4C 实施时说明：数据目录位置、保留天数、谁可以持有 Bearer 签发权、本批不进入生产。操作说明见 `docs/D01-项目管理/09-第四阶段远程部署与认证说明.md`。该说明只记录已经实现和已经实测的部分，不把第四阶段整段标成通过。
+
+### 9.4 实施核对（2026-10-13）
+
+- 规范页已打开。会话头常量是 `MCP-Session-Id`，协议头常量是 `MCP-Protocol-Version`，只放在 `protocol.py`。架构草稿里的 `Mcp-Session-Id` 与规范大小写不同；HTTP 解析不区分大小写。
+- PyPI `mcp` 2.3.0 已核对。当前解释器 `import mcp` 为 `ModuleNotFoundError`。`--transport-backend sdk` 退出码 2，文档标记 SDK 后端未启用。未执行 pip 安装。
+- 默认后端是 compat。STDIO 帧保持 4A 的 Content-Length，本批不改。
+- 本批不部署生产，不在进程内终止 TLS。监听只允许回环地址。
 
 ## 10. 4D：客户端接入验证清单
 

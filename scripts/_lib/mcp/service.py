@@ -8,6 +8,7 @@ import hmac
 import json
 import os
 import re
+import time
 from typing import Any, Dict, List, Mapping, Tuple
 
 from ..boards.offline_board_adapter import OfflineBoardAdapter
@@ -55,11 +56,15 @@ _ABS_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\|//)")
 def handle_tool(name: str, arguments: Any, context: Mapping[str, Any]) -> Dict[str, Any]:
     registry: Registry = context["registry"]
     audit: AuditStore = context["audit"]
-    os_user = str(context.get("os_user") or "")
-    principal = auth.resolve_stdio_principal(registry, os_user)
+    principal = auth.resolve_request_principal(registry, context)
     principal_id = principal.principal_id if principal else ""
     project_id = ""
     task_id = ""
+    if name in WRITE_TOOL_NAMES and not audit.chain_intact():
+        return {
+            "isError": True,
+            "structured": error("GATE_REJECTED", details={"reason": "AUDIT_GAP"}).body(),
+        }
     try:
         if name in WRITE_TOOL_NAMES:
             payload = _dispatch_write(name, arguments, registry, principal, context)
@@ -671,6 +676,7 @@ def _dispatch_write(
         raise error("CONFLICT", details={"reason": "UNBOUND"})
     if decision["action"] == "in_progress":
         raise error("CONFLICT", details={"reason": "IN_PROGRESS"}, retryable=True)
+    _test_hold(context)
     try:
         payload = _execute_write(
             name,
@@ -706,6 +712,19 @@ def _dispatch_write(
         "_task_id": str(body.get("task_id") or cleaned.get("task_id") or ""),
         "body": body,
     }
+
+
+def _test_hold(context: Mapping[str, Any]) -> None:
+    raw = context.get("test_hold_seconds")
+    if raw is None:
+        return
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError):
+        return
+    if seconds <= 0:
+        return
+    time.sleep(min(seconds, 5.0))
 
 
 def _execute_write(

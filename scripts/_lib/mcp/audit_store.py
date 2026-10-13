@@ -9,6 +9,7 @@ import os
 from datetime import datetime, timezone
 from typing import Any, Dict, Mapping
 
+from ..core import file_lock
 from .redaction import RedactionRejected, fit_audit_line, mask_data
 
 
@@ -16,6 +17,15 @@ class AuditStore:
     def __init__(self, directory: str) -> None:
         self.directory = os.path.realpath(directory)
         self._path = os.path.join(self.directory, "events.jsonl")
+        self._tip = os.path.join(self.directory, "chain.tip")
+        self._lock = self._path + ".lock"
+
+    def chain_intact(self) -> bool:
+        try:
+            with file_lock.acquire_lock(self._lock, blocking=True, timeout=5.0):
+                return self._chain_intact()
+        except Exception:
+            return False
 
     def append(
         self,
@@ -39,15 +49,77 @@ class AuditStore:
         }
         if diagnostic:
             record["diagnostic"] = diagnostic[:64]
-        line = fit_audit_line(record)
         try:
-            os.makedirs(self.directory, exist_ok=True)
-            with open(self._path, "a", encoding="utf-8") as handle:
-                handle.write(line + "\n")
-                handle.flush()
-                os.fsync(handle.fileno())
+            with file_lock.acquire_lock(self._lock, blocking=True, timeout=5.0):
+                if not self._chain_intact():
+                    return
+                previous, seq = self._tail()
+                record["seq"] = seq + 1
+                record["prev_sha256"] = previous
+                line = fit_audit_line(record)
+                os.makedirs(self.directory, exist_ok=True)
+                with open(self._path, "a", encoding="utf-8") as handle:
+                    handle.write(line + "\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                tip = hashlib.sha256(line.encode("utf-8")).hexdigest()
+                temporary = self._tip + ".tmp"
+                with open(temporary, "w", encoding="utf-8") as handle:
+                    handle.write(tip)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary, self._tip)
         except OSError:
             return
+
+    def _chain_intact(self) -> bool:
+        if not os.path.isfile(self._path):
+            return not os.path.isfile(self._tip)
+        previous = ""
+        expected = 1
+        last_line = ""
+        try:
+            with open(self._path, "r", encoding="utf-8") as handle:
+                for raw in handle:
+                    line = raw.rstrip("\r\n")
+                    if not line:
+                        continue
+                    try:
+                        item = json.loads(line)
+                    except json.JSONDecodeError:
+                        return False
+                    if not isinstance(item, dict):
+                        return False
+                    if item.get("seq") != expected or item.get("prev_sha256") != previous:
+                        return False
+                    previous = hashlib.sha256(line.encode("utf-8")).hexdigest()
+                    last_line = line
+                    expected += 1
+        except (OSError, UnicodeError):
+            return False
+        if not last_line:
+            return not os.path.isfile(self._tip)
+        try:
+            with open(self._tip, "r", encoding="utf-8") as handle:
+                tip = handle.read().strip()
+        except OSError:
+            return False
+        return tip == hashlib.sha256(last_line.encode("utf-8")).hexdigest()
+
+    def _tail(self) -> tuple:
+        if not os.path.isfile(self._path):
+            return "", 0
+        previous = ""
+        seq = 0
+        with open(self._path, "r", encoding="utf-8") as handle:
+            for raw in handle:
+                line = raw.rstrip("\r\n")
+                if not line:
+                    continue
+                item = json.loads(line)
+                seq = int(item.get("seq") or 0)
+                previous = hashlib.sha256(line.encode("utf-8")).hexdigest()
+        return previous, seq
 
 
 def _digest(arguments: Mapping[str, Any] | None) -> str:

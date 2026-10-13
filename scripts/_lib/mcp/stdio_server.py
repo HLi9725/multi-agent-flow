@@ -4,12 +4,13 @@
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import dataclass
 from typing import Any, BinaryIO, Dict, Mapping
 
 from scripts.enums import TaskStatus
 
-from .auth import resolve_stdio_principal
+from .auth import resolve_request_principal
 from .errors import McpError, error
 from .protocol import FrameError, MCP_PROTOCOL_VERSION, encode_message, read_message
 from .schema import SCHEMA_VERSION, tool_specs
@@ -19,7 +20,7 @@ _SERVER_NAME = "yy-flow"
 
 
 @dataclass
-class _Session:
+class RpcSession:
     announced: bool = False
     ready: bool = False
     failed: bool = False
@@ -31,7 +32,7 @@ def create_stdio_server() -> Dict[str, Any]:
 
 
 def serve(stdin: BinaryIO, stdout: BinaryIO, context: Mapping[str, Any]) -> None:
-    session = _Session()
+    session = RpcSession()
     while True:
         try:
             message = read_message(stdin)
@@ -40,12 +41,12 @@ def serve(stdin: BinaryIO, stdout: BinaryIO, context: Mapping[str, Any]) -> None
             continue
         if message is None:
             return
-        for response in _dispatch(message, session, context):
+        for response in dispatch_rpc(message, session, context):
             if not _write(stdout, response):
                 return
 
 
-def _dispatch(message: Mapping[str, Any], session: _Session, context: Mapping[str, Any]) -> list:
+def dispatch_rpc(message: Mapping[str, Any], session: RpcSession, context: Mapping[str, Any]) -> list:
     if message.get("jsonrpc") != "2.0" or not isinstance(message.get("method"), str):
         return [_rpc_error(_request_id(message), error("VALIDATION", details={"reason": "FRAME"}))]
     method = message["method"]
@@ -72,7 +73,7 @@ def _dispatch(message: Mapping[str, Any], session: _Session, context: Mapping[st
     return [_rpc_error(request_id, error("VALIDATION", details={"reason": "UNKNOWN_METHOD", "field": "method"}))]
 
 
-def _initialize(message: Mapping[str, Any], session: _Session, request_id: Any) -> Dict[str, Any]:
+def _initialize(message: Mapping[str, Any], session: RpcSession, request_id: Any) -> Dict[str, Any]:
     if session.announced or session.failed:
         session.failed = True
         raise error("VALIDATION", details={"reason": "SESSION"})
@@ -96,7 +97,7 @@ def _initialize(message: Mapping[str, Any], session: _Session, request_id: Any) 
 
 
 def _visible_tools(context: Mapping[str, Any]) -> list:
-    principal = resolve_stdio_principal(context["registry"], str(context.get("os_user") or ""))
+    principal = resolve_request_principal(context["registry"], context)
     if principal is None:
         raise error("UNAUTHENTICATED")
     if principal.disabled:
@@ -107,7 +108,7 @@ def _visible_tools(context: Mapping[str, Any]) -> list:
     return tool_specs(TaskStatus.all_values(), scopes)
 
 
-def _require_ready(session: _Session) -> None:
+def _require_ready(session: RpcSession) -> None:
     if session.failed or not session.ready:
         raise error("VALIDATION", details={"reason": "NOT_INITIALIZED"})
 
@@ -122,12 +123,11 @@ def _call_tool(message: Mapping[str, Any], context: Mapping[str, Any]) -> Dict[s
         raise error("VALIDATION", details={"reason": "BAD_TYPE", "field": "name"})
     if arguments is None:
         arguments = {}
-    try:
-        outcome = handle_tool(name, arguments, context)
-    except McpError:
-        raise
-    except Exception:
-        raise error("VALIDATION", details={"reason": "INTERNAL"}) from None
+    timeout = _timeout_seconds(context)
+    if timeout is None:
+        outcome = _invoke_tool(name, arguments, context)
+    else:
+        outcome = _invoke_tool_with_timeout(name, arguments, context, timeout)
     structured = outcome.get("structured")
     if not isinstance(structured, dict):
         raise error("VALIDATION", details={"reason": "INTERNAL"})
@@ -137,6 +137,55 @@ def _call_tool(message: Mapping[str, Any], context: Mapping[str, Any]) -> Dict[s
         "structuredContent": structured,
         "isError": bool(outcome.get("isError")),
     }
+
+
+def _timeout_seconds(context: Mapping[str, Any]) -> float | None:
+    raw = context.get("tool_timeout_seconds")
+    if raw is None:
+        return None
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if seconds <= 0:
+        return None
+    return min(seconds, 15.0)
+
+
+def _invoke_tool(name: str, arguments: Any, context: Mapping[str, Any]) -> Dict[str, Any]:
+    try:
+        outcome = handle_tool(name, arguments, context)
+    except McpError:
+        raise
+    except Exception:
+        raise error("VALIDATION", details={"reason": "INTERNAL"}) from None
+    if not isinstance(outcome, dict):
+        raise error("VALIDATION", details={"reason": "INTERNAL"})
+    return outcome
+
+
+def _invoke_tool_with_timeout(name: str, arguments: Any, context: Mapping[str, Any], timeout: float) -> Dict[str, Any]:
+    holder: Dict[str, Any] = {}
+
+    def runner() -> None:
+        try:
+            holder["outcome"] = _invoke_tool(name, arguments, context)
+        except McpError as exc:
+            holder["error"] = exc
+        except Exception:
+            holder["error"] = error("VALIDATION", details={"reason": "INTERNAL"})
+
+    worker = threading.Thread(target=runner, daemon=True)
+    worker.start()
+    worker.join(timeout)
+    if worker.is_alive():
+        raise error("CONFLICT", details={"reason": "TIMEOUT"}, retryable=True)
+    if "error" in holder:
+        raise holder["error"]
+    outcome = holder.get("outcome")
+    if not isinstance(outcome, dict):
+        raise error("VALIDATION", details={"reason": "INTERNAL"})
+    return outcome
 
 
 _BAD_ID = object()
