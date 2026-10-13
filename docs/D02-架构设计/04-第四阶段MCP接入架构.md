@@ -267,7 +267,7 @@ Cursor 原生编排、Codex/Antigravity Production Runner、单角色 CLI 继续
 python scripts/mcp_server.py stdio --registry <登记文件>
 ```
 
-进程标准输入输出使用 JSON-RPC。设计锁定的帧为：`Content-Length: <字节数>\r\n\r\n` 加 UTF-8 正文。该帧格式与方法名在实施时必须核对 PyPI/spec 中 MCP 2025-11-25 的 STDIO 章节后再冻结常量；若核对结果与上述帧不一致，只改 `protocol.py`，不改 `service.py`。
+进程标准输入输出使用 JSON-RPC。官方 STDIO 帧仍是 `Content-Length: <字节数>\r\n\r\n` 加 UTF-8 正文。2026-10-13 已核对规范页，官方帧没有改成换行 JSON，因此不得删除现有 Content-Length 读写。客户端若首字节不是该头，按第 10.2 节兼容；只改 `protocol.py` 的帧读写，不改 `service.py`、工具 Schema、权限和状态机。
 
 最小方法集：`initialize`、`notifications/initialized`、`tools/list`、`tools/call`、`ping`。`initialize` 声明的协议版本字符串锁定为 `2025-11-25`。客户端协商到其他版本：会话失败，`VALIDATION`，进程不降级到未写明的旧行为。
 
@@ -374,7 +374,7 @@ STDIO 没有网络凭证。主体取启动进程的操作系统用户，经登�
 若当前环境无法安装官方包，使用不依赖网络的兼容层，放在 `protocol.py`：
 
 - JSON-RPC 2.0 请求、成功响应、错误响应、通知。
-- STDIO：按核对后的帧读取；在核对前按第 7 节的 Content-Length 帧实现，并加测试固定该帧。一旦 spec 核对结果不同，测试与帧一起改。
+- STDIO：官方帧保持第 7 节的 Content-Length。另有一种只在读取端按首字节分流的换行 JSON，契约在第 10.2 节。两种帧都要有测试。不得为了换行 JSON 删掉 Content-Length。
 - Streamable HTTP 最小集：单一路径 `POST /mcp` 与 `GET /mcp`。POST 的 `Accept` 必须同时包含 `application/json` 与 `text/event-stream`；本批工具调用可以回 `application/json` 单对象，缺 Accept 则拒绝。`GET /mcp` 在会话建立后返回短 `text/event-stream`（心跳或空事件）并结束，不长期挂起。会话头以规范为准，名为 `MCP-Session-Id`；协议版本头为 `MCP-Protocol-Version`。这两个常量只放在 `protocol.py`。HTTP 头匹配不区分大小写。
 - `initialize` 之后才能 `tools/call`。
 - 兼容层不实现完整采样、根目录、资源订阅。本阶段工具只有第 6 节列出的任务工具，不提供 resources 读磁盘。
@@ -432,27 +432,52 @@ Scope 不自动包含低级 scope。验收主体如果也要读任务，授权�
 
 - 规范页已打开。会话头常量是 `MCP-Session-Id`，协议头常量是 `MCP-Protocol-Version`，只放在 `protocol.py`。架构草稿里的 `Mcp-Session-Id` 与规范大小写不同；HTTP 解析不区分大小写。
 - PyPI `mcp` 2.3.0 已核对。当前解释器 `import mcp` 为 `ModuleNotFoundError`。`--transport-backend sdk` 退出码 2，文档标记 SDK 后端未启用。未执行 pip 安装。
-- 默认后端是 compat。STDIO 帧保持 4A 的 Content-Length，本批不改。
+- 默认后端是 compat。4C 交付时 STDIO 仍只实现 Content-Length。4D 实测后的双帧契约见第 10.2 节；在按该节改 `protocol.py` 之前，运行中的服务端仍只读 Content-Length。
 - 本批不部署生产，不在进程内终止 TLS。监听只允许回环地址。
 
 ## 10. 4D：客户端接入验证清单
 
-平台行为以真实客户端为准。本文不根据产品名称推断某个客户端已经允许 MCP 写入。下列各项在本文写作时均为 **未验证**。实施报告必须逐条保留该标记，直到有真实客户端记录；模拟单测不能把标记改成已验证。
+平台行为以真实客户端为准。本文不根据产品名称推断某个客户端已经允许 MCP 写入。下列各项在本文写作时均为 **未验证**。2026-10-13 的客户端实测没有把任何一项改成已验证。做不到或未做完的项改为阻断，或继续保持未验证。模拟单测不能把标记改成已验证。
 
 | 编号 | 项 | 通过标准 | 状态 |
 | --- | --- | --- | --- |
-| D1 | 目标客户端能否配置 STDIO MCP | 能完成 initialize 与 `tools/list`，且只看到当前批次工具 | 未验证 |
+| D1 | 目标客户端能否配置 STDIO MCP | 能完成 initialize 与 `tools/list`，且只看到当前批次工具 | 阻断 |
 | D2 | 只读闭环 | `get_project` 到 `list_tasks` 到 `get_task`，未知项目被拒绝 | 未验证 |
-| D3 | 写入确认 | 客户端在真正调用写工具前有人类确认；确认结果进入传输上下文而不是模型参数 | 未验证 |
+| D3 | 写入确认 | 客户端在真正调用写工具前有人类确认；确认结果进入传输上下文而不是模型参数 | 阻断 |
 | D4 | 写后查回 | `create_task` 或 `transition_task` 后 `get_task` 版本变化与账本一致 | 未验证 |
 | D5 | 撤销 | 撤销 `jti` 后下一次调用为 `REVOKED`，撤销前的成功结果仍可按幂等键重放给原主体以外的管理员读审计 | 未验证 |
 | D6 | Streamable HTTP | 核对 spec 后的会话头、POST、SSE 在目标客户端可用 | 未验证 |
-| D7 | 验收控件 | `request_acceptance` 没有人类确认时失败，有确认时才进入门禁 | 未验证 |
+| D7 | 验收控件 | `request_acceptance` 没有人类确认时失败，有确认时才进入门禁 | 阻断 |
 | D8 | Cursor 原生工作流 | 不配置 MCP 时，现有子代理与 CLI 流转仍可进行 | 未验证 |
 
 Cursor 原生工作流不强制安装 MCP，也不强制安装官方 SDK。MCP 是可选入口。可选卡片 UI 若以后要做，只消费本章工具的结构化 JSON；没有 UI 时，客户端展示 `get_status` 的文本字段即可。UI 不与 4A–4C 的服务发布绑在一起，缺 UI 不阻断工具验收。
 
 ChatGPT 或其他宿主的交互在 D1–D7 有该宿主的记录之前，不写入支持列表。
+
+### 10.1 实施核对（2026-10-13）
+
+命令、退出码和阻断原因见 `docs/D01-项目管理/10-第四阶段客户端接入记录.md`。第四阶段没有全部通过。4E 连接器未做。可选卡片 UI 未做，缺 UI 不阻断已有服务。仓库内没有新增会被 Cursor 自动加载的 `.cursor/mcp.json`。
+
+### 10.2 STDIO 双帧兼容
+
+本节锁定 `protocol.py` 的 STDIO 读写。代码已按本节实现，真实客户端仍未复测。本节不把 D1–D8 改成已验证。依据是 2026-10-13 的客户端记录：Claude Code 2.1.90 的 STDIO 首包是一行 UTF-8 JSON，以 `\n` 结尾，没有 `Content-Length`；服务端因此没有完成健康检查。官方规范里的 STDIO 仍是 Content-Length。两种帧并存，只作用于 STDIO。Streamable HTTP 的 POST、GET 和 SSE 不改。
+
+读取下一条消息时先看第一个字节：
+
+1. 尚无字节即 EOF：与现有行为一样，返回空，不报 `FrameError`。
+2. 第一个字节是 `C` 或 `c`：把该字节放回缓冲，整帧按现有 Content-Length 规则读取。头名必须是 `Content-Length`（大小写不敏感），形式仍是 `Content-Length: <字节数>\r\n\r\n` 加正好该字节数的正文。头块上限仍是 256 字节。正文上限仍是 1 MiB（1048576 字节）。其他头名、重复长度、长度越界、截断、非 UTF-8、非 JSON 对象，都是 `FrameError`。
+3. 第一个字节不是 `C` 或 `c`：本帧按单行 UTF-8 JSON。从该字节读到第一个 `\n`，一行一条。去掉结尾的 `\n`；若剩余末字节是 `\r`，再去掉这一个 `\r`。剩余字节必须不超过 1 MiB，并且 `json.loads` 的结果必须是一个对象。未遇到 `\n`、空行、超限、编码失败、JSON 失败或结果不是对象，都是 `FrameError`。不得把多行拼成一条，也不得在这一行里面再找 `Content-Length`。
+
+响应使用与本次已成功解析的请求相同的帧：
+
+- 本次请求是 Content-Length：响应仍走现有 `encode_message`，即 Content-Length 头加正文。
+- 本次请求是换行 JSON：响应是同一条紧凑 UTF-8 JSON，以 `\n` 结尾，前面不加 `Content-Length`。不含结尾 `\n` 的正文不得超过 1 MiB。
+- 通知没有响应体，就不写帧。
+- 解析失败不写响应帧。`FrameError` 不携带正文，异常文本为空。已读字节不得进入异常、日志、审计或 JSON-RPC 的 `message` / `data`。
+
+同一连接上可以按条切换帧：每一条响应只跟自己的请求走，不因为上一条是 Content-Length 就拒绝下一条换行 JSON。已经通过的 Content-Length 测试必须继续通过。后续测试至少覆盖：Content-Length 往返、一行 `initialize` 得到一行响应、超长行与坏 JSON 为 `FrameError` 且输出中没有原正文。这些测试通过之前，D1 仍是阻断。
+
+本兼容不改工具 Schema、`SCHEMA_VERSION`、权限 scope、`validate()`、Evidence 类型和看板状态枚举。代码已按本节实现；D1 是否已验证仍以客户端接入记录为准。
 
 ## 11. 4E：GitHub Projects 连接器
 
@@ -469,7 +494,7 @@ YY-Flow 看板、Evidence、Checkpoint 是执行状态的权威。GitHub Project
 
 GitHub 上的状态变化不能把 YY-Flow 推进到 `已验收`、`已完成` 或任何其他状态。若外部状态看起来像验收，记冲突 `EXTERNAL_ACCEPTANCE_IGNORED`，等待 `request_acceptance`。
 
-若允许外部修改需求标题或描述，同步引擎生成契约变更记录到审计，并停止覆盖该任务的投影，直到 YY-Flow 侧有明确的契约更新。引擎不静默改写运行中任务的名称、验收标准或 Profile。
+外部标题或正文按第 11.7 节处理：记契约变更并停止覆盖该任务的投影，直到 YY-Flow 侧有明确的契约更新。引擎不改任务的名称、验收标准或 Profile。
 
 ### 11.2 同步引擎
 
@@ -482,7 +507,7 @@ class GithubTransport(Protocol):
 
 `GithubResult` 区分：成功数据、GraphQL 错误、HTTP 状态、速率限制重置时间、分页 `pageInfo`。禁止用空字典表示失败。现有 `GitHubProjectsAdapter._graphql_query` 在失败时返回 `{}` 并打印日志，同步引擎不调用该吞掉错误的路径作为成功依据。遗留 Adapter 保留给旧 CLI。新传输可以复用其查询字符串，但必须向上返回错误类型。
 
-无 `GITHUB_TOKEN` 或等价的登记凭证时，真实传输在调用前失败，错误标记为 `CREDENTIALS_ABSENT`。单元测试使用 `FakeGithubTransport`，不访问网络。文档与测试报告把真实调用标为 **未验证**，直到有沙箱项目的记录。不得用生产看板做演练。
+无 `GITHUB_TOKEN` 且登记文件中的等价凭证也为空时，按第 11.7 节返回 `CREDENTIALS_ABSENT`。单元测试使用 `FakeGithubTransport`，不访问网络。文档与测试报告把真实调用标为 **未验证**，直到有沙箱项目的记录。不得用生产看板做演练。
 
 身份映射表在连接器配置中：`github_login -> yy_flow_assignee`。未映射的登录名写入差异报告的 `unmapped_actor`，不猜测角色，不把 GitHub 登录写成 YY-Flow 处理人。令牌权限取项目读，写出阶段才增加项目字段写。令牌不进入仓库、日志和 MCP 响应。
 
@@ -498,18 +523,7 @@ class GithubTransport(Protocol):
 - 每条外部项保存 `external_updated_at`。更早的事件记 `stale` 并跳过。
 - 乱序到达时，较新事件先应用；较旧事件随后到达则保持跳过。
 
-冲突规则：
-
-| 情况 | 动作 |
-| --- | --- |
-| 仅外部标题变化，且 YY-Flow 任务不在 `进行中`/`审查中`/`测试中` | 记契约变更，不自动改 YY-Flow |
-| 外部与投影状态不一致，且 YY-Flow 未验收 | 以 YY-Flow 为准重写投影；写失败则进入部分失败队列 |
-| 外部试图表示验收 | 忽略写出，审计 `EXTERNAL_ACCEPTANCE_IGNORED` |
-| 两边都在上次同步后改过同一投影字段 | `CONFLICT`，停止该任务的写出，其他任务继续 |
-
-软删除映射：YY-Flow `is_deleted=true` 投影为 GitHub 归档或从项目移除，具体操作名在实施时按当时 API 字段映射表写死。恢复则重新加入项目。映射表不能把“归档”理解成 `已取消` 或 `已验收`。
-
-部分失败：每个写出动作有 `pending|applied|failed`。进程中断后从第一条 `failed` 或 `pending` 续做。已 `applied` 的不重复创建项；创建以 GitHub item id 记在同步账本里。任一条 failed 时，本轮总结果不是成功。
+冲突、软删除映射和部分失败续跑按第 11.7 节执行。软删除不是新的看板状态，归档也不是 `已取消` 或 `已验收`。
 
 现有 Adapter 的缺口（实施时要在新引擎补上，而不是在旧方法里返回假成功）：
 
@@ -538,6 +552,30 @@ python scripts/mcp_server.py sync-github --project-id <已登记 ID> --mode read
 - Jira 状态机与 YY-Flow 状态机不是同一个。禁止用 Jira transition 反向驱动 `已验收`。
 - 飞书现有 Adapter 通过 `npx` 子进程调 CLI。MCP 进程与同步引擎都不得把这种 shell 调用暴露给模型，也不得接受来自工具参数的命令字符串。后续飞书批次若继续，应换成显式 HTTP API，并单独做令牌与分页设计。
 - 两者都要先只读对齐，再决定是否受控写出。
+
+### 11.7 实施锁定
+
+第 11.1 到 11.6 节加上本节即可开工 4E。本节只写死原先可以两边解释的五点。不新增看板状态名，不新增 Evidence 类型。`CREDENTIALS_ABSENT`、`EXTERNAL_ACCEPTANCE_IGNORED`、`NO_EXTERNAL_ITEM`、`unmapped_actor` 只是同步结果原因，不是 `validate()` 的状态，也不是现有四类 Evidence。真实 GitHub 调用保持未验证。当前没有可用的 GitHub 凭据，实施时不得把缺凭据的单测写成真实调用已通过。
+
+**默认只读。** `write_enabled` 缺省为 false。本地命令默认 `--mode read-only`。只读轮次只发送 ProjectV2 查询并生成差异报告，不调用 mutation。`--mode write` 在 `write_enabled` 不是 true 时拒绝启动，网络写的次数为零。
+
+**无凭据。** 环境变量 `GITHUB_TOKEN` 与登记文件中的等价凭证都为空时，真实传输在打开连接之前失败，原因固定为 `CREDENTIALS_ABSENT`。不访问 `api.github.com`，不用空对象表示空项目，不把凭证写入仓库、日志、差异报告或 MCP 响应。`FakeGithubTransport` 不需要令牌；使用假传输的测试不能把真实调用标成已验证。
+
+**软删除映射。** 只在写出模式、并且同步账本已经有该任务的 GitHub item id 时投影可见性：
+
+- `is_deleted=true`：调用 `archiveProjectV2Item`。
+- `is_deleted=false` 且该项已归档：调用 `unarchiveProjectV2Item`，沿用同一个 item id，不新建项。
+
+禁止 `deleteProjectV2Item`。没有 item id 时，不为了归档去创建一项；该任务的差异原因是 `NO_EXTERNAL_ITEM`，本条不算已对齐。归档和取消归档都不修改 YY-Flow 的 `status`，也不表示 `已取消` 或 `已验收`。
+
+**冲突。** 投影字段只有标题、正文、GitHub Status 单选、处理人。Evidence、Checkpoint、幂等账本和验收标记不是投影字段。
+
+- 外部改了标题或正文：审计记契约变更，并停止继续写出该任务。不改 YY-Flow 的名称、状态、Profile 或验收标准。其他任务继续。YY-Flow 侧没有新的契约更新记录之前，不得恢复覆盖该任务。
+- 外部 Status 与 YY-Flow 当前状态不一致：不调用 `validate()`，不推进 YY-Flow。写出模式用 YY-Flow 当前状态名重写同名 option；没有同名 option 时，该条进入部分失败队列。外部 Status 文本是 `已验收`，或用其他文本表示验收：YY-Flow 保持原状态，审计 `EXTERNAL_ACCEPTANCE_IGNORED`。写出模式仍可把 GitHub Status 改回 YY-Flow 当前状态的同名 option，不得把 YY-Flow 写成 `已验收`。
+- 上次成功同步之后，两边都改过同一个投影字段：该任务结果为 `CONFLICT`，停止该任务的写出，不自动合并。其他任务继续。
+- 未出现在 `github_login -> yy_flow_assignee` 中的登录名只记 `unmapped_actor`。同步不修改 YY-Flow 的 assignee，也不按登录名猜测角色。
+
+**部分失败续跑。** 每个写出动作只有 `pending`、`applied`、`failed`。进程中断后按原顺序找到第一条 `pending` 或 `failed` 继续。`applied` 不再次创建。创建前先用账本中的 item id 或交付 ID 读取；GitHub 上已经有该项就改记 `applied` 再继续，没有才重试同一次创建。还有任一条 `failed` 时，本轮总结果不是成功。续跑不清 cursor，不清已 `applied` 的记录，也不把第一页当成全量。
 
 ## 12. 兼容
 
@@ -576,8 +614,8 @@ python scripts/mcp_server.py sync-github --project-id <已登记 ID> --mode read
 1. 4A：`protocol.py`、`schema.py`、`errors.py`、`redaction.py`、`registry.py`、`service.py` 的四个读工具、`stdio_server.py`、`mcp_server.py stdio`、`tests/test_mcp_stdio.py`。
 2. 4B：幂等账本、`expected_card_version` 可选参数、写工具、适配器软删除方法、`tests/test_mcp_write.py`。
 3. 4C：`auth.py`、`http_server.py`、撤销与限流、兼容层或核对后的官方 SDK、`tests/test_mcp_http_auth.py`。本步结束仍不部署生产。
-4. 4D：按第 10 节清单做真实客户端记录。未做的项保持未验证。
-5. 4E：同步引擎与假传输测试。只读模式先于 `write_enabled`。真实 GitHub 调用单独标记。
+4. 4D：按第 10 节清单做真实客户端记录。未做的项保持未验证。STDIO 双帧只按第 10.2 节改 `protocol.py`；改完并补测试之前，D1 仍是阻断。
+5. 4E：按第 11 节与第 11.7 节实现同步引擎和假传输测试。只读模式先于 `write_enabled`。不新增状态名或 Evidence 类型。真实 GitHub 调用单独标记为未验证。
 
 任一步发现需要新的状态名或新的 Evidence 类型，停止并回到架构评审。用新增状态绕过 `已验收` 或 EvidenceGate 不符合本设计。
 
@@ -606,6 +644,7 @@ python scripts/mcp_server.py sync-github --project-id <已登记 ID> --mode read
 | 4C 远程认证 | 高 | 主体来源一旦改读模型参数，即跨项目泄露 | HTTP 入口默认不启动。凭证校验失败全部 `UNAUTHENTICATED`。回滚为只保留 STDIO |
 | 4C 兼容层与官方 SDK 不一致 | 中 | 未核对 PyPI/spec 就宣称兼容会让客户端连不上 | 默认 `compat`，协议常量集中。核对失败则不切换 `sdk` |
 | 4D 客户端 | 中 | 未验证项被写成已支持会误导接入 | 清单默认未验证。没有记录不得改标记 |
+| STDIO 双帧 | 中 | 删掉 Content-Length 会使已测 4A 夹具失败；换行帧若回显正文会泄露 | 只改 `protocol.py` 的帧读写。回滚时恢复为只读 Content-Length。不改 Schema、权限、状态机 |
 | 4E 写出 | 高 | 外部状态反向覆盖会绕过验收；旧 Adapter 空字典会被当成空项目 | 默认只读。`write_enabled` 默认 false。真实令牌缺失时不发网络。回滚配置即可停止写出，YY-Flow 数据不从 GitHub 回灌 |
 | 4E 飞书 shell | 高 | 现有实现带命令执行。若从 MCP 调用即任意命令风险 | 本批不接飞书。同步引擎禁止 subprocess |
 

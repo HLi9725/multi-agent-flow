@@ -12,7 +12,14 @@ from scripts.enums import TaskStatus
 
 from .auth import resolve_request_principal
 from .errors import McpError, error
-from .protocol import FrameError, MCP_PROTOCOL_VERSION, encode_message, read_message
+from .protocol import (
+    FRAME_CONTENT_LENGTH,
+    FRAME_NEWLINE,
+    FrameError,
+    MCP_PROTOCOL_VERSION,
+    encode_framed,
+    read_framed,
+)
 from .schema import SCHEMA_VERSION, tool_specs
 from .service import handle_tool
 
@@ -35,14 +42,14 @@ def serve(stdin: BinaryIO, stdout: BinaryIO, context: Mapping[str, Any]) -> None
     session = RpcSession()
     while True:
         try:
-            message = read_message(stdin)
+            framed = read_framed(stdin)
         except FrameError:
-            _write(stdout, _rpc_error(None, error("VALIDATION", details={"reason": "FRAME"})))
             continue
-        if message is None:
+        if framed is None:
             return
+        message, frame = framed
         for response in dispatch_rpc(message, session, context):
-            if not _write(stdout, response):
+            if not _write(stdout, response, frame):
                 return
 
 
@@ -212,10 +219,10 @@ def _rpc_error(request_id: Any, exc: McpError) -> Dict[str, Any]:
     }
 
 
-def _write(stdout: BinaryIO, payload: Mapping[str, Any]) -> bool:
+def _write(stdout: BinaryIO, payload: Mapping[str, Any], frame: str = FRAME_CONTENT_LENGTH) -> bool:
     try:
-        stdout.write(encode_message(payload))
+        stdout.write(encode_framed(payload, frame))
         stdout.flush()
-    except (BrokenPipeError, OSError):
+    except (BrokenPipeError, OSError, FrameError):
         return False
     return True

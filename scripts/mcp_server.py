@@ -13,6 +13,7 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
+from scripts._lib.connectors.github_projects_sync import run_sync
 from scripts._lib.mcp.audit_store import AuditStore
 from scripts._lib.mcp.auth import AuthAdminError, current_os_user, ensure_grants, issue_token, revoke_jti
 from scripts._lib.mcp.backup import BackupError, backup_tree, restore_tree
@@ -141,6 +142,35 @@ def _auth(args: argparse.Namespace) -> int:
     return 2
 
 
+def _looks_like_path(value: str) -> bool:
+    if not isinstance(value, str) or not value.strip():
+        return True
+    if ".." in value:
+        return True
+    return any(mark in value for mark in ("/", "\\", ":"))
+
+
+def _sync_github(args: argparse.Namespace) -> int:
+    if _looks_like_path(args.project_id):
+        _stderr("项目标识无效\n")
+        return 2
+    registry = _load(os.environ.get("YY_FLOW_MCP_REGISTRY", ""))
+    if registry is None:
+        return 2
+    project = registry.get_project(args.project_id)
+    if project is None:
+        _stderr("项目未登记\n")
+        return 2
+    report = run_sync(project, mode=args.mode, registry=registry, environ=os.environ)
+    sys.stdout.write(json.dumps(report.public_dict(), ensure_ascii=False, sort_keys=True) + "\n")
+    sys.stdout.flush()
+    if report.reason in {"WRITE_DISABLED", "CREDENTIALS_ABSENT", "VALIDATION"}:
+        return 2
+    if args.mode != "write" and report.network_writes:
+        return 2
+    return 0 if report.ok else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="mcp_server.py", add_help=True)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -169,6 +199,9 @@ def main(argv: list[str] | None = None) -> int:
     restore = auth_sub.add_parser("restore")
     restore.add_argument("--src", required=True)
     restore.add_argument("--dest", required=True)
+    sync = sub.add_parser("sync-github")
+    sync.add_argument("--project-id", required=True)
+    sync.add_argument("--mode", choices=("read-only", "write"), default="read-only")
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
     if args.command == "stdio":
         return _stdio(args)
@@ -176,6 +209,8 @@ def main(argv: list[str] | None = None) -> int:
         return _http(args)
     if args.command == "auth":
         return _auth(args)
+    if args.command == "sync-github":
+        return _sync_github(args)
     _stderr("官方 SDK 后端未启用\n")
     return 2
 

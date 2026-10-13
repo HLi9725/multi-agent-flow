@@ -7,6 +7,7 @@ import json
 import os
 import re
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Dict, List, Mapping
 
 from .schema import DISPLAY_NAME_MAX, PROJECT_ID_RE
@@ -24,6 +25,10 @@ class ProjectRecord:
     evidence_root: str
     board_kind: str
     board_config: str = ""
+    github_project_id: str = ""
+    write_enabled: bool = False
+    identity_map: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
+    github_credential_env: str = "GITHUB_TOKEN"
 
 
 @dataclass(frozen=True)
@@ -45,9 +50,27 @@ class Registry:
     cursor_key: bytes = b""
     token_key: bytes = b""
     token_audience: str = ""
+    credentials: Dict[str, str] = field(default_factory=dict, repr=False)
 
     def get_project(self, project_id: str) -> ProjectRecord | None:
         return self.projects.get(project_id)
+
+    def credential_value(self, project_id: str, environ: Mapping[str, str]) -> str:
+        """返回凭证本身。调用方不得写入日志、报告或响应。"""
+        inline = self.credentials.get(project_id, "")
+        if isinstance(inline, str) and inline.strip():
+            return inline
+        project = self.projects.get(project_id)
+        if project is None:
+            return ""
+        named = environ.get(project.github_credential_env, "")
+        if isinstance(named, str) and named.strip():
+            return named
+        if project.github_credential_env != "GITHUB_TOKEN":
+            fallback = environ.get("GITHUB_TOKEN", "")
+            if isinstance(fallback, str) and fallback.strip():
+                return fallback
+        return ""
 
 
 class RegistryError(Exception):
@@ -114,7 +137,7 @@ def _cursor_key(path: str, data: Mapping[str, object]) -> bytes:
     return hashlib.sha256(raw).digest()
 
 
-def _parse_project(item: Mapping[str, object]) -> ProjectRecord:
+def _parse_project(item: Mapping[str, object]) -> tuple[ProjectRecord, str]:
     project_id = item.get("project_id")
     if not isinstance(project_id, str) or PROJECT_ID_RE.fullmatch(project_id) is None:
         raise RegistryError("登记文件无法读取")
@@ -145,7 +168,33 @@ def _parse_project(item: Mapping[str, object]) -> ProjectRecord:
     raw_config = item.get("board_config")
     if isinstance(raw_config, str) and raw_config.strip():
         board_config = _resolve_under(data_root, raw_config, "")
-    return ProjectRecord(
+    github_project_id = item.get("github_project_id", "")
+    if github_project_id is None:
+        github_project_id = ""
+    if not isinstance(github_project_id, str):
+        raise RegistryError("登记文件无法读取")
+    write_enabled = item.get("write_enabled", False) is True
+    identity_raw = item.get("identity_map", {})
+    if identity_raw is None:
+        identity_raw = {}
+    if not isinstance(identity_raw, dict):
+        raise RegistryError("登记文件无法读取")
+    identity: Dict[str, str] = {}
+    for login, assignee in identity_raw.items():
+        if not isinstance(login, str) or not isinstance(assignee, str):
+            raise RegistryError("登记文件无法读取")
+        identity[login] = assignee
+    env_name = item.get("github_credential_env", "GITHUB_TOKEN")
+    if env_name is None or env_name == "":
+        env_name = "GITHUB_TOKEN"
+    if not isinstance(env_name, str) or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", env_name.strip()) is None:
+        raise RegistryError("登记文件无法读取")
+    credential = item.get("github_credential", "")
+    if credential is None:
+        credential = ""
+    if not isinstance(credential, str):
+        raise RegistryError("登记文件无法读取")
+    record = ProjectRecord(
         project_id=project_id,
         display_name=display[:DISPLAY_NAME_MAX],
         org_id=org_id.strip(),
@@ -154,7 +203,12 @@ def _parse_project(item: Mapping[str, object]) -> ProjectRecord:
         evidence_root=evidence_root,
         board_kind=str(board_kind),
         board_config=board_config,
+        github_project_id=github_project_id.strip(),
+        write_enabled=write_enabled,
+        identity_map=MappingProxyType(identity),
+        github_credential_env=env_name.strip(),
     )
+    return record, credential
 
 
 def _parse_principal(item: Mapping[str, object]) -> PrincipalRecord:
@@ -203,13 +257,16 @@ def load_registry(path: str) -> Registry:
     if not isinstance(projects_raw, list) or not isinstance(principals_raw, list):
         raise RegistryError("登记文件无法读取")
     projects: Dict[str, ProjectRecord] = {}
+    credentials: Dict[str, str] = {}
     for item in projects_raw:
         if not isinstance(item, dict):
             raise RegistryError("登记文件无法读取")
-        project = _parse_project(item)
+        project, credential = _parse_project(item)
         if project.project_id in projects:
             raise RegistryError("登记文件无法读取")
         projects[project.project_id] = project
+        if credential.strip():
+            credentials[project.project_id] = credential
     principals = []
     for item in principals_raw:
         if not isinstance(item, dict):
@@ -233,6 +290,7 @@ def load_registry(path: str) -> Registry:
         cursor_key=_cursor_key(real, data),
         token_key=token_key,
         token_audience=audience.strip()[:128],
+        credentials=credentials,
     )
 
 

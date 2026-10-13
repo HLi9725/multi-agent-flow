@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import getpass
+import io
 import json
 import os
 import subprocess
@@ -16,7 +17,15 @@ import pytest
 from scripts._lib.boards.offline_board_adapter import OfflineBoardAdapter
 from scripts._lib.mcp import MCP_PROTOCOL_VERSION
 from scripts._lib.mcp.audit_store import AuditStore
-from scripts._lib.mcp.protocol import encode_message, read_message
+from scripts._lib.mcp.protocol import (
+    FRAME_CONTENT_LENGTH,
+    FRAME_NEWLINE,
+    FrameError,
+    encode_message,
+    read_framed,
+    read_message,
+)
+from scripts._lib.mcp.stdio_server import serve
 from scripts._lib.mcp.registry import load_registry
 from scripts._lib.mcp.schema import SCHEMA_VERSION
 from scripts._lib.mcp.service import handle_tool
@@ -594,3 +603,171 @@ def test_snapshot_over_100_does_not_skip_ids_when_insert_happens(tmp_path: Path,
     assert "T0101" in found
     assert found.count("T0100") == 1
     assert len(found) == len(set(found))
+
+
+def _line(payload: dict) -> bytes:
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n"
+
+
+def _initialize_payload(req_id: int) -> dict:
+    return {
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {"name": "frame-test", "version": "0"},
+        },
+    }
+
+
+def test_content_length_roundtrip_still_parses() -> None:
+    payload = {"jsonrpc": "2.0", "id": 7, "method": "ping"}
+    raw = encode_message(payload)
+    assert raw.startswith(b"Content-Length:")
+    message, kind = read_framed(io.BytesIO(raw))
+    assert kind == FRAME_CONTENT_LENGTH
+    assert message == payload
+
+
+def test_line_initialize_returns_one_line() -> None:
+    stdin = io.BytesIO(_line(_initialize_payload(1)))
+    stdout = io.BytesIO()
+    serve(stdin, stdout, {})
+    raw = stdout.getvalue()
+    assert raw.endswith(b"\n")
+    assert b"\n" not in raw[:-1]
+    assert not raw.startswith(b"Content-Length:")
+    parsed = json.loads(raw.decode("utf-8"))
+    assert parsed["id"] == 1
+    assert parsed["result"]["protocolVersion"] == MCP_PROTOCOL_VERSION
+
+
+def test_overlong_line_and_bad_json_hide_body() -> None:
+    secret = "SECRET_FRAME_BODY_9f3a"
+    bad = ("{not-json " + secret + "}\n").encode("utf-8")
+    stdout = io.BytesIO()
+    try:
+        read_message(io.BytesIO(bad))
+    except FrameError as exc:
+        assert str(exc) == ""
+        assert exc.args == ()
+        assert secret not in str(exc)
+    else:
+        raise AssertionError("坏 JSON 应是 FrameError")
+    serve(io.BytesIO(bad), stdout, {})
+    assert secret.encode("utf-8") not in stdout.getvalue()
+    marker = b"SECRET_LONG_9f3a"
+    huge = b"{" + marker + (b"A" * (1024 * 1024)) + b"}\n"
+    try:
+        read_message(io.BytesIO(huge))
+    except FrameError as exc:
+        assert str(exc) == ""
+        assert marker.decode("ascii") not in str(exc)
+    else:
+        raise AssertionError("超长行应是 FrameError")
+    huge_out = io.BytesIO()
+    serve(io.BytesIO(huge), huge_out, {})
+    assert huge_out.getvalue() == b""
+    assert marker not in huge_out.getvalue()
+
+
+def test_same_stream_switches_from_content_length_to_line() -> None:
+    first = _initialize_payload(1)
+    second = {"jsonrpc": "2.0", "id": 2, "method": "ping"}
+    stdin = io.BytesIO(encode_message(first) + _line(second))
+    request = io.BytesIO(stdin.getvalue())
+    left, left_kind = read_framed(request)
+    right, right_kind = read_framed(request)
+    assert left_kind == FRAME_CONTENT_LENGTH
+    assert right_kind == FRAME_NEWLINE
+    assert left["id"] == 1
+    assert right["id"] == 2
+    stdout = io.BytesIO()
+    serve(stdin, stdout, {})
+    response = io.BytesIO(stdout.getvalue())
+    started, started_kind = read_framed(response)
+    ping, ping_kind = read_framed(response)
+    assert started_kind == FRAME_CONTENT_LENGTH
+    assert ping_kind == FRAME_NEWLINE
+    assert started["result"]["protocolVersion"] == MCP_PROTOCOL_VERSION
+    assert ping["result"] == {}
+    assert read_framed(response) is None
+
+
+def _serve_bytes(payload: bytes) -> bytes:
+    stdout = io.BytesIO()
+    serve(io.BytesIO(payload), stdout, {})
+    return stdout.getvalue()
+
+
+def _initialize_payload(req_id: int) -> dict:
+    return {
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {"name": "frame-test", "version": "0"},
+        },
+    }
+
+
+def test_content_length_reader_still_roundtrips() -> None:
+    payload = {"jsonrpc": "2.0", "id": 3, "method": "ping"}
+    stream = io.BytesIO(encode_message(payload))
+    assert read_message(stream) == payload
+    assert read_message(stream) is None
+    out = _serve_bytes(encode_message(_initialize_payload(7)))
+    assert out.startswith(b"Content-Length:")
+    message = read_message(io.BytesIO(out))
+    assert message is not None
+    assert message["id"] == 7
+    assert message["result"]["protocolVersion"] == MCP_PROTOCOL_VERSION
+
+
+def test_newline_initialize_returns_newline_frame() -> None:
+    raw = json.dumps(_initialize_payload(1), ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n"
+    out = _serve_bytes(raw)
+    assert out.endswith(b"\n")
+    assert not out.startswith(b"Content-Length")
+    assert b"Content-Length" not in out
+    message = json.loads(out.decode("utf-8"))
+    assert message["id"] == 1
+    assert message["result"]["protocolVersion"] == MCP_PROTOCOL_VERSION
+    ping = encode_message({"jsonrpc": "2.0", "id": 2, "method": "ping"})
+    mixed = _serve_bytes(raw + ping)
+    head, tail = mixed.split(b"\n", 1)
+    assert b"Content-Length" not in head
+    assert tail.startswith(b"Content-Length:")
+    assert read_message(io.BytesIO(tail))["id"] == 2
+
+
+def test_newline_frame_errors_do_not_echo_original_bytes() -> None:
+    secret = b"ORIGINAL_LINE_SENTINEL_9f3a"
+    overlong = b'{"k":"' + secret + (b"A" * (1024 * 1024)) + b'"}\n'
+    overlong_out = _serve_bytes(overlong)
+    assert overlong_out == b""
+    assert secret not in overlong_out
+
+    array_secret = "ORIGINAL_ARRAY_SENTINEL_9f3a"
+    array_out = _serve_bytes(json.dumps([array_secret]).encode("utf-8") + b"\n")
+    assert array_out == b""
+    assert array_secret.encode("utf-8") not in array_out
+
+    truncated_secret = b"ORIGINAL_TRUNC_SENTINEL_9f3a"
+    truncated_out = _serve_bytes(b'{"secret":"' + truncated_secret)
+    assert truncated_out == b""
+    assert truncated_secret not in truncated_out
+
+    body = b'{"secret":"' + b"ORIGINAL_CL_SENTINEL_9f3a" + b'"}'
+    clipped = f"Content-Length: {len(body) + 40}\r\n\r\n".encode("ascii") + body
+    clipped_out = _serve_bytes(clipped)
+    assert clipped_out == b""
+    assert b"ORIGINAL_CL_SENTINEL_9f3a" not in clipped_out
+    with pytest.raises(FrameError) as caught:
+        read_message(io.BytesIO(b"Content-Length: 4\r\n\r\n1234"))
+    assert str(caught.value) == ""
+    assert "1234" not in str(caught.value)
