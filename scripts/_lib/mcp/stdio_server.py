@@ -1,0 +1,159 @@
+# -*- coding: utf-8 -*-
+"""本地 STDIO 循环。无网络监听。官方 SDK 未在本批次创建。"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from typing import Any, BinaryIO, Dict, Mapping
+
+from scripts.enums import TaskStatus
+
+from .errors import McpError, error
+from .protocol import FrameError, MCP_PROTOCOL_VERSION, encode_message, read_message
+from .schema import SCHEMA_VERSION, tool_specs
+from .service import handle_tool
+
+_SERVER_NAME = "yy-flow"
+
+
+@dataclass
+class _Session:
+    announced: bool = False
+    ready: bool = False
+    failed: bool = False
+
+
+def create_stdio_server() -> Dict[str, Any]:
+    """兼容层工厂。默认后端不导入官方 mcp 包。"""
+    return {"backend": "compat", "protocol": MCP_PROTOCOL_VERSION}
+
+
+def serve(stdin: BinaryIO, stdout: BinaryIO, context: Mapping[str, Any]) -> None:
+    session = _Session()
+    while True:
+        try:
+            message = read_message(stdin)
+        except FrameError:
+            _write(stdout, _rpc_error(None, error("VALIDATION", details={"reason": "FRAME"})))
+            continue
+        if message is None:
+            return
+        for response in _dispatch(message, session, context):
+            if not _write(stdout, response):
+                return
+
+
+def _dispatch(message: Mapping[str, Any], session: _Session, context: Mapping[str, Any]) -> list:
+    if message.get("jsonrpc") != "2.0" or not isinstance(message.get("method"), str):
+        return [_rpc_error(_request_id(message), error("VALIDATION", details={"reason": "FRAME"}))]
+    method = message["method"]
+    if "id" not in message:
+        if method == "notifications/initialized" and session.announced and not session.failed:
+            session.ready = True
+        return []
+    request_id = _request_id(message)
+    if request_id is _BAD_ID:
+        return [_rpc_error(None, error("VALIDATION", details={"reason": "FRAME"}))]
+    try:
+        if method == "initialize":
+            return [_initialize(message, session, request_id)]
+        if method == "ping":
+            return [_rpc_ok(request_id, {})]
+        if method == "tools/list":
+            _require_ready(session)
+            return [_rpc_ok(request_id, {"tools": tool_specs(TaskStatus.all_values())})]
+        if method == "tools/call":
+            _require_ready(session)
+            return [_rpc_ok(request_id, _call_tool(message, context))]
+    except McpError as exc:
+        return [_rpc_error(request_id, exc)]
+    return [_rpc_error(request_id, error("VALIDATION", details={"reason": "UNKNOWN_METHOD", "field": "method"}))]
+
+
+def _initialize(message: Mapping[str, Any], session: _Session, request_id: Any) -> Dict[str, Any]:
+    if session.announced or session.failed:
+        session.failed = True
+        raise error("VALIDATION", details={"reason": "SESSION"})
+    params = message.get("params", {})
+    if not isinstance(params, dict):
+        session.failed = True
+        raise error("VALIDATION", details={"reason": "PROTOCOL_VERSION"})
+    version = params.get("protocolVersion")
+    if version != MCP_PROTOCOL_VERSION:
+        session.failed = True
+        raise error("VALIDATION", details={"reason": "PROTOCOL_VERSION"})
+    session.announced = True
+    return _rpc_ok(
+        request_id,
+        {
+            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": _SERVER_NAME, "version": SCHEMA_VERSION},
+        },
+    )
+
+
+def _require_ready(session: _Session) -> None:
+    if session.failed or not session.ready:
+        raise error("VALIDATION", details={"reason": "NOT_INITIALIZED"})
+
+
+def _call_tool(message: Mapping[str, Any], context: Mapping[str, Any]) -> Dict[str, Any]:
+    params = message.get("params", {})
+    if not isinstance(params, dict):
+        raise error("VALIDATION", details={"reason": "BAD_TYPE", "field": "params"})
+    name = params.get("name")
+    arguments = params.get("arguments", {})
+    if not isinstance(name, str):
+        raise error("VALIDATION", details={"reason": "BAD_TYPE", "field": "name"})
+    if arguments is None:
+        arguments = {}
+    try:
+        outcome = handle_tool(name, arguments, context)
+    except McpError:
+        raise
+    except Exception:
+        raise error("VALIDATION", details={"reason": "INTERNAL"}) from None
+    structured = outcome.get("structured")
+    if not isinstance(structured, dict):
+        raise error("VALIDATION", details={"reason": "INTERNAL"})
+    text = json.dumps(structured, ensure_ascii=False, separators=(",", ":"))
+    return {
+        "content": [{"type": "text", "text": text}],
+        "structuredContent": structured,
+        "isError": bool(outcome.get("isError")),
+    }
+
+
+_BAD_ID = object()
+
+
+def _request_id(message: Mapping[str, Any]) -> Any:
+    if "id" not in message:
+        return None
+    request_id = message.get("id")
+    if isinstance(request_id, bool) or not isinstance(request_id, (str, int)):
+        return _BAD_ID
+    return request_id
+
+
+def _rpc_ok(request_id: Any, result: Mapping[str, Any]) -> Dict[str, Any]:
+    return {"jsonrpc": "2.0", "id": request_id, "result": result}
+
+
+def _rpc_error(request_id: Any, exc: McpError) -> Dict[str, Any]:
+    return {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "error": {"code": exc.rpc_code, "message": exc.message, "data": exc.body()},
+    }
+
+
+def _write(stdout: BinaryIO, payload: Mapping[str, Any]) -> bool:
+    try:
+        stdout.write(encode_message(payload))
+        stdout.flush()
+    except (BrokenPipeError, OSError):
+        return False
+    return True

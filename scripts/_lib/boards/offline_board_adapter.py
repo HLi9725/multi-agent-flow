@@ -208,10 +208,16 @@ class OfflineBoardAdapter:
     # 统一接口
     # ------------------------------------------------------------------
     def list_records_readonly(self, filter_json: Optional[Dict[str, Any]] = None,
-                              limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
-        """获取记录列表的只读快照（无锁）"""
+                              limit: Optional[int] = 100, offset: int = 0,
+                              include_deleted: bool = False) -> List[Dict[str, Any]]:
+        """获取记录列表的只读快照（无锁）。
+
+        默认仍隐藏软删除。include_deleted 仅供已授权的管理读路径一次取全量。
+        limit 为 None 时返回该次读取的全部记录，不再按页拼接。
+        """
         cards = self._read_cards()
-        cards = [c for c in cards if not c.get("is_deleted")]
+        if not include_deleted:
+            cards = [c for c in cards if not c.get("is_deleted")]
         items = [{"record_id": c.get("id"), "fields": c} for c in cards]
         if filter_json:
             for cond in filter_json.get("conditions", []):
@@ -230,6 +236,8 @@ class OfflineBoardAdapter:
                     else:
                         filtered.append(item)
                 items = filtered
+        if limit is None:
+            return items[offset:]
         return items[offset : offset + limit]
 
     def list_records(self, filter_json: Optional[Dict[str, Any]] = None,

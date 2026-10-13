@@ -25,6 +25,9 @@ docs/D01-项目管理/*
 !docs/D01-项目管理/06-第三四阶段开发实施计划.md
 !docs/D01-项目管理/07-第三阶段Profile使用与迁移说明.md
 !docs/D01-项目管理/08-T0034开发报告.md
+!docs/D02-架构设计/
+docs/D02-架构设计/*
+!docs/D02-架构设计/04-第四阶段MCP接入架构.md
 logs/
 *.lock
 */*.lock
