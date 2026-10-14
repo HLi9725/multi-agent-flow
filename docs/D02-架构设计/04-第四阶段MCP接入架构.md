@@ -323,16 +323,16 @@ STDIO 没有网络凭证。主体取启动进程的操作系统用户，经登�
 
 ### 8.4 用户验收
 
-验收与通用流转拆开。
+验收与通用流转拆开。`request_acceptance` 只申请，不把任务写成「已验收」。
 
 - `transition_task` 看到 `已验收`：`ACCEPTANCE_REQUIRED`。
-- `request_acceptance` 要求权限 `acceptance`，以及可信上下文中的人类确认标记 `acceptance_confirmed=true`。该标记由传输层在用户于客户端完成确认控件后设置。模型在 JSON 里写 `acceptance_confirmed` 无效，因为服务在合并参数前删除该键，只读上下文。
-- 任务当前状态必须是 `已完成`。Runner 任务还必须已有服务端生成的 `confirmation_request_id`（现有 Checkpoint / 会话字段）。MCP 不生成替代 ID，也不接受模型传入的 ID 覆盖。
-- 证据类型必须是 `user_confirmation`。门禁上下文沿用 `EvidenceGate` 对 `USER_CONFIRMATION` 的要求：`confirmation_result.is_real_host`、`user_source=explicit_user`、`confirmed_at`、`confirmation_id` 与服务端 request id 一致。
-- 看板写入只允许 `已完成 -> 已验收`，角色使用现有矩阵中有权做此转换的 PM 路径，并带 `delegated_by` 为已通过白名单的人类授权来源。`validate_delegation_authority` 不通过则 `FORBIDDEN`。
-- 终态之后任何再流转仍由现有终态锁拒绝。MCP 把它映射为 `FORBIDDEN`，不新增“撤销验收”工具。
+- 进程环境变量 `YY_FLOW_MCP_ACCEPTANCE_CONFIRMED` 和模型参数 `acceptance_confirmed` 都不构成逐次用户确认。STDIO 与 HTTP 把上下文里的该标记固定为假。
+- 申请成功时，服务端生成不可预测编号，写入项目数据根 `mcp_auth/acceptance/<编号>.json`。返回项目、任务、候选 SHA、契约哈希、质量证据摘要、动作 `accept`、编号和过期时间。任务保持「已完成」。同一幂等键返回同一编号。
+- 用户在本机执行 `python scripts/mcp_server.py acceptance --registry <登记> --id <编号> --decision approve|reject`。身份只取操作系统用户，匹配登记主体，并且该主体对项目有 `acceptance`。命令行里的用户编号不参与判断。
+- 批准仍要独立通过 EvidenceGate。门禁失败不消费为成功验收。拒绝把原任务从「已完成」退回「已退回」，不新建任务。成功后记录一次性消费；已消费且状态已落盘时再次调用只返回原结果。
+- Runner 的 `accept` / `reject` 仍走检查点上的 `confirmation_request_id`。那条入口不因本节被写成 MCP 通道已经通过。
 
-无 Runner Checkpoint 的历史任务：若从未进入 Production Runner，验收仍只能在状态已经是 `已完成`、权限为 `acceptance`、且存在一份通过 EvidenceGate 的 `USER_CONFIRMATION` 时发生。不能因为任务旧就改用通用 transition 跳过该工具。
+无 Runner Checkpoint 的任务也可以申请。批准前任务必须仍是「已完成」，并且引用的质量证据仍与候选和契约一致。
 
 ### 8.5 状态、审计、并发与故障
 

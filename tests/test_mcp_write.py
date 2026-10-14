@@ -353,7 +353,7 @@ def _submit(session: StdioSession, task_id: str, key: str, evidence_type: str, m
 
 
 def test_request_acceptance_requires_gate_and_transport_confirmation(tmp_path: Path) -> None:
-    """模型参数不能代替传输确认；成功验收必须经过 USER_CONFIRMATION 门禁。"""
+    """模型参数和环境变量都不能把任务变成已验收。"""
     grants = {"alpha": ["read", "task.transition", "evidence.submit", "acceptance"]}
     registry, _board = _prepare(tmp_path, grants, role="DEV")
     plain = _open(tmp_path, registry, confirmed=False)
@@ -391,8 +391,10 @@ def test_request_acceptance_requires_gate_and_transport_confirmation(tmp_path: P
                 "acceptance_confirmed": True,
             },
         )
-        assert rejected["isError"] is True
-        assert rejected["structuredContent"]["code"] == "ACCEPTANCE_REQUIRED"
+        assert rejected["isError"] is False, rejected["structuredContent"]
+        assert rejected["structuredContent"]["status"] == "已完成"
+        assert rejected["structuredContent"]["action"] == "accept"
+        assert rejected["structuredContent"]["confirmation_id"]
         assert _version(plain, task_id)[1] == "已完成"
     finally:
         plain.close()
@@ -426,8 +428,9 @@ def test_request_acceptance_requires_gate_and_transport_confirmation(tmp_path: P
                 "acceptance_confirmed": True,
             },
         )
-        assert model_only["structuredContent"]["code"] == "ACCEPTANCE_REQUIRED"
-        assert model_only["structuredContent"]["details"]["reason"] == "CONFIRMATION"
+        assert model_only["isError"] is False, model_only["structuredContent"]
+        assert model_only["structuredContent"]["status"] == "已完成"
+        assert model_only["structuredContent"]["action"] == "accept"
         assert _version(confirmed, task_id)[1] == "已完成"
         server_id = "srv-confirm-9f3a"
         confirm_path = tmp_path / MARKER / "alpha" / "mcp_auth" / "confirmation" / f"{task_id}.json"
@@ -446,7 +449,8 @@ def test_request_acceptance_requires_gate_and_transport_confirmation(tmp_path: P
                 "evidence_id": user_id,
             },
         )
-        assert stale_model["structuredContent"]["code"] == "GATE_REJECTED"
+        assert stale_model["isError"] is False, stale_model["structuredContent"]
+        assert stale_model["structuredContent"]["status"] == "已完成"
         assert _version(confirmed, task_id)[1] == "已完成"
         witnessed = _submit(
             confirmed,
@@ -477,8 +481,10 @@ def test_request_acceptance_requires_gate_and_transport_confirmation(tmp_path: P
             },
         )
         assert accepted["isError"] is False, accepted["structuredContent"]
-        assert accepted["structuredContent"]["status"] == "已验收"
-        assert _version(confirmed, task_id)[1] == "已验收"
+        assert accepted["structuredContent"]["status"] == "已完成"
+        assert accepted["structuredContent"]["action"] == "accept"
+        assert accepted["structuredContent"]["confirmation_id"]
+        assert _version(confirmed, task_id)[1] == "已完成"
         fresh = confirmed.call(
             "create_task",
             {

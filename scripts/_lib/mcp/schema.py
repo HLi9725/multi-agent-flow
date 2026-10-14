@@ -230,7 +230,7 @@ def tool_specs(status_enum: List[str], scopes: Any = None) -> List[Dict[str, Any
         },
         {
             "name": "request_acceptance",
-            "description": "在独立授权下请求用户验收",
+            "description": "申请用户验收并返回确认编号，不把任务改为已验收",
             "inputSchema": _object_schema(
                 {
                     "project_id": _project_id_schema(),

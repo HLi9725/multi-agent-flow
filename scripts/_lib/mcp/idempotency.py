@@ -189,7 +189,22 @@ def _replay_from_target(target: Any) -> Dict[str, Any]:
     if not isinstance(target, dict):
         return {}
     body = {}
-    for key in ("task_id", "status", "assignee", "evidence_id", "content_hash", "task_version", "is_deleted"):
+    for key in (
+        "task_id",
+        "status",
+        "assignee",
+        "evidence_id",
+        "content_hash",
+        "task_version",
+        "is_deleted",
+        "project_id",
+        "candidate_sha",
+        "contract_hash",
+        "confirmation_id",
+        "expires_at",
+        "action",
+        "quality_evidence_summary",
+    ):
         if key in target:
             body[key] = target[key]
     return body

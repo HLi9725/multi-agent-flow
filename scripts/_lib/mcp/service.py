@@ -656,8 +656,6 @@ def _dispatch_write(
     scopes = auth.scopes_for(principal, project.project_id)
     if TOOL_SCOPE[name] not in scopes:
         raise error("FORBIDDEN")
-    if name == "request_acceptance" and not context.get("acceptance_confirmed"):
-        raise error("ACCEPTANCE_REQUIRED")
     digest = _request_digest(cleaned)
     ledger = _ledger(project)
     decision = ledger.start(
@@ -817,7 +815,7 @@ def _execute_write(
     if name == "transition_task":
         return _transition_task(cleaned, project, principal)
     if name == "request_acceptance":
-        return _request_acceptance(cleaned, project, principal, context)
+        return _request_acceptance(cleaned, project, principal, context, ledger, digest)
     if name == "soft_delete":
         return _set_visibility(cleaned, project, deleted=True)
     return _set_visibility(cleaned, project, deleted=False)
@@ -1018,7 +1016,12 @@ def _intent_target(name: str, cleaned: Mapping[str, Any], project: ProjectRecord
             "assignee": str(cleaned.get("assignee") or ""),
         }
     if name == "request_acceptance":
-        return {"task_id": str(cleaned.get("task_id") or ""), "status": "已验收"}
+        return {
+            "task_id": str(cleaned.get("task_id") or ""),
+            "status": "已完成",
+            "evidence_id": str(cleaned.get("evidence_id") or ""),
+            "action": "accept",
+        }
     if name == "submit_evidence":
         return {"evidence_id": _evidence_identity(project, str(cleaned.get("task_id") or ""), str(cleaned.get("idempotency_key") or ""))}
     if name == "soft_delete":
@@ -1150,102 +1153,13 @@ def _request_acceptance(
     project: ProjectRecord,
     principal: auth.AuthContext,
     context: Mapping[str, Any],
+    ledger: Any,
+    digest: str,
 ) -> Dict[str, Any]:
-    from scripts._lib.core.agent_schema import AgentHandle, ConfirmationResult
-    from scripts._lib.core.evidence_gate import EvidenceGate, EvidenceGateError, EvidenceValidationContext
-    from scripts._lib.core.evidence_schema import EvidenceError, EvidenceType
-    from scripts._lib.core.evidence_store import EvidenceStore
-    from scripts.transition_task import transition_task_pipeline
+    del context
+    from .acceptance import create_application
 
-    if not context.get("acceptance_confirmed"):
-        raise error("ACCEPTANCE_REQUIRED")
-    task_id = str(cleaned["task_id"])
-    card, _version = _read_card_stable(project, task_id)
-    if card is None or card.get("is_deleted"):
-        raise error("NOT_FOUND")
-    if str(card.get("status") or "") != "已完成":
-        raise error("ACCEPTANCE_REQUIRED", details={"reason": "STATUS", "current": str(card.get("status") or "")})
-    current = task_version(card)
-    if current != cleaned["expected_version"]:
-        raise error("CONFLICT", details={"reason": "VERSION", "task_version": current})
-    store = EvidenceStore(project.evidence_root)
-    try:
-        record = store.read(str(cleaned["evidence_id"]))
-    except EvidenceError:
-        raise error("NOT_FOUND") from None
-    if record.evidence_type != EvidenceType.USER_CONFIRMATION:
-        raise error("GATE_REJECTED", details={"reason": "EVIDENCE_TYPE"})
-    confirmation_id = _server_confirmation_id(project, task_id)
-    if not confirmation_id:
-        raise error("ACCEPTANCE_REQUIRED", details={"reason": "CONFIRMATION"})
-    meta = record.metadata
-    try:
-        EvidenceGate(store, project.data_root).validate_evidence(
-            str(cleaned["evidence_id"]),
-            EvidenceValidationContext(
-                project_id=project.project_id,
-                task_id=task_id,
-                actor_role=str(meta.actor_role),
-                transition_from=str(meta.transition_from),
-                transition_to=str(meta.transition_to),
-                baseline_commit=record.baseline_commit,
-                result_commit=record.result_commit,
-                expected_invocation_id=str(meta.host_invocation_id),
-                expected_adapter=str(meta.adapter),
-                expected_workspace_mode=str(meta.workspace_mode),
-                expected_evidence_type=EvidenceType.USER_CONFIRMATION,
-                host_handle=AgentHandle(
-                    session_id=str(meta.host_session_id),
-                    host_id=str(meta.host_id),
-                    is_real_host=True,
-                ),
-                expected_capabilities=_transport_capabilities(True),
-                confirmation_result=ConfirmationResult(confirmation_id, "accept", True, True),
-            ),
-        )
-    except EvidenceGateError:
-        raise error("GATE_REJECTED", details={"reason": "GATE"}) from None
-    import contextlib
-    import io
-
-    version_state: Dict[str, Any] = {}
-    end_time = card.get("end_time") or card.get("end_date") or "1970-01-01 00:00:00"
-
-    def run() -> bool:
-        sink = io.StringIO()
-        with contextlib.redirect_stdout(sink):
-            return transition_task_pipeline(
-            config_path=project.board_config or None,
-            task_id=task_id,
-            current_role="PM",
-            from_status="已完成",
-            to_status="已验收",
-            assignee=str(card.get("assignee") or "严经理"),
-            task_type=str(card.get("type") or "A"),
-            end_time=str(end_time),
-            delegated_by="USER",
-            delegation_reason="explicit_user",
-            expected_card_version=str(cleaned["expected_version"]),
-            version_state=version_state,
-            runner_evidence_id=str(cleaned["evidence_id"]),
-            )
-        return False
-
-    ok = _call_in_project(project, run)
-    if version_state.get("conflict"):
-        raise error("CONFLICT", details={"reason": "VERSION", "task_version": version_state.get("task_version")})
-    if not ok:
-        raise error("FORBIDDEN", details={"reason": "ACCEPTANCE"})
-    updated = _read_card(project, task_id) or {}
-    return {
-        "_project_id": project.project_id,
-        "_task_id": task_id,
-        "_allow": ["task_id", "status", "task_version", "evidence_id", "replayed", "code"],
-        "task_id": task_id,
-        "status": "已验收",
-        "task_version": task_version(updated),
-        "evidence_id": str(cleaned["evidence_id"]),
-    }
+    return create_application(project, principal, cleaned, ledger, digest)
 
 
 def _capability_namespace(extra: Mapping[str, Any]) -> Any:
@@ -1345,7 +1259,18 @@ def _fact_reached(project: ProjectRecord, tool: str, record: Mapping[str, Any]) 
         return "missing"
     if tool == "create_task":
         return "achieved"
-    if tool in {"transition_task", "request_acceptance"}:
+    if tool == "request_acceptance":
+        from .acceptance import matching_application
+
+        found = matching_application(
+            project,
+            principal_id=str(record.get("principal_id") or ""),
+            task_id=str(target.get("task_id") or ""),
+            idempotency_key=str(record.get("idempotency_key") or ""),
+            digest=str(record.get("request_sha256") or ""),
+        )
+        return "achieved" if found is not None else "missing"
+    if tool == "transition_task":
         status = str(target.get("status") or "")
         assignee = str(target.get("assignee") or "")
         if status and str(card.get("status") or "") != status:

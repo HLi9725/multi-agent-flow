@@ -51,7 +51,7 @@ def _stdio(args: argparse.Namespace) -> int:
         "registry": registry,
         "audit": AuditStore(audit_dir),
         "os_user": current_os_user(),
-        "acceptance_confirmed": os.environ.get("YY_FLOW_MCP_ACCEPTANCE_CONFIRMED") == "1",
+        "acceptance_confirmed": False,
     }
     serve(sys.stdin.buffer, sys.stdout.buffer, context)
     return 0
@@ -82,7 +82,7 @@ def _http(args: argparse.Namespace) -> int:
     context = {
         "registry": registry,
         "audit": AuditStore(os.path.join(os.path.dirname(registry.path), "mcp_audit")),
-        "acceptance_confirmed": os.environ.get("YY_FLOW_MCP_ACCEPTANCE_CONFIRMED") == "1",
+        "acceptance_confirmed": False,
         "transport": "http",
         "tool_timeout_seconds": timeout,
     }
@@ -150,6 +150,38 @@ def _looks_like_path(value: str) -> bool:
     return any(mark in value for mark in ("/", "\\", ":"))
 
 
+def run_acceptance(args: argparse.Namespace) -> int:
+    """本地验收决定。user_id 即使传入也不参与身份判断。"""
+    registry = _load(args.registry)
+    if registry is None:
+        return 2
+    from scripts._lib.mcp.acceptance import decide_acceptance
+
+    audit = AuditStore(os.path.join(os.path.dirname(registry.path), "mcp_audit"))
+    result = decide_acceptance(
+        registry,
+        args.id,
+        args.decision,
+        user_id=getattr(args, "user_id", "") or "",
+        audit=audit,
+    )
+    public = {
+        "ok": bool(result.get("ok")),
+        "code": result.get("code") or "",
+        "reason": result.get("reason") or "",
+        "project_id": result.get("project_id") or "",
+        "task_id": result.get("task_id") or "",
+        "confirmation_id": result.get("confirmation_id") or "",
+        "decision": result.get("decision") or "",
+        "status": result.get("status") or "",
+        "consumed": bool(result.get("consumed")),
+        "replayed": bool(result.get("replayed")),
+    }
+    sys.stdout.write(json.dumps(public, ensure_ascii=False, sort_keys=True) + "\n")
+    sys.stdout.flush()
+    return 0 if result.get("ok") else 2
+
+
 def _sync_github(args: argparse.Namespace) -> int:
     if _looks_like_path(args.project_id):
         _stderr("项目标识无效\n")
@@ -199,6 +231,11 @@ def main(argv: list[str] | None = None) -> int:
     restore = auth_sub.add_parser("restore")
     restore.add_argument("--src", required=True)
     restore.add_argument("--dest", required=True)
+    acceptance = sub.add_parser("acceptance")
+    acceptance.add_argument("--registry", required=True)
+    acceptance.add_argument("--id", required=True)
+    acceptance.add_argument("--decision", required=True, choices=("approve", "reject"))
+    acceptance.add_argument("--user-id", default="")
     sync = sub.add_parser("sync-github")
     sync.add_argument("--project-id", required=True)
     sync.add_argument("--mode", choices=("read-only", "write"), default="read-only")
@@ -209,6 +246,8 @@ def main(argv: list[str] | None = None) -> int:
         return _http(args)
     if args.command == "auth":
         return _auth(args)
+    if args.command == "acceptance":
+        return run_acceptance(args)
     if args.command == "sync-github":
         return _sync_github(args)
     _stderr("官方 SDK 后端未启用\n")
