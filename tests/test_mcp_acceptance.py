@@ -123,21 +123,25 @@ def _quality_extra(card, task_id, session, role):
              "decision": "PASS", "acceptance_criteria_hash": card["acceptance_criteria_hash"]}
     if role == "REVIEWER":
         return extra
-    commands = ["python -m pytest -q"]
-    results = [{"command": commands[0], "exit_code": 0, "output_hash": "e" * 64}]
+    from scripts._lib.core.production_runner import effective_controlled_commands
+
+    commands = list(effective_controlled_commands(("python -m pytest -q",), "", "b" * 40))
+    results = [{"command": command, "exit_code": 0, "output_hash": "e" * 64} for command in commands]
     coverage = [{"criterion_id": item["id"], "status": "PASS", "evidence": "isolated assertions"}
                 for item in card["acceptance_criteria_items"]]
     report = {"task_id": task_id, "baseline_commit": "a" * 40, "candidate_commit": "b" * 40,
               "session_id": session, "qa_request_id": "qa-request-01",
               "acceptance_criteria_hash": card["acceptance_criteria_hash"], "decision": "PASS",
-              "acceptance_coverage": coverage, "test_commands": [{"command": commands[0], "exit_code": 0}],
+              "acceptance_coverage": coverage,
+              "test_commands": [{"command": command, "exit_code": 0} for command in commands],
               "negative_scenarios": [{"name": "denied", "status": "PASS"}], "defects": [], "uncovered_risks": []}
     def digest(value):
         return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
     extra.update(qa_decision="PASS", qa_request_id="qa-request-01", qa_report=report,
                  qa_report_hash=digest(report), covered_criterion_ids=[item["criterion_id"] for item in coverage],
-                 required_test_commands=commands, runner_test_results=results, required_test_command_count=1,
-                 negative_scenario_count=1, uncovered_risk_count=0, defect_count=0, test_exit_codes=[0],
+                 required_test_commands=commands, runner_test_results=results, required_test_command_count=len(commands),
+                 negative_scenario_count=1, uncovered_risk_count=0, defect_count=0,
+                 test_exit_codes=[0 for _command in commands],
                  test_command_hash=digest(commands), test_output_hash=digest(results))
     return extra
 
@@ -940,3 +944,82 @@ def test_checkpoint_bindings_cannot_reuse_other_quality(tmp_path, binding):
     if binding == "commands": authority["required_test_commands"] = ["different-command"]
     if binding == "requirement": authority["requirement_hash"] = "d" * 64
     assert acceptance_mod._quality_problem(project, authority, task, EvidenceStore(project.evidence_root).read(evid)) == "QUALITY_CHAIN"
+
+
+def test_qa_commands_must_equal_runner_controlled_list(tmp_path: Path) -> None:
+    registry, task_id, _evidence_id, _confirmation = _apply(tmp_path, "cmdlist")
+    project = load_registry(str(registry)).get_project("alpha")
+    assert project is not None
+    store = EvidenceStore(project.evidence_root)
+    original = store.read("qa-cmdlist")
+    authority = acceptance_mod._authority(project, acceptance_mod._card(project, task_id))
+    assert acceptance_mod._quality_problem(project, authority, task_id, original) is None
+
+    def plant(evidence_id: str, mutate) -> None:
+        extra = acceptance_mod._plain(original.metadata.extra)
+        mutate(extra)
+        meta = original.metadata
+        store.append(
+            EvidenceRecord(
+                evidence_id=evidence_id,
+                evidence_type=original.evidence_type,
+                baseline_commit=original.baseline_commit,
+                result_commit=original.result_commit,
+                artifacts=original.artifacts,
+                metadata=EvidenceMetadata(
+                    project_id=meta.project_id,
+                    task_id=meta.task_id,
+                    actor_role=meta.actor_role,
+                    host_id=meta.host_id,
+                    adapter=meta.adapter,
+                    host_session_id=meta.host_session_id,
+                    host_invocation_id=meta.host_invocation_id,
+                    is_real_host=meta.is_real_host,
+                    workspace_mode=meta.workspace_mode,
+                    transition_from=meta.transition_from,
+                    transition_to=meta.transition_to,
+                    created_at=meta.created_at,
+                    extra=extra,
+                ),
+            )
+        )
+
+    def extra_command(extra: dict) -> None:
+        extra["required_test_commands"] = list(extra["required_test_commands"]) + ["echo extra"]
+        extra["qa_report"]["test_commands"] = list(extra["qa_report"]["test_commands"]) + [
+            {"command": "echo extra", "exit_code": 0}
+        ]
+
+    def missing_command(extra: dict) -> None:
+        extra["required_test_commands"] = list(extra["required_test_commands"])[:-1]
+        extra["qa_report"]["test_commands"] = list(extra["qa_report"]["test_commands"])[:-1]
+
+    def duplicate_command(extra: dict) -> None:
+        extra["required_test_commands"] = list(extra["required_test_commands"]) + [extra["required_test_commands"][-1]]
+        extra["qa_report"]["test_commands"] = list(extra["qa_report"]["test_commands"]) + [
+            dict(extra["qa_report"]["test_commands"][-1])
+        ]
+
+    def wrong_candidate(extra: dict) -> None:
+        wrong = "git diff --check " + ("c" * 40) + ".." + ("d" * 40) + " --"
+        commands = list(extra["required_test_commands"])
+        commands[-1] = wrong
+        extra["required_test_commands"] = commands
+        report_commands = list(extra["qa_report"]["test_commands"])
+        report_commands[-1] = {"command": wrong, "exit_code": 0}
+        extra["qa_report"]["test_commands"] = report_commands
+
+    def failed_exit(extra: dict) -> None:
+        report_commands = list(extra["qa_report"]["test_commands"])
+        report_commands[-1] = {"command": report_commands[-1]["command"], "exit_code": 1}
+        extra["qa_report"]["test_commands"] = report_commands
+
+    for evidence_id, mutate in (
+        ("qa-extra", extra_command),
+        ("qa-missing", missing_command),
+        ("qa-duplicate", duplicate_command),
+        ("qa-candidate", wrong_candidate),
+        ("qa-failed", failed_exit),
+    ):
+        plant(evidence_id, mutate)
+        assert acceptance_mod._quality_problem(project, authority, task_id, store.read(evidence_id)) == "QUALITY_CHAIN"

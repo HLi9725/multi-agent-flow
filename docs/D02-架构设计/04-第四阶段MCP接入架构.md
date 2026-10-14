@@ -331,7 +331,7 @@ STDIO 没有网络凭证。主体取启动进程的操作系统用户，经登�
 - 用户在本机交互式控制台执行 `python scripts/mcp_server.py acceptance --registry <登记> --id <编号> --decision approve|reject`，并在控制台设备上重新输入确认编号。管道标准输入不能批准。身份只取操作系统进程令牌上的账户名（Windows 打开当前进程令牌后解析账户，POSIX 使用 `geteuid`），不读取 `USERNAME`、`USER`、`LOGNAME`，也不使用线程模拟令牌。该账户必须匹配登记主体，并且该主体对项目有 `acceptance`。命令行里的用户编号不参与判断。同一操作系统账户不能单独证明是人在批准；非交互调用会被拒绝。模型若能自己打开伪终端，这条边界仍然不够，不能写成已经具备独立人类审批控件。
 - 申请必须引用检查点里的最新候选，以及同一候选上的独立质量链。Standard 需要真实宿主上的审查 PASS 与测试 PASS，二者会话不同。审查通过可以记在 `transition_to=TESTING`，测试通过记在 `qa_decision`。Lite 需要可区分的 Verifier PASS（`verifier_decision`）。这些记录可以没有产物。`USER_CONFIRMATION` 不是质量证据。契约哈希包含检查点快照里的验收标准哈希；快照若带有验收条目或验收正文，一并纳入。没有检查点时，使用任务卡上的候选、验收条目和备注。改变条目或候选后，旧确认编号失效。
 - 批准在质量链通过之后才写入用户确认证据，并仍要独立通过 EvidenceGate。门禁失败不消费为成功验收。拒绝把原任务从「已完成」退回「已退回」，不新建任务。成功后记录一次性消费；已消费且终态审计已落盘时，再次调用只返回原结果。若看板已经改完但终态审计写入失败，返回「业务已应用、审计待补记」；重试只补记审计，不再次流转。
-- Runner 的 `accept` / `reject` 仍走检查点上的 `confirmation_request_id`。那条入口不因本节被写成 MCP 通道已经通过。
+- Runner 的 `accept` / `reject` 仍走检查点上的 `confirmation_request_id`。MCP 确认编号是另一套编号。申请时由服务端把检查点编号写入申请记录，批准时用该编号调用 `Runner.accept`，不把两个编号当成同一个，也不改写检查点里的编号。用户确认证据同时记下 `confirmation_id`（Runner）和 `mcp_confirmation_id`（MCP）。锁顺序是先占验收记录锁，再占 Runner 锁。
 
 没有检查点、或检查点不能唯一确定最新候选时，不能申请。批准前任务必须仍是「已完成」。
 

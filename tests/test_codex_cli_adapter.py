@@ -157,6 +157,15 @@ def test_codex_cli_adapter_command_building_and_no_invalid_a_flag():
     assert "-s" in cmd_rev
     assert "--approve-for-me" not in cmd_rev
     assert cmd_rev[cmd_rev.index("-s") + 1] == "read-only"
+    req_rev_flag = AgentRequest(
+        session_id="sess_rev_flag",
+        prompt="Check code correctness",
+        role="REVIEWER",
+        workspace_dir=os.path.abspath("."),
+        extra_context={"sandbox": True},
+    )
+    cmd_rev_flag = adapter.build_codex_exec_command(req_rev_flag)
+    assert cmd_rev_flag[cmd_rev_flag.index("-s") + 1] == "read-only"
     assert cmd_rev[cmd_rev.index("-C") + 1] == os.path.abspath(".")
 
     # 2. DEV role with auto approval generates --approve-for-me WITHOUT -s (DEF-T0050-7)

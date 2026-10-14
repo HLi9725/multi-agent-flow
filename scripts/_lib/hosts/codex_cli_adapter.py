@@ -189,7 +189,10 @@ class CodexCliAdapter(BaseHostAdapter):
         role = (request.role or "").upper().strip()
         requested_sandbox = None
         if isinstance(request.extra_context, Mapping):
-            requested_sandbox = request.extra_context.get("sandbox_mode") or request.extra_context.get("sandbox")
+            requested_sandbox = request.extra_context.get("sandbox_mode")
+            if not isinstance(requested_sandbox, str):
+                raw_sandbox = request.extra_context.get("sandbox")
+                requested_sandbox = raw_sandbox if isinstance(raw_sandbox, str) else None
 
         if requested_sandbox is not None:
             if requested_sandbox not in ALLOWED_SANDBOX_MODES:

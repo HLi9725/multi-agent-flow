@@ -1299,6 +1299,18 @@ def _snapshot_mismatches(snapshot: Mapping[str, Any], spec: TaskExecutionSpec) -
     return mismatches
 
 
+def effective_controlled_commands(configured, baseline: str, candidate: str, fallback: str = "") -> Tuple[str, ...]:
+    """契约里的受控命令，再加上 Runner 固定追加的差异检查。"""
+    if configured:
+        commands = tuple(str(item) for item in configured)
+    elif fallback:
+        commands = (str(fallback),)
+    else:
+        commands = ("python -m pytest -q",)
+    gate = f"git diff --check {baseline}..{candidate} --"
+    return commands + (gate,)
+
+
 class ProductionRunnerError(Exception):
     pass
 
@@ -4224,11 +4236,13 @@ class ProductionRunner:
                     message=f"Unable to create bounded QA candidate payload: {exc}",
                 )
 
-            configured_test_commands = spec.test_commands or (spec.test_command or "python -m pytest -q",)
-            format_gate_command = f"git diff --check {spec.baseline_commit}..{candidate_commit} --"
-            # Mandatory trusted gate: callers cannot remove it with a custom
-            # --test-command list.
-            test_commands = tuple(configured_test_commands) + (format_gate_command,)
+            test_commands = effective_controlled_commands(
+                spec.test_commands,
+                spec.baseline_commit,
+                candidate_commit,
+                spec.test_command or "",
+            )
+            format_gate_command = test_commands[-1]
             qa_stage_deadline = time.monotonic() + float(spec.qa_timeout_seconds)
             validated_commands = []
             for test_cmd in test_commands:
@@ -5610,6 +5624,8 @@ class ProductionRunner:
         task_id: str,
         confirmation_request_id: str,
         authority_root: Optional[str] = None,
+        *,
+        external_confirmation_id: str = "",
     ) -> RunnerResult:
         """Explicitly accept the exact pending candidate and synchronize board/checkpoint."""
         _validate_task_id(task_id)
@@ -5750,6 +5766,8 @@ class ProductionRunner:
                 "user_source": "explicit_user",
                 "confirmed_at": confirmed_at,
             })
+            if external_confirmation_id:
+                confirmation_extra["mcp_confirmation_id"] = external_confirmation_id
             confirmation_meta = EvidenceMetadata(
                 project_id=ckpt.project_id, task_id=task_id, actor_role="PM",
                 host_id="explicit_user_cli", adapter="run_task_cli",

@@ -138,6 +138,7 @@ def create_application(
             "evidence_content_hash": evidence.content_hash,
             "baseline_commit": evidence.baseline_commit,
             "candidate_sha": str(checkpoint.get("candidate_commit") or ""),
+            "runner_confirmation_request_id": str(checkpoint.get("runner_confirmation_request_id") or ""),
             "contract_hash": _contract_hash(project, card, evidence, checkpoint),
             "quality_evidence_summary": _quality_summary(project, checkpoint, task_id),
             "action": "accept",
@@ -255,6 +256,13 @@ def _decide_locked(
         gate_problem = _approve_gate(project, record)
         if gate_problem is not None:
             return _failure("GATE_REJECTED", gate_problem, project.project_id, record)
+        if _runner_checkpoint(project, str(record.get("task_id") or "")) is None:
+            try:
+                _mint_and_validate(project, record)
+            except McpError:
+                return _failure("GATE_REJECTED", "GATE", project.project_id, record)
+            except Exception:
+                return _failure("GATE_REJECTED", "GATE", project.project_id, record)
     if not stored:
         record["decision"] = decision
         record["decided_by"] = os_user
@@ -438,6 +446,64 @@ def _replay_consumed(project: ProjectRecord, record: Mapping[str, Any]) -> Dict[
     }
 
 
+def _runner_checkpoint(project: ProjectRecord, task_id: str):
+    """读取检查点对象。锁顺序是先验收记录锁，再 Runner 锁。"""
+    if not task_id:
+        return None
+    matches = glob.glob(os.path.join(project.data_root, "runner_checkpoints", "*", task_id + ".json"))
+    if len(matches) != 1:
+        return None
+    data = _read_json(matches[0])
+    if not isinstance(data, dict):
+        return None
+    try:
+        from ..core.runner_schema import RunnerCheckpoint
+
+        checkpoint = RunnerCheckpoint.from_dict(data)
+    except (TypeError, ValueError, KeyError):
+        return None
+    if checkpoint.task_id != task_id or checkpoint.project_id != project.project_id:
+        return None
+    return checkpoint
+
+
+def _accept_bound_runner(project: ProjectRecord, record: Mapping[str, Any], checkpoint) -> Dict[str, Any]:
+    """用检查点自己的确认编号走 Runner.accept。MCP 编号只记在绑定字段。"""
+    from ..core.production_runner import ProductionRunner
+    from ..core.runner_checkpoint_store import RunnerCheckpointStore
+
+    runner_id = str(checkpoint.confirmation_request_id or "")
+    bound = str(record.get("runner_confirmation_request_id") or "")
+    if not runner_id or (bound and bound != runner_id):
+        return _failure("CONFLICT", "CONFIRMATION", project.project_id, record)
+    if str(checkpoint.candidate_commit or "") != str(record.get("candidate_sha") or ""):
+        return _failure("CONFLICT", "CANDIDATE", project.project_id, record)
+    snapshot = checkpoint.execution_spec_snapshot if isinstance(checkpoint.execution_spec_snapshot, Mapping) else {}
+    project_root = str(snapshot.get("project_root") or project.data_root)
+    store = RunnerCheckpointStore(
+        data_root=project.data_root,
+        project_root=project_root,
+        project_id=checkpoint.project_id,
+    )
+    runner = ProductionRunner(checkpoint_store=store)
+    result = runner.accept(
+        project_root,
+        str(record.get("task_id") or ""),
+        runner_id,
+        project.data_root,
+        external_confirmation_id=str(record.get("confirmation_id") or ""),
+    )
+    if not result.success:
+        message = str(result.message or "")
+        if "locked" in message.lower():
+            return _failure("CONFLICT", "IN_PROGRESS", project.project_id, record)
+        return _failure("GATE_REJECTED", "TRANSITION", project.project_id, record)
+    updated = _card(project, str(record.get("task_id") or "")) or {}
+    if str(updated.get("status") or "") != "已验收":
+        return _failure("GATE_REJECTED", "TRANSITION", project.project_id, record)
+    return {"ok": True, "status": "已验收", "task_version": _version(updated)}
+
+
 def _apply_decision(project: ProjectRecord, record: Mapping[str, Any], decision: str) -> Dict[str, Any]:
     task_id = str(record.get("task_id") or "")
     card = _card(project, task_id)
@@ -448,6 +514,9 @@ def _apply_decision(project: ProjectRecord, record: Mapping[str, Any], decision:
         return _failure("ACCEPTANCE_REQUIRED", "STATUS", project.project_id, record)
     if record.get("intent_version") != _version(card):
         return _failure("CONFLICT", "VERSION", project.project_id, record)
+    runner_checkpoint = _runner_checkpoint(project, task_id)
+    if decision == "approve" and runner_checkpoint is not None:
+        return _accept_bound_runner(project, record, runner_checkpoint)
     target = "已验收" if decision == "approve" else "已退回"
     assignee = str(card.get("assignee") or card.get("owner") or "李开发")
     end_time = str(card.get("end_time") or card.get("end_date") or "")
@@ -501,12 +570,6 @@ def _approve_gate(project: ProjectRecord, record: Mapping[str, Any]) -> str | No
         return "CANDIDATE"
     if problem is not None:
         return problem
-    try:
-        _mint_and_validate(project, record)
-    except McpError:
-        return "GATE"
-    except Exception:
-        return "GATE"
     return None
 
 
@@ -596,8 +659,17 @@ def _binding_problem(
         return "FORBIDDEN", "PROJECT"
     if str(record.get("principal_id") or "") != principal.principal_id:
         return "FORBIDDEN", "PRINCIPAL"
-    if not record.get("consumed") and _expired(str(record.get("expires_at") or "")):
+    if (
+        not record.get("consumed")
+        and not str(record.get("decision") or "")
+        and _expired(str(record.get("expires_at") or ""))
+    ):
         return "ACCEPTANCE_REQUIRED", "EXPIRED"
+    runner_checkpoint = _runner_checkpoint(project, str(record.get("task_id") or ""))
+    bound_runner_id = str(record.get("runner_confirmation_request_id") or "")
+    live_runner_id = "" if runner_checkpoint is None else str(runner_checkpoint.confirmation_request_id or "")
+    if bound_runner_id and bound_runner_id != live_runner_id:
+        return "CONFLICT", "CONFIRMATION"
     evidence = _read_evidence(project, str(record.get("evidence_id") or ""))
     card = _card(project, str(record.get("task_id") or ""))
     if evidence is None or card is None:
@@ -917,6 +989,7 @@ def _authority(project: ProjectRecord, card: Mapping[str, Any]) -> Dict[str, Any
             "acceptance_criteria": str(snapshot.get("acceptance_criteria") or ""),
             "acceptance_criteria_items": _criteria_items(snapshot),
             "profile_id": profile,
+            "runner_confirmation_request_id": str(checkpoint.confirmation_request_id or ""),
             "builder_session_id": str(checkpoint.builder_session_id or ""),
             "baseline_commit": str(snapshot.get("baseline_commit") or ""),
             "requirement_hash": str(snapshot.get("requirement_hash") or ""),
@@ -1149,10 +1222,22 @@ def _validate_quality_evidence(project, authority, evidence) -> bool:
             report = extra["qa_report"]
             if any(not isinstance(item, Mapping) or item.get("status") != "PASS" for item in report["negative_scenarios"]):
                 return False
-            if any(not isinstance(item, Mapping) or type(item.get("exit_code")) is not int or item["exit_code"] != 0 for item in report["test_commands"]):
-                return False
-            required = authority.get("required_test_commands")
-            if required and list(extra["required_test_commands"]) != list(required):
+            from ..core.production_runner import effective_controlled_commands
+
+            expected = list(effective_controlled_commands(
+                authority.get("required_test_commands") or (),
+                str(authority.get("baseline_commit") or ""),
+                str(authority.get("candidate_commit") or ""),
+            ))
+            recorded = [str(item) for item in (extra.get("required_test_commands") or [])]
+            reported = []
+            for item in report["test_commands"]:
+                if not isinstance(item, Mapping) or type(item.get("exit_code")) is not int or item["exit_code"] != 0:
+                    return False
+                if recorded.count(str(item.get("command") or "")) != 1:
+                    return False
+                reported.append(str(item.get("command") or ""))
+            if recorded != expected or reported != expected or len(recorded) != len(set(recorded)):
                 return False
             coverage = extra["qa_report"]["acceptance_coverage"]
             ids = [item.get("criterion_id") for item in coverage if isinstance(item, Mapping) and item.get("status") == "PASS"]
