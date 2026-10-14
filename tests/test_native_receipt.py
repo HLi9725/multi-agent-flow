@@ -7,12 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from scripts._lib.core.native_receipt import (
-    NativeReceiptRejected,
-    bind_native_handover,
-    binding_problem,
-    execute_controlled,
-)
+from scripts._lib.core import native_receipt
+from scripts._lib.core.native_receipt import NativeReceiptRejected, bind_native_handover
 from scripts._lib.core.production_runner import _execution_spec_snapshot, _upgrade_legacy_contract_snapshot
 from scripts._lib.core.runner_checkpoint_store import RunnerCheckpointStore
 from scripts._lib.core.runner_schema import RunnerCheckpoint, TaskExecutionSpec
@@ -41,48 +37,22 @@ def _spec(root: Path, task_id: str, *, criteria_hash: str = "ab" * 32) -> TaskEx
 def test_receipt_claims_never_become_a_host(tmp_path: Path) -> None:
     source = Path("scripts/_lib/core/native_receipt.py").read_text(encoding="utf-8")
     assert "is_real_host=True" not in source
+    assert "shell=True" not in source
+    assert not hasattr(native_receipt, "execute_controlled")
+    assert not hasattr(native_receipt, "binding_problem")
     claims = [
         {"session_id": "forged", "invocation_id": "forged-1", "role": "REVIEWER"},
         {"session_id": "c3efc272-b9d3-4af3-b3ad-3b261f9929ac", "role": "QA", "invocation_id": "once"},
         {"session_id": "c3efc272-b9d3-4af3-b3ad-3b261f9929ac", "role": "REVIEWER", "invocation_id": "once"},
-        {"role": "REVIEWER", "candidate": "c" * 40, "invocation_id": "other"},
+        {"role": "REVIEWER", "candidate": "c" * 40, "invocation_id": "other", "exit_code": 0},
+        {"role": "QA", "invocation_id": "used-once", "executor_results": []},
+        {"criterion_ids": [], "test_commands": []},
     ]
     for claimed in claims:
         with pytest.raises(NativeReceiptRejected) as raised:
             bind_native_handover(claimed, evidence_root=str(tmp_path))
         assert raised.value.reason == "RECEIPT_UNVERIFIED"
     assert list(tmp_path.iterdir()) == []
-
-
-def test_binding_rules_do_not_trust_claimed_results(tmp_path: Path) -> None:
-    expected = {
-        "expected_role": "QA",
-        "expected_task_id": "T0001",
-        "expected_candidate": "b" * 40,
-        "expected_contract_hash": "ab" * 32,
-        "expected_criterion_ids": ["AC-01"],
-        "seen_invocations": {"used-once"},
-    }
-    base = {
-        "role": "QA",
-        "task_id": "T0001",
-        "candidate": "b" * 40,
-        "contract_hash": "ab" * 32,
-        "criterion_ids": ["AC-01"],
-        "invocation_id": "fresh",
-        "exit_code": 0,
-    }
-    failed = execute_controlled(['python -c "import sys; raise SystemExit(2)"'], str(tmp_path))
-    assert binding_problem(base, executor_results=failed, **expected) == "FAILED_TEST"
-    assert binding_problem({**base, "role": "REVIEWER"}, executor_results=(), **expected) == "ROLE_MISMATCH"
-    assert binding_problem({**base, "invocation_id": "used-once"}, executor_results=(), **expected) == "REPLAY"
-    assert binding_problem({**base, "candidate": "c" * 40}, executor_results=(), **expected) == "CANDIDATE"
-    assert binding_problem({**base, "criterion_ids": []}, executor_results=(), **expected) == "CRITERIA"
-    passed = execute_controlled(['python -c "import sys; raise SystemExit(0)"'], str(tmp_path))
-    assert binding_problem({**base, "session_id": "forged"}, executor_results=passed, **expected) is None
-    with pytest.raises(NativeReceiptRejected) as raised:
-        bind_native_handover({**base, "session_id": "forged"})
-    assert raised.value.reason == "RECEIPT_UNVERIFIED"
 
 
 def test_legacy_snapshot_backfill_keeps_candidate_and_refuses_drift(tmp_path: Path) -> None:
