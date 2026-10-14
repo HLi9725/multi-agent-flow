@@ -1311,6 +1311,29 @@ def effective_controlled_commands(configured, baseline: str, candidate: str, fal
     return commands + (gate,)
 
 
+def _user_confirmations_for_decision(store, candidate: str, runner_id: str, external_id: str) -> List[Any]:
+    """找出同一次批准已经写下的用户证据，避免检查点保存失败后再写一条。"""
+    found = []
+    if not os.path.isdir(store.root_dir):
+        return found
+    for name in os.listdir(store.root_dir):
+        if not name.endswith(".json"):
+            continue
+        try:
+            record = store.read(name[: -len(".json")])
+        except Exception:
+            continue
+        if record.evidence_type != EvidenceType.USER_CONFIRMATION or record.result_commit != candidate:
+            continue
+        extra = record.metadata.extra
+        if external_id:
+            if extra.get("mcp_confirmation_id") == external_id and extra.get("confirmation_id") == runner_id:
+                found.append(record)
+        elif extra.get("confirmation_id") == runner_id and not extra.get("mcp_confirmation_id"):
+            found.append(record)
+    return found
+
+
 class ProductionRunnerError(Exception):
     pass
 
@@ -5418,22 +5441,35 @@ class ProductionRunner:
                 spec = replace(spec, status_at_read='已退回')
             if spec.status_at_read == "已退回":
                 reason = ckpt.last_error or "User acceptance rejection recovered after interruption."
+                pending_mcp = ""
+                if isinstance(ckpt.approval_diagnostics, Mapping):
+                    pending_mcp = str(ckpt.approval_diagnostics.get("pending_mcp_confirmation_id") or "")
                 history = list(ckpt.defects_history)
-                history.append({
-                    "cycle": ckpt.candidate_generation,
-                    "role": "USER_ACCEPTANCE",
-                    "defects": [{
-                        "defect_id": f"DEF-{task_id}-USER-ACCEPTANCE",
-                        "severity": "P1",
-                        "description": reason,
-                    }],
-                    "summary": reason,
-                })
+                already = any(
+                    isinstance(item, Mapping) and pending_mcp and item.get("mcp_confirmation_id") == pending_mcp
+                    for item in history
+                )
+                if not already:
+                    history.append({
+                        "cycle": ckpt.candidate_generation,
+                        "role": "USER_ACCEPTANCE",
+                        "defects": [{
+                            "defect_id": f"DEF-{task_id}-USER-ACCEPTANCE",
+                            "severity": "P1",
+                            "description": reason,
+                        }],
+                        "summary": reason,
+                        "mcp_confirmation_id": pending_mcp,
+                    })
+                diagnostics = dict(ckpt.approval_diagnostics) if isinstance(ckpt.approval_diagnostics, Mapping) else {}
+                diagnostics.pop("pending_mcp_confirmation_id", None)
                 ckpt = replace(
                     ckpt,
                     state=RunnerState.NEEDS_USER_INPUT.value,
                     current_role="BUILDER",
                     defects_history=tuple(history),
+                    confirmation_request_id=None,
+                    approval_diagnostics=diagnostics,
                     updated_at=time.time(),
                 )
                 self.checkpoint_store.save_checkpoint(ckpt)
@@ -5757,30 +5793,43 @@ class ProductionRunner:
                     return RunnerResult(False, ckpt.state, task_id, candidate_commit=candidate,
                                         message="Acceptance EvidenceGate replay failed: independent identity or QA semantic proof is invalid.")
 
-            user_evidence_id = f"evi_user_{task_id.lower()}_{int(time.time()*1000)}"
-            confirmed_at = time.time()
-            user_caps = HostCapabilities(is_real_host=True)
-            confirmation_extra = _extract_capabilities_extra(user_caps)
-            confirmation_extra.update({
-                "confirmation_id": confirmation_request_id,
-                "user_source": "explicit_user",
-                "confirmed_at": confirmed_at,
-            })
-            if external_confirmation_id:
-                confirmation_extra["mcp_confirmation_id"] = external_confirmation_id
-            confirmation_meta = EvidenceMetadata(
-                project_id=ckpt.project_id, task_id=task_id, actor_role="PM",
-                host_id="explicit_user_cli", adapter="run_task_cli",
-                host_session_id=confirmation_request_id,
-                host_invocation_id=f"accept-{uuid.uuid4().hex}", is_real_host=True,
-                workspace_mode="user_confirmation", transition_from="PENDING_USER_ACCEPTANCE",
-                transition_to="ACCEPTED", created_at=confirmed_at,
-                extra=confirmation_extra,
+            matches = _user_confirmations_for_decision(
+                self.evidence_store, str(candidate), confirmation_request_id, external_confirmation_id,
             )
-            self.evidence_store.append(EvidenceRecord(
-                evidence_id=user_evidence_id, evidence_type=EvidenceType.USER_CONFIRMATION,
-                baseline_commit=str(baseline), result_commit=str(candidate), artifacts=(), metadata=confirmation_meta,
-            ))
+            linked = [item for item in matches if item.evidence_id in ckpt.evidence_ids]
+            if len(linked) > 1 or (len(matches) > 1 and not linked):
+                return RunnerResult(False, ckpt.state, task_id, candidate_commit=candidate,
+                                    message="Acceptance found conflicting user confirmation evidence.")
+            chosen = linked[0] if linked else (matches[0] if len(matches) == 1 else None)
+            if chosen is None:
+                user_evidence_id = f"evi_user_{task_id.lower()}_{int(time.time()*1000)}"
+                confirmed_at = time.time()
+                user_caps = HostCapabilities(is_real_host=True)
+                confirmation_extra = _extract_capabilities_extra(user_caps)
+                confirmation_extra.update({
+                    "confirmation_id": confirmation_request_id,
+                    "user_source": "explicit_user",
+                    "confirmed_at": confirmed_at,
+                })
+                if external_confirmation_id:
+                    confirmation_extra["mcp_confirmation_id"] = external_confirmation_id
+                confirmation_meta = EvidenceMetadata(
+                    project_id=ckpt.project_id, task_id=task_id, actor_role="PM",
+                    host_id="explicit_user_cli", adapter="run_task_cli",
+                    host_session_id=confirmation_request_id,
+                    host_invocation_id=f"accept-{uuid.uuid4().hex}", is_real_host=True,
+                    workspace_mode="user_confirmation", transition_from="PENDING_USER_ACCEPTANCE",
+                    transition_to="ACCEPTED", created_at=confirmed_at,
+                    extra=confirmation_extra,
+                )
+                self.evidence_store.append(EvidenceRecord(
+                    evidence_id=user_evidence_id, evidence_type=EvidenceType.USER_CONFIRMATION,
+                    baseline_commit=str(baseline), result_commit=str(candidate), artifacts=(), metadata=confirmation_meta,
+                ))
+            else:
+                user_evidence_id = chosen.evidence_id
+                confirmation_meta = chosen.metadata
+                user_caps = HostCapabilities(is_real_host=True)
             if self.evidence_gate is None:
                 self.evidence_gate = EvidenceGate(store=self.evidence_store, project_root=project_root)
             confirmation_handle = AgentHandle(
@@ -5815,7 +5864,9 @@ class ProductionRunner:
                     ),
                 ),
             )
-            accepted_ids = tuple(ckpt.evidence_ids) + (user_evidence_id,)
+            accepted_ids = tuple(ckpt.evidence_ids)
+            if user_evidence_id not in accepted_ids:
+                accepted_ids = accepted_ids + (user_evidence_id,)
             # Persist the explicit confirmation before changing the board. If the
             # process dies after the transition, a later audit can still prove
             # exactly which confirmation authorized it.
@@ -5854,6 +5905,8 @@ class ProductionRunner:
         confirmation_request_id: str,
         reason: str,
         authority_root: Optional[str] = None,
+        *,
+        external_confirmation_id: str = "",
     ) -> RunnerResult:
         """Serialize user rejection against start/resume/accept for the same task."""
         _validate_task_id(task_id)
@@ -5863,8 +5916,15 @@ class ProductionRunner:
                                 message="Task is active in another Runner process; rejection is locked.")
         try:
             return self._reject_unlocked(
-                project_root, task_id, confirmation_request_id, reason, authority_root
+                project_root, task_id, confirmation_request_id, reason, authority_root,
+                external_confirmation_id=external_confirmation_id,
             )
+        except Exception as exc:
+            current = self.checkpoint_store.load_checkpoint(task_id)
+            return RunnerResult(False, current.state if current else RunnerState.FAILED.value, task_id,
+                                candidate_commit=current.candidate_commit if current else None,
+                                evidence_ids=current.evidence_ids if current else (),
+                                message=f"Rejection validation failed closed: {self._sanitize_diagnostic(exc)}")
         finally:
             self.checkpoint_store.release_runner_lock((lock_handle, lock_file))
 
@@ -5875,6 +5935,8 @@ class ProductionRunner:
         confirmation_request_id: str,
         reason: str,
         authority_root: Optional[str] = None,
+        *,
+        external_confirmation_id: str = "",
     ) -> RunnerResult:
         """Return the original task for Builder repair without creating a new card."""
         _validate_task_id(task_id)
@@ -5905,11 +5967,15 @@ class ProductionRunner:
             detail = "; ".join(drift) if drift else f"board status={live_spec.status_at_read!r}"
             return RunnerResult(False, ckpt.state, task_id, candidate_commit=ckpt.candidate_commit,
                                 message=f"Rejection contract revalidation failed: {detail}")
+        diagnostics = dict(ckpt.approval_diagnostics) if isinstance(ckpt.approval_diagnostics, Mapping) else {}
+        if external_confirmation_id:
+            diagnostics["pending_mcp_confirmation_id"] = external_confirmation_id
         pending_rejection = replace(
             ckpt,
             state=RunnerState.REJECTION_PENDING.value,
             current_role="PM",
             last_error=reason,
+            approval_diagnostics=diagnostics,
             updated_at=time.time(),
         )
         self.checkpoint_store.save_checkpoint(pending_rejection)
@@ -5918,9 +5984,12 @@ class ProductionRunner:
             f"用户验收退回原任务：{reason}", live_spec.task_type,
         )
         if not ok:
+            rolled_back = dict(pending_rejection.approval_diagnostics) if isinstance(pending_rejection.approval_diagnostics, Mapping) else {}
+            rolled_back.pop("pending_mcp_confirmation_id", None)
             self.checkpoint_store.save_checkpoint(replace(
                 pending_rejection,
                 state=RunnerState.PENDING_USER_ACCEPTANCE.value,
+                approval_diagnostics=rolled_back,
                 last_error=self._sanitize_diagnostic(error),
                 updated_at=time.time(),
             ))
@@ -5933,11 +6002,14 @@ class ProductionRunner:
             "defects": [{"defect_id": f"DEF-{task_id}-USER-ACCEPTANCE", "severity": "P1",
                          "description": reason}],
             "summary": reason,
+            "mcp_confirmation_id": external_confirmation_id,
         })
+        cleared = dict(diagnostics)
+        cleared.pop("pending_mcp_confirmation_id", None)
         returned = replace(
             ckpt, state=RunnerState.NEEDS_USER_INPUT.value, current_role="BUILDER",
             defects_history=tuple(history), last_error=reason, updated_at=time.time(),
-            confirmation_request_id=None,
+            confirmation_request_id=None, approval_diagnostics=cleared,
         )
         self.checkpoint_store.save_checkpoint(returned)
         return RunnerResult(True, RunnerState.NEEDS_USER_INPUT.value, task_id,

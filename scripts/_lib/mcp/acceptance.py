@@ -235,6 +235,8 @@ def _decide_locked(
             return _backfill_audit(project, path, record, principal, decision, audit)
         return _replay_consumed(project, record)
     recovered = _recover_applied(project, record, principal, decision) if stored == decision else None
+    if isinstance(recovered, dict) and recovered.get("ok") is False:
+        return recovered
     problem = None if recovered is not None else _binding_problem(project, record, principal)
     if problem is not None:
         code, reason = problem
@@ -301,26 +303,227 @@ def _decide_locked(
     return _success(project, record, decision, finished.get("status") or "", finished.get("task_version") or "", "")
 
 
+def plan_rejection_checkpoint_sync(registry: Registry, confirmation_id: str) -> Dict[str, Any]:
+    """只读核对既有拒绝能否补齐检查点。不写看板、检查点或证据。"""
+    located = _locate(registry, confirmation_id)
+    if located is None:
+        return {"ok": False, "reason": "NOT_FOUND", "writes": []}
+    project, _path, record = located
+    task_id = str(record.get("task_id") or "")
+    card = _card(project, task_id)
+    checkpoint = _runner_checkpoint(project, task_id)
+    marker = _decision_marker(record, "reject")
+    process = "" if card is None else str(card.get("process") or "") + "\n" + str(card.get("remarks") or "")
+    bound_runner = str(record.get("runner_confirmation_request_id") or "")
+    proven = (
+        record.get("consumed") is True
+        and record.get("decision") == "reject"
+        and record.get("audit_ok") is True
+        and bool(bound_runner)
+        and card is not None
+        and card.get("status") == "已退回"
+        and marker in process
+        and checkpoint is not None
+        and checkpoint.state == "PENDING_USER_ACCEPTANCE"
+        and str(checkpoint.confirmation_request_id or "") == bound_runner
+        and str(checkpoint.candidate_commit or "") == str(record.get("candidate_sha") or "")
+        and not list(checkpoint.defects_history)
+    )
+    if not proven:
+        return {
+            "ok": False,
+            "reason": "UNPROVEN",
+            "status": "" if card is None else str(card.get("status") or ""),
+            "checkpoint_state": "" if checkpoint is None else checkpoint.state,
+            "writes": [],
+        }
+    return {
+        "ok": True,
+        "reason": "READY",
+        "task_id": task_id,
+        "candidate_sha": str(record.get("candidate_sha") or ""),
+        "confirmation_id": confirmation_id,
+        "writes": ["checkpoint.state=NEEDS_USER_INPUT", "checkpoint.current_role=BUILDER", "append one rejection defect"],
+    }
+
+
 def _decision_marker(record: Mapping[str, Any], decision: str) -> str:
     return f"acceptance-decision:{record.get('confirmation_id')}:{decision}"
 
 
 def _recover_applied(project, record, principal, decision):
-    """Only recover the exact transition carrying this durable intent's marker."""
+    """补记已经落地的同一次决定。未应用的过期批准不从这里放行。"""
     if record.get("project_id") != project.project_id or record.get("principal_id") != principal.principal_id:
         return None
-    card = _card(project, str(record.get("task_id") or ""))
-    if card is None or card.get("status") != ("已验收" if decision == "approve" else "已退回"):
-        return None
-    if _decision_marker(record, decision) not in str(card.get("process") or ""):
+    task_id = str(record.get("task_id") or "")
+    card = _card(project, task_id)
+    expected = "已验收" if decision == "approve" else "已退回"
+    if card is None or card.get("status") != expected:
         return None
     evidence = _read_evidence(project, str(record.get("evidence_id") or ""))
     authority = _authority(project, card)
     if evidence is None or authority is None or not record.get("recovery_contract_hash"):
         return None
+    if str(authority.get("candidate_commit") or "") != str(record.get("candidate_sha") or ""):
+        return None
     if record["recovery_contract_hash"] != _contract_hash(project, card, evidence, authority, include_journal=False):
         return None
+    checkpoint = _runner_checkpoint(project, task_id)
+    mcp_id = str(record.get("confirmation_id") or "")
+    if decision == "approve":
+        linked_ids = () if checkpoint is None else tuple(checkpoint.evidence_ids)
+        confirmation = _bound_user_confirmation(
+            project, mcp_id, str(record.get("candidate_sha") or ""), linked_ids,
+        )
+        if checkpoint is not None:
+            if confirmation is None or confirmation.evidence_id not in tuple(checkpoint.evidence_ids):
+                return None
+            if checkpoint.state != "ACCEPTED":
+                marked = _mark_checkpoint_accepted(project, checkpoint)
+                if marked == "busy":
+                    return _failure("CONFLICT", "IN_PROGRESS", project.project_id, record)
+                if marked != "done":
+                    return None
+        elif _decision_marker(record, decision) not in str(card.get("process") or "") and confirmation is None:
+            return None
+    elif checkpoint is not None:
+        if checkpoint.state == "NEEDS_USER_INPUT" and _rejection_matches(checkpoint, mcp_id):
+            pass
+        elif checkpoint.state == "REJECTION_PENDING" and _pending_rejection_matches(checkpoint, record):
+            finished = _finish_recorded_rejection(project, checkpoint, record)
+            if finished == "busy":
+                return _failure("CONFLICT", "IN_PROGRESS", project.project_id, record)
+            if finished != "done":
+                return None
+        else:
+            return None
+    elif _decision_marker(record, decision) not in str(card.get("process") or ""):
+        return None
     return {"ok": True, "status": card["status"], "task_version": _version(card)}
+
+
+def _bound_user_confirmation(project: ProjectRecord, mcp_id: str, candidate: str, evidence_ids: tuple = ()):
+    """同一决定有多条证据时，只认已经写进检查点的那一条。"""
+    root = project.evidence_root
+    if not mcp_id or not root or not os.path.isdir(root):
+        return None
+    matches = []
+    for name in os.listdir(root):
+        if not name.endswith(".json"):
+            continue
+        evidence = _read_evidence(project, name[: -len(".json")])
+        if evidence is None or evidence.evidence_type != EvidenceType.USER_CONFIRMATION:
+            continue
+        if evidence.metadata.extra.get("mcp_confirmation_id") != mcp_id:
+            continue
+        if evidence.result_commit != candidate:
+            continue
+        matches.append(evidence)
+    linked = [item for item in matches if item.evidence_id in set(evidence_ids)]
+    if len(linked) == 1:
+        return linked[0]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def _rejection_matches(checkpoint, mcp_id: str) -> bool:
+    for item in checkpoint.defects_history:
+        if isinstance(item, Mapping) and item.get("mcp_confirmation_id") == mcp_id and mcp_id:
+            return True
+    return False
+
+
+def _pending_rejection_matches(checkpoint, record: Mapping[str, Any]) -> bool:
+    diagnostics = checkpoint.approval_diagnostics if isinstance(checkpoint.approval_diagnostics, Mapping) else {}
+    pending = str(diagnostics.get("pending_mcp_confirmation_id") or "")
+    runner_id = str(checkpoint.confirmation_request_id or "")
+    bound = str(record.get("runner_confirmation_request_id") or "")
+    return bool(
+        pending
+        and pending == str(record.get("confirmation_id") or "")
+        and runner_id
+        and runner_id == bound
+        and str(checkpoint.candidate_commit or "") == str(record.get("candidate_sha") or "")
+    )
+
+
+def _runner_store(project: ProjectRecord, checkpoint):
+    from ..core.runner_checkpoint_store import RunnerCheckpointStore
+
+    snapshot = checkpoint.execution_spec_snapshot if isinstance(checkpoint.execution_spec_snapshot, Mapping) else {}
+    return RunnerCheckpointStore(
+        data_root=project.data_root,
+        project_root=str(snapshot.get("project_root") or project.data_root),
+        project_id=checkpoint.project_id,
+    )
+
+
+def _mark_checkpoint_accepted(project: ProjectRecord, checkpoint) -> str:
+    store = _runner_store(project, checkpoint)
+    lock = store.acquire_runner_lock(checkpoint.task_id)
+    if lock[0] is None:
+        return "busy"
+    try:
+        current = store.load_checkpoint(checkpoint.task_id) or checkpoint
+        if current.state == "ACCEPTED":
+            return "done"
+        store.save_checkpoint(replace_checkpoint(current))
+        return "done"
+    finally:
+        store.release_runner_lock(lock)
+
+
+def _finish_recorded_rejection(project: ProjectRecord, checkpoint, record: Mapping[str, Any]) -> str:
+    """只补齐已经退回看板的检查点。不第二次流转，不追加重复缺陷。"""
+    store = _runner_store(project, checkpoint)
+    lock = store.acquire_runner_lock(checkpoint.task_id)
+    if lock[0] is None:
+        return "busy"
+    try:
+        current = store.load_checkpoint(checkpoint.task_id)
+        if current is None:
+            return "missing"
+        mcp_id = str(record.get("confirmation_id") or "")
+        if current.state == "NEEDS_USER_INPUT" and _rejection_matches(current, mcp_id):
+            return "done"
+        if current.state != "REJECTION_PENDING" or not _pending_rejection_matches(current, record):
+            return "missing"
+        history = list(current.defects_history)
+        if not _rejection_matches(current, mcp_id):
+            history.append({
+                "cycle": current.candidate_generation,
+                "role": "USER_ACCEPTANCE",
+                "defects": [{
+                    "defect_id": f"DEF-{current.task_id}-USER-ACCEPTANCE",
+                    "severity": "P1",
+                    "description": str(current.last_error or "用户拒绝验收"),
+                }],
+                "summary": str(current.last_error or "用户拒绝验收"),
+                "mcp_confirmation_id": mcp_id,
+            })
+        diagnostics = dict(current.approval_diagnostics) if isinstance(current.approval_diagnostics, Mapping) else {}
+        diagnostics.pop("pending_mcp_confirmation_id", None)
+        from dataclasses import replace
+
+        store.save_checkpoint(replace(
+            current,
+            state="NEEDS_USER_INPUT",
+            current_role="BUILDER",
+            defects_history=tuple(history),
+            confirmation_request_id=None,
+            approval_diagnostics=diagnostics,
+            updated_at=time.time(),
+        ))
+        return "done"
+    finally:
+        store.release_runner_lock(lock)
+
+
+def replace_checkpoint(checkpoint):
+    from dataclasses import replace
+
+    return replace(checkpoint, state="ACCEPTED", current_role="PM", last_error=None, updated_at=time.time())
 
 
 def _backfill_audit(
@@ -504,6 +707,42 @@ def _accept_bound_runner(project: ProjectRecord, record: Mapping[str, Any], chec
     return {"ok": True, "status": "已验收", "task_version": _version(updated)}
 
 
+def _reject_bound_runner(project: ProjectRecord, record: Mapping[str, Any], checkpoint) -> Dict[str, Any]:
+    """用检查点自己的确认编号走 Runner.reject。MCP 编号写入缺陷历史。"""
+    from ..core.production_runner import ProductionRunner
+    from ..core.runner_checkpoint_store import RunnerCheckpointStore
+
+    runner_id = str(checkpoint.confirmation_request_id or "")
+    bound = str(record.get("runner_confirmation_request_id") or "")
+    if not runner_id or (bound and bound != runner_id):
+        return _failure("CONFLICT", "CONFIRMATION", project.project_id, record)
+    snapshot = checkpoint.execution_spec_snapshot if isinstance(checkpoint.execution_spec_snapshot, Mapping) else {}
+    project_root = str(snapshot.get("project_root") or project.data_root)
+    store = RunnerCheckpointStore(
+        data_root=project.data_root,
+        project_root=project_root,
+        project_id=checkpoint.project_id,
+    )
+    runner = ProductionRunner(checkpoint_store=store)
+    result = runner.reject(
+        project_root,
+        str(record.get("task_id") or ""),
+        runner_id,
+        "用户拒绝验收",
+        project.data_root,
+        external_confirmation_id=str(record.get("confirmation_id") or ""),
+    )
+    if not result.success:
+        message = str(result.message or "")
+        if "locked" in message.lower():
+            return _failure("CONFLICT", "IN_PROGRESS", project.project_id, record)
+        return _failure("GATE_REJECTED", "TRANSITION", project.project_id, record)
+    updated = _card(project, str(record.get("task_id") or "")) or {}
+    if str(updated.get("status") or "") != "已退回":
+        return _failure("GATE_REJECTED", "TRANSITION", project.project_id, record)
+    return {"ok": True, "status": "已退回", "task_version": _version(updated)}
+
+
 def _apply_decision(project: ProjectRecord, record: Mapping[str, Any], decision: str) -> Dict[str, Any]:
     task_id = str(record.get("task_id") or "")
     card = _card(project, task_id)
@@ -515,8 +754,10 @@ def _apply_decision(project: ProjectRecord, record: Mapping[str, Any], decision:
     if record.get("intent_version") != _version(card):
         return _failure("CONFLICT", "VERSION", project.project_id, record)
     runner_checkpoint = _runner_checkpoint(project, task_id)
-    if decision == "approve" and runner_checkpoint is not None:
+    if runner_checkpoint is not None and decision == "approve":
         return _accept_bound_runner(project, record, runner_checkpoint)
+    if runner_checkpoint is not None and decision == "reject":
+        return _reject_bound_runner(project, record, runner_checkpoint)
     target = "已验收" if decision == "approve" else "已退回"
     assignee = str(card.get("assignee") or card.get("owner") or "李开发")
     end_time = str(card.get("end_time") or card.get("end_date") or "")
