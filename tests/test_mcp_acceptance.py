@@ -3,13 +3,16 @@
 
 from __future__ import annotations
 
+import getpass
+import hashlib
 import json
 import threading
 from pathlib import Path
 
 import pytest
 
-from scripts._lib.core.evidence_schema import EvidenceMetadata, EvidenceRecord, EvidenceType
+from scripts._lib.core.evidence_schema import ArtifactRecord, EvidenceMetadata, EvidenceRecord, EvidenceType
+from scripts._lib.mcp import acceptance as acceptance_mod
 from scripts._lib.core.evidence_store import EvidenceStore
 from scripts._lib.mcp.acceptance import decide_acceptance, load_acceptance_record
 from scripts._lib.mcp.audit_store import AuditStore, AuditWriteError
@@ -55,6 +58,58 @@ def _acceptance_path(registry_path: Path, confirmation_id: str) -> Path:
     return Path(project.data_root) / "mcp_auth" / "acceptance" / f"{confirmation_id}.json"
 
 
+def _bind_card(tmp: Path, task_id: str, candidate: str = "b" * 40, items: list | None = None) -> None:
+    path = tmp / MARKER / "alpha" / "user_data" / "board.json"
+    cards = json.loads(path.read_text(encoding="utf-8"))
+    criteria = items or [{"id": "AC-01", "text": "隔离任务保持已完成直到本机确认"}]
+    for card in cards:
+        if card.get("id") != task_id:
+            continue
+        card["candidate_commit"] = candidate
+        card["acceptance_criteria_items"] = criteria
+        card["acceptance_criteria_hash"] = hashlib.sha256(
+            json.dumps(criteria, ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
+        card["remarks"] = "验收标准: " + criteria[0]["text"]
+    path.write_text(json.dumps(cards, ensure_ascii=False), encoding="utf-8")
+
+
+def _plant_pair(tmp: Path, registry: Path, task_id: str, suffix: str, *, real_host: bool = True, artifacts: bool = True) -> str:
+    project = load_registry(str(registry)).get_project("alpha")
+    assert project is not None
+    store = EvidenceStore(project.evidence_root)
+    reviewer_id = "reviewer-" + suffix
+    for role, session, evidence_id in (
+        ("REVIEWER", "reviewer-session-" + suffix, reviewer_id),
+        ("QA", "qa-session-" + suffix, "qa-" + suffix),
+    ):
+        store.append(
+            EvidenceRecord(
+                evidence_id=evidence_id,
+                evidence_type=EvidenceType.TASK_COMPLETE,
+                baseline_commit="a" * 40,
+                result_commit="b" * 40,
+                artifacts=(ArtifactRecord(relative_path="reports/note.txt", sha256_hash="ab" * 32),) if artifacts else (),
+                metadata=EvidenceMetadata(
+                    project_id="alpha",
+                    task_id=task_id,
+                    actor_role=role,
+                    host_id="yy-flow-host",
+                    adapter="yy-flow",
+                    host_session_id=session,
+                    host_invocation_id="invoke-" + evidence_id,
+                    is_real_host=real_host,
+                    workspace_mode="runner",
+                    transition_from="测试中",
+                    transition_to="已完成",
+                    created_at=1,
+                    extra={"decision": "PASS"},
+                ),
+            )
+        )
+    return reviewer_id
+
+
 def _apply(tmp: Path, suffix: str, *, confirmed_env: bool = True) -> tuple[Path, str, str, str]:
     registry, _board_path = _prepare(
         tmp,
@@ -64,15 +119,8 @@ def _apply(tmp: Path, suffix: str, *, confirmed_env: bool = True) -> tuple[Path,
     session = _open(tmp, registry, confirmed=confirmed_env)
     try:
         task_id = _finish_type_b(session, "验收样例" + suffix, "task-" + suffix + "-0001")
-        uploaded = _submit(
-            session,
-            task_id,
-            "evid-" + suffix + "-0001",
-            "user_confirmation",
-            {"user_source": "explicit_user", "confirmed_at": "2026-10-14T02:00:00Z"},
-        )
-        assert uploaded["isError"] is False, uploaded["structuredContent"]
-        evidence_id = uploaded["structuredContent"]["evidence_id"]
+        _bind_card(tmp, task_id)
+        evidence_id = _plant_pair(tmp, registry, task_id, suffix)
         version, status = _version(session, task_id)
         assert status == "已完成"
         applied = session.call(
@@ -96,7 +144,7 @@ def _apply(tmp: Path, suffix: str, *, confirmed_env: bool = True) -> tuple[Path,
         assert body["candidate_sha"] == "b" * 40
         assert body["contract_hash"]
         assert body["expires_at"]
-        assert body["quality_evidence_summary"]["evidence_type"] == "user_confirmation"
+        assert body["quality_evidence_summary"]["roles"] == ["QA", "REVIEWER"]
         confirmation_id = body["confirmation_id"]
         replay = session.call(
             "request_acceptance",
@@ -128,9 +176,39 @@ def test_request_without_human_confirmation_stays_completed(tmp_path: Path) -> N
     assert loaded["consumed"] is False
 
 
-def test_approve_is_one_time_and_ignores_user_id(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_approve_is_one_time_and_ignores_user_id(tmp_path: Path) -> None:
     registry, task_id, _evidence_id, confirmation_id = _apply(tmp_path, "approve1", confirmed_env=True)
     before = task_version(next(card for card in _board(tmp_path) if card.get("id") == task_id))
+    payload = decide_acceptance(
+        load_registry(str(registry)),
+        confirmation_id,
+        "approve",
+        user_id="intruder",
+        audit=AuditStore(str(tmp_path / "mcp_audit")),
+    )
+    assert payload["ok"] is True, payload
+    assert payload["status"] == "已验收"
+    assert payload["consumed"] is True
+    assert payload["decision"] == "approve"
+    assert _status(tmp_path, task_id) == "已验收"
+    after = task_version(next(card for card in _board(tmp_path) if card.get("id") == task_id))
+    assert after != before
+    replayed = decide_acceptance(
+        load_registry(str(registry)),
+        confirmation_id,
+        "approve",
+        user_id="someone-else",
+        audit=AuditStore(str(tmp_path / "mcp_audit")),
+    )
+    assert replayed["ok"] is True
+    assert replayed["replayed"] is True
+    assert replayed["status"] == "已验收"
+    assert task_version(next(card for card in _board(tmp_path) if card.get("id") == task_id)) == after
+    assert len([card for card in _board(tmp_path) if card.get("id")]) == 1
+
+
+def test_cli_without_console_does_not_approve(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    registry, task_id, _evidence_id, confirmation_id = _apply(tmp_path, "console")
     code = main(
         [
             "acceptance",
@@ -144,35 +222,11 @@ def test_approve_is_one_time_and_ignores_user_id(tmp_path: Path, capsys: pytest.
             "intruder",
         ]
     )
-    captured = capsys.readouterr()
-    assert code == 0, captured.out + captured.err
-    payload = json.loads(captured.out)
-    assert payload["ok"] is True
-    assert payload["status"] == "已验收"
-    assert payload["consumed"] is True
-    assert payload["decision"] == "approve"
-    assert _status(tmp_path, task_id) == "已验收"
-    after = task_version(next(card for card in _board(tmp_path) if card.get("id") == task_id))
-    assert after != before
-    again = main(
-        [
-            "acceptance",
-            "--registry",
-            str(registry),
-            "--id",
-            confirmation_id,
-            "--decision",
-            "approve",
-            "--user-id",
-            "someone-else",
-        ]
-    )
-    replayed = json.loads(capsys.readouterr().out)
-    assert again == 0
-    assert replayed["replayed"] is True
-    assert replayed["status"] == "已验收"
-    assert task_version(next(card for card in _board(tmp_path) if card.get("id") == task_id)) == after
-    assert len([card for card in _board(tmp_path) if card.get("id")]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 2
+    assert payload["reason"] == "CONSOLE"
+    assert payload["consumed"] is False
+    assert _status(tmp_path, task_id) == "已完成"
 
 
 def test_reject_returns_same_task(tmp_path: Path) -> None:
@@ -228,7 +282,7 @@ def test_binding_and_identity_rejections(tmp_path: Path, monkeypatch: pytest.Mon
     record = json.loads(path.read_text(encoding="utf-8"))
     assert record.get("consumed") is not True
 
-    monkeypatch.setattr("scripts._lib.mcp.acceptance.getpass.getuser", lambda: "nobody-os")
+    monkeypatch.setattr("scripts._lib.mcp.acceptance._os_user", lambda: "nobody-os")
     denied = decide_acceptance(load_registry(str(registry)), confirmation_id, "approve", user_id="principal-dev")
     assert denied["code"] == "UNAUTHENTICATED"
     assert _status(tmp_path, task_id) == "已完成"
@@ -295,7 +349,7 @@ def test_missing_quality_forged_pass_and_model_gate(tmp_path: Path) -> None:
             },
         )
         assert rejected["structuredContent"]["code"] == "GATE_REJECTED"
-        assert rejected["structuredContent"]["details"]["reason"] == "EVIDENCE_TYPE"
+        assert rejected["structuredContent"]["details"]["reason"] == "QUALITY_CHAIN"
         assert _version(session, task_id)[1] == "已完成"
     finally:
         session.close()
@@ -344,15 +398,12 @@ def test_missing_quality_forged_pass_and_model_gate(tmp_path: Path) -> None:
                 "acceptance_confirmed": True,
             },
         )
-        assert planted["isError"] is False, planted["structuredContent"]
-        assert planted["structuredContent"]["status"] == "已完成"
-        planted_id = planted["structuredContent"]["confirmation_id"]
+        assert planted["isError"] is True
+        assert planted["structuredContent"]["code"] == "GATE_REJECTED"
+        assert planted["structuredContent"]["details"]["reason"] == "EVIDENCE_TYPE"
+        assert _version(session, task_id)[1] == "已完成"
     finally:
         session.close()
-    gated = decide_acceptance(load_registry(str(registry)), planted_id, "approve", user_id="model")
-    assert gated["code"] == "GATE_REJECTED"
-    assert gated["reason"] == "GATE"
-    assert gated["consumed"] is False
     assert _status(tmp_path, task_id) == "已完成"
 
 
@@ -484,3 +535,231 @@ def test_interrupt_recovery_audit_and_ledger(tmp_path: Path, monkeypatch: pytest
             assert restored is not None
             assert restored["task_id"] == task_id2
     assert found
+
+
+def test_checkpoint_criteria_hash_changes_contract(tmp_path: Path) -> None:
+    registry, task_id, evidence_id, _confirmation_id = _apply(tmp_path, "snap01")
+    project = load_registry(str(registry)).get_project("alpha")
+    assert project is not None
+    path = Path(project.data_root) / "runner_checkpoints" / "alpha" / f"{task_id}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    snapshot = {
+        "acceptance_criteria_hash": "a" * 64,
+        "task_id": task_id,
+    }
+    path.write_text(
+        json.dumps(
+            {
+                "task_id": task_id,
+                "project_id": "alpha",
+                "state": "PENDING_USER_ACCEPTANCE",
+                "current_role": "PM",
+                "candidate_commit": "b" * 40,
+                "execution_spec_snapshot": snapshot,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    card = next(item for item in _board(tmp_path) if item.get("id") == task_id)
+    authority = acceptance_mod._authority(project, card)
+    assert authority is not None
+    assert authority["acceptance_criteria_hash"] == "a" * 64
+    assert authority["candidate_commit"] == "b" * 40
+    evidence = acceptance_mod._read_evidence(project, evidence_id)
+    first = acceptance_mod._contract_hash(project, card, evidence, authority)
+    snapshot["acceptance_criteria_hash"] = "b" * 64
+    path.write_text(
+        json.dumps(
+            {
+                "task_id": task_id,
+                "project_id": "alpha",
+                "state": "PENDING_USER_ACCEPTANCE",
+                "current_role": "PM",
+                "candidate_commit": "b" * 40,
+                "execution_spec_snapshot": snapshot,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    moved = acceptance_mod._authority(project, card)
+    assert moved is not None
+    assert acceptance_mod._contract_hash(project, card, evidence, moved) != first
+    path.unlink()
+
+
+def test_runner_shaped_quality_chain_can_apply(tmp_path: Path) -> None:
+    registry, _board_path = _prepare(
+        tmp_path,
+        {"alpha": ["read", "task.transition", "evidence.submit", "acceptance"]},
+        role="DEV",
+    )
+    session = _open(tmp_path, registry, confirmed=False)
+    try:
+        task_id = _finish_type_b(session, "真实证据形状", "task-shape-0001")
+        _bind_card(tmp_path, task_id)
+        project = load_registry(str(registry)).get_project("alpha")
+        assert project is not None
+        store = EvidenceStore(project.evidence_root)
+        store.append(
+            EvidenceRecord(
+                evidence_id="reviewer-shape",
+                evidence_type=EvidenceType.TASK_TRANSITION,
+                baseline_commit="a" * 40,
+                result_commit="b" * 40,
+                artifacts=(),
+                metadata=EvidenceMetadata(
+                    project_id="alpha",
+                    task_id=task_id,
+                    actor_role="REVIEWER",
+                    host_id="review-host",
+                    adapter="yy-flow",
+                    host_session_id="sess_reviewer_shape",
+                    host_invocation_id="invoke-reviewer-shape",
+                    is_real_host=True,
+                    workspace_mode="workspace_read",
+                    transition_from="REVIEWING",
+                    transition_to="TESTING",
+                    created_at=1,
+                    extra={"acceptance_criteria_hash": "c" * 64},
+                ),
+            )
+        )
+        store.append(
+            EvidenceRecord(
+                evidence_id="qa-shape",
+                evidence_type=EvidenceType.TASK_TRANSITION,
+                baseline_commit="a" * 40,
+                result_commit="b" * 40,
+                artifacts=(),
+                metadata=EvidenceMetadata(
+                    project_id="alpha",
+                    task_id=task_id,
+                    actor_role="QA",
+                    host_id="qa-host",
+                    adapter="yy-flow",
+                    host_session_id="sess_qa_shape",
+                    host_invocation_id="invoke-qa-shape",
+                    is_real_host=True,
+                    workspace_mode="workspace_read",
+                    transition_from="TESTING",
+                    transition_to="PENDING_USER_ACCEPTANCE",
+                    created_at=1,
+                    extra={"qa_decision": "PASS"},
+                ),
+            )
+        )
+        version, status = _version(session, task_id)
+        assert status == "已完成"
+        applied = session.call(
+            "request_acceptance",
+            {
+                "project_id": "alpha",
+                "task_id": task_id,
+                "idempotency_key": "shape-apply-0001",
+                "expected_version": version,
+                "evidence_id": "reviewer-shape",
+            },
+        )
+        assert applied["isError"] is False, applied["structuredContent"]
+        assert applied["structuredContent"]["quality_evidence_summary"]["roles"] == ["QA", "REVIEWER"]
+        assert _status(tmp_path, task_id) == "已完成"
+    finally:
+        session.close()
+
+
+def test_os_user_ignores_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("USERNAME", "forged-user")
+    monkeypatch.setenv("USER", "forged-user")
+    monkeypatch.setenv("LOGNAME", "forged-user")
+    assert getpass.getuser() == "forged-user"
+    assert acceptance_mod._os_user() != "forged-user"
+    assert acceptance_mod._os_user()
+
+
+def test_contract_tracks_criteria_and_latest_candidate(tmp_path: Path) -> None:
+    registry, task_id, _evidence_id, confirmation_id = _apply(tmp_path, "criteria")
+    reg = load_registry(str(registry))
+    _bind_card(tmp_path, task_id, items=[{"id": "AC-02", "text": "改过的验收条目"}])
+    criteria = decide_acceptance(reg, confirmation_id, "approve")
+    assert criteria["reason"] == "CONTRACT"
+    assert criteria["consumed"] is False
+    assert _status(tmp_path, task_id) == "已完成"
+    _bind_card(tmp_path, task_id, candidate="c" * 40)
+    candidate = decide_acceptance(reg, confirmation_id, "approve")
+    assert candidate["reason"] == "CANDIDATE"
+    assert _status(tmp_path, task_id) == "已完成"
+
+
+def test_user_confirmation_cannot_replace_quality_chain(tmp_path: Path) -> None:
+    registry, task_id, evidence_id, _confirmation_id = _apply(tmp_path, "chain1")
+    session = _open(tmp_path, registry, confirmed=True)
+    try:
+        version, status = _version(session, task_id)
+        assert status == "已完成"
+        uploaded = _submit(
+            session,
+            task_id,
+            "solo-confirm-0001",
+            "user_confirmation",
+            {"user_source": "explicit_user", "confirmed_at": "2026-10-14T02:00:00Z"},
+        )
+        assert uploaded["isError"] is False
+        rejected = session.call(
+            "request_acceptance",
+            {
+                "project_id": "alpha",
+                "task_id": task_id,
+                "idempotency_key": "solo-apply-0001",
+                "expected_version": version,
+                "evidence_id": uploaded["structuredContent"]["evidence_id"],
+                "acceptance_confirmed": True,
+            },
+        )
+        assert rejected["isError"] is True
+        assert rejected["structuredContent"]["details"]["reason"] == "EVIDENCE_TYPE"
+        assert _version(session, task_id)[1] == "已完成"
+    finally:
+        session.close()
+    assert evidence_id.startswith("reviewer-")
+
+
+def test_audit_backfill_does_not_transition_again(tmp_path: Path) -> None:
+    registry, task_id, _evidence_id, confirmation_id = _apply(tmp_path, "backfill")
+    audit_dir = tmp_path / "backfill-audit"
+
+    class _OkFails(AuditStore):
+        def append(self, **kwargs):
+            if kwargs.get("code") == "OK":
+                raise AuditWriteError()
+            return super().append(**kwargs)
+
+    pending = decide_acceptance(
+        load_registry(str(registry)),
+        confirmation_id,
+        "approve",
+        audit=_OkFails(str(audit_dir)),
+    )
+    assert pending["ok"] is True, pending
+    assert pending["code"] == "APPLIED_AUDIT_PENDING"
+    assert pending["message"] == "业务已应用、审计待补记"
+    assert pending["status"] == "已验收"
+    assert _status(tmp_path, task_id) == "已验收"
+    version = task_version(next(card for card in _board(tmp_path) if card.get("id") == task_id))
+    lines = (audit_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    assert any('"code": "PENDING"' in line or '"code":"PENDING"' in line for line in lines)
+    assert not any('"code": "OK"' in line or '"code":"OK"' in line for line in lines)
+    retried = decide_acceptance(
+        load_registry(str(registry)),
+        confirmation_id,
+        "approve",
+        audit=AuditStore(str(audit_dir)),
+    )
+    assert retried["ok"] is True, retried
+    assert retried["code"] == "OK"
+    assert retried["replayed"] is True
+    assert task_version(next(card for card in _board(tmp_path) if card.get("id") == task_id)) == version
+    assert _status(tmp_path, task_id) == "已验收"
+    retried_lines = (audit_dir / "events.jsonl").read_text(encoding="utf-8")
+    assert '"OK"' in retried_lines or '"code": "OK"' in retried_lines

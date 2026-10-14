@@ -4,7 +4,8 @@
 from __future__ import annotations
 
 import contextlib
-import getpass
+import ctypes
+import glob
 import hashlib
 import io
 import json
@@ -24,7 +25,9 @@ from .errors import McpError, error
 from .registry import ProjectRecord, Registry, assert_registered_path
 
 ACCEPTANCE_TTL = timedelta(minutes=15)
+AUDIT_PENDING_MESSAGE = "业务已应用、审计待补记"
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
+_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _PUBLIC_FIELDS = (
     "project_id",
     "task_id",
@@ -103,15 +106,17 @@ def create_application(
     current = task_version(card)
     if current != cleaned["expected_version"]:
         raise error("CONFLICT", details={"reason": "VERSION", "task_version": current})
+    checkpoint = _authority(project, card)
     evidence = _read_evidence(project, str(cleaned["evidence_id"]))
-    if evidence is None:
+    problem = _quality_problem(project, checkpoint, task_id, evidence)
+    if problem == "MISSING_CANDIDATE":
+        raise error("GATE_REJECTED", details={"reason": "CANDIDATE"})
+    if problem == "CANDIDATE":
+        raise error("CONFLICT", details={"reason": "CANDIDATE"})
+    if problem is not None:
+        raise error("GATE_REJECTED", details={"reason": problem})
+    if checkpoint is None or evidence is None:
         raise error("GATE_REJECTED", details={"reason": "MISSING_QUALITY"})
-    if evidence.evidence_type != EvidenceType.USER_CONFIRMATION:
-        raise error("GATE_REJECTED", details={"reason": "EVIDENCE_TYPE"})
-    if not evidence.result_commit or not evidence.baseline_commit or not evidence.content_hash:
-        raise error("GATE_REJECTED", details={"reason": "MISSING_QUALITY"})
-    if evidence.metadata.task_id != task_id or evidence.metadata.project_id != project.project_id:
-        raise error("GATE_REJECTED", details={"reason": "EVIDENCE"})
     existing = matching_application(
         project,
         principal_id=principal.principal_id,
@@ -132,9 +137,9 @@ def create_application(
             "evidence_id": evidence.evidence_id,
             "evidence_content_hash": evidence.content_hash,
             "baseline_commit": evidence.baseline_commit,
-            "candidate_sha": evidence.result_commit,
-            "contract_hash": _contract_hash(project, card, evidence),
-            "quality_evidence_summary": _quality_summary(evidence),
+            "candidate_sha": str(checkpoint.get("candidate_commit") or ""),
+            "contract_hash": _contract_hash(project, card, evidence, checkpoint),
+            "quality_evidence_summary": _quality_summary(project, checkpoint, task_id),
             "action": "accept",
             "expires_at": (now + ACCEPTANCE_TTL).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "idempotency_key": str(cleaned["idempotency_key"]),
@@ -217,15 +222,23 @@ def _decide_locked(
     audit: AuditStore | None,
 ) -> Dict[str, Any]:
     del registry
+    stored = str(record.get("decision") or "")
+    if record.get("consumed"):
+        if str(record.get("project_id") or "") != project.project_id:
+            return _failure("FORBIDDEN", "PROJECT", project.project_id, record)
+        if str(record.get("principal_id") or "") != principal.principal_id:
+            return _failure("FORBIDDEN", "PRINCIPAL", project.project_id, record)
+        if stored != decision:
+            return _failure("CONFLICT", "DECISION", project.project_id, record)
+        if record.get("audit_ok") is False:
+            return _backfill_audit(project, path, record, principal, decision, audit)
+        return _replay_consumed(project, record)
     problem = _binding_problem(project, record, principal)
     if problem is not None:
         code, reason = problem
         return _failure(code, reason, project.project_id, record)
-    stored = str(record.get("decision") or "")
     if stored and stored != decision:
         return _failure("CONFLICT", "DECISION", project.project_id, record)
-    if record.get("consumed") and stored == decision:
-        return _replay_consumed(project, record)
     if audit is not None:
         audit.append(
             principal_id=principal.principal_id,
@@ -250,6 +263,7 @@ def _decide_locked(
     if not finished.get("ok"):
         return finished
     record["consumed"] = True
+    record["audit_ok"] = False
     record["result"] = {
         "task_id": str(record.get("task_id") or ""),
         "status": finished.get("status") or "",
@@ -262,32 +276,113 @@ def _decide_locked(
     reloaded = _read_json(path)
     if not isinstance(reloaded, dict) or reloaded.get("consumed") is not True:
         return _failure("GATE_REJECTED", "LEDGER", project.project_id, record)
-    if audit is not None:
-        try:
-            audit.append(
-                principal_id=principal.principal_id,
-                project_id=project.project_id,
-                tool="acceptance_decide",
-                code="OK",
-                task_id=str(record.get("task_id") or ""),
-                arguments={"confirmation_id": record.get("confirmation_id"), "decision": decision},
-                required=True,
-                event_id=_event_id(record, decision + ":done"),
-            )
-        except AuditWriteError:
-            return _failure("GATE_REJECTED", "AUDIT", project.project_id, record)
+    record = reloaded
+    if not _append_ok_audit(project, record, principal, decision, audit):
+        return _pending_audit(project, record, decision, finished.get("status") or "", finished.get("task_version") or "")
+    record["audit_ok"] = True
+    if not _persist(project, path, record):
+        return _pending_audit(project, record, decision, finished.get("status") or "", finished.get("task_version") or "")
+    return _success(project, record, decision, finished.get("status") or "", finished.get("task_version") or "", "")
+
+
+def _backfill_audit(
+    project: ProjectRecord,
+    path: str,
+    record: Dict[str, Any],
+    principal: auth.AuthContext,
+    decision: str,
+    audit: AuditStore | None,
+) -> Dict[str, Any]:
+    """业务已经落盘时只补记审计，不再次流转。"""
+    card = _card(project, str(record.get("task_id") or ""))
+    status = "" if card is None or card.get("status") is None else str(card.get("status"))
+    expected = "已验收" if decision == "approve" else "已退回"
+    if status != expected:
+        return _failure("CONFLICT", "DECISION", project.project_id, record)
+    result = record.get("result") if isinstance(record.get("result"), dict) else {}
+    version = str(result.get("task_version") or _version(card or {}))
+    if not _append_ok_audit(project, record, principal, decision, audit):
+        return _pending_audit(project, record, decision, status, version)
+    record["audit_ok"] = True
+    if not _persist(project, path, record):
+        return _pending_audit(project, record, decision, status, version)
+    return _success(project, record, decision, status, version, "REPLAY", replayed=True)
+
+
+def _append_ok_audit(
+    project: ProjectRecord,
+    record: Mapping[str, Any],
+    principal: auth.AuthContext,
+    decision: str,
+    audit: AuditStore | None,
+) -> bool:
+    if audit is None:
+        return True
+    try:
+        audit.append(
+            principal_id=principal.principal_id,
+            project_id=project.project_id,
+            tool="acceptance_decide",
+            code="OK",
+            task_id=str(record.get("task_id") or ""),
+            arguments={"confirmation_id": record.get("confirmation_id"), "decision": decision},
+            required=True,
+            event_id=_event_id(record, decision + ":done"),
+        )
+    except AuditWriteError:
+        return False
+    return True
+
+
+def _pending_audit(
+    project: ProjectRecord,
+    record: Mapping[str, Any],
+    decision: str,
+    status: str,
+    task_version: str,
+) -> Dict[str, Any]:
     return {
         "ok": True,
-        "code": "OK",
-        "reason": "",
+        "code": "APPLIED_AUDIT_PENDING",
+        "reason": "AUDIT_PENDING",
+        "message": AUDIT_PENDING_MESSAGE,
         "project_id": project.project_id,
         "task_id": str(record.get("task_id") or ""),
         "confirmation_id": str(record.get("confirmation_id") or ""),
         "decision": decision,
-        "status": finished.get("status") or "",
-        "task_version": finished.get("task_version") or "",
+        "status": status,
+        "task_version": task_version,
+        "consumed": True,
+        "replayed": False,
+    }
+
+
+def _success(
+    project: ProjectRecord,
+    record: Mapping[str, Any],
+    decision: str,
+    status: str,
+    task_version: str,
+    reason: str,
+    *,
+    replayed: bool = False,
+) -> Dict[str, Any]:
+    body = {
+        "ok": True,
+        "code": "OK",
+        "reason": reason,
+        "message": "",
+        "project_id": project.project_id,
+        "task_id": str(record.get("task_id") or ""),
+        "confirmation_id": str(record.get("confirmation_id") or ""),
+        "decision": decision,
+        "status": status,
+        "task_version": task_version,
         "consumed": True,
     }
+    if replayed:
+        body["replayed"] = True
+    return body
 
 
 def _replay_consumed(project: ProjectRecord, record: Mapping[str, Any]) -> Dict[str, Any]:
@@ -369,23 +464,15 @@ def _apply_decision(project: ProjectRecord, record: Mapping[str, Any], decision:
 
 
 def _approve_gate(project: ProjectRecord, record: Mapping[str, Any]) -> str | None:
+    task_id = str(record.get("task_id") or "")
+    card = _card(project, task_id)
+    checkpoint = None if card is None else _authority(project, card)
     evidence = _read_evidence(project, str(record.get("evidence_id") or ""))
-    if evidence is None:
-        return "MISSING_QUALITY"
-    if evidence.evidence_type != EvidenceType.USER_CONFIRMATION:
-        return "EVIDENCE_TYPE"
-    if not evidence.result_commit or not evidence.baseline_commit or not evidence.content_hash:
-        return "MISSING_QUALITY"
-    extra = evidence.metadata.extra
-    decision = str(extra.get("decision") or "")
-    if decision.upper() == "PASS" and evidence.evidence_type != EvidenceType.USER_CONFIRMATION:
-        return "EVIDENCE_TYPE"
-    if str(extra.get("user_source") or "") != "explicit_user" or not extra.get("confirmed_at"):
-        return "MISSING_QUALITY"
-    claimed_id = str(extra.get("confirmation_id") or "")
-    if evidence.metadata.is_real_host or (claimed_id and claimed_id != record.get("confirmation_id")):
-        if _referenced_gate_failed(project, record, evidence):
-            return "GATE"
+    problem = _quality_problem(project, checkpoint, task_id, evidence)
+    if problem == "MISSING_CANDIDATE":
+        return "CANDIDATE"
+    if problem is not None:
+        return problem
     try:
         _mint_and_validate(project, record)
     except McpError:
@@ -393,45 +480,6 @@ def _approve_gate(project: ProjectRecord, record: Mapping[str, Any]) -> str | No
     except Exception:
         return "GATE"
     return None
-
-
-def _referenced_gate_failed(project: ProjectRecord, record: Mapping[str, Any], evidence: Any) -> bool:
-    from ..core.agent_schema import AgentHandle, ConfirmationResult, HostCapabilities
-    from ..core.evidence_gate import EvidenceGate, EvidenceGateError, EvidenceValidationContext
-
-    meta = evidence.metadata
-    try:
-        EvidenceGate(EvidenceStore(project.evidence_root), project.data_root).validate_evidence(
-            evidence.evidence_id,
-            EvidenceValidationContext(
-                project_id=project.project_id,
-                task_id=str(record.get("task_id") or ""),
-                actor_role=str(meta.actor_role),
-                transition_from=str(meta.transition_from),
-                transition_to=str(meta.transition_to),
-                baseline_commit=evidence.baseline_commit,
-                result_commit=evidence.result_commit,
-                expected_invocation_id=str(meta.host_invocation_id),
-                expected_adapter=str(meta.adapter),
-                expected_workspace_mode=str(meta.workspace_mode),
-                expected_evidence_type=EvidenceType.USER_CONFIRMATION,
-                host_handle=AgentHandle(
-                    session_id=str(meta.host_session_id),
-                    host_id=str(meta.host_id),
-                    is_real_host=True,
-                ),
-                expected_capabilities=HostCapabilities(is_real_host=True),
-                confirmation_result=ConfirmationResult(
-                    str(record.get("confirmation_id") or ""),
-                    "accept",
-                    True,
-                    True,
-                ),
-            ),
-        )
-    except (EvidenceGateError, EvidenceError, OSError, ValueError, TypeError):
-        return True
-    return False
 
 
 def _mint_and_validate(project: ProjectRecord, record: Mapping[str, Any]) -> str:
@@ -530,9 +578,11 @@ def _binding_problem(
         return "FORBIDDEN", "TASK"
     if evidence.metadata.project_id != project.project_id:
         return "FORBIDDEN", "PROJECT"
-    if str(record.get("candidate_sha") or "") != evidence.result_commit:
+    checkpoint = None if card is None else _authority(project, card)
+    latest = "" if checkpoint is None else str(checkpoint.get("candidate_commit") or "")
+    if not _SHA_RE.fullmatch(latest) or latest != str(record.get("candidate_sha") or "") or latest != evidence.result_commit:
         return "CONFLICT", "CANDIDATE"
-    if str(record.get("contract_hash") or "") != _contract_hash(project, card, evidence):
+    if str(record.get("contract_hash") or "") != _contract_hash(project, card, evidence, checkpoint):
         return "CONFLICT", "CONTRACT"
     if str(record.get("evidence_content_hash") or "") != str(evidence.content_hash or ""):
         return "CONFLICT", "CONTRACT"
@@ -555,24 +605,41 @@ def _public_body(record: Mapping[str, Any], card: Mapping[str, Any]) -> Dict[str
     }
 
 
-def _quality_summary(evidence: Any) -> Dict[str, Any]:
+def _quality_summary(project: ProjectRecord, checkpoint: Mapping[str, Any], task_id: str) -> Dict[str, Any]:
+    candidate = str(checkpoint.get("candidate_commit") or "")
+    profile = _profile(checkpoint)
+    roles: list[str] = []
+    evidence_ids: list[str] = []
+    for item in _iter_evidence(project):
+        role = _matched_role(item, profile, candidate, project.project_id, task_id, checkpoint)
+        if role is None:
+            continue
+        roles.append(role)
+        evidence_ids.append(item.evidence_id)
     return {
-        "evidence_id": evidence.evidence_id,
-        "evidence_type": evidence.evidence_type.value,
-        "content_hash": evidence.content_hash or "",
-        "baseline_commit": evidence.baseline_commit,
-        "result_commit": evidence.result_commit,
+        "profile": profile,
+        "candidate_sha": candidate,
+        "roles": sorted(set(roles)),
+        "evidence_ids": sorted(evidence_ids),
+        "acceptance_criteria_hash": str(checkpoint.get("acceptance_criteria_hash") or ""),
+        "acceptance_criteria_items": _criteria_items(checkpoint),
     }
 
 
-def _contract_hash(project: ProjectRecord, card: Mapping[str, Any], evidence: Any) -> str:
+def _contract_hash(project: ProjectRecord, card: Mapping[str, Any], evidence: Any, checkpoint: Mapping[str, Any]) -> str:
     material = {
+        "acceptance_criteria": str(checkpoint.get("acceptance_criteria") or ""),
+        "acceptance_criteria_hash": str(checkpoint.get("acceptance_criteria_hash") or ""),
+        "acceptance_criteria_items": _criteria_items(checkpoint),
         "baseline_commit": evidence.baseline_commit,
+        "candidate_sha": str(checkpoint.get("candidate_commit") or ""),
+        "card_description": str(card.get("description") or ""),
+        "card_process": str(card.get("process") or ""),
+        "card_remarks": str(card.get("remarks") or ""),
         "evidence_content_hash": evidence.content_hash or "",
         "evidence_id": evidence.evidence_id,
-        "evidence_type": evidence.evidence_type.value,
+        "profile_id": _profile(checkpoint),
         "project_id": project.project_id,
-        "result_commit": evidence.result_commit,
         "task_id": str(card.get("id") or evidence.metadata.task_id),
         "task_name": str(card.get("name") or ""),
         "task_type": str(card.get("type") or ""),
@@ -602,13 +669,100 @@ def _event_id(record: Mapping[str, Any], decision: str) -> str:
 
 
 def _os_user() -> str:
+    """读取进程令牌上的账户名。不读取环境变量，也不使用线程模拟令牌。"""
+    if os.name == "nt":
+        return _windows_process_user()
     try:
-        name = getpass.getuser()
-    except Exception:
+        import pwd
+
+        return pwd.getpwuid(os.geteuid()).pw_name
+    except (ImportError, KeyError, OSError, AttributeError):
         return ""
-    if isinstance(name, str):
-        return name.strip()
-    return ""
+
+
+def _windows_process_user() -> str:
+    try:
+        advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.GetCurrentProcess.restype = ctypes.c_void_p
+        kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+        advapi.OpenProcessToken.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_void_p)]
+        advapi.OpenProcessToken.restype = ctypes.c_int
+        advapi.GetTokenInformation.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.POINTER(ctypes.c_ulong),
+        ]
+        advapi.GetTokenInformation.restype = ctypes.c_int
+        advapi.LookupAccountSidW.argtypes = [
+            ctypes.c_wchar_p,
+            ctypes.c_void_p,
+            ctypes.c_wchar_p,
+            ctypes.POINTER(ctypes.c_ulong),
+            ctypes.c_wchar_p,
+            ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(ctypes.c_ulong),
+        ]
+        advapi.LookupAccountSidW.restype = ctypes.c_int
+        token = ctypes.c_void_p()
+        if not advapi.OpenProcessToken(kernel.GetCurrentProcess(), 0x0008, ctypes.byref(token)):
+            return ""
+    except (AttributeError, OSError):
+        return ""
+    try:
+        length = ctypes.c_ulong(0)
+        advapi.GetTokenInformation(token, 1, None, 0, ctypes.byref(length))
+        if length.value <= 0:
+            return ""
+        raw = ctypes.create_string_buffer(length.value)
+        if not advapi.GetTokenInformation(token, 1, raw, length, ctypes.byref(length)):
+            return ""
+        sid = ctypes.cast(raw, ctypes.POINTER(ctypes.c_void_p))[0]
+        name = ctypes.create_unicode_buffer(256)
+        name_size = ctypes.c_ulong(len(name))
+        domain = ctypes.create_unicode_buffer(256)
+        domain_size = ctypes.c_ulong(len(domain))
+        sid_use = ctypes.c_ulong()
+        if not advapi.LookupAccountSidW(
+            None,
+            sid,
+            name,
+            ctypes.byref(name_size),
+            domain,
+            ctypes.byref(domain_size),
+            ctypes.byref(sid_use),
+        ):
+            return ""
+        return str(name.value or "").strip()
+    except (AttributeError, OSError, ValueError):
+        return ""
+    finally:
+        if token:
+            kernel.CloseHandle(token)
+
+
+def interactive_confirmation(confirmation_id: str) -> bool:
+    """只从控制台设备读取确认编号。管道标准输入不能批准。"""
+    import sys
+
+    if confirmation_id == "" or not sys.stdin.isatty():
+        return False
+    try:
+        if os.name == "nt":
+            handle = open("CONIN$", "r", encoding="utf-8", errors="replace")
+        else:
+            handle = open("/dev/tty", "r", encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    try:
+        typed = handle.readline()
+    except OSError:
+        return False
+    finally:
+        handle.close()
+    return isinstance(typed, str) and typed.strip() == confirmation_id
 
 
 def _expired(value: str) -> bool:
@@ -696,6 +850,185 @@ def _read_json(path: str) -> Dict[str, Any] | None:
     if not isinstance(data, dict):
         return None
     return data
+
+
+def _authority(project: ProjectRecord, card: Mapping[str, Any]) -> Dict[str, Any] | None:
+    """最新候选以 Runner 检查点为准；没有检查点时才读任务卡上的候选。"""
+    task_id = str(card.get("id") or "")
+    matches = glob.glob(os.path.join(project.data_root, "runner_checkpoints", "*", task_id + ".json"))
+    if len(matches) > 1:
+        return None
+    if len(matches) == 1:
+        data = _read_json(matches[0])
+        if not isinstance(data, dict):
+            return None
+        try:
+            from ..core.runner_schema import RunnerCheckpoint
+
+            checkpoint = RunnerCheckpoint.from_dict(data)
+        except (TypeError, ValueError, KeyError):
+            return None
+        snapshot = checkpoint.execution_spec_snapshot if isinstance(checkpoint.execution_spec_snapshot, Mapping) else {}
+        options = checkpoint.execution_options if isinstance(checkpoint.execution_options, Mapping) else {}
+        policy = options.get("workflow_policy") if isinstance(options.get("workflow_policy"), Mapping) else {}
+        profile = "standard"
+        found = str(policy.get("profile_id") or "")
+        if found == "docs-short":
+            profile = "docs"
+        elif found in {"standard", "lite", "docs"}:
+            profile = found
+        candidate = str(checkpoint.candidate_commit or "")
+        criteria_hash = str(snapshot.get("acceptance_criteria_hash") or "")
+        if not _SHA_RE.fullmatch(candidate) or not criteria_hash:
+            return None
+        return {
+            "candidate_commit": candidate,
+            "acceptance_criteria_hash": criteria_hash,
+            "acceptance_criteria": str(snapshot.get("acceptance_criteria") or ""),
+            "acceptance_criteria_items": _criteria_items(snapshot),
+            "profile_id": profile,
+            "builder_session_id": str(checkpoint.builder_session_id or ""),
+        }
+    candidate = str(card.get("candidate_commit") or "")
+    if not _SHA_RE.fullmatch(candidate):
+        return None
+    return {
+        "candidate_commit": candidate,
+        "acceptance_criteria_hash": str(card.get("acceptance_criteria_hash") or ""),
+        "acceptance_criteria": str(card.get("acceptance_criteria") or ""),
+        "acceptance_criteria_items": _criteria_items(card),
+        "profile_id": "standard",
+        "builder_session_id": "",
+    }
+
+
+def _profile(checkpoint: Mapping[str, Any]) -> str:
+    profile = str(checkpoint.get("profile_id") or "")
+    if profile in {"standard", "lite", "docs"}:
+        return profile
+    return "standard"
+
+
+def _criteria_items(checkpoint: Mapping[str, Any]) -> list[Dict[str, str]]:
+    raw = checkpoint.get("acceptance_criteria_items")
+    items: list[Dict[str, str]] = []
+    if not isinstance(raw, list):
+        return items
+    for item in raw:
+        if isinstance(item, dict):
+            items.append(
+                {
+                    "id": str(item.get("id") or item.get("criterion_id") or ""),
+                    "text": str(item.get("text") or ""),
+                }
+            )
+        elif isinstance(item, str):
+            items.append({"id": "", "text": item})
+    return items
+
+
+def _iter_evidence(project: ProjectRecord) -> list[Any]:
+    root = project.evidence_root
+    if not root or not os.path.isdir(root):
+        return []
+    found = []
+    for name in sorted(os.listdir(root)):
+        if not name.endswith(".json"):
+            continue
+        record = _read_evidence(project, name[: -len(".json")])
+        if record is not None:
+            found.append(record)
+    return found
+
+
+def _matched_role(
+    evidence: Any,
+    profile: str,
+    candidate: str,
+    project_id: str,
+    task_id: str,
+    checkpoint: Mapping[str, Any],
+) -> str | None:
+    meta = evidence.metadata
+    if meta.project_id != project_id or meta.task_id != task_id:
+        return None
+    if not meta.is_real_host or evidence.result_commit != candidate:
+        return None
+    if evidence.evidence_type == EvidenceType.USER_CONFIRMATION:
+        return None
+    role = str(meta.actor_role or "")
+    if profile == "lite":
+        builder = str(checkpoint.get("builder_session_id") or "")
+        session = str(meta.host_session_id or "")
+        if role != "VERIFIER" or not _role_passed(meta, "VERIFIER"):
+            return None
+        if "verifier" not in session.lower() or (builder and session == builder):
+            return None
+        return "VERIFIER"
+    if profile == "docs":
+        if role != "DOCS_CHECK" or not _role_passed(meta, "DOCS_CHECK"):
+            return None
+        return "DOCS_CHECK"
+    if role not in {"REVIEWER", "QA"} or not _role_passed(meta, role):
+        return None
+    return role
+
+
+def _role_passed(meta: Any, role: str) -> bool:
+    extra = meta.extra
+    if role == "REVIEWER":
+        marked = str(extra.get("decision") or extra.get("review_decision") or "").upper()
+        return marked == "PASS" or str(meta.transition_to or "") == "TESTING"
+    if role == "QA":
+        return str(extra.get("qa_decision") or extra.get("decision") or "").upper() == "PASS"
+    if role == "VERIFIER":
+        return extra.get("verifier_decision") == "PASS"
+    if role == "DOCS_CHECK":
+        marked = str(extra.get("decision") or "").upper()
+        return marked == "PASS" or extra.get("verifier_decision") == "PASS"
+    return False
+
+
+def _quality_problem(
+    project: ProjectRecord,
+    checkpoint: Mapping[str, Any] | None,
+    task_id: str,
+    evidence: Any,
+) -> str | None:
+    if evidence is None:
+        return "MISSING_QUALITY"
+    if not evidence.baseline_commit or not evidence.content_hash:
+        return "MISSING_QUALITY"
+    if evidence.evidence_type == EvidenceType.USER_CONFIRMATION:
+        return "EVIDENCE_TYPE"
+    if checkpoint is None or not _SHA_RE.fullmatch(str(checkpoint.get("candidate_commit") or "")):
+        return "MISSING_CANDIDATE"
+    if evidence.metadata.task_id != task_id or evidence.metadata.project_id != project.project_id:
+        return "EVIDENCE"
+    candidate = str(checkpoint.get("candidate_commit") or "")
+    if evidence.result_commit != candidate:
+        return "CANDIDATE"
+    profile = _profile(checkpoint)
+    matched = [
+        item
+        for item in _iter_evidence(project)
+        if _matched_role(item, profile, candidate, project.project_id, task_id, checkpoint) is not None
+    ]
+    if profile == "standard":
+        reviewers = [item for item in matched if item.metadata.actor_role == "REVIEWER"]
+        testers = [item for item in matched if item.metadata.actor_role == "QA"]
+        if not reviewers or not testers:
+            return "QUALITY_CHAIN"
+        review_sessions = {str(item.metadata.host_session_id or "") for item in reviewers}
+        test_sessions = {str(item.metadata.host_session_id or "") for item in testers}
+        if review_sessions & test_sessions:
+            return "QUALITY_CHAIN"
+    elif not matched:
+        return "QUALITY_CHAIN"
+    allowed = {item.evidence_id for item in matched}
+    if evidence.evidence_id not in allowed:
+        return "QUALITY_CHAIN"
+    return None
 
 
 def _read_evidence(project: ProjectRecord, evidence_id: str) -> Any:

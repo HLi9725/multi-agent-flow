@@ -391,10 +391,9 @@ def test_request_acceptance_requires_gate_and_transport_confirmation(tmp_path: P
                 "acceptance_confirmed": True,
             },
         )
-        assert rejected["isError"] is False, rejected["structuredContent"]
-        assert rejected["structuredContent"]["status"] == "已完成"
-        assert rejected["structuredContent"]["action"] == "accept"
-        assert rejected["structuredContent"]["confirmation_id"]
+        assert rejected["isError"] is True, rejected["structuredContent"]
+        assert rejected["structuredContent"]["code"] == "GATE_REJECTED"
+        assert rejected["structuredContent"]["details"]["reason"] == "EVIDENCE_TYPE"
         assert _version(plain, task_id)[1] == "已完成"
     finally:
         plain.close()
@@ -415,7 +414,7 @@ def test_request_acceptance_requires_gate_and_transport_confirmation(tmp_path: P
         )
         assert forged["isError"] is True
         assert forged["structuredContent"]["code"] == "GATE_REJECTED"
-        assert forged["structuredContent"]["details"]["reason"] == "EVIDENCE_TYPE"
+        assert forged["structuredContent"]["details"]["reason"] == "CANDIDATE"
         assert _version(confirmed, task_id)[1] == "已完成"
         model_only = confirmed.call(
             "request_acceptance",
@@ -428,9 +427,9 @@ def test_request_acceptance_requires_gate_and_transport_confirmation(tmp_path: P
                 "acceptance_confirmed": True,
             },
         )
-        assert model_only["isError"] is False, model_only["structuredContent"]
-        assert model_only["structuredContent"]["status"] == "已完成"
-        assert model_only["structuredContent"]["action"] == "accept"
+        assert model_only["isError"] is True, model_only["structuredContent"]
+        assert model_only["structuredContent"]["code"] == "GATE_REJECTED"
+        assert model_only["structuredContent"]["details"]["reason"] == "EVIDENCE_TYPE"
         assert _version(confirmed, task_id)[1] == "已完成"
         server_id = "srv-confirm-9f3a"
         confirm_path = tmp_path / MARKER / "alpha" / "mcp_auth" / "confirmation" / f"{task_id}.json"
@@ -449,8 +448,8 @@ def test_request_acceptance_requires_gate_and_transport_confirmation(tmp_path: P
                 "evidence_id": user_id,
             },
         )
-        assert stale_model["isError"] is False, stale_model["structuredContent"]
-        assert stale_model["structuredContent"]["status"] == "已完成"
+        assert stale_model["isError"] is True, stale_model["structuredContent"]
+        assert stale_model["structuredContent"]["code"] == "GATE_REJECTED"
         assert _version(confirmed, task_id)[1] == "已完成"
         witnessed = _submit(
             confirmed,
@@ -480,10 +479,9 @@ def test_request_acceptance_requires_gate_and_transport_confirmation(tmp_path: P
                 "evidence_id": witnessed_id,
             },
         )
-        assert accepted["isError"] is False, accepted["structuredContent"]
-        assert accepted["structuredContent"]["status"] == "已完成"
-        assert accepted["structuredContent"]["action"] == "accept"
-        assert accepted["structuredContent"]["confirmation_id"]
+        assert accepted["isError"] is True, accepted["structuredContent"]
+        assert accepted["structuredContent"]["code"] == "GATE_REJECTED"
+        assert accepted["structuredContent"]["details"]["reason"] == "EVIDENCE_TYPE"
         assert _version(confirmed, task_id)[1] == "已完成"
         fresh = confirmed.call(
             "create_task",

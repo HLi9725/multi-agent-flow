@@ -155,8 +155,25 @@ def run_acceptance(args: argparse.Namespace) -> int:
     registry = _load(args.registry)
     if registry is None:
         return 2
-    from scripts._lib.mcp.acceptance import decide_acceptance
+    from scripts._lib.mcp.acceptance import decide_acceptance, interactive_confirmation
 
+    if not interactive_confirmation(str(args.id or "")):
+        public = {
+            "ok": False,
+            "code": "FORBIDDEN",
+            "reason": "CONSOLE",
+            "message": "需要在控制台输入确认编号，管道输入不能批准",
+            "project_id": "",
+            "task_id": "",
+            "confirmation_id": str(args.id or ""),
+            "decision": "",
+            "status": "",
+            "consumed": False,
+            "replayed": False,
+        }
+        sys.stdout.write(json.dumps(public, ensure_ascii=False, sort_keys=True) + "\n")
+        sys.stdout.flush()
+        return 2
     audit = AuditStore(os.path.join(os.path.dirname(registry.path), "mcp_audit"))
     result = decide_acceptance(
         registry,
@@ -176,9 +193,12 @@ def run_acceptance(args: argparse.Namespace) -> int:
         "status": result.get("status") or "",
         "consumed": bool(result.get("consumed")),
         "replayed": bool(result.get("replayed")),
+        "message": result.get("message") or "",
     }
     sys.stdout.write(json.dumps(public, ensure_ascii=False, sort_keys=True) + "\n")
     sys.stdout.flush()
+    if result.get("code") == "APPLIED_AUDIT_PENDING":
+        return 2
     return 0 if result.get("ok") else 2
 
 
