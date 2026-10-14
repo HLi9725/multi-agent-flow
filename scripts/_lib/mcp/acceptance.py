@@ -659,11 +659,7 @@ def _binding_problem(
         return "FORBIDDEN", "PROJECT"
     if str(record.get("principal_id") or "") != principal.principal_id:
         return "FORBIDDEN", "PRINCIPAL"
-    if (
-        not record.get("consumed")
-        and not str(record.get("decision") or "")
-        and _expired(str(record.get("expires_at") or ""))
-    ):
+    if not record.get("consumed") and _expired(str(record.get("expires_at") or "")):
         return "ACCEPTANCE_REQUIRED", "EXPIRED"
     runner_checkpoint = _runner_checkpoint(project, str(record.get("task_id") or ""))
     bound_runner_id = str(record.get("runner_confirmation_request_id") or "")
