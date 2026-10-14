@@ -617,6 +617,8 @@ def _remember(spec: TaskExecutionSpec, checkpoint: RunnerCheckpoint, policy: Map
 
 
 def _finish_docs(runner, spec, checkpoint, policy, files, candidate_commit, evidence_ids, board_status):
+    from .agent_schema import HostCapabilities
+    from .production_runner import _extract_capabilities_extra
     ok, errors = assess_docs(files)
     if not ok:
         message = "文档必要检查未通过，不能短链: " + "; ".join(errors)
@@ -644,8 +646,11 @@ def _finish_docs(runner, spec, checkpoint, policy, files, candidate_commit, evid
             transition_to="COMPLETED",
             created_at=time.time(),
             extra={
+                **_extract_capabilities_extra(HostCapabilities(is_real_host=True)),
                 "workflow_profile_id": PROFILE_DOCS,
                 "verifier_decision": "PASS",
+                "acceptance_criteria_hash": spec.acceptance_criteria_hash,
+                "contract_hash": spec.requirement_hash,
                 "checks": "secret_scan,doc_metadata,path_depth",
             },
         ),
@@ -800,11 +805,12 @@ def _finish_lite(
         return _pass_lite(
             runner, spec, checkpoint, policy, candidate_commit, evidence_ids,
             board_status, builder_session_id, session_id, result, handle, adapter, runner_checks,
+            parsed,
         )
     return "return", RunnerResult(False, RunnerState.NEEDS_USER_INPUT.value, spec.task_id, message="Verifier 协议重试耗尽")
 
 
-def _verifier_evidence(spec, candidate, session_id, result, handle, adapter, decision, evidence_ids, runner_checks=None):
+def _verifier_evidence(spec, candidate, session_id, result, handle, adapter, decision, evidence_ids, runner_checks=None, report=None):
     caps = adapter.detect_capabilities()
     from .production_runner import _extract_capabilities_extra, _extract_real_invocation_id
     invocation = _extract_real_invocation_id(result, handle) or f"inv_verifier_{int(time.time() * 1000)}"
@@ -829,6 +835,9 @@ def _verifier_evidence(spec, candidate, session_id, result, handle, adapter, dec
             "host_managed_profile": "flow-runner-verifier",
             "candidate_commit": candidate,
             "runner_checks": dict(runner_checks or {}),
+            "acceptance_criteria_hash": spec.acceptance_criteria_hash,
+            "contract_hash": spec.requirement_hash,
+            "verifier_report": dict(report or {}),
         },
     )
     record = EvidenceRecord(
@@ -842,9 +851,9 @@ def _verifier_evidence(spec, candidate, session_id, result, handle, adapter, dec
     return evidence_id, record, invocation, caps
 
 
-def _pass_lite(runner, spec, checkpoint, policy, candidate, evidence_ids, board_status, builder_session_id, session_id, result, handle, adapter, runner_checks):
+def _pass_lite(runner, spec, checkpoint, policy, candidate, evidence_ids, board_status, builder_session_id, session_id, result, handle, adapter, runner_checks, report=None):
     evidence_id, record, invocation, caps = _verifier_evidence(
-        spec, candidate, session_id, result, handle, adapter, "PASS", evidence_ids, runner_checks,
+        spec, candidate, session_id, result, handle, adapter, "PASS", evidence_ids, runner_checks, report,
     )
     runner.evidence_store.append(record)
     try:

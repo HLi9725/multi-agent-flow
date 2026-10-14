@@ -155,7 +155,13 @@ def run_acceptance(args: argparse.Namespace) -> int:
     registry = _load(args.registry)
     if registry is None:
         return 2
-    from scripts._lib.mcp.acceptance import decide_acceptance, interactive_confirmation
+    from scripts._lib.mcp.acceptance import decide_acceptance, interactive_confirmation, load_acceptance_record
+
+    application = load_acceptance_record(registry, str(args.id or ""))
+    if application is not None:
+        summary = {key: application.get(key) for key in ("project_id", "task_id", "candidate_sha", "contract_hash", "expires_at")}
+        summary["decision"] = args.decision
+        _stderr(json.dumps(summary, ensure_ascii=False, sort_keys=True) + "\n请核对上述目标，并在控制台输入确认编号：\n")
 
     if not interactive_confirmation(str(args.id or "")):
         public = {
@@ -197,7 +203,7 @@ def run_acceptance(args: argparse.Namespace) -> int:
     }
     sys.stdout.write(json.dumps(public, ensure_ascii=False, sort_keys=True) + "\n")
     sys.stdout.flush()
-    if result.get("code") == "APPLIED_AUDIT_PENDING":
+    if result.get("code") in {"APPLIED_AUDIT_PENDING", "APPLIED_LEDGER_PENDING"}:
         return 2
     return 0 if result.get("ok") else 2
 

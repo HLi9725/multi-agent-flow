@@ -7,6 +7,7 @@ import getpass
 import hashlib
 import json
 import threading
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,8 @@ import pytest
 from scripts._lib.core.evidence_schema import ArtifactRecord, EvidenceMetadata, EvidenceRecord, EvidenceType
 from scripts._lib.mcp import acceptance as acceptance_mod
 from scripts._lib.core.evidence_store import EvidenceStore
+from scripts._lib.core.agent_schema import HostCapabilities
+from scripts._lib.core.production_runner import _extract_capabilities_extra
 from scripts._lib.mcp.acceptance import decide_acceptance, load_acceptance_record
 from scripts._lib.mcp.audit_store import AuditStore, AuditWriteError
 from scripts._lib.mcp.idempotency import IdempotencyStore
@@ -79,6 +82,11 @@ def _plant_pair(tmp: Path, registry: Path, task_id: str, suffix: str, *, real_ho
     assert project is not None
     store = EvidenceStore(project.evidence_root)
     reviewer_id = "reviewer-" + suffix
+    card = next(item for item in _board(tmp) if item.get("id") == task_id)
+    report_path = Path(project.data_root) / "reports" / "note.txt"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text("isolated quality artifact", encoding="utf-8")
+    artifact_hash = hashlib.sha256(report_path.read_bytes()).hexdigest()
     for role, session, evidence_id in (
         ("REVIEWER", "reviewer-session-" + suffix, reviewer_id),
         ("QA", "qa-session-" + suffix, "qa-" + suffix),
@@ -86,10 +94,10 @@ def _plant_pair(tmp: Path, registry: Path, task_id: str, suffix: str, *, real_ho
         store.append(
             EvidenceRecord(
                 evidence_id=evidence_id,
-                evidence_type=EvidenceType.TASK_COMPLETE,
+                evidence_type=EvidenceType.TASK_TRANSITION,
                 baseline_commit="a" * 40,
                 result_commit="b" * 40,
-                artifacts=(ArtifactRecord(relative_path="reports/note.txt", sha256_hash="ab" * 32),) if artifacts else (),
+                artifacts=(ArtifactRecord(relative_path="reports/note.txt", sha256_hash=artifact_hash),) if artifacts else (),
                 metadata=EvidenceMetadata(
                     project_id="alpha",
                     task_id=task_id,
@@ -100,14 +108,38 @@ def _plant_pair(tmp: Path, registry: Path, task_id: str, suffix: str, *, real_ho
                     host_invocation_id="invoke-" + evidence_id,
                     is_real_host=real_host,
                     workspace_mode="runner",
-                    transition_from="测试中",
-                    transition_to="已完成",
+                    transition_from="REVIEWING" if role == "REVIEWER" else "TESTING",
+                    transition_to="TESTING" if role == "REVIEWER" else "PENDING_USER_ACCEPTANCE",
                     created_at=1,
-                    extra={"decision": "PASS"},
+                    extra=_quality_extra(card, task_id, session, role),
                 ),
             )
         )
     return reviewer_id
+
+
+def _quality_extra(card, task_id, session, role):
+    extra = {**_extract_capabilities_extra(HostCapabilities(is_real_host=True)),
+             "decision": "PASS", "acceptance_criteria_hash": card["acceptance_criteria_hash"]}
+    if role == "REVIEWER":
+        return extra
+    commands = ["python -m pytest -q"]
+    results = [{"command": commands[0], "exit_code": 0, "output_hash": "e" * 64}]
+    coverage = [{"criterion_id": item["id"], "status": "PASS", "evidence": "isolated assertions"}
+                for item in card["acceptance_criteria_items"]]
+    report = {"task_id": task_id, "baseline_commit": "a" * 40, "candidate_commit": "b" * 40,
+              "session_id": session, "qa_request_id": "qa-request-01",
+              "acceptance_criteria_hash": card["acceptance_criteria_hash"], "decision": "PASS",
+              "acceptance_coverage": coverage, "test_commands": [{"command": commands[0], "exit_code": 0}],
+              "negative_scenarios": [{"name": "denied", "status": "PASS"}], "defects": [], "uncovered_risks": []}
+    def digest(value):
+        return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+    extra.update(qa_decision="PASS", qa_request_id="qa-request-01", qa_report=report,
+                 qa_report_hash=digest(report), covered_criterion_ids=[item["criterion_id"] for item in coverage],
+                 required_test_commands=commands, runner_test_results=results, required_test_command_count=1,
+                 negative_scenario_count=1, uncovered_risk_count=0, defect_count=0, test_exit_codes=[0],
+                 test_command_hash=digest(commands), test_output_hash=digest(results))
+    return extra
 
 
 def _apply(tmp: Path, suffix: str, *, confirmed_env: bool = True) -> tuple[Path, str, str, str]:
@@ -467,6 +499,7 @@ def test_interrupt_recovery_audit_and_ledger(tmp_path: Path, monkeypatch: pytest
     path = _acceptance_path(registry, confirmation_id)
     loaded["decision"] = "approve"
     loaded["decided_by"] = "recovered"
+    loaded["intent_version"] = task_version(next(card for card in _board(tmp_path) if card.get("id") == task_id))
     path.write_text(json.dumps(loaded, ensure_ascii=False), encoding="utf-8")
     resumed = decide_acceptance(
         load_registry(str(registry)),
@@ -599,6 +632,7 @@ def test_runner_shaped_quality_chain_can_apply(tmp_path: Path) -> None:
     try:
         task_id = _finish_type_b(session, "真实证据形状", "task-shape-0001")
         _bind_card(tmp_path, task_id)
+        card = next(item for item in _board(tmp_path) if item.get("id") == task_id)
         project = load_registry(str(registry)).get_project("alpha")
         assert project is not None
         store = EvidenceStore(project.evidence_root)
@@ -622,7 +656,7 @@ def test_runner_shaped_quality_chain_can_apply(tmp_path: Path) -> None:
                     transition_from="REVIEWING",
                     transition_to="TESTING",
                     created_at=1,
-                    extra={"acceptance_criteria_hash": "c" * 64},
+                    extra={key: value for key, value in _quality_extra(card, task_id, "sess_reviewer_shape", "REVIEWER").items() if key != "decision"},
                 ),
             )
         )
@@ -646,7 +680,7 @@ def test_runner_shaped_quality_chain_can_apply(tmp_path: Path) -> None:
                     transition_from="TESTING",
                     transition_to="PENDING_USER_ACCEPTANCE",
                     created_at=1,
-                    extra={"qa_decision": "PASS"},
+                    extra=_quality_extra(card, task_id, "sess_qa_shape", "QA"),
                 ),
             )
         )
@@ -763,3 +797,146 @@ def test_audit_backfill_does_not_transition_again(tmp_path: Path) -> None:
     assert _status(tmp_path, task_id) == "已验收"
     retried_lines = (audit_dir / "events.jsonl").read_text(encoding="utf-8")
     assert '"OK"' in retried_lines or '"code": "OK"' in retried_lines
+
+
+@pytest.mark.parametrize("corruption", ["missing", "hash"])
+def test_quality_artifacts_are_validated(tmp_path, corruption):
+    registry, task, evid, cid = _apply(tmp_path, "artifact")
+    reg = load_registry(str(registry))
+    project = reg.get_project("alpha")
+    path = Path(project.data_root) / "reports" / "note.txt"
+    if corruption == "missing":
+        path.unlink()
+    else:
+        path.write_text("modified", encoding="utf-8")
+    result = decide_acceptance(reg, cid, "approve", audit=AuditStore(str(tmp_path / "audit")))
+    assert result["ok"] is False and result["reason"] == "QUALITY_CHAIN"
+    assert _status(tmp_path, task) == "已完成"
+
+
+def _rewrite_quality(project, evidence_id, transform):
+    store = EvidenceStore(project.evidence_root)
+    original = store.read(evidence_id)
+    extra = acceptance_mod._plain(original.metadata.extra)
+    transform(extra)
+    (Path(project.evidence_root) / (evidence_id + ".json")).unlink()
+    store.append(replace(original, metadata=replace(original.metadata, extra=extra), content_hash=None))
+
+
+@pytest.mark.parametrize("case", ["unknown", "missing", "duplicate", "failed", "hash", "command_failure", "bad_report_hash", "rejected_review", "negative_failure", "report_command_failure", "conflicting_qa"])
+def test_quality_semantics_fail_closed(tmp_path, case):
+    registry, task, evid, cid = _apply(tmp_path, "semantic")
+    reg = load_registry(str(registry)); project = reg.get_project("alpha")
+    qa_id = "qa-semantic"
+    def mutate(extra):
+        if case == "rejected_review":
+            extra["decision"] = "REJECT"
+            return
+        if case == "hash":
+            extra["acceptance_criteria_hash"] = "f" * 64
+        elif case == "bad_report_hash":
+            extra["qa_report_hash"] = "f" * 64
+        elif case == "command_failure":
+            extra["runner_test_results"][0]["exit_code"] = 1
+        elif case == "conflicting_qa":
+            extra["decision"] = "FAIL"
+        elif case in {"negative_failure", "report_command_failure"}:
+            if case == "negative_failure": extra["qa_report"]["negative_scenarios"][0]["status"] = "FAIL"
+            else: extra["qa_report"]["test_commands"][0]["exit_code"] = 1
+            extra["qa_report_hash"] = hashlib.sha256(json.dumps(extra["qa_report"], ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+        else:
+            coverage = extra["qa_report"]["acceptance_coverage"]
+            if case == "unknown": coverage[0]["criterion_id"] = "MADE_UP"
+            if case == "missing": coverage.clear()
+            if case == "duplicate": coverage.append(dict(coverage[0]))
+            if case == "failed": coverage[0]["status"] = "FAIL"
+            extra["qa_report_hash"] = hashlib.sha256(json.dumps(extra["qa_report"], ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+            extra["covered_criterion_ids"] = [item["criterion_id"] for item in coverage if item["status"] == "PASS"]
+    _rewrite_quality(project, evid if case == "rejected_review" else qa_id, mutate)
+    card = acceptance_mod._card(project, task)
+    authority = acceptance_mod._authority(project, card)
+    assert acceptance_mod._quality_problem(project, authority, task, EvidenceStore(project.evidence_root).read(evid)) is not None
+    assert _status(tmp_path, task) == "已完成"
+
+
+@pytest.mark.parametrize("decision", ["approve", "reject"])
+def test_applied_decision_ledger_failure_recovers_in_new_process(tmp_path, monkeypatch, decision):
+    import subprocess
+    import sys
+    registry, task, evid, cid = _apply(tmp_path, "recovery")
+    reg = load_registry(str(registry))
+    real = acceptance_mod._persist
+    failed = False
+    def persist(project, path, record):
+        nonlocal failed
+        if record.get("consumed") and not failed:
+            failed = True
+            return False
+        return real(project, path, record)
+    monkeypatch.setattr(acceptance_mod, "_persist", persist)
+    first = decide_acceptance(reg, cid, decision, audit=AuditStore(str(tmp_path / "audit")))
+    assert first["code"] == "APPLIED_LEDGER_PENDING" and first["consumed"] is True
+    version = task_version(next(card for card in _board(tmp_path) if card.get("id") == task))
+    intent_path = _acceptance_path(registry, cid)
+    intent = json.loads(intent_path.read_text(encoding="utf-8"))
+    intent["expires_at"] = "2000-01-01T00:00:00Z"
+    intent_path.write_text(json.dumps(intent, ensure_ascii=False), encoding="utf-8")
+    source = (
+        "import json,sys; from scripts._lib.mcp.registry import load_registry; "
+        "from scripts._lib.mcp.acceptance import decide_acceptance; "
+        "from scripts._lib.mcp.audit_store import AuditStore; "
+        "print(json.dumps(decide_acceptance(load_registry(sys.argv[1]),sys.argv[2],sys.argv[3],audit=AuditStore(sys.argv[4]))))"
+    )
+    child = subprocess.run([sys.executable, "-c", source, str(registry), cid, decision, str(tmp_path / "audit")],
+                           cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+    assert child.returncode == 0, child.stderr
+    result = json.loads(child.stdout.strip().splitlines()[-1])
+    assert result["ok"] is True and result["consumed"] is True
+    assert _status(tmp_path, task) == ("已验收" if decision == "approve" else "已退回")
+    assert task_version(next(card for card in _board(tmp_path) if card.get("id") == task)) == version
+    rows = [json.loads(line) for line in (tmp_path / "audit" / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert len([row for row in rows if row.get("code") == "OK"]) == 1
+
+
+@pytest.mark.parametrize("case", ["valid", "failed_report", "wrong_ac", "unknown_ac", "failed_check"])
+def test_lite_quality_requires_bound_report(tmp_path, case):
+    registry, task, _, _ = _apply(tmp_path, "litequality")
+    reg = load_registry(str(registry)); project = reg.get_project("alpha")
+    authority = acceptance_mod._authority(project, acceptance_mod._card(project, task))
+    authority.update(profile_id="lite", builder_session_id="builder-session")
+    checks = {"diff_check": {"exit_code": 0, "passed": True, "summary": "clean"},
+              "security_scan": {"exit_code": 0, "passed": True, "summary": "clean"},
+              "tests": [{"command": "python -m pytest", "exit_code": 0, "summary": "passed"}]}
+    report = {"decision": "PASS", "candidate_commit": "b" * 40,
+              "acceptance_criteria_hash": authority["acceptance_criteria_hash"],
+              "acceptance_coverage": [{"criterion_id": "AC-01", "status": "PASS"}], "runner_checks": checks}
+    if case == "failed_report": report["decision"] = "FAIL"
+    if case == "wrong_ac": report["acceptance_criteria_hash"] = "f" * 64
+    if case == "unknown_ac": report["acceptance_coverage"][0]["criterion_id"] = "MADE_UP"
+    if case == "failed_check": checks["tests"][0]["exit_code"] = 1
+    extra = {**_extract_capabilities_extra(HostCapabilities(is_real_host=True)),
+             "acceptance_criteria_hash": authority["acceptance_criteria_hash"],
+             "workflow_profile_id": "lite", "verifier_decision": "PASS", "runner_checks": checks, "verifier_report": report}
+    store = EvidenceStore(project.evidence_root)
+    store.append(EvidenceRecord(evidence_id="verifier-bound", evidence_type=EvidenceType.TASK_TRANSITION,
+        baseline_commit="a" * 40, result_commit="b" * 40, artifacts=(),
+        metadata=EvidenceMetadata(project_id="alpha", task_id=task, actor_role="VERIFIER", host_id="codex",
+            adapter="codex", host_session_id="sess-verifier-independent", host_invocation_id="invoke-verifier",
+            is_real_host=True, workspace_mode="workspace_read", transition_from="BUILDING",
+            transition_to="PENDING_USER_ACCEPTANCE", created_at=1, extra=extra)))
+    problem = acceptance_mod._quality_problem(project, authority, task, store.read("verifier-bound"))
+    assert (problem is None) == (case == "valid")
+
+
+@pytest.mark.parametrize("binding", ["evidence_ids", "session", "invocation", "baseline", "commands", "requirement"])
+def test_checkpoint_bindings_cannot_reuse_other_quality(tmp_path, binding):
+    registry, task, evid, _ = _apply(tmp_path, "checkpointbind")
+    reg = load_registry(str(registry)); project = reg.get_project("alpha")
+    authority = acceptance_mod._authority(project, acceptance_mod._card(project, task))
+    if binding == "evidence_ids": authority["evidence_ids"] = [evid]
+    if binding == "session": authority["role_sessions"] = {"QA": "different-session"}
+    if binding == "invocation": authority["role_invocations"] = {"QA": "different-invocation"}
+    if binding == "baseline": authority["baseline_commit"] = "d" * 40
+    if binding == "commands": authority["required_test_commands"] = ["different-command"]
+    if binding == "requirement": authority["requirement_hash"] = "d" * 64
+    assert acceptance_mod._quality_problem(project, authority, task, EvidenceStore(project.evidence_root).read(evid)) == "QUALITY_CHAIN"

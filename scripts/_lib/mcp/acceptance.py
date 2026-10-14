@@ -233,7 +233,8 @@ def _decide_locked(
         if record.get("audit_ok") is False:
             return _backfill_audit(project, path, record, principal, decision, audit)
         return _replay_consumed(project, record)
-    problem = _binding_problem(project, record, principal)
+    recovered = _recover_applied(project, record, principal, decision) if stored == decision else None
+    problem = None if recovered is not None else _binding_problem(project, record, principal)
     if problem is not None:
         code, reason = problem
         return _failure(code, reason, project.project_id, record)
@@ -250,16 +251,21 @@ def _decide_locked(
             required=True,
             event_id=_event_id(record, decision),
         )
-    if decision == "approve":
+    if decision == "approve" and recovered is None:
         gate_problem = _approve_gate(project, record)
         if gate_problem is not None:
             return _failure("GATE_REJECTED", gate_problem, project.project_id, record)
     if not stored:
         record["decision"] = decision
         record["decided_by"] = os_user
+        card = _card(project, str(record.get("task_id") or "")) or {}
+        authority = _authority(project, card)
+        evidence = _read_evidence(project, str(record.get("evidence_id") or ""))
+        record["intent_version"] = _version(card)
+        record["recovery_contract_hash"] = _contract_hash(project, card, evidence, authority, include_journal=False)
         if not _persist(project, path, record):
             return _failure("GATE_REJECTED", "LEDGER", project.project_id, record)
-    finished = _apply_decision(project, record, decision)
+    finished = recovered if recovered is not None else _apply_decision(project, record, decision)
     if not finished.get("ok"):
         return finished
     record["consumed"] = True
@@ -272,7 +278,9 @@ def _decide_locked(
         "confirmation_id": record.get("confirmation_id"),
     }
     if not _persist(project, path, record):
-        return _failure("GATE_REJECTED", "LEDGER", project.project_id, record)
+        pending = _pending_audit(project, record, decision, finished.get("status") or "", finished.get("task_version") or "")
+        pending.update(code="APPLIED_LEDGER_PENDING", reason="LEDGER_PENDING", message="业务已应用、消费记录及审计待补记")
+        return pending
     reloaded = _read_json(path)
     if not isinstance(reloaded, dict) or reloaded.get("consumed") is not True:
         return _failure("GATE_REJECTED", "LEDGER", project.project_id, record)
@@ -283,6 +291,28 @@ def _decide_locked(
     if not _persist(project, path, record):
         return _pending_audit(project, record, decision, finished.get("status") or "", finished.get("task_version") or "")
     return _success(project, record, decision, finished.get("status") or "", finished.get("task_version") or "", "")
+
+
+def _decision_marker(record: Mapping[str, Any], decision: str) -> str:
+    return f"acceptance-decision:{record.get('confirmation_id')}:{decision}"
+
+
+def _recover_applied(project, record, principal, decision):
+    """Only recover the exact transition carrying this durable intent's marker."""
+    if record.get("project_id") != project.project_id or record.get("principal_id") != principal.principal_id:
+        return None
+    card = _card(project, str(record.get("task_id") or ""))
+    if card is None or card.get("status") != ("已验收" if decision == "approve" else "已退回"):
+        return None
+    if _decision_marker(record, decision) not in str(card.get("process") or ""):
+        return None
+    evidence = _read_evidence(project, str(record.get("evidence_id") or ""))
+    authority = _authority(project, card)
+    if evidence is None or authority is None or not record.get("recovery_contract_hash"):
+        return None
+    if record["recovery_contract_hash"] != _contract_hash(project, card, evidence, authority, include_journal=False):
+        return None
+    return {"ok": True, "status": card["status"], "task_version": _version(card)}
 
 
 def _backfill_audit(
@@ -414,12 +444,10 @@ def _apply_decision(project: ProjectRecord, record: Mapping[str, Any], decision:
     if card is None:
         return _failure("NOT_FOUND", "TASK", project.project_id, record)
     status = str(card.get("status") or "")
-    if decision == "approve" and status == "已验收":
-        return {"ok": True, "status": status, "task_version": _version(card)}
-    if decision == "reject" and status == "已退回":
-        return {"ok": True, "status": status, "task_version": _version(card)}
     if status != "已完成":
         return _failure("ACCEPTANCE_REQUIRED", "STATUS", project.project_id, record)
+    if record.get("intent_version") != _version(card):
+        return _failure("CONFLICT", "VERSION", project.project_id, record)
     target = "已验收" if decision == "approve" else "已退回"
     assignee = str(card.get("assignee") or card.get("owner") or "李开发")
     end_time = str(card.get("end_time") or card.get("end_date") or "")
@@ -443,7 +471,7 @@ def _apply_decision(project: ProjectRecord, record: Mapping[str, Any], decision:
                 delegation_reason="explicit_user",
                 expected_card_version=_version(card),
                 version_state=version_state,
-                remarks="用户拒绝验收" if decision == "reject" else "",
+                remarks=("用户拒绝验收 " if decision == "reject" else "用户批准验收 ") + _decision_marker(record, decision),
             )
 
     from scripts import paths
@@ -626,7 +654,7 @@ def _quality_summary(project: ProjectRecord, checkpoint: Mapping[str, Any], task
     }
 
 
-def _contract_hash(project: ProjectRecord, card: Mapping[str, Any], evidence: Any, checkpoint: Mapping[str, Any]) -> str:
+def _contract_hash(project: ProjectRecord, card: Mapping[str, Any], evidence: Any, checkpoint: Mapping[str, Any], *, include_journal: bool = True) -> str:
     material = {
         "acceptance_criteria": str(checkpoint.get("acceptance_criteria") or ""),
         "acceptance_criteria_hash": str(checkpoint.get("acceptance_criteria_hash") or ""),
@@ -634,8 +662,6 @@ def _contract_hash(project: ProjectRecord, card: Mapping[str, Any], evidence: An
         "baseline_commit": evidence.baseline_commit,
         "candidate_sha": str(checkpoint.get("candidate_commit") or ""),
         "card_description": str(card.get("description") or ""),
-        "card_process": str(card.get("process") or ""),
-        "card_remarks": str(card.get("remarks") or ""),
         "evidence_content_hash": evidence.content_hash or "",
         "evidence_id": evidence.evidence_id,
         "profile_id": _profile(checkpoint),
@@ -644,6 +670,8 @@ def _contract_hash(project: ProjectRecord, card: Mapping[str, Any], evidence: An
         "task_name": str(card.get("name") or ""),
         "task_type": str(card.get("type") or ""),
     }
+    if include_journal:
+        material.update(card_process=str(card.get("process") or ""), card_remarks=str(card.get("remarks") or ""))
     raw = json.dumps(material, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()
 
@@ -869,6 +897,8 @@ def _authority(project: ProjectRecord, card: Mapping[str, Any]) -> Dict[str, Any
         except (TypeError, ValueError, KeyError):
             return None
         snapshot = checkpoint.execution_spec_snapshot if isinstance(checkpoint.execution_spec_snapshot, Mapping) else {}
+        if checkpoint.task_id != task_id or checkpoint.project_id != project.project_id:
+            return None
         options = checkpoint.execution_options if isinstance(checkpoint.execution_options, Mapping) else {}
         policy = options.get("workflow_policy") if isinstance(options.get("workflow_policy"), Mapping) else {}
         profile = "standard"
@@ -888,6 +918,14 @@ def _authority(project: ProjectRecord, card: Mapping[str, Any]) -> Dict[str, Any
             "acceptance_criteria_items": _criteria_items(snapshot),
             "profile_id": profile,
             "builder_session_id": str(checkpoint.builder_session_id or ""),
+            "baseline_commit": str(snapshot.get("baseline_commit") or ""),
+            "requirement_hash": str(snapshot.get("requirement_hash") or ""),
+            "evidence_ids": list(checkpoint.evidence_ids),
+            "role_sessions": {"REVIEWER": checkpoint.reviewer_session_id, "QA": checkpoint.qa_session_id,
+                              "VERIFIER": checkpoint.verifier_session_id},
+            "role_invocations": {"REVIEWER": checkpoint.reviewer_invocation_id, "QA": checkpoint.qa_invocation_id,
+                                 "VERIFIER": checkpoint.verifier_invocation_id},
+            "required_test_commands": list(snapshot.get("test_commands") or ()),
         }
     candidate = str(card.get("candidate_commit") or "")
     if not _SHA_RE.fullmatch(candidate):
@@ -977,10 +1015,11 @@ def _matched_role(
 def _role_passed(meta: Any, role: str) -> bool:
     extra = meta.extra
     if role == "REVIEWER":
-        marked = str(extra.get("decision") or extra.get("review_decision") or "").upper()
-        return marked == "PASS" or str(meta.transition_to or "") == "TESTING"
+        marks = [str(extra[key]).upper() for key in ("decision", "review_decision") if key in extra]
+        return all(mark == "PASS" for mark in marks) and (bool(marks) or str(meta.transition_to or "") == "TESTING")
     if role == "QA":
-        return str(extra.get("qa_decision") or extra.get("decision") or "").upper() == "PASS"
+        marks = [str(extra[key]).upper() for key in ("qa_decision", "decision") if key in extra]
+        return bool(marks) and all(mark == "PASS" for mark in marks)
     if role == "VERIFIER":
         return extra.get("verifier_decision") == "PASS"
     if role == "DOCS_CHECK":
@@ -1009,10 +1048,19 @@ def _quality_problem(
     if evidence.result_commit != candidate:
         return "CANDIDATE"
     profile = _profile(checkpoint)
+    criteria = _criteria_items(checkpoint)
+    criterion_ids = [item["id"] for item in criteria]
+    if not criterion_ids or any(not item for item in criterion_ids) or len(criterion_ids) != len(set(criterion_ids)):
+        return "CONTRACT"
+    if not re.fullmatch(r"[0-9a-f]{64}", str(checkpoint.get("acceptance_criteria_hash") or "")):
+        return "CONTRACT"
     matched = [
         item
         for item in _iter_evidence(project)
+        if "evidence_ids" not in checkpoint or item.evidence_id in checkpoint["evidence_ids"]
         if _matched_role(item, profile, candidate, project.project_id, task_id, checkpoint) is not None
+        and _validate_quality_evidence(project, checkpoint, item)
+        and item.baseline_commit == evidence.baseline_commit
     ]
     if profile == "standard":
         reviewers = [item for item in matched if item.metadata.actor_role == "REVIEWER"]
@@ -1029,6 +1077,99 @@ def _quality_problem(
     if evidence.evidence_id not in allowed:
         return "QUALITY_CHAIN"
     return None
+
+
+def _validate_quality_evidence(project, authority, evidence) -> bool:
+    """Use the shared gate, then bind semantic coverage to the authoritative ACs."""
+    from ..core.agent_schema import AgentHandle, HostCapabilities, CapabilitySupport
+    from ..core.evidence_gate import EvidenceGate, EvidenceValidationContext
+    from ..core.evidence_schema import EvidenceGateError
+    from ..core.workflow_policy import PolicyError
+    meta = evidence.metadata
+    role = meta.actor_role
+    extra = meta.extra
+    if extra.get("acceptance_criteria_hash") != authority.get("acceptance_criteria_hash"):
+        return False
+    if authority.get("requirement_hash") and extra.get("contract_hash") != authority["requirement_hash"]:
+        return False
+    if authority.get("baseline_commit") and evidence.baseline_commit != authority["baseline_commit"]:
+        return False
+    session = (authority.get("role_sessions") or {}).get(role)
+    invocation = (authority.get("role_invocations") or {}).get(role)
+    if session and meta.host_session_id != session:
+        return False
+    if invocation and meta.host_invocation_id != invocation:
+        return False
+    if authority.get("builder_session_id") and meta.host_session_id == authority["builder_session_id"]:
+        return False
+    if evidence.evidence_type != EvidenceType.TASK_TRANSITION:
+        return False
+    transitions = {"REVIEWER": ("REVIEWING", "TESTING"), "QA": ("TESTING", "PENDING_USER_ACCEPTANCE"),
+                   "VERIFIER": ("BUILDING", "PENDING_USER_ACCEPTANCE"), "DOCS_CHECK": ("IN_PROGRESS", "COMPLETED")}
+    if role not in transitions or (meta.transition_from, meta.transition_to) != transitions[role]:
+        return False
+    try:
+        values = {}
+        for key in HostCapabilities.__dataclass_fields__:
+            if key == "extra":
+                continue
+            value = extra["capability_" + key]
+            if key.startswith("supports_"):
+                value = CapabilitySupport(value)
+            values[key] = value
+        caps = HostCapabilities(**values)
+        if caps.is_real_host is not True:
+            return False
+        ctx = EvidenceValidationContext(
+            project_id=project.project_id, task_id=meta.task_id, actor_role=role,
+            transition_from=meta.transition_from, transition_to=meta.transition_to,
+            baseline_commit=evidence.baseline_commit, result_commit=authority["candidate_commit"],
+            expected_invocation_id=meta.host_invocation_id, expected_adapter=meta.adapter,
+            expected_workspace_mode=meta.workspace_mode, expected_evidence_type=evidence.evidence_type,
+            host_handle=AgentHandle(session_id=meta.host_session_id, host_id=meta.host_id, is_real_host=True),
+            expected_capabilities=caps, require_qa_semantics=role == "QA",
+            expected_metadata={"acceptance_criteria_hash": authority["acceptance_criteria_hash"]},
+        )
+        gate = EvidenceGate(EvidenceStore(project.evidence_root), project.data_root)
+        if role == "VERIFIER":
+            gate.validate_lite_verifier(evidence.evidence_id, ctx, builder_session_id=str(authority.get("builder_session_id") or ""))
+            report = extra.get("verifier_report")
+            from ..core.lightweight_profile import _parse_verifier
+            parsed = _parse_verifier(json.dumps(_plain(report)), candidate=authority["candidate_commit"],
+                           runner_checks=extra.get("runner_checks") or {},
+                           acceptance_criteria_hash=authority["acceptance_criteria_hash"],
+                           expected_criterion_ids=[item["id"] for item in _criteria_items(authority)])
+            if parsed.get("decision") != "PASS":
+                return False
+        else:
+            gate.validate_evidence(evidence.evidence_id, ctx)
+        if role == "DOCS_CHECK" and extra.get("checks") != "secret_scan,doc_metadata,path_depth":
+            return False
+        if role == "QA":
+            report = extra["qa_report"]
+            if any(not isinstance(item, Mapping) or item.get("status") != "PASS" for item in report["negative_scenarios"]):
+                return False
+            if any(not isinstance(item, Mapping) or type(item.get("exit_code")) is not int or item["exit_code"] != 0 for item in report["test_commands"]):
+                return False
+            required = authority.get("required_test_commands")
+            if required and list(extra["required_test_commands"]) != list(required):
+                return False
+            coverage = extra["qa_report"]["acceptance_coverage"]
+            ids = [item.get("criterion_id") for item in coverage if isinstance(item, Mapping) and item.get("status") == "PASS"]
+            expected = [item["id"] for item in _criteria_items(authority)]
+            if len(ids) != len(coverage) or len(ids) != len(set(ids)) or set(ids) != set(expected):
+                return False
+        return True
+    except (EvidenceError, EvidenceGateError, PolicyError, OSError, KeyError, TypeError, ValueError):
+        return False
+
+
+def _plain(value):
+    if isinstance(value, Mapping):
+        return {key: _plain(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain(item) for item in value]
+    return value
 
 
 def _read_evidence(project: ProjectRecord, evidence_id: str) -> Any:
