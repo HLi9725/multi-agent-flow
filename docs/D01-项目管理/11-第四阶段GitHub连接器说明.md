@@ -49,3 +49,9 @@ tags: [MCP, GitHub Projects, 4E, STDIO]
 - 创建草稿只声明 `addProjectV2DraftIssue` 实际接收的 `projectId`、`title`、`body`。任务编号和交付 ID 写进正文的 `yy-flow-task-id` 与 `yy-flow-delivery-id` 行，读回时去掉这两行再比较正文。创建响应丢失后，下一轮用该约定认领已有项并记 `applied`，不再创建一次。
 - 状态更新先读取 Project 的 Status 单选，用 YY-Flow 当前状态名匹配同名 option。找到才把 `fieldId` 和 `optionId` 写入 `updateProjectV2ItemFieldValue`。没有同名 option 时该条保持 `failed`，本轮不是成功。不调用 `validate()`，也不改 YY-Flow 的状态。
 - 归档和取消归档继续使用已有 item id，不把状态名当作 ID，也不调用 `deleteProjectV2Item`。
+
+## 6. 2026-10-14 沙箱条件
+
+本机没有 `GITHUB_TOKEN`、`GH_TOKEN`，也没有 `gh` 命令。`~\.config\gh\hosts.yml`、`%APPDATA%\GitHub CLI\hosts.yml` 和 `~\.github\token` 都不存在。因此没有发起 `api.github.com` 请求。假传输结果仍然不是真实 GitHub 通过。
+
+继续只读验证需要沙箱 Project 的所有者、项目编号，以及只含 Projects 读权限的凭据。凭据不要粘贴到对话里，放到本机环境变量或 GitHub CLI 登录状态即可。只读凭据不能做写入测试。写入前还要单独授权目标条目和清理方式。禁止操作正式业务看板。
