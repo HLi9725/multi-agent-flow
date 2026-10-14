@@ -1187,7 +1187,7 @@ def _execution_options_from_spec(spec: TaskExecutionSpec) -> Dict[str, Any]:
 def _execution_spec_snapshot(spec: TaskExecutionSpec) -> Dict[str, Any]:
     """Freeze the business contract and original Git baseline for every resume/accept."""
     return {
-        "contract_hash_version": 2,
+        "contract_hash_version": 3,
         "project_id": spec.project_id,
         "project_root": os.path.realpath(spec.project_root),
         "authority_root": os.path.realpath(spec.authority_root),
@@ -1197,6 +1197,8 @@ def _execution_spec_snapshot(spec: TaskExecutionSpec) -> Dict[str, Any]:
         "owner": spec.owner,
         "requirement_hash": spec.requirement_hash,
         "acceptance_criteria_hash": spec.acceptance_criteria_hash,
+        "acceptance_criteria_items": [item.to_dict() for item in spec.acceptance_criteria_items],
+        "test_commands": list(spec.test_commands),
         "task_version_at_start": spec.task_version,
         "baseline_commit": spec.baseline_commit,
         "baseline_branch": spec.baseline_branch,
@@ -1212,37 +1214,69 @@ def _upgrade_legacy_contract_snapshot(
     merely workflow history.  Ambiguous legacy drift therefore remains
     fail-closed and is surfaced by ``_snapshot_mismatches``.
     """
+    original = dict(snapshot)
     upgraded = dict(snapshot)
     try:
         version = int(upgraded.get("contract_hash_version") or 1)
     except (TypeError, ValueError):
         version = 1
-    if version >= 2:
-        return upgraded
-
     current = _execution_spec_snapshot(spec)
+    if not _stored_contract_matches(upgraded, spec, current):
+        return original
+    if (
+        version >= 3
+        and _same_contract_value(upgraded.get("acceptance_criteria_items"), current["acceptance_criteria_items"])
+        and _same_contract_value(upgraded.get("test_commands") or [], current["test_commands"])
+    ):
+        return original
+    if (
+        "acceptance_criteria_items" in upgraded
+        and upgraded.get("acceptance_criteria_items") not in (None, [])
+        and not _same_contract_value(upgraded.get("acceptance_criteria_items"), current["acceptance_criteria_items"])
+    ):
+        return original
+    if (
+        "test_commands" in upgraded
+        and not _same_contract_value(upgraded.get("test_commands") or [], current["test_commands"])
+    ):
+        return original
+    upgraded["acceptance_criteria_items"] = list(current["acceptance_criteria_items"])
+    upgraded["test_commands"] = list(current["test_commands"])
+    upgraded["contract_hash_version"] = 3
+    upgraded["migration"] = {
+        "from_version": version,
+        "reason": "reloaded spec matched the stored contract hash",
+    }
+    return upgraded
+
+
+def _contract_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return tuple(sorted((str(key), _contract_value(item)) for key, item in value.items()))
+    if isinstance(value, (list, tuple)):
+        return tuple(_contract_value(item) for item in value)
+    return value
+
+
+def _same_contract_value(left: Any, right: Any) -> bool:
+    return _contract_value(left) == _contract_value(right)
+
+
+def _stored_contract_matches(snapshot: Mapping[str, Any], spec: TaskExecutionSpec, current: Mapping[str, Any]) -> bool:
     identity_fields = (
         "project_id", "project_root", "authority_root", "task_id", "task_name",
         "task_type", "owner",
     )
     if any(
-        upgraded.get(name) not in (None, "")
-        and upgraded.get(name) != current.get(name)
+        snapshot.get(name) not in (None, "")
+        and snapshot.get(name) != current.get(name)
         for name in identity_fields
     ):
-        return upgraded
-    if upgraded.get("requirement_hash") != spec.requirement_hash:
-        return upgraded
-    expected_criteria = upgraded.get("acceptance_criteria_hash")
-    if not expected_criteria or expected_criteria != spec.acceptance_criteria_hash:
-        return upgraded
-
-    upgraded["contract_hash_version"] = 2
-    upgraded["migration"] = {
-        "from_version": version,
-        "reason": "legacy snapshot hashes exactly matched the canonical contract",
-    }
-    return upgraded
+        return False
+    if snapshot.get("requirement_hash") != spec.requirement_hash:
+        return False
+    expected_criteria = snapshot.get("acceptance_criteria_hash")
+    return bool(expected_criteria) and expected_criteria == spec.acceptance_criteria_hash
 
 
 def _snapshot_mismatches(snapshot: Mapping[str, Any], spec: TaskExecutionSpec) -> List[str]:
@@ -1254,11 +1288,15 @@ def _snapshot_mismatches(snapshot: Mapping[str, Any], spec: TaskExecutionSpec) -
         "project_id", "project_root", "authority_root", "task_id", "task_name",
         "task_type", "owner", "requirement_hash", "acceptance_criteria_hash",
     )
-    return [
+    mismatches = [
         f"{name}: expected {snapshot.get(name)!r}, got {current.get(name)!r}"
         for name in immutable_fields
-        if snapshot.get(name) not in (None, "") and snapshot.get(name) != current.get(name)
+        if snapshot.get(name) not in (None, "") and not _same_contract_value(snapshot.get(name), current.get(name))
     ]
+    for name in ("acceptance_criteria_items", "test_commands"):
+        if name in snapshot and not _same_contract_value(snapshot.get(name), current.get(name)):
+            mismatches.append(f"{name}: expected {snapshot.get(name)!r}, got {current.get(name)!r}")
+    return mismatches
 
 
 class ProductionRunnerError(Exception):

@@ -950,10 +950,10 @@ def _profile(checkpoint: Mapping[str, Any]) -> str:
 def _criteria_items(checkpoint: Mapping[str, Any]) -> list[Dict[str, str]]:
     raw = checkpoint.get("acceptance_criteria_items")
     items: list[Dict[str, str]] = []
-    if not isinstance(raw, list):
+    if isinstance(raw, str) or not isinstance(raw, (list, tuple)):
         return items
     for item in raw:
-        if isinstance(item, dict):
+        if isinstance(item, Mapping):
             items.append(
                 {
                     "id": str(item.get("id") or item.get("criterion_id") or ""),

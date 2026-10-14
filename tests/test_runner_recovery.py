@@ -592,7 +592,9 @@ def test_legacy_contract_snapshot_migrates_once_without_weakening_v2_guard(tmp_p
     legacy = production_runner_module._execution_spec_snapshot(spec)
     legacy.pop("contract_hash_version")
     migrated = production_runner_module._upgrade_legacy_contract_snapshot(legacy, spec)
-    assert migrated["contract_hash_version"] == 2
+    assert migrated["contract_hash_version"] == 3
+    assert migrated["acceptance_criteria_items"]
+    assert migrated["baseline_commit"] == legacy["baseline_commit"]
     assert migrated["requirement_hash"] == "b" * 64
     ambiguous = dict(legacy, requirement_hash="c" * 64)
     assert production_runner_module._upgrade_legacy_contract_snapshot(ambiguous, spec) == ambiguous
