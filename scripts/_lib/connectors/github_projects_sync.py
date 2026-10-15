@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """GitHub Projects 投影同步。只读对齐不写 YY-Flow，也不写 GitHub。
 
-真实 HTTP 未验证。凭证不得进入日志、差异报告或返回值。
+真实沙箱验证记录见 GitHub 连接器说明。凭证不得进入日志、报告或返回值。
 """
 
 from __future__ import annotations
@@ -10,6 +10,7 @@ import json
 import os
 import urllib.error
 import urllib.request
+from ..core.file_lock import acquire_lock, LockBusyError
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping, Protocol
@@ -174,7 +175,7 @@ class SyncReport:
 
 
 class HttpGithubTransport:
-    """真实 GraphQL。本环境没有核对过沙箱项目，调用结果保持未验证。"""
+    """真实 GraphQL；是否已验证以具体目标与演练记录为准。"""
 
     def __init__(self, token: str, opener: Callable | None = None) -> None:
         self._token = token
@@ -209,6 +210,21 @@ class HttpGithubTransport:
 
 
 def run_sync(
+    project: ProjectRecord,
+    **kwargs,
+) -> SyncReport:
+    """Serialize one project's durable intents, including across processes."""
+    try:
+        with acquire_lock(os.path.join(_sync_dir(project), "sync.lock")):
+            return _run_sync_locked(project, **kwargs)
+    except LockBusyError:
+        return SyncReport(reason="LOCK_BUSY")
+    except (OSError, ValueError, UnicodeError):
+        # Do not print paths, transport exceptions or persisted payloads.
+        return SyncReport(reason="LOCAL_STATE_INVALID")
+
+
+def _run_sync_locked(
     project: ProjectRecord,
     *,
     mode: str = "read-only",
@@ -271,6 +287,7 @@ def run_sync(
     report.event_outcomes = outcomes
     report.projection_writes = writes
     normalized = _overlay_event_state(normalized, ledger)
+    _reconcile_applied(ledger, normalized)
     _diff_tasks(project, tasks, normalized, ledger, report)
     if mode == "write" and pulled.completed and not report.partial:
         _write_projection(project, tasks, normalized, ledger, transport, report)
@@ -312,8 +329,12 @@ class _Pull:
 
 
 def _pull_pages(project, transport, ledger, report, clock, pause, page_budget: int) -> _Pull:
-    pulled = _Pull()
+    pulled = _Pull(items=list(ledger.get("pending_items", [])))
     cursor = ledger.get("cursor") or None
+    if cursor and "pending_items" not in ledger:
+        # Legacy cursors lack the earlier page content. Rescan from the start,
+        # retaining the old checkpoint until a successful page supersedes it.
+        cursor = None
     if cursor == "":
         cursor = None
     pages = 0
@@ -368,6 +389,7 @@ def _pull_pages(project, transport, ledger, report, clock, pause, page_budget: i
         pages += 1
         if not page_info.get("hasNextPage"):
             ledger["cursor"] = ""
+            ledger.pop("pending_items", None)
             pulled.completed = True
             return pulled
         end_cursor = page_info.get("endCursor") or ""
@@ -378,6 +400,7 @@ def _pull_pages(project, transport, ledger, report, clock, pause, page_budget: i
             return pulled
         cursor = end_cursor
         ledger["cursor"] = end_cursor
+        ledger["pending_items"] = list(pulled.items)
     report.partial = True
     report.reason = "PARTIAL"
     pulled.early_reason = "PARTIAL"
@@ -435,7 +458,6 @@ def _write_projection(project, tasks, normalized, ledger, transport, report: Syn
         if row.get("outcome") in {"CONFLICT", "CONTRACT_CHANGED", "NO_EXTERNAL_ITEM"}
     }
     actions = ledger.setdefault("actions", [])
-    index = {action["key"]: action for action in actions if isinstance(action, dict) and action.get("key")}
     ordered = sorted((task for task in tasks if task.get("id")), key=lambda task: str(task["id"]))
     for task in ordered:
         task_id = str(task["id"])
@@ -448,33 +470,40 @@ def _write_projection(project, tasks, normalized, ledger, transport, report: Syn
         item_id = link.get("item_id") or (item or {}).get("id") or ""
         if item_id:
             link["item_id"] = item_id
-        archived = bool((item or {}).get("archived") or link.get("archived"))
+        archived = bool(item.get("archived")) if item is not None else bool(link.get("archived"))
         if task.get("is_deleted"):
             if not item_id:
                 _add_result(report, task_id, "NO_EXTERNAL_ITEM")
                 continue
-            _ensure_action(actions, index, f"archive:{task_id}", task_id, "archive", item_id)
+            if not archived:
+                _ensure_action(actions, f"archive:{task_id}", task_id, "archive", item_id, task)
             continue
         if archived and item_id:
-            _ensure_action(actions, index, f"unarchive:{task_id}", task_id, "unarchive", item_id)
+            _ensure_action(actions, f"unarchive:{task_id}", task_id, "unarchive", item_id, task)
             continue
         if not item_id:
-            _ensure_action(actions, index, f"create:{task_id}", task_id, "create", "")
+            _ensure_action(actions, f"create:{task_id}", task_id, "create", "", task)
             continue
         if _needs_status_write(task, item, report, task_id):
-            _ensure_action(actions, index, f"project:{task_id}", task_id, "project", item_id)
-    start = 0
-    for offset, action in enumerate(actions):
-        if action.get("status") in {"pending", "failed"}:
-            start = offset
-            break
-    else:
-        start = len(actions)
+            _ensure_action(actions, f"project:{task_id}", task_id, "project", item_id, task)
     tasks_by_id = {str(task.get("id")): task for task in tasks if task.get("id")}
-    option_index = _load_status_options(transport, report, project.github_project_id)
-    for action in actions[start:]:
-        if action.get("status") == "applied":
+    active = []
+    for action in actions:
+        if action.get("status") not in {"pending", "failed"}:
             continue
+        task_id = action["task_id"]
+        task = tasks_by_id.get(task_id)
+        item = by_task.get(task_id)
+        if task_id in blocked:
+            continue  # A previous pending action must not bypass a new conflict.
+        if not task or not _action_needed(action, task, item):
+            action["status"] = "superseded"
+            continue
+        active.append(action)
+    # Write-ahead intents survive a process exit after the remote mutation.
+    _save_ledger(project, ledger)
+    option_index = _load_status_options(transport, report, project.github_project_id)
+    for action in active:
         _execute_action(
             project,
             action,
@@ -485,6 +514,9 @@ def _write_projection(project, tasks, normalized, ledger, transport, report: Syn
             ledger,
             option_index,
         )
+        if action.get("status") == "applied":
+            _ack_action(ledger, action)
+        _save_ledger(project, ledger)
 
 
 def _acceptance_only(report: SyncReport, task_id: str) -> bool:
@@ -503,25 +535,95 @@ def _needs_status_write(task, item, report: SyncReport, task_id: str) -> bool:
     if any(row.get("task_id") == task_id and row.get("outcome") == "EXTERNAL_ACCEPTANCE_IGNORED" for row in report.task_results):
         return True
     external = (item or {}).get("status") or ""
-    return bool(external) and external != task.get("status")
+    return external != task.get("status")
 
 
-def _ensure_action(actions, index, key, task_id, op, item_id) -> None:
-    current = index.get(key)
-    if current is None:
-        action = {
-            "key": key,
-            "task_id": task_id,
-            "op": op,
-            "status": "pending",
-            "item_id": item_id,
-            "delivery_id": key,
-        }
-        actions.append(action)
-        index[key] = action
+def _ensure_action(actions, key, task_id, op, item_id, task) -> None:
+    family = [a for a in actions if a.get("base_key", a.get("key")) == key]
+    current = family[-1] if family else None
+    desired = _yy_view(task)
+    if op == "create" and current is not None:
+        # Creation identity is immutable across local edits. In particular,
+        # never mint a fresh attempted=False identity after a lost response.
+        if item_id:
+            current["item_id"] = item_id
         return
-    if current.get("status") != "applied" and item_id and not current.get("item_id"):
-        current["item_id"] = item_id
+    if current is not None and current.get("status") in {"pending", "failed"}:
+        if current.get("desired") not in (None, desired):
+            current["status"] = "superseded"
+        else:
+            current.setdefault("desired", desired)
+            if item_id:
+                current["item_id"] = item_id
+            return
+    # Stable create marker; recurring projections get a fresh durable generation.
+    generation = len(family) + 1
+    action_key = key if generation == 1 else f"{key}#{generation}"
+    actions.append({
+        "key": action_key,
+        "base_key": key,
+        "task_id": task_id,
+        "op": op,
+        "status": "pending",
+        "item_id": item_id,
+        "delivery_id": action_key,
+        "desired": desired,
+    })
+
+
+def _action_needed(action, task, item) -> bool:
+    op = action.get("op")
+    archived = bool((item or {}).get("archived"))
+    deleted = bool(task.get("is_deleted"))
+    desired = action.get("desired")
+    if op != "create" and desired is not None and desired != _yy_view(task):
+        return False
+    if op == "create":
+        # Even when rediscovered remotely, execute reconciliation, not creation.
+        return not deleted
+    if op == "archive":
+        return deleted and not archived
+    if op == "unarchive":
+        return not deleted and archived
+    return op == "project" and not deleted and not archived and (item or {}).get("status", "") != task.get("status")
+
+
+def _ack_action(ledger, action) -> None:
+    if action.get("op") != "project" or not isinstance(action.get("desired"), dict):
+        return
+    link = ledger.setdefault("tasks", {}).setdefault(action["task_id"], {})
+    baseline = link.get("baseline")
+    if not isinstance(baseline, dict):
+        return
+    value = action["desired"].get("status", "")
+    baseline.setdefault("yy", {})["status"] = value
+    baseline.setdefault("gh", {})["status"] = value
+    link.setdefault("external", {})["status"] = value
+
+
+def _reconcile_applied(ledger, normalized) -> None:
+    """Reconcile only durable known intents; never infer arbitrary acceptance."""
+    by_task = {item["task_id"]: item for item in normalized if item.get("task_id")}
+    for action in ledger.get("actions", []):
+        item = by_task.get(action.get("task_id"))
+        if not item:
+            continue
+        desired = action.get("desired")
+        op = action.get("op")
+        if action.get("status") in {"pending", "failed"} and isinstance(desired, dict):
+            reached = (op == "project" and item.get("status") == desired.get("status")) or (op == "archive" and item.get("archived")) or (op == "unarchive" and not item.get("archived"))
+            if reached:
+                action["status"] = "applied"
+                _ack_action(ledger, action)
+        elif op == "project" and action.get("status") == "applied" and desired is None:
+            # Legacy receipt: only acknowledge the already recorded local status,
+            # and only if the current remote value corroborates it exactly.
+            link = ledger.get("tasks", {}).get(action.get("task_id"), {})
+            baseline = link.get("baseline") or {}
+            yy = baseline.get("yy") or {}
+            gh = baseline.get("gh") or {}
+            if yy.get("status") == item.get("status") and all(gh.get(k, "") == item.get(k, "") for k in ("title", "body")):
+                baseline["gh"]["status"] = item["status"]
 
 
 def _marker_value(text: str, marker: str) -> str:
@@ -598,23 +700,41 @@ def _execute_action(project, action, task, normalized, transport, report: SyncRe
             ledger.setdefault("tasks", {}).setdefault(action["task_id"], {})["item_id"] = found
             ledger.setdefault("deliveries", {})[action["delivery_id"]] = {"applied": True, "item_id": found}
             return
+        if action.get("attempted"):
+            # A lost create response is ambiguous until the marker becomes
+            # visible. Never create a second remote item just to make progress.
+            action["status"] = "failed"
+            _add_result(report, action["task_id"], "REMOTE_RECONCILIATION_REQUIRED")
+            return
+        action["attempted"] = True
+        _save_ledger(project, ledger)
         result = _mutate(
             transport,
             report,
             _CREATE_QUERY,
             {
                 "projectId": project.github_project_id,
-                "title": str(task.get("name") or action["task_id"]),
-                "body": _draft_body(task, str(action["task_id"]), str(action.get("delivery_id") or "")),
+                "title": str((action.get("desired") or {}).get("title") or task.get("name") or action["task_id"]),
+                "body": _draft_body(
+                    {"body": (action.get("desired") or {}).get("body", task.get("remarks") or task.get("body") or "")},
+                    str(action["task_id"]), str(action.get("delivery_id") or ""),
+                ),
             },
         )
-        if result.ok:
+        created = _created_id(result) if result.ok else ""
+        if created:
             action["status"] = "applied"
-            created = _created_id(result) or item_id
             action["item_id"] = created
             ledger.setdefault("tasks", {}).setdefault(action["task_id"], {})["item_id"] = created
             ledger.setdefault("deliveries", {})[action["delivery_id"]] = {"applied": True, "item_id": created}
             return
+        if result.data is None and (
+            result.http_status in {401, 403}
+            or _error_code(result) in {"GRAPHQL_VALIDATION_FAILED", "INSUFFICIENT_SCOPES", "UNAUTHORIZED", "FORBIDDEN"}
+        ) and not _is_rate_limited(result):
+            # Explicit authorization/validation rejection did not apply the
+            # mutation. A later authorized retry need not remain ambiguous.
+            action["attempted"] = False
         action["status"] = "failed"
         return
     if op == "archive":
@@ -836,8 +956,7 @@ def _remember_items(ledger, normalized) -> None:
         link = links.setdefault(task_id, {})
         if item.get("id"):
             link["item_id"] = item["id"]
-        if item.get("archived"):
-            link["archived"] = True
+        link["archived"] = bool(item.get("archived"))
 
 
 def _apply_events(events, ledger, project: ProjectRecord):
@@ -1019,8 +1138,6 @@ def _is_forbidden(result: GithubResult) -> bool:
 def _is_rate_limited(result: GithubResult) -> bool:
     if result.http_status == 429:
         return True
-    if result.rate_limit_reset_at is not None and not result.ok:
-        return True
     for err in result.graphql_errors:
         text = err if isinstance(err, str) else ""
         if isinstance(err, Mapping):
@@ -1076,12 +1193,12 @@ def _load_tasks(project: ProjectRecord) -> list:
         with open(path, "r", encoding="utf-8") as handle:
             data = json.load(handle)
     except (OSError, UnicodeError, json.JSONDecodeError):
-        return []
+        raise ValueError("Invalid local board") from None
     if isinstance(data, list):
         return [item for item in data if isinstance(item, dict)]
     if isinstance(data, dict) and isinstance(data.get("tasks"), list):
         return [item for item in data["tasks"] if isinstance(item, dict)]
-    return []
+    raise ValueError("Invalid local board")
 
 
 def _sync_dir(project: ProjectRecord) -> str:
@@ -1100,13 +1217,26 @@ def _load_ledger(project: ProjectRecord) -> dict:
         with open(path, "r", encoding="utf-8") as handle:
             data = json.load(handle)
     except (OSError, UnicodeError, json.JSONDecodeError):
-        return {"cursor": "", "tasks": {}, "deliveries": {}, "actions": []}
+        raise ValueError("Invalid sync ledger") from None
     if not isinstance(data, dict):
-        return {"cursor": "", "tasks": {}, "deliveries": {}, "actions": []}
+        raise ValueError("Invalid sync ledger")
     data.setdefault("cursor", "")
     data.setdefault("tasks", {})
     data.setdefault("deliveries", {})
     data.setdefault("actions", [])
+    if not isinstance(data["tasks"], dict) or not isinstance(data["deliveries"], dict) or not isinstance(data["actions"], list):
+        raise ValueError("Invalid sync ledger")
+    if not isinstance(data.get("pending_items", []), list):
+        raise ValueError("Invalid sync ledger")
+    if not isinstance(data["cursor"], str) or not all(isinstance(link, dict) for link in data["tasks"].values()):
+        raise ValueError("Invalid sync ledger")
+    for action in data["actions"]:
+        if not isinstance(action, dict) or not all(isinstance(action.get(key), str) for key in ("key", "task_id", "op", "status")):
+            raise ValueError("Invalid sync action")
+        if action.get("desired") is not None and not isinstance(action["desired"], dict):
+            raise ValueError("Invalid sync action")
+    if not all(isinstance(item, dict) for item in data.get("pending_items", [])):
+        raise ValueError("Invalid sync page")
     return data
 
 

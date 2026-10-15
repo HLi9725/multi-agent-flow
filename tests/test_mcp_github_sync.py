@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""4E GitHub Projects 同步。假传输覆盖分页、冲突和部分失败。真实 HTTP 未验证。"""
+"""4E 同步回归。模拟传输默认运行；真实沙箱仅显式选择后只读运行。"""
 
 from __future__ import annotations
 
@@ -73,7 +73,9 @@ class FakeGithubTransport:
                 self._mutation_index += 1
                 return result
             return GithubResult(
-                data={"updateProjectV2ItemFieldValue": {"projectV2Item": {"id": "PVTI"}}},
+                data={"addProjectV2DraftIssue": {"projectItem": {"id": "PVTI"}}}
+                if "addProjectV2DraftIssue" in query
+                else {"updateProjectV2ItemFieldValue": {"projectV2Item": {"id": variables.get("itemId", "PVTI")}}},
                 http_status=200,
             )
         after = variables.get("after") or ""
@@ -659,6 +661,30 @@ def test_missing_status_option_fails_the_round(tmp_path: Path) -> None:
     assert board.read_bytes() == original
 
 
-@pytest.mark.skip(reason="未验证：不访问真实 GitHub")
-def test_real_github_projects_http_未验证() -> None:
-    raise AssertionError("未验证")
+@pytest.mark.skipif(
+    os.environ.get("YY_FLOW_GITHUB_REAL_SANDBOX") != "https://github.com/users/HLi9725/projects/2",
+    reason="默认离线运行；真实沙箱须显式选择并配置本进程凭据，历史实测见连接器说明",
+)
+def test_real_github_projects_sandbox_read_only(tmp_path: Path) -> None:
+    token = os.environ.get("GITHUB_TOKEN", "")
+    if not token:
+        pytest.fail("Real sandbox credential absent", pytrace=False)
+    transport = HttpGithubTransport(token)
+    identity = transport.query(
+        'query($id:ID!){node(id:$id){... on ProjectV2{id title url}}}',
+        {"id":"PVT_kwHOEv0NRs4BnI4K"},
+    )
+    if not identity.ok:
+        pytest.fail("Real sandbox identity query failed", pytrace=False)
+    node = (identity.data or {}).get("node") or {}
+    assert node.get("url") == "https://github.com/users/HLi9725/projects/2"
+    assert node.get("title") == "yy-flow-s4-sandbox"
+    project = ProjectRecord(
+        project_id="sandbox-probe", display_name="Sandbox", org_id="sandbox",
+        data_root=str(tmp_path), board_file=str(tmp_path/"absent-board.json"),
+        evidence_root=str(tmp_path/"evidence"), board_kind="github",
+        github_project_id="PVT_kwHOEv0NRs4BnI4K", write_enabled=False,
+    )
+    report = run_sync(project, mode="read-only", transport=transport)
+    assert report.ok and report.network_reads >= 1
+    assert report.network_writes == 0 and not report.partial
