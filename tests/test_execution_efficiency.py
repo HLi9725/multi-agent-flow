@@ -80,6 +80,20 @@ def test_rule_sources_no_longer_offer_tag_based_automatic_acceptance():
     assert "禁止跨候选复用" in cursor
 
 
+def test_context_profile_is_explicit_and_cannot_be_changed_by_stale_environment(monkeypatch):
+    monkeypatch.setenv("YY_FLOW_PROFILE", "standard")
+    text = build_context("VERIFIER", "review", profile_id="lite")
+    assert "工作流门禁 (lite)" in text
+    assert "工作流门禁 (standard)" not in text
+    assert "任务类型不授予免检" in build_context("PM", "dispatch", profile_id="standard")
+    assert "工作流门禁 (docs-short)" in build_context("DOCS", "submit", profile_id="docs-short")
+
+
+def test_context_refuses_unknown_or_unresolved_profile():
+    with pytest.raises(SystemExit):
+        build_context("DEV", profile_id="auto")
+
+
 @pytest.mark.parametrize("exit_code", [0, 1])
 def test_lite_observation_does_not_change_checks_or_exit_codes(tmp_path, monkeypatch, exit_code):
     from types import SimpleNamespace

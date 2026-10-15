@@ -41,7 +41,7 @@ def read_markdown_section(filepath: str, max_lines: int = 40) -> str:
             return "".join(lines[:max_lines])
     return ""
 
-def build_context(role: str, action: str = "general") -> str:
+def build_context(role: str, action: str = "general", profile_id: str = None) -> str:
     role_upper = role.upper()
     role_data = load_role_yaml(role_upper)
 
@@ -85,8 +85,8 @@ def build_context(role: str, action: str = "general") -> str:
     elif action == "dispatch":
         context_output.append("- 执行任务分级三问判定 (L0/L1/L2)：")
         context_output.append("  1. 会留下文件/仓库变更吗？否 -> L0 即时问答（直接作答不建卡，L0 无卡不违规）；")
-        context_output.append("  2. 留下的东西需要事后追溯吗？否 -> L0，是 -> L1 轻量任务（B/C/D/F/G，建卡走短链）；")
-        context_output.append("  3. 需要多角色协作或动核心资产吗？是 -> L2 标准任务（A 类，建卡走全链）；")
+        context_output.append("  2. 留下的东西需要事后追溯吗？否 -> L0，是 -> L1 建卡；")
+        context_output.append("  3. 需要多角色协作或动核心资产吗？是 -> L2；实际质量链以已固化 Profile 为准，任务类型不授予免检。")
         context_output.append("- 硬红线：修改文件/仓库必建卡；结论被引用必建卡；用户显式要求建卡必建卡。")
     elif action == "submit":
         context_output.append("- 生成/更新开发任务报告；")
@@ -104,7 +104,10 @@ def build_context(role: str, action: str = "general") -> str:
     except ImportError:
         from scripts._lib.core.rule_source import RuleSourceError, load_rule_bundle
     try:
-        bundle = load_rule_bundle(role_upper, action=action, host=os.environ.get("YY_FLOW_HOST", "cursor"), profile_id=os.environ.get("YY_FLOW_PROFILE", "standard"))
+        selected_profile = profile_id if profile_id is not None else os.environ.get("YY_FLOW_PROFILE", "standard")
+        if selected_profile not in ("standard", "lite", "docs-short"):
+            raise RuleSourceError("上下文必须绑定已固化的有效 Profile，不在此入口选择或降级策略")
+        bundle = load_rule_bundle(role_upper, action=action, host=os.environ.get("YY_FLOW_HOST", "cursor"), profile_id=selected_profile)
     except RuleSourceError as exc:
         raise SystemExit(str(exc))
     context_output.append("## 4. 按需加载的完整规则")
@@ -118,10 +121,12 @@ def main():
     parser = argparse.ArgumentParser(description="动态角色 Prompt 上下文裁剪合成器")
     parser.add_argument("--role", required=True, help="角色代码 (PM|ARCHITECT|DEV|FRONTEND|REVIEWER|QA|DOCS|DEVOPS)")
     parser.add_argument("--action", default="general", help="当前动作 (claim|submit|review|test|approve|dispatch|general)")
+    parser.add_argument("--profile", choices=("standard", "lite", "docs-short"), default=None,
+                        help="已固化 Profile，仅控制上下文内容，不选择或持久化策略")
 
     args = parser.parse_args()
 
-    context = build_context(role=args.role, action=args.action)
+    context = build_context(role=args.role, action=args.action, profile_id=args.profile)
     print(context)
 
 if __name__ == "__main__":
