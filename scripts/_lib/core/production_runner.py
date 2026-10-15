@@ -28,6 +28,7 @@ except Exception:
         import paths
 from ..boards.board_adapter_factory import get_board_adapter
 from ..boards.offline_board_adapter import OfflineBoardAdapter
+from .command_observation import observe_command
 from .adapter_manifest import (
     AdapterManifest,
     AuthBoundaryType,
@@ -4462,20 +4463,29 @@ class ProductionRunner:
                         message=f"Running controlled QA command: {command}",
                         candidate_commit=candidate_commit,
                     )
+                    command_started = time.monotonic()
                     try:
                         remaining_qa_seconds = qa_stage_deadline - time.monotonic()
                         if remaining_qa_seconds <= 0:
                             raise subprocess.TimeoutExpired(command_args, spec.qa_timeout_seconds)
-                        test_proc = subprocess.run(
-                            command_args,
-                            cwd=worktree_dir,
-                            env=_build_qa_subprocess_env(),
-                            capture_output=True,
-                            text=True,
-                            encoding="utf-8",
-                            errors="replace",
-                            timeout=remaining_qa_seconds,
-                        )
+                        def command_waiting(elapsed):
+                            self._emit_progress(
+                                task_id=task_id, state=RunnerState.QA_TESTING.value,
+                                role="RUNNER", event="qa_command_waiting",
+                                message=f"Controlled QA command still running; elapsed={elapsed:.1f}s; waiting for process exit, not model output.",
+                                candidate_commit=candidate_commit,
+                            )
+                        with observe_command(command_waiting):
+                            test_proc = subprocess.run(
+                                command_args,
+                                cwd=worktree_dir,
+                                env=_build_qa_subprocess_env(),
+                                capture_output=True,
+                                text=True,
+                                encoding="utf-8",
+                                errors="replace",
+                                timeout=remaining_qa_seconds,
+                            )
                         exit_code = test_proc.returncode
                         output_material = (test_proc.stdout or "") + "\n" + (test_proc.stderr or "")
                     except subprocess.TimeoutExpired as exc:
@@ -4494,6 +4504,7 @@ class ProductionRunner:
                             "error_type": type(exc).__name__,
                             "message": str(exc),
                         })
+                    command_duration = round(max(0.0, time.monotonic() - command_started), 3)
                     masked_output = self.evidence_store._mask_text(output_material)
                     output_hash = hashlib.sha256(
                         output_material.encode("utf-8", errors="replace")
@@ -4504,6 +4515,7 @@ class ProductionRunner:
                     command_results.append({
                         "command": command,
                         "exit_code": exit_code,
+                        "duration_seconds": command_duration,
                         "output_hash": output_hash,
                         "summary": execution_summary["text"],
                         "counts": execution_summary["counts"],
@@ -4512,6 +4524,7 @@ class ProductionRunner:
                     qa_command_evidence.append({
                         "command": command,
                         "exit_code": exit_code,
+                        "duration_seconds": command_duration,
                         "cwd": os.path.realpath(worktree_dir),
                         "candidate_commit": candidate_commit,
                         "output_hash": output_hash,
@@ -4528,7 +4541,7 @@ class ProductionRunner:
                         state=RunnerState.QA_TESTING.value,
                         role="RUNNER",
                         event="qa_command_completed",
-                        message=f"Controlled QA command exited {exit_code}: {command}",
+                        message=f"Controlled QA command exited {exit_code}; duration={command_duration:.3f}s: {command}",
                         candidate_commit=candidate_commit,
                     )
                     # Zero tests is a deterministic test configuration defect,

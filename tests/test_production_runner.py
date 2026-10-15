@@ -738,6 +738,7 @@ def test_production_runner_full_pass_pipeline(
     qa_evidence = evidence_store.read(next(item for item in reversed(result.evidence_ids) if item.startswith("evi_qa_")))
     diagnostics = qa_evidence.metadata.extra["test_diagnostics"]
     assert diagnostics[0]["exit_code"] == 0
+    assert all(item["duration_seconds"] >= 0 for item in qa_evidence.metadata.extra["runner_test_results"])
     assert "passed" in diagnostics[0]["output_excerpt"]
     assert qa_evidence.metadata.extra["qa_report"]["acceptance_coverage"][0]["evidence"] == "***MASKED***"
     assert qa_evidence.metadata.extra["qa_report"]["negative_scenarios"][0]["evidence"] == "***MASKED***"
@@ -783,7 +784,7 @@ def test_production_runner_full_pass_pipeline(
     )
     assert any(event["event"] == "qa_command_started" for event in progress_events)
     assert any(
-        event["event"] == "qa_command_completed" and "exited 0" in event["message"]
+        event["event"] == "qa_command_completed" and "exited 0" in event["message"] and "duration=" in event["message"]
         for event in progress_events
     )
     board = json.loads((repo_dir / "user_data" / "board.json").read_text(encoding="utf-8"))

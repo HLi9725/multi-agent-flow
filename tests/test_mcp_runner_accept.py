@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 import textwrap
 import time
 from pathlib import Path
@@ -32,15 +33,15 @@ class _Ledger:
 
 
 def _git(repo: Path, *args: str) -> str:
-    return subprocess.check_output(["git", *args], cwd=repo, text=True).strip()
+    return subprocess.check_output(["git", *args], cwd=repo, text=True, timeout=30).strip()
 
 
 def _prepare(tmp: Path):
     repo = tmp / "repo"
     repo.mkdir()
-    subprocess.check_call(["git", "init"], cwd=repo)
-    subprocess.check_call(["git", "config", "user.email", "test@example.com"], cwd=repo)
-    subprocess.check_call(["git", "config", "user.name", "Test"], cwd=repo)
+    _git(repo, "init")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "Test")
     (repo / "app.txt").write_text("base\n", encoding="utf-8")
     (repo / "user_data").mkdir()
     (repo / "config").mkdir()
@@ -53,12 +54,12 @@ def _prepare(tmp: Path):
         "user_data/\nmcp_registry.json\nmcp_auth/\nmcp_audit/\nrunner_checkpoints/\n",
         encoding="utf-8",
     )
-    subprocess.check_call(["git", "add", "."], cwd=repo)
-    subprocess.check_call(["git", "commit", "-m", "base"], cwd=repo)
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "base")
     baseline = _git(repo, "rev-parse", "HEAD")
     (repo / "app.txt").write_text("candidate\n", encoding="utf-8")
-    subprocess.check_call(["git", "add", "."], cwd=repo)
-    subprocess.check_call(["git", "commit", "-m", "candidate"], cwd=repo)
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "candidate")
     candidate = _git(repo, "rev-parse", "HEAD")
     card = {
         "id": "T0778",
@@ -251,7 +252,7 @@ def test_mcp_approve_uses_runner_accept_without_equating_ids(tmp_path: Path) -> 
         result = decide_acceptance(registry, {body['confirmation_id']!r}, 'approve', audit=AuditStore({str(repo / 'mcp_audit')!r}))
         print(json.dumps({{'ok': result.get('ok'), 'replayed': result.get('replayed'), 'status': result.get('status')}}))
     """)
-    completed = subprocess.run(["python", "-c", script], cwd=Path.cwd(), capture_output=True, text=True)
+    completed = subprocess.run([sys.executable, "-c", script], cwd=Path.cwd(), capture_output=True, text=True, timeout=60)
     assert completed.returncode == 0, completed.stderr
     replay = json.loads(completed.stdout.strip().splitlines()[-1])
     assert replay["replayed"] is True

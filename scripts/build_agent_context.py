@@ -67,19 +67,14 @@ def build_context(role: str, action: str = "general") -> str:
         for resp in role_data.get("responsibilities", []):
             context_output.append(f"  - {resp}")
 
-        context_output.append("\n**允许推动的状态流转**:")
+        context_output.append("\n**允许返回的流转结论（只读角色不直接落库）**:")
         for trans in role_data.get("allowed_transitions", []):
             context_output.append(f"  - {trans}")
         context_output.append("\n")
 
-    # 2. 团队红线（精简版）
-    context_output.append("## 2. 团队协作 6 大防错红线 (来自 rules/AGENTS.md)")
-    context_output.append("1. **绝对禁止越权修改状态**：未在授权角色集合内严禁推动状态；")
-    context_output.append("2. **打回绝对禁止新建编号**：一律在原任务上置为 `已退回` 并追加 `DEF-TXXX-N` 备注；")
-    context_output.append("3. **绝对禁止先干后补**：自领取任务必须先将看板状态更至 `进行中` 落库后再编码（L0 即时问答除外）；")
-    context_output.append("4. **绝对禁止孤儿报告**：复审/复测结论直接追加至原报告；")
-    context_output.append("5. **绝对禁止无元数据乱建深层文档与擅改原文档**：工程文档深度≤3级，Markdown附带Frontmatter标头，草稿入 `草稿箱/` 隔离；归档原项目历史文档时绝对禁止改动/覆盖/删除原文档。")
-    context_output.append("6. **Subagent 官方标准路径实时查证原则**：初始化或挂载 Subagent 时须查证当前 Agent 官方规范路径与格式。")
+    context_output.append("## 2. 状态写入所有权")
+    context_output.append("Reviewer、QA、Verifier 只返回绑定任务、候选和身份的结论；Runner 或主协调者核验后落库。")
+    context_output.append("公共安全规则在下方完整加载一次，不另造可能漂移的摘要。子代理规范仅在初始化、安装或导出格式变更时查证。")
     context_output.append("\n")
 
     # 3. 对应 Action 的极简门控提示
@@ -97,11 +92,10 @@ def build_context(role: str, action: str = "general") -> str:
         context_output.append("- 生成/更新开发任务报告；")
         context_output.append("- 更新看板为 `审查中`，处理人同步更改为 `REVIEWER`。")
     elif action == "review":
-        context_output.append("- 通关：更至 `测试中`，处理人移交 `QA`；")
-        context_output.append("- 打回：更至 `已退回`，处理人改回原负责人，备注写入 `DEF-TXXX-N`。")
+        context_output.append("- 只读返回 PASS 或 REJECT；主协调者核验后转至测试中或已退回，不由 Reviewer 执行写入。")
     elif action == "test":
-        context_output.append("- 通关：更至 `已完成`，处理人移交 `PM`，强制写入结束时间；")
-        context_output.append("- 打回：更至 `已退回`，处理人改回原负责人。")
+        context_output.append("- 只读返回 PASS 或 FAIL；主协调者核验后落库并在完成时写结束时间，不由 QA 写入。")
+        context_output.append("- 托管模式由 Runner 执行命令，QA 不重跑；原生模式由 QA 执行一次约定的最终测试。")
     else:
         context_output.append("- 严格遵守【状态与处理人原子绑定】原则。")
 

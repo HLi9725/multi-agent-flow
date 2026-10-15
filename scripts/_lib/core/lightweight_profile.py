@@ -10,6 +10,7 @@ from dataclasses import replace
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .agent_schema import AgentPermissionRequiredError, AgentRequest
+from .command_observation import observe_command
 from .evidence_gate import EvidenceValidationContext
 from .evidence_schema import EvidenceMetadata, EvidenceRecord, EvidenceType
 from .runner_schema import RunnerCheckpoint, RunnerResult, RunnerState, TaskExecutionSpec
@@ -398,7 +399,24 @@ def _collect_runner_checks(runner, spec, worktree: str, candidate: str):
         valid, error, argv = _validate_qa_test_command(command, worktree)
         if not valid:
             raise LiteEnvironmentError(f"受控测试命令无法执行，已暂停: {error}")
-        proc = _run_lite_command(argv, worktree, timeout)
+        emit = getattr(runner, "_emit_progress", None)
+        def waiting(elapsed):
+            if emit is not None:
+                emit(
+                    task_id=spec.task_id, state=RunnerState.QA_TESTING.value,
+                    role="RUNNER", event="lite_command_waiting",
+                    message=f"Controlled Lite check still running; elapsed={elapsed:.1f}s; waiting for process exit.",
+                    candidate_commit=candidate,
+                )
+        with observe_command(waiting if emit is not None else None) as timing:
+            proc = _run_lite_command(argv, worktree, timeout)
+        if emit is not None:
+            emit(
+                task_id=spec.task_id, state=RunnerState.QA_TESTING.value,
+                role="RUNNER", event="lite_command_completed",
+                message=f"Controlled Lite check exited {proc.returncode}; duration={timing.duration_seconds:.3f}s.",
+                candidate_commit=candidate,
+            )
         output = _redact_check_output(runner, (proc.stdout or "") + (proc.stderr or ""))
         kind = _lite_command_failure_kind(command, int(proc.returncode), output)
         tests.append({
@@ -407,6 +425,7 @@ def _collect_runner_checks(runner, spec, worktree: str, candidate: str):
             "summary": _summarize_qa_command_output(command, proc.returncode, output)["text"],
         })
         evidence.append(_evidence_item(command, int(proc.returncode), output, "test", kind))
+        evidence[-1]["duration_seconds"] = timing.duration_seconds
     payload = {
         "diff_check": {
             "command": diff_command,
