@@ -54,8 +54,22 @@ tags: [MCP, GitHub Projects, 4E, STDIO]
 
 本机没有 `GITHUB_TOKEN`、`GH_TOKEN`，也没有 `gh` 命令。`~\.config\gh\hosts.yml`、`%APPDATA%\GitHub CLI\hosts.yml` 和 `~\.github\token` 都不存在。因此没有发起 `api.github.com` 请求。假传输结果仍然不是真实 GitHub 通过。
 
-继续只读验证需要沙箱 Project 的所有者、项目编号，以及只含 Projects 读权限的凭据。凭据不要粘贴到对话里，放到本机环境变量或 GitHub CLI 登录状态即可。只读凭据不能做写入测试。写入前还要单独授权目标条目和清理方式。禁止操作正式业务看板。
+继续只读验证需要沙箱 Project 的 GraphQL 节点编号，以及连接器实际会读取的凭据。凭据不要粘贴到对话里。只读凭据不能做写入测试。写入前还要单独授权目标条目和清理方式。禁止操作正式业务看板。GitHub CLI 的登录状态不会被当前连接器读取。
 
 ## 7. 2026-10-15 条件复检
 
-沿用 T0041 做了只读条件检查，没有改任务状态。记录和文档里仍然没有沙箱 Project 所有者和项目编号。本机没有 `GITHUB_TOKEN`、`GH_TOKEN`，没有 `gh` 命令，也没有 `~\.config\gh\hosts.yml`、`%APPDATA%\GitHub CLI\hosts.yml` 或 `~\.github\token`。因此没有连接 `api.github.com`，没有做项目识别、读取或分页。假传输和协议自测仍然不是真实 GitHub 验证。T0041 保持已阻塞。缺少的外部条件是：沙箱所有者、项目编号，以及只含 Projects 读权限的本机凭据或 CLI 登录状态。
+沿用 T0041 做了只读条件检查。记录和文档里仍然没有沙箱 Project 所有者和项目编号。本机进程、用户和系统范围都没有 `GITHUB_TOKEN`、`GH_TOKEN`、`GITHUB_PAT`，没有 `gh` 命令，也没有 `~\.config\gh\hosts.yml`、`%APPDATA%\GitHub CLI\hosts.yml` 或 `~\.github\token`。因此没有连接 `api.github.com`。假传输和协议自测仍然不是真实 GitHub 验证。当时把 CLI 登录状态写成可用凭据来源，与实现不符，以第 8 节为准。
+
+## 8. 2026-10-15 凭据来源核对
+
+`python scripts/mcp_server.py sync-github --help` 退出码 0。正式入口只有 `--project-id` 和 `--mode`。`--mode` 缺省 `read-only`。命令没有 `--registry`。登记文件只从环境变量 `YY_FLOW_MCP_REGISTRY` 读取。`--project-id` 是登记里的 YY-Flow 项目编号，不是 GitHub Project 编号。GitHub 目标写在登记字段 `github_project_id`，查询使用 `node(id: $projectId)`，所以它必须是 Project 的 GraphQL 节点编号。
+
+连接器实际读取凭据的顺序是：登记字段 `github_credential`，然后 `github_credential_env` 所指的环境变量。该字段缺省，或在登记里写成空，解析时就定为 `GITHUB_TOKEN`。只有这个名字不是 `GITHUB_TOKEN` 且对应变量没有值时，才再读 `GITHUB_TOKEN`。它不读取 `GH_TOKEN`，除非登记把 `github_credential_env` 设成这个名字。它也不读取 GitHub CLI 的 `hosts.yml` 或 `gh auth token`。登记里的 `github_credential` 不得写入仓库。
+
+同日再次检查：进程、用户和系统范围的 `GITHUB_TOKEN`、`GH_TOKEN`、`GITHUB_PAT` 都为空。文档和代码注释里没有沙箱所有者和 `github_project_id`。没有执行 `sync-github`，因为没有可映射的沙箱，也没有连接器认可的凭据。真实只读、真实多页和真实写入都未验证。`write_enabled` 保持缺省 false。T0041 在记录这次核对后回到已阻塞。
+
+下一次开始前需要同时提供：
+
+1. 沙箱 Project 的所有者和 GraphQL 节点编号。不要改用其他项目代替。
+2. 只含该沙箱 Projects 读取权限的凭据，放在当前进程的 `GITHUB_TOKEN`，或放在登记 `github_credential_env` 指定的环境变量里。不要把令牌贴进对话、登记文件或提交。
+3. 只读通过后，写入仍要单独授权目标条目、最小权限和清理方式。
