@@ -214,3 +214,45 @@ Cursor 原生验收核对真实子代理记录、策略、候选、检查与官�
 ```
 
 细节与测量基线见 `docs/D01-项目管理/12-工作流效率治理.md`。
+
+## 9. 共享安装与项目接入
+
+接入入口只有 `scripts/setup_project.py`。默认预览，追加 `--apply` 才写入项目级角色、规则和 MCP 配置。受管服务名是 `yy-flow`。登记只给当前操作系统用户的 `read`，不会自动打开建卡、流转或验收。
+
+已实现的是下面这些命令，以及 apply 结束前的本地 STDIO 协议自检。协议自检会做 initialize、tools/list、项目和任务读取、未知项目拒绝、写入拒绝。它不是 Cursor、Codex 或 Antigravity 的真实连接。AC-14 要求的真实客户端现场探活尚未验证，不能写成已通过。`--skip-self-check` 只用于故障注入，同样不是现场验证。
+
+首次安装共享正本（Windows，默认源 `HLi9725/multi-agent-flow`，默认入口 `main`）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install_global.ps1
+python "$env:USERPROFILE\agent-skills\multi-agent-flow\scripts\setup_project.py" `
+  --project-root "D:\work\demo" `
+  --skill-root "$env:USERPROFILE\agent-skills\multi-agent-flow" `
+  --clients cursor,codex,antigravity
+python "$env:USERPROFILE\agent-skills\multi-agent-flow\scripts\setup_project.py" `
+  --project-root "D:\work\demo" `
+  --skill-root "$env:USERPROFILE\agent-skills\multi-agent-flow" `
+  --clients cursor,codex,antigravity `
+  --apply
+```
+
+已有项目更新受管配置，或正本更新后再接入。正本目录有本地改动、运行看板或 `.yy-flow-running` 时，安装器会拒绝，不会自动 stash，也不会结束用户进程。
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install_global.ps1 -Ref main
+python .yy-flow\skill\scripts\setup_project.py --project-root . --clients cursor,codex,antigravity --apply
+python .yy-flow\skill\scripts\setup_project.py --project-root . --diagnose
+```
+
+Linux / macOS 的 `scripts/install_global.sh` 提供同样的参数边界。当前没有在这些系统上完成一次真实安装，不能把脚本存在或语法检查写成安装成功。
+
+诊断、只恢复未完成事务、移除仍与受管哈希一致的 `yy-flow` 条目：
+
+```powershell
+python scripts\setup_project.py --project-root "D:\work\demo" --diagnose
+python scripts\setup_project.py --project-root "D:\work\demo" --recover --apply
+python scripts\setup_project.py --project-root "D:\work\demo" --remove
+python scripts\setup_project.py --project-root "D:\work\demo" --remove --apply
+```
+
+适用边界：只生成项目内配置；保留其他 MCP、TOML 注释和运行数据；同名非受管条目或用户改过的受管文件会拒绝覆盖。不写 `github_credential`，不把进程里的令牌写入生成文件，不修改用户全局客户端配置。

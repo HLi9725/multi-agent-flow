@@ -73,17 +73,41 @@ powershell -ExecutionPolicy Bypass -File .yy-flow\skill\scripts\init_skill.ps1
 ```
 
 <details>
-<summary><b>多项目共享安装（可选，单份只读正本 + 全局软链）</b></summary>
+<summary><b>多项目共享安装与项目接入</b></summary>
+
+共享安装器只更新受管代码正本，不改 `~/.cursor`、`~/.codex`、`~/.gemini`。默认仓库是 `HLi9725/multi-agent-flow`，默认稳定入口是 `main`，并记录最终解析到的提交。功能分支不是默认入口。
+
+```powershell
+# Windows 首次安装共享正本（需要能访问 GitHub；脏目录或运行标记会拒绝更新）
+powershell -ExecutionPolicy Bypass -File .\scripts\install_global.ps1
+
+# 已有正本更新到 main。不能热更新时会要求先停用占用正本的进程，不会代为结束进程
+powershell -ExecutionPolicy Bypass -File .\scripts\install_global.ps1 -Ref main
+```
 
 ```bash
-# Linux / macOS 一次性全局共享安装：
-bash scripts/install_global.sh
-
-# Windows PowerShell 一次性全局共享安装：
-powershell -ExecutionPolicy Bypass -File .\scripts\install_global.ps1
+# Linux / macOS。下面只是命令形式；没有在对应系统上实际安装成功过，不能把脚本语法检查当成安装成功
+YY_FLOW_INSTALL_SOURCE=HLi9725/multi-agent-flow bash scripts/install_global.sh main
 ```
-- **代码共享**：`~/agent-skills/multi-agent-flow` 正本只读；
-- **数据隔离**：每个项目的 `user_data/` 自动锚定各自项目根。
+
+项目接入的唯一入口是 `scripts/setup_project.py`。默认只预览；只有 `--apply` 才写入。服务名固定为 `yy-flow`。登记默认只有当前操作系统用户对指定项目的 `read`。`--skip-self-check` 只用于故障注入，不是真实客户端连接，也不是 AC-14 通过。AC-14 的真实 Cursor、Codex、Antigravity 现场探活尚未验证。
+
+```powershell
+# 预览。项目内已有 .yy-flow/skill 时可以不传 --skill-root
+python scripts/setup_project.py --project-root "D:\work\demo" --skill-root "D:\agent-skills\multi-agent-flow" --clients cursor,codex,antigravity
+
+# 首次接入或更新受管配置
+python scripts/setup_project.py --project-root "D:\work\demo" --skill-root "D:\agent-skills\multi-agent-flow" --clients cursor,codex,antigravity --apply
+
+# 只读诊断、恢复未完成写入、移除未改动的受管条目
+python scripts/setup_project.py --project-root "D:\work\demo" --diagnose
+python scripts/setup_project.py --project-root "D:\work\demo" --recover --apply
+python scripts/setup_project.py --project-root "D:\work\demo" --remove --apply
+```
+
+- 适用边界：项目级 Cursor `.cursor/mcp.json`、Codex `.codex/config.toml`、Antigravity `.agents/mcp_config.json`。不写用户全局配置，不自动授予写入、流转或验收权限。
+- 成功时的 STDIO 结果只说明协议自检通过。它不能代替在真实客户端里发现并查询。
+- 共享正本若是某个业务项目的 `.yy-flow/skill`，接入会拒绝，避免数据根落到那个项目。
 
 </details>
 
