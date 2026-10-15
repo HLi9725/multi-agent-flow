@@ -86,7 +86,11 @@ from .runner_schema import (
     RunnerState,
     TaskExecutionSpec,
 )
-from .task_spec_loader import load_task_execution_spec, verify_optimistic_concurrency
+from .task_spec_loader import (
+    TaskSpecInvalidStatusError,
+    load_task_execution_spec,
+    verify_optimistic_concurrency,
+)
 from .qa_protocol_diagnostics import MAX_QA_OUTPUT_CHARS, report_diagnostic, repair_changes_known_semantics
 from .worktree_manager import WorktreeManager
 from .worktree_schema import WorktreeRequest
@@ -1309,6 +1313,109 @@ def effective_controlled_commands(configured, baseline: str, candidate: str, fal
         commands = ("python -m pytest -q",)
     gate = f"git diff --check {baseline}..{candidate} --"
     return commands + (gate,)
+
+
+def assert_formal_user_confirmation(
+    store: EvidenceStore,
+    project_root: str,
+    evidence_id: str,
+    *,
+    project_id: str,
+    task_id: str,
+    baseline: str,
+    candidate: str,
+    runner_confirmation_id: str,
+    mcp_confirmation_id: str = "",
+) -> EvidenceRecord:
+    """用正式批准同一套 EvidenceGate 校验用户证据，不另做宽松判断。"""
+    record = store.read(evidence_id)
+    extra = record.metadata.extra
+    if mcp_confirmation_id and extra.get("mcp_confirmation_id") != mcp_confirmation_id:
+        raise EvidenceGateError("Evidence rejected: MCP confirmation id is not bound.")
+    if extra.get("confirmation_id") != runner_confirmation_id:
+        raise EvidenceGateError("Evidence rejected: Runner confirmation id is not bound.")
+    user_caps = HostCapabilities(is_real_host=True)
+    EvidenceGate(store=store, project_root=project_root).validate_evidence(
+        evidence_id,
+        EvidenceValidationContext(
+            project_id=project_id,
+            task_id=task_id,
+            actor_role="PM",
+            transition_from="PENDING_USER_ACCEPTANCE",
+            transition_to="ACCEPTED",
+            baseline_commit=str(baseline),
+            result_commit=str(candidate),
+            expected_invocation_id=record.metadata.host_invocation_id,
+            expected_adapter="run_task_cli",
+            expected_workspace_mode="user_confirmation",
+            expected_evidence_type=EvidenceType.USER_CONFIRMATION,
+            host_handle=AgentHandle(
+                session_id=runner_confirmation_id,
+                host_id="explicit_user_cli",
+                status="completed",
+                is_real_host=True,
+                adapter_instance_id="run_task_cli",
+                invocation_token="explicit-user-confirmation",
+            ),
+            expected_capabilities=user_caps,
+            confirmation_result=ConfirmationResult(
+                request_id=runner_confirmation_id,
+                selected_option="accept",
+                is_confirmed=True,
+                is_real_host=True,
+            ),
+        ),
+    )
+    return record
+
+
+def linked_formal_user_confirmation(
+    store: EvidenceStore,
+    project_root: str,
+    evidence_ids,
+    *,
+    project_id: str,
+    task_id: str,
+    baseline: str,
+    candidate: str,
+    runner_confirmation_id: str,
+    mcp_confirmation_id: str = "",
+) -> Optional[EvidenceRecord]:
+    """只接受检查点当前引用、且通过正式门禁的唯一用户证据。"""
+    proved: List[EvidenceRecord] = []
+    for evidence_id in tuple(evidence_ids or ()):
+        try:
+            record = store.read(evidence_id)
+        except (EvidenceError, OSError, ValueError):
+            continue
+        if record.evidence_type != EvidenceType.USER_CONFIRMATION:
+            continue
+        try:
+            proved.append(assert_formal_user_confirmation(
+                store,
+                project_root,
+                evidence_id,
+                project_id=project_id,
+                task_id=task_id,
+                baseline=baseline,
+                candidate=candidate,
+                runner_confirmation_id=runner_confirmation_id,
+                mcp_confirmation_id=mcp_confirmation_id,
+            ))
+        except EvidenceGateError:
+            continue
+    if len(proved) == 1:
+        return proved[0]
+    return None
+
+
+def _mcp_defect_recorded(checkpoint, mcp_confirmation_id: str) -> bool:
+    if not mcp_confirmation_id:
+        return False
+    for item in checkpoint.defects_history:
+        if isinstance(item, Mapping) and item.get("mcp_confirmation_id") == mcp_confirmation_id:
+            return True
+    return False
 
 
 def _user_confirmations_for_decision(store, candidate: str, runner_id: str, external_id: str) -> List[Any]:
@@ -5679,40 +5786,58 @@ class ProductionRunner:
                                     message="Confirmation request ID mismatch (Fail-Closed).")
 
             authority = os.path.realpath(authority_root or project_root)
-            live_spec = load_task_execution_spec(
-                project_root=project_root,
-                task_id=task_id,
-                authority_root=authority,
-                overrides=dict(ckpt.execution_options),
-            )
+            try:
+                live_spec = load_task_execution_spec(
+                    project_root=project_root,
+                    task_id=task_id,
+                    authority_root=authority,
+                    overrides=dict(ckpt.execution_options),
+                )
+            except TaskSpecInvalidStatusError as exc:
+                live_spec = load_task_execution_spec(
+                    project_root=project_root,
+                    task_id=task_id,
+                    authority_root=authority,
+                    overrides=dict(ckpt.execution_options),
+                    allow_terminal_read=True,
+                )
+                if live_spec.status_at_read != "已验收":
+                    raise exc
             drift = _snapshot_mismatches(ckpt.execution_spec_snapshot, live_spec)
-            if not drift and live_spec.status_at_read == "已验收" and ckpt.evidence_ids:
+            if not drift and live_spec.status_at_read == "已验收":
                 if self.evidence_store is None:
                     self.evidence_store = EvidenceStore(
                         root_dir=os.path.join(project_root, "user_data", "runner_evidence")
                     )
-                try:
-                    last_record = self.evidence_store.read(ckpt.evidence_ids[-1])
-                    confirmed = (
-                        last_record.evidence_type == EvidenceType.USER_CONFIRMATION
-                        and last_record.metadata.extra.get("confirmation_id") == confirmation_request_id
-                        and last_record.result_commit == ckpt.candidate_commit
-                    )
-                except Exception:
-                    confirmed = False
-                if confirmed:
-                    accepted = replace(
-                        ckpt, state=RunnerState.ACCEPTED.value, current_role="PM",
-                        last_error=None, updated_at=time.time(),
-                    )
-                    self.checkpoint_store.save_checkpoint(accepted)
+                proved = linked_formal_user_confirmation(
+                    self.evidence_store,
+                    project_root,
+                    ckpt.evidence_ids,
+                    project_id=ckpt.project_id,
+                    task_id=task_id,
+                    baseline=str(ckpt.execution_spec_snapshot.get("baseline_commit") or ""),
+                    candidate=str(ckpt.candidate_commit or ""),
+                    runner_confirmation_id=confirmation_request_id,
+                    mcp_confirmation_id=external_confirmation_id,
+                )
+                if proved is None:
                     return RunnerResult(
-                        True, RunnerState.ACCEPTED.value, task_id,
-                        candidate_commit=ckpt.candidate_commit,
-                        candidate_generation=ckpt.candidate_generation,
+                        False, ckpt.state, task_id, candidate_commit=ckpt.candidate_commit,
                         evidence_ids=ckpt.evidence_ids,
-                        message="Recovered acceptance after board/checkpoint interruption.",
+                        message="Acceptance recovery rejected by the formal evidence gate.",
                     )
+                accepted = replace(
+                    ckpt, state=RunnerState.ACCEPTED.value, current_role="PM",
+                    last_error=None, updated_at=time.time(),
+                )
+                self.checkpoint_store.save_checkpoint(accepted)
+                return RunnerResult(
+                    True, RunnerState.ACCEPTED.value, task_id,
+                    candidate_commit=ckpt.candidate_commit,
+                    candidate_generation=ckpt.candidate_generation,
+                    evidence_ids=ckpt.evidence_ids,
+                    message="Recovered acceptance after board/checkpoint interruption.",
+                )
             if drift or live_spec.status_at_read != "已完成":
                 detail = "; ".join(drift) if drift else f"board status={live_spec.status_at_read!r}"
                 return RunnerResult(False, ckpt.state, task_id, candidate_commit=ckpt.candidate_commit,
@@ -5828,41 +5953,16 @@ class ProductionRunner:
                 ))
             else:
                 user_evidence_id = chosen.evidence_id
-                confirmation_meta = chosen.metadata
-                user_caps = HostCapabilities(is_real_host=True)
-            if self.evidence_gate is None:
-                self.evidence_gate = EvidenceGate(store=self.evidence_store, project_root=project_root)
-            confirmation_handle = AgentHandle(
-                session_id=confirmation_request_id,
-                host_id="explicit_user_cli",
-                status="completed",
-                is_real_host=True,
-                adapter_instance_id="run_task_cli",
-                invocation_token="explicit-user-confirmation",
-            )
-            self.evidence_gate.validate_evidence(
+            assert_formal_user_confirmation(
+                self.evidence_store,
+                project_root,
                 user_evidence_id,
-                EvidenceValidationContext(
-                    project_id=ckpt.project_id,
-                    task_id=task_id,
-                    actor_role="PM",
-                    transition_from="PENDING_USER_ACCEPTANCE",
-                    transition_to="ACCEPTED",
-                    baseline_commit=str(baseline),
-                    result_commit=str(candidate),
-                    expected_invocation_id=confirmation_meta.host_invocation_id,
-                    expected_adapter="run_task_cli",
-                    expected_workspace_mode="user_confirmation",
-                    expected_evidence_type=EvidenceType.USER_CONFIRMATION,
-                    host_handle=confirmation_handle,
-                    expected_capabilities=user_caps,
-                    confirmation_result=ConfirmationResult(
-                        request_id=confirmation_request_id,
-                        selected_option="accept",
-                        is_confirmed=True,
-                        is_real_host=True,
-                    ),
-                ),
+                project_id=ckpt.project_id,
+                task_id=task_id,
+                baseline=str(baseline),
+                candidate=str(candidate),
+                runner_confirmation_id=confirmation_request_id,
+                mcp_confirmation_id=external_confirmation_id,
             )
             accepted_ids = tuple(ckpt.evidence_ids)
             if user_evidence_id not in accepted_ids:
@@ -5895,6 +5995,97 @@ class ProductionRunner:
                                 candidate_commit=current.candidate_commit if current else None,
                                 evidence_ids=current.evidence_ids if current else (),
                                 message=f"Acceptance validation failed closed: {self._sanitize_diagnostic(exc)}")
+        finally:
+            self.checkpoint_store.release_runner_lock((lock_handle, lock_file))
+
+    def recover_rejection_checkpoint(
+        self,
+        project_root: str,
+        task_id: str,
+        confirmation_request_id: str,
+        *,
+        mcp_confirmation_id: str,
+        candidate: str,
+        baseline: str,
+        authority_root: Optional[str] = None,
+    ) -> RunnerResult:
+        """锁内重读检查点。只补齐已退回任务，不把其他状态改成返工。"""
+        _validate_task_id(task_id)
+        lock_handle, lock_file = self.checkpoint_store.acquire_runner_lock(task_id)
+        if lock_handle is None:
+            return RunnerResult(False, RunnerState.FAILED.value, task_id,
+                                message="Task is active in another Runner process; rejection recovery is locked.")
+        try:
+            current = self.checkpoint_store.load_checkpoint(task_id)
+            if current is None:
+                return RunnerResult(False, RunnerState.FAILED.value, task_id,
+                                    message="Checkpoint missing during rejection recovery.")
+            if str(current.candidate_commit or "") != str(candidate or ""):
+                return RunnerResult(False, current.state, task_id, candidate_commit=current.candidate_commit,
+                                    message="Rejection recovery conflict: candidate changed.")
+            snapshot = current.execution_spec_snapshot if isinstance(current.execution_spec_snapshot, Mapping) else {}
+            if str(snapshot.get("baseline_commit") or "") != str(baseline or ""):
+                return RunnerResult(False, current.state, task_id, candidate_commit=current.candidate_commit,
+                                    message="Rejection recovery conflict: baseline changed.")
+            authority = os.path.realpath(authority_root or project_root)
+            live_spec = load_task_execution_spec(
+                project_root=project_root,
+                task_id=task_id,
+                authority_root=authority,
+                overrides=dict(current.execution_options),
+            )
+            drift = _snapshot_mismatches(snapshot, live_spec)
+            if drift or live_spec.status_at_read != "已退回":
+                detail = "; ".join(drift) if drift else f"board status={live_spec.status_at_read!r}"
+                return RunnerResult(False, current.state, task_id, candidate_commit=current.candidate_commit,
+                                    message=f"Rejection recovery conflict: {detail}")
+            if (
+                current.state == RunnerState.NEEDS_USER_INPUT.value
+                and _mcp_defect_recorded(current, mcp_confirmation_id)
+            ):
+                return RunnerResult(True, current.state, task_id, candidate_commit=current.candidate_commit,
+                                    evidence_ids=current.evidence_ids,
+                                    message="Rejection checkpoint already recovered.")
+            if current.state != RunnerState.REJECTION_PENDING.value:
+                return RunnerResult(False, current.state, task_id, candidate_commit=current.candidate_commit,
+                                    message="Rejection recovery conflict: checkpoint state is not recoverable.")
+            if str(current.confirmation_request_id or "") != confirmation_request_id:
+                return RunnerResult(False, current.state, task_id, candidate_commit=current.candidate_commit,
+                                    message="Rejection recovery conflict: confirmation id changed.")
+            diagnostics = current.approval_diagnostics if isinstance(current.approval_diagnostics, Mapping) else {}
+            if str(diagnostics.get("pending_mcp_confirmation_id") or "") != mcp_confirmation_id or not mcp_confirmation_id:
+                return RunnerResult(False, current.state, task_id, candidate_commit=current.candidate_commit,
+                                    message="Rejection recovery conflict: MCP confirmation id changed.")
+            reason = str(current.last_error or "用户拒绝验收")
+            history = list(current.defects_history)
+            if not _mcp_defect_recorded(current, mcp_confirmation_id):
+                history.append({
+                    "cycle": current.candidate_generation,
+                    "role": "USER_ACCEPTANCE",
+                    "defects": [{
+                        "defect_id": f"DEF-{task_id}-USER-ACCEPTANCE",
+                        "severity": "P1",
+                        "description": reason,
+                    }],
+                    "summary": reason,
+                    "mcp_confirmation_id": mcp_confirmation_id,
+                })
+            cleared = dict(diagnostics)
+            cleared.pop("pending_mcp_confirmation_id", None)
+            returned = replace(
+                current,
+                state=RunnerState.NEEDS_USER_INPUT.value,
+                current_role="BUILDER",
+                defects_history=tuple(history),
+                confirmation_request_id=None,
+                approval_diagnostics=cleared,
+                last_error=reason,
+                updated_at=time.time(),
+            )
+            self.checkpoint_store.save_checkpoint(returned)
+            return RunnerResult(True, returned.state, task_id, candidate_commit=current.candidate_commit,
+                                evidence_ids=current.evidence_ids,
+                                message="Rejection checkpoint recovered for the original task.")
         finally:
             self.checkpoint_store.release_runner_lock((lock_handle, lock_file))
 

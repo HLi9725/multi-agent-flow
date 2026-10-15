@@ -360,6 +360,9 @@ def _recover_applied(project, record, principal, decision):
     expected = "已验收" if decision == "approve" else "已退回"
     if card is None or card.get("status") != expected:
         return None
+    checkpoint = _runner_checkpoint(project, task_id)
+    if str(record.get("runner_confirmation_request_id") or "") and checkpoint is None:
+        return _failure("CONFLICT", "CHECKPOINT", project.project_id, record)
     evidence = _read_evidence(project, str(record.get("evidence_id") or ""))
     authority = _authority(project, card)
     if evidence is None or authority is None or not record.get("recovery_contract_hash"):
@@ -368,84 +371,30 @@ def _recover_applied(project, record, principal, decision):
         return None
     if record["recovery_contract_hash"] != _contract_hash(project, card, evidence, authority, include_journal=False):
         return None
-    checkpoint = _runner_checkpoint(project, task_id)
     mcp_id = str(record.get("confirmation_id") or "")
     if decision == "approve":
-        linked_ids = () if checkpoint is None else tuple(checkpoint.evidence_ids)
-        confirmation = _bound_user_confirmation(
-            project, mcp_id, str(record.get("candidate_sha") or ""), linked_ids,
-        )
-        if checkpoint is not None:
-            if confirmation is None or confirmation.evidence_id not in tuple(checkpoint.evidence_ids):
+        if checkpoint is None:
+            if str(record.get("runner_confirmation_request_id") or ""):
+                return _failure("CONFLICT", "CHECKPOINT", project.project_id, record)
+            if _decision_marker(record, decision) not in str(card.get("process") or ""):
                 return None
-            if checkpoint.state != "ACCEPTED":
-                marked = _mark_checkpoint_accepted(project, checkpoint)
-                if marked == "busy":
-                    return _failure("CONFLICT", "IN_PROGRESS", project.project_id, record)
-                if marked != "done":
-                    return None
-        elif _decision_marker(record, decision) not in str(card.get("process") or "") and confirmation is None:
-            return None
-    elif checkpoint is not None:
-        if checkpoint.state == "NEEDS_USER_INPUT" and _rejection_matches(checkpoint, mcp_id):
-            pass
-        elif checkpoint.state == "REJECTION_PENDING" and _pending_rejection_matches(checkpoint, record):
-            finished = _finish_recorded_rejection(project, checkpoint, record)
-            if finished == "busy":
-                return _failure("CONFLICT", "IN_PROGRESS", project.project_id, record)
-            if finished != "done":
-                return None
+            if not _validate_card_user_confirmation(project, record):
+                return _failure("GATE_REJECTED", "GATE", project.project_id, record)
         else:
-            return None
+            proved = _prove_runner_acceptance(project, checkpoint, record)
+            if isinstance(proved, dict):
+                return proved
+            if checkpoint.state != "ACCEPTED":
+                finished = _finish_acceptance_with_runner(project, record, checkpoint)
+                if finished is not None:
+                    return finished
+    elif checkpoint is not None:
+        finished = _finish_rejection_with_runner(project, record, checkpoint)
+        if finished is not None:
+            return finished
     elif _decision_marker(record, decision) not in str(card.get("process") or ""):
         return None
     return {"ok": True, "status": card["status"], "task_version": _version(card)}
-
-
-def _bound_user_confirmation(project: ProjectRecord, mcp_id: str, candidate: str, evidence_ids: tuple = ()):
-    """同一决定有多条证据时，只认已经写进检查点的那一条。"""
-    root = project.evidence_root
-    if not mcp_id or not root or not os.path.isdir(root):
-        return None
-    matches = []
-    for name in os.listdir(root):
-        if not name.endswith(".json"):
-            continue
-        evidence = _read_evidence(project, name[: -len(".json")])
-        if evidence is None or evidence.evidence_type != EvidenceType.USER_CONFIRMATION:
-            continue
-        if evidence.metadata.extra.get("mcp_confirmation_id") != mcp_id:
-            continue
-        if evidence.result_commit != candidate:
-            continue
-        matches.append(evidence)
-    linked = [item for item in matches if item.evidence_id in set(evidence_ids)]
-    if len(linked) == 1:
-        return linked[0]
-    if len(matches) == 1:
-        return matches[0]
-    return None
-
-
-def _rejection_matches(checkpoint, mcp_id: str) -> bool:
-    for item in checkpoint.defects_history:
-        if isinstance(item, Mapping) and item.get("mcp_confirmation_id") == mcp_id and mcp_id:
-            return True
-    return False
-
-
-def _pending_rejection_matches(checkpoint, record: Mapping[str, Any]) -> bool:
-    diagnostics = checkpoint.approval_diagnostics if isinstance(checkpoint.approval_diagnostics, Mapping) else {}
-    pending = str(diagnostics.get("pending_mcp_confirmation_id") or "")
-    runner_id = str(checkpoint.confirmation_request_id or "")
-    bound = str(record.get("runner_confirmation_request_id") or "")
-    return bool(
-        pending
-        and pending == str(record.get("confirmation_id") or "")
-        and runner_id
-        and runner_id == bound
-        and str(checkpoint.candidate_commit or "") == str(record.get("candidate_sha") or "")
-    )
 
 
 def _runner_store(project: ProjectRecord, checkpoint):
@@ -459,71 +408,84 @@ def _runner_store(project: ProjectRecord, checkpoint):
     )
 
 
-def _mark_checkpoint_accepted(project: ProjectRecord, checkpoint) -> str:
+def _prove_runner_acceptance(project: ProjectRecord, checkpoint, record: Mapping[str, Any]):
+    """正式门禁失败时返回拒绝体。通过时返回 None，由调用方决定是否只补记录。"""
+    from ..core.evidence_store import EvidenceStore
+    from ..core.production_runner import linked_formal_user_confirmation
+
+    runner_id = str(record.get("runner_confirmation_request_id") or "")
+    live_runner_id = str(checkpoint.confirmation_request_id or "")
+    if not runner_id or runner_id != live_runner_id:
+        return _failure("CONFLICT", "CONFIRMATION", project.project_id, record)
+    if str(checkpoint.candidate_commit or "") != str(record.get("candidate_sha") or ""):
+        return _failure("CONFLICT", "CANDIDATE", project.project_id, record)
+    snapshot = checkpoint.execution_spec_snapshot if isinstance(checkpoint.execution_spec_snapshot, Mapping) else {}
+    baseline = str(snapshot.get("baseline_commit") or "")
+    if baseline != str(record.get("baseline_commit") or ""):
+        return _failure("CONFLICT", "CONTRACT", project.project_id, record)
+    proved = linked_formal_user_confirmation(
+        EvidenceStore(project.evidence_root),
+        str(snapshot.get("project_root") or project.data_root),
+        checkpoint.evidence_ids,
+        project_id=checkpoint.project_id,
+        task_id=str(record.get("task_id") or ""),
+        baseline=baseline,
+        candidate=str(checkpoint.candidate_commit or ""),
+        runner_confirmation_id=runner_id,
+        mcp_confirmation_id=str(record.get("confirmation_id") or ""),
+    )
+    if proved is None:
+        return _failure("GATE_REJECTED", "GATE", project.project_id, record)
+    return None
+
+
+def _finish_acceptance_with_runner(project: ProjectRecord, record: Mapping[str, Any], checkpoint):
+    """交给 Runner.accept 在锁内重读。检查点缺失或状态变化时不写。"""
+    from ..core.production_runner import ProductionRunner
+
+    snapshot = checkpoint.execution_spec_snapshot if isinstance(checkpoint.execution_spec_snapshot, Mapping) else {}
     store = _runner_store(project, checkpoint)
-    lock = store.acquire_runner_lock(checkpoint.task_id)
-    if lock[0] is None:
-        return "busy"
-    try:
-        current = store.load_checkpoint(checkpoint.task_id) or checkpoint
-        if current.state == "ACCEPTED":
-            return "done"
-        store.save_checkpoint(replace_checkpoint(current))
-        return "done"
-    finally:
-        store.release_runner_lock(lock)
+    runner = ProductionRunner(checkpoint_store=store)
+    result = runner.accept(
+        str(snapshot.get("project_root") or project.data_root),
+        str(record.get("task_id") or ""),
+        str(record.get("runner_confirmation_request_id") or ""),
+        project.data_root,
+        external_confirmation_id=str(record.get("confirmation_id") or ""),
+    )
+    if not result.success:
+        message = str(result.message or "")
+        if "locked" in message.lower():
+            return _failure("CONFLICT", "IN_PROGRESS", project.project_id, record)
+        return _failure("CONFLICT", "CHECKPOINT", project.project_id, record)
+    current = store.load_checkpoint(str(record.get("task_id") or ""))
+    if current is None or current.state != "ACCEPTED":
+        return _failure("CONFLICT", "CHECKPOINT", project.project_id, record)
+    return None
 
 
-def _finish_recorded_rejection(project: ProjectRecord, checkpoint, record: Mapping[str, Any]) -> str:
-    """只补齐已经退回看板的检查点。不第二次流转，不追加重复缺陷。"""
+def _finish_rejection_with_runner(project: ProjectRecord, record: Mapping[str, Any], checkpoint):
+    """交给 Runner 在锁内重读。不按锁前旧对象改状态。"""
+    from ..core.production_runner import ProductionRunner
+
+    snapshot = checkpoint.execution_spec_snapshot if isinstance(checkpoint.execution_spec_snapshot, Mapping) else {}
     store = _runner_store(project, checkpoint)
-    lock = store.acquire_runner_lock(checkpoint.task_id)
-    if lock[0] is None:
-        return "busy"
-    try:
-        current = store.load_checkpoint(checkpoint.task_id)
-        if current is None:
-            return "missing"
-        mcp_id = str(record.get("confirmation_id") or "")
-        if current.state == "NEEDS_USER_INPUT" and _rejection_matches(current, mcp_id):
-            return "done"
-        if current.state != "REJECTION_PENDING" or not _pending_rejection_matches(current, record):
-            return "missing"
-        history = list(current.defects_history)
-        if not _rejection_matches(current, mcp_id):
-            history.append({
-                "cycle": current.candidate_generation,
-                "role": "USER_ACCEPTANCE",
-                "defects": [{
-                    "defect_id": f"DEF-{current.task_id}-USER-ACCEPTANCE",
-                    "severity": "P1",
-                    "description": str(current.last_error or "用户拒绝验收"),
-                }],
-                "summary": str(current.last_error or "用户拒绝验收"),
-                "mcp_confirmation_id": mcp_id,
-            })
-        diagnostics = dict(current.approval_diagnostics) if isinstance(current.approval_diagnostics, Mapping) else {}
-        diagnostics.pop("pending_mcp_confirmation_id", None)
-        from dataclasses import replace
-
-        store.save_checkpoint(replace(
-            current,
-            state="NEEDS_USER_INPUT",
-            current_role="BUILDER",
-            defects_history=tuple(history),
-            confirmation_request_id=None,
-            approval_diagnostics=diagnostics,
-            updated_at=time.time(),
-        ))
-        return "done"
-    finally:
-        store.release_runner_lock(lock)
-
-
-def replace_checkpoint(checkpoint):
-    from dataclasses import replace
-
-    return replace(checkpoint, state="ACCEPTED", current_role="PM", last_error=None, updated_at=time.time())
+    runner = ProductionRunner(checkpoint_store=store)
+    result = runner.recover_rejection_checkpoint(
+        str(snapshot.get("project_root") or project.data_root),
+        str(record.get("task_id") or ""),
+        str(record.get("runner_confirmation_request_id") or ""),
+        mcp_confirmation_id=str(record.get("confirmation_id") or ""),
+        candidate=str(record.get("candidate_sha") or ""),
+        baseline=str(record.get("baseline_commit") or ""),
+        authority_root=project.data_root,
+    )
+    if not result.success:
+        message = str(result.message or "")
+        if "locked" in message.lower():
+            return _failure("CONFLICT", "IN_PROGRESS", project.project_id, record)
+        return _failure("CONFLICT", "CHECKPOINT", project.project_id, record)
+    return None
 
 
 def _backfill_audit(
@@ -677,7 +639,7 @@ def _accept_bound_runner(project: ProjectRecord, record: Mapping[str, Any], chec
 
     runner_id = str(checkpoint.confirmation_request_id or "")
     bound = str(record.get("runner_confirmation_request_id") or "")
-    if not runner_id or (bound and bound != runner_id):
+    if not runner_id or not bound or bound != runner_id:
         return _failure("CONFLICT", "CONFIRMATION", project.project_id, record)
     if str(checkpoint.candidate_commit or "") != str(record.get("candidate_sha") or ""):
         return _failure("CONFLICT", "CANDIDATE", project.project_id, record)
@@ -714,7 +676,7 @@ def _reject_bound_runner(project: ProjectRecord, record: Mapping[str, Any], chec
 
     runner_id = str(checkpoint.confirmation_request_id or "")
     bound = str(record.get("runner_confirmation_request_id") or "")
-    if not runner_id or (bound and bound != runner_id):
+    if not runner_id or not bound or bound != runner_id:
         return _failure("CONFLICT", "CONFIRMATION", project.project_id, record)
     snapshot = checkpoint.execution_spec_snapshot if isinstance(checkpoint.execution_spec_snapshot, Mapping) else {}
     project_root = str(snapshot.get("project_root") or project.data_root)
@@ -814,17 +776,70 @@ def _approve_gate(project: ProjectRecord, record: Mapping[str, Any]) -> str | No
     return None
 
 
-def _mint_and_validate(project: ProjectRecord, record: Mapping[str, Any]) -> str:
+def _card_confirmation_evidence_id(confirmation_id: str) -> str:
+    return "mcpacc" + hashlib.sha256(confirmation_id.encode("utf-8")).hexdigest()[:24]
+
+
+def _card_confirmation_invocation(confirmation_id: str) -> str:
+    return "accept-" + hashlib.sha256(b"inv" + confirmation_id.encode("utf-8")).hexdigest()[:20]
+
+
+def _card_confirmation_context(project: ProjectRecord, record: Mapping[str, Any]):
     from ..core.agent_schema import AgentHandle, ConfirmationResult, HostCapabilities
+    from ..core.evidence_gate import EvidenceValidationContext
+
+    confirmation_id = str(record.get("confirmation_id") or "")
+    return EvidenceValidationContext(
+        project_id=project.project_id,
+        task_id=str(record.get("task_id") or ""),
+        actor_role="PM",
+        transition_from="已完成",
+        transition_to="已验收",
+        baseline_commit=str(record.get("baseline_commit") or ""),
+        result_commit=str(record.get("candidate_sha") or ""),
+        expected_invocation_id=_card_confirmation_invocation(confirmation_id),
+        expected_adapter="yy-flow",
+        expected_workspace_mode="user_confirmation",
+        expected_evidence_type=EvidenceType.USER_CONFIRMATION,
+        host_handle=AgentHandle(
+            session_id="mcp-human-session",
+            host_id="yy-flow-host",
+            is_real_host=True,
+        ),
+        expected_capabilities=HostCapabilities(is_real_host=True),
+        confirmation_result=ConfirmationResult(confirmation_id, "accept", True, True),
+    )
+
+
+def _validate_card_user_confirmation(project: ProjectRecord, record: Mapping[str, Any]) -> bool:
+    """复核无检查点批准已经写下的用户证据。缺失时不补写。"""
+    from ..core.evidence_gate import EvidenceGate, EvidenceGateError
+    from ..core.evidence_store import EvidenceStore
+
+    evidence_id = _card_confirmation_evidence_id(str(record.get("confirmation_id") or ""))
+    store = EvidenceStore(project.evidence_root)
+    try:
+        store.read(evidence_id)
+    except EvidenceError:
+        return False
+    try:
+        EvidenceGate(store, project.data_root).validate_evidence(
+            evidence_id, _card_confirmation_context(project, record),
+        )
+    except EvidenceGateError:
+        return False
+    return True
+
+
+def _mint_and_validate(project: ProjectRecord, record: Mapping[str, Any]) -> str:
+    from ..core.agent_schema import HostCapabilities
     from ..core.evidence_gate import EvidenceGate, EvidenceGateError
     from ..core.evidence_schema import EvidenceMetadata, EvidenceRecord
     from ..core.evidence_store import EvidenceStore
     from ..core.production_runner import _extract_capabilities_extra
-    from ..core.evidence_gate import EvidenceValidationContext
 
     confirmation_id = str(record.get("confirmation_id") or "")
-    evidence_id = "mcpacc" + hashlib.sha256(confirmation_id.encode("utf-8")).hexdigest()[:24]
-    invocation = "accept-" + hashlib.sha256(b"inv" + confirmation_id.encode("utf-8")).hexdigest()[:20]
+    evidence_id = _card_confirmation_evidence_id(confirmation_id)
     caps = HostCapabilities(is_real_host=True)
     extra = _extract_capabilities_extra(caps)
     extra.update(
@@ -852,7 +867,7 @@ def _mint_and_validate(project: ProjectRecord, record: Mapping[str, Any]) -> str
                     host_id="yy-flow-host",
                     adapter="yy-flow",
                     host_session_id="mcp-human-session",
-                    host_invocation_id=invocation,
+                    host_invocation_id=_card_confirmation_invocation(confirmation_id),
                     is_real_host=True,
                     workspace_mode="user_confirmation",
                     transition_from="已完成",
@@ -864,27 +879,7 @@ def _mint_and_validate(project: ProjectRecord, record: Mapping[str, Any]) -> str
         )
     try:
         EvidenceGate(store, project.data_root).validate_evidence(
-            evidence_id,
-            EvidenceValidationContext(
-                project_id=project.project_id,
-                task_id=str(record.get("task_id") or ""),
-                actor_role="PM",
-                transition_from="已完成",
-                transition_to="已验收",
-                baseline_commit=str(record.get("baseline_commit") or ""),
-                result_commit=str(record.get("candidate_sha") or ""),
-                expected_invocation_id=invocation,
-                expected_adapter="yy-flow",
-                expected_workspace_mode="user_confirmation",
-                expected_evidence_type=EvidenceType.USER_CONFIRMATION,
-                host_handle=AgentHandle(
-                    session_id="mcp-human-session",
-                    host_id="yy-flow-host",
-                    is_real_host=True,
-                ),
-                expected_capabilities=caps,
-                confirmation_result=ConfirmationResult(confirmation_id, "accept", True, True),
-            ),
+            evidence_id, _card_confirmation_context(project, record),
         )
     except EvidenceGateError as exc:
         raise error("GATE_REJECTED", details={"reason": "GATE"}) from exc
@@ -905,7 +900,9 @@ def _binding_problem(
     runner_checkpoint = _runner_checkpoint(project, str(record.get("task_id") or ""))
     bound_runner_id = str(record.get("runner_confirmation_request_id") or "")
     live_runner_id = "" if runner_checkpoint is None else str(runner_checkpoint.confirmation_request_id or "")
-    if bound_runner_id and bound_runner_id != live_runner_id:
+    if runner_checkpoint is not None and (
+        not bound_runner_id or (live_runner_id and bound_runner_id != live_runner_id)
+    ):
         return "CONFLICT", "CONFIRMATION"
     evidence = _read_evidence(project, str(record.get("evidence_id") or ""))
     card = _card(project, str(record.get("task_id") or ""))

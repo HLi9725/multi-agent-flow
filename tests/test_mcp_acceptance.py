@@ -902,6 +902,41 @@ def test_applied_decision_ledger_failure_recovers_in_new_process(tmp_path, monke
     assert len([row for row in rows if row.get("code") == "OK"]) == 1
 
 
+def test_card_only_recovery_rejects_tampered_user_evidence(tmp_path, monkeypatch):
+    """隔离测试双重。无检查点批准已落地后，篡改用户证据不能补记消费记录。"""
+    import hashlib
+    from scripts._lib.core.evidence_store import canonical_json
+
+    registry, _task, _evid, cid = _apply(tmp_path, "cardgate")
+    reg = load_registry(str(registry))
+    real = acceptance_mod._persist
+    failed = False
+
+    def persist(project, path, record):
+        nonlocal failed
+        if record.get("consumed") and not failed:
+            failed = True
+            return False
+        return real(project, path, record)
+
+    monkeypatch.setattr(acceptance_mod, "_persist", persist)
+    first = decide_acceptance(reg, cid, "approve", audit=AuditStore(str(tmp_path / "audit")))
+    assert first["code"] == "APPLIED_LEDGER_PENDING", first
+    monkeypatch.undo()
+    evidence_id = "mcpacc" + hashlib.sha256(cid.encode("utf-8")).hexdigest()[:24]
+    matches = list(tmp_path.rglob(evidence_id + ".json"))
+    assert len(matches) == 1
+    data = json.loads(matches[0].read_text(encoding="utf-8"))
+    data.pop("content_hash", None)
+    data["metadata"]["project_id"] = "other-project"
+    data["content_hash"] = hashlib.sha256(canonical_json(data)).hexdigest()
+    matches[0].write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    result = decide_acceptance(reg, cid, "approve", audit=AuditStore(str(tmp_path / "audit")))
+    assert result["ok"] is False and result["reason"] == "GATE", result
+    saved = json.loads(_acceptance_path(registry, cid).read_text(encoding="utf-8"))
+    assert saved["consumed"] is not True
+
+
 @pytest.mark.parametrize("case", ["valid", "failed_report", "wrong_ac", "unknown_ac", "failed_check"])
 def test_lite_quality_requires_bound_report(tmp_path, case):
     registry, task, _, _ = _apply(tmp_path, "litequality")

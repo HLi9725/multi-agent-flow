@@ -9,6 +9,8 @@ import textwrap
 import time
 from pathlib import Path
 
+import pytest
+
 from scripts._lib.core.agent_schema import HostCapabilities
 from scripts._lib.core.evidence_schema import EvidenceMetadata, EvidenceRecord, EvidenceType
 from scripts._lib.core.evidence_store import EvidenceStore
@@ -460,6 +462,186 @@ def test_duplicate_user_confirmation_file_does_not_block_linked_recovery(tmp_pat
     del candidate
 
 
+def _rewrite_evidence(path: Path, mutate) -> None:
+    import hashlib
+    from scripts._lib.core.evidence_store import canonical_json
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data.pop("content_hash", None)
+    mutate(data)
+    data["content_hash"] = hashlib.sha256(canonical_json(data)).hexdigest()
+    path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+
+def _pending_applied_approval(tmp_path: Path, monkeypatch):
+    """测试双重。业务已应用，消费记录第一次保存失败。"""
+    import scripts._lib.mcp.acceptance as acceptance_mod
+
+    repo, candidate, registry_path, registry, project, card, principal, project_id = _open(tmp_path)
+    body = create_application(project, principal, {
+        "task_id": "T0778", "evidence_id": "evi_qa_bound",
+        "expected_version": task_version(card), "idempotency_key": "tamper-approve",
+    }, _Ledger(), "digest-tamper-approve")
+    real = acceptance_mod._persist
+    failed = {"done": False}
+
+    def persist(project_record, path, record):
+        if record.get("consumed") and not failed["done"]:
+            failed["done"] = True
+            return False
+        return real(project_record, path, record)
+
+    monkeypatch.setattr(acceptance_mod, "_persist", persist)
+    first = decide_acceptance(registry, body["confirmation_id"], "approve", audit=AuditStore(str(repo / "mcp_audit")))
+    assert first["code"] == "APPLIED_LEDGER_PENDING", first
+    monkeypatch.undo()
+    store = RunnerCheckpointStore(data_root=str(repo), project_root=str(repo), project_id=project_id)
+    evidence_id = store.load_checkpoint("T0778").evidence_ids[-1]
+    return repo, candidate, registry_path, registry, body, project_id, evidence_id
+
+
+@pytest.mark.parametrize("field", ["project", "task", "role", "host", "source", "runner", "transition"])
+def test_applied_approval_recovery_rejects_tampered_user_evidence(tmp_path: Path, monkeypatch, field: str) -> None:
+    """隔离测试双重。完整性仍有效，但正式门禁字段被改过时不能补记消费记录。"""
+    repo, _candidate, _registry_path, registry, body, project_id, evidence_id = _pending_applied_approval(tmp_path, monkeypatch)
+    path = repo / "user_data" / "runner_evidence" / f"{evidence_id}.json"
+
+    def mutate(data: dict) -> None:
+        meta = data["metadata"]
+        if field == "project":
+            meta["project_id"] = "other-project"
+        elif field == "task":
+            meta["task_id"] = "T9999"
+        elif field == "role":
+            meta["actor_role"] = "QA"
+        elif field == "host":
+            meta["is_real_host"] = False
+        elif field == "source":
+            meta["extra"]["user_source"] = "model"
+        elif field == "runner":
+            meta["extra"]["confirmation_id"] = "runner-id-was-replaced"
+        else:
+            meta["transition_to"] = "BUILDING"
+
+    _rewrite_evidence(path, mutate)
+    result = decide_acceptance(registry, body["confirmation_id"], "approve", audit=AuditStore(str(repo / "mcp_audit")))
+    assert result["ok"] is False, result
+    assert result["reason"] in {"GATE", "CONFIRMATION"}
+    saved = json.loads((repo / "mcp_auth" / "acceptance" / f"{body['confirmation_id']}.json").read_text(encoding="utf-8"))
+    assert saved["consumed"] is not True
+    store = RunnerCheckpointStore(data_root=str(repo), project_root=str(repo), project_id=project_id)
+    assert store.load_checkpoint("T0778").state == RunnerState.ACCEPTED.value
+    assert _user_confirmations(repo) == 1
+
+
+def test_acceptance_recovery_rechecks_checkpoint_inside_lock(tmp_path: Path, monkeypatch) -> None:
+    """隔离测试双重。锁前看到的检查点与锁内读取不一致时不写 ACCEPTED。"""
+    from dataclasses import replace
+
+    repo, _candidate, _registry_path, registry, project, card, principal, project_id = _open(tmp_path)
+    body = create_application(project, principal, {
+        "task_id": "T0778", "evidence_id": "evi_qa_bound",
+        "expected_version": task_version(card), "idempotency_key": "lock-approve",
+    }, _Ledger(), "digest-lock-approve")
+    real_save = RunnerCheckpointStore.save_checkpoint
+
+    def save(self, checkpoint):
+        if checkpoint.state == RunnerState.ACCEPTED.value:
+            raise OSError("checkpoint disk")
+        return real_save(self, checkpoint)
+
+    monkeypatch.setattr(RunnerCheckpointStore, "save_checkpoint", save)
+    first = decide_acceptance(registry, body["confirmation_id"], "approve", audit=AuditStore(str(repo / "mcp_audit")))
+    assert first["ok"] is False, first
+    monkeypatch.undo()
+    real_load = RunnerCheckpointStore.load_checkpoint
+
+    def load(self, task_id):
+        current = real_load(self, task_id)
+        if current is None:
+            return None
+        return replace(current, confirmation_request_id="changed-inside-lock")
+
+    monkeypatch.setattr(RunnerCheckpointStore, "load_checkpoint", load)
+    result = decide_acceptance(registry, body["confirmation_id"], "approve", audit=AuditStore(str(repo / "mcp_audit")))
+    assert result["reason"] == "CHECKPOINT", result
+    monkeypatch.undo()
+    store = RunnerCheckpointStore(data_root=str(repo), project_root=str(repo), project_id=project_id)
+    assert store.load_checkpoint("T0778").state == RunnerState.PENDING_USER_ACCEPTANCE.value
+    assert store.load_checkpoint("T0778").confirmation_request_id == "runner-conf-not-mcp"
+    saved = json.loads((repo / "mcp_auth" / "acceptance" / f"{body['confirmation_id']}.json").read_text(encoding="utf-8"))
+    assert saved["consumed"] is not True
+    assert _user_confirmations(repo) == 1
+
+
+def test_acceptance_recovery_does_not_substitute_missing_checkpoint(tmp_path: Path, monkeypatch) -> None:
+    """隔离测试双重。锁内读不到检查点时，不得用锁前对象写成 ACCEPTED。"""
+    repo, _candidate, _registry_path, registry, project, card, principal, project_id = _open(tmp_path)
+    body = create_application(project, principal, {
+        "task_id": "T0778", "evidence_id": "evi_qa_bound",
+        "expected_version": task_version(card), "idempotency_key": "missing-checkpoint",
+    }, _Ledger(), "digest-missing-checkpoint")
+    real_save = RunnerCheckpointStore.save_checkpoint
+
+    def save(self, checkpoint):
+        if checkpoint.state == RunnerState.ACCEPTED.value:
+            raise OSError("checkpoint disk")
+        return real_save(self, checkpoint)
+
+    monkeypatch.setattr(RunnerCheckpointStore, "save_checkpoint", save)
+    first = decide_acceptance(registry, body["confirmation_id"], "approve", audit=AuditStore(str(repo / "mcp_audit")))
+    assert first["ok"] is False, first
+    monkeypatch.undo()
+    monkeypatch.setattr(RunnerCheckpointStore, "load_checkpoint", lambda self, task_id: None)
+    result = decide_acceptance(registry, body["confirmation_id"], "approve", audit=AuditStore(str(repo / "mcp_audit")))
+    assert result["reason"] == "CHECKPOINT", result
+    monkeypatch.undo()
+    store = RunnerCheckpointStore(data_root=str(repo), project_root=str(repo), project_id=project_id)
+    assert store.load_checkpoint("T0778").state == RunnerState.PENDING_USER_ACCEPTANCE.value
+    saved = json.loads((repo / "mcp_auth" / "acceptance" / f"{body['confirmation_id']}.json").read_text(encoding="utf-8"))
+    assert saved["consumed"] is not True
+
+
+def test_rejection_recovery_rechecks_checkpoint_inside_lock(tmp_path: Path, monkeypatch) -> None:
+    """隔离测试双重。锁内候选变化时不把拒绝检查点改成返工。"""
+    from dataclasses import replace
+
+    repo, _candidate, _registry_path, registry, project, card, principal, project_id = _open(tmp_path)
+    body = create_application(project, principal, {
+        "task_id": "T0778", "evidence_id": "evi_qa_bound",
+        "expected_version": task_version(card), "idempotency_key": "lock-reject",
+    }, _Ledger(), "digest-lock-reject")
+    real_save = RunnerCheckpointStore.save_checkpoint
+
+    def save(self, checkpoint):
+        if checkpoint.state == RunnerState.NEEDS_USER_INPUT.value:
+            raise OSError("checkpoint disk")
+        return real_save(self, checkpoint)
+
+    monkeypatch.setattr(RunnerCheckpointStore, "save_checkpoint", save)
+    first = decide_acceptance(registry, body["confirmation_id"], "reject", audit=AuditStore(str(repo / "mcp_audit")))
+    assert first["ok"] is False, first
+    monkeypatch.undo()
+    real_load = RunnerCheckpointStore.load_checkpoint
+
+    def load(self, task_id):
+        current = real_load(self, task_id)
+        if current is None:
+            return None
+        return replace(current, candidate_commit="ab" * 20)
+
+    monkeypatch.setattr(RunnerCheckpointStore, "load_checkpoint", load)
+    result = decide_acceptance(registry, body["confirmation_id"], "reject", audit=AuditStore(str(repo / "mcp_audit")))
+    assert result["reason"] == "CHECKPOINT", result
+    monkeypatch.undo()
+    store = RunnerCheckpointStore(data_root=str(repo), project_root=str(repo), project_id=project_id)
+    current = store.load_checkpoint("T0778")
+    assert current.state == RunnerState.REJECTION_PENDING.value
+    assert current.defects_history == () or len(current.defects_history) == 0
+    saved = json.loads((repo / "mcp_auth" / "acceptance" / f"{body['confirmation_id']}.json").read_text(encoding="utf-8"))
+    assert saved["consumed"] is not True
+
+
 def test_unapplied_expired_runner_approval_is_rejected(tmp_path: Path) -> None:
     """测试双重。尚未应用的过期批准不能执行。"""
     repo, _candidate, _registry_path, registry, project, card, principal, project_id = _open(tmp_path)
@@ -477,6 +659,47 @@ def test_unapplied_expired_runner_approval_is_rejected(tmp_path: Path) -> None:
     store = RunnerCheckpointStore(data_root=str(repo), project_root=str(repo), project_id=project_id)
     assert store.load_checkpoint("T0778").state == RunnerState.PENDING_USER_ACCEPTANCE.value
     assert _user_confirmations(repo) == 0
+
+
+def test_empty_runner_binding_is_not_borrowed_from_checkpoint(tmp_path: Path) -> None:
+    """隔离测试双重。确认记录没有 Runner 编号时，不得改用检查点编号执行。"""
+    repo, _candidate, _registry_path, registry, project, card, principal, project_id = _open(tmp_path)
+    body = create_application(project, principal, {
+        "task_id": "T0778", "evidence_id": "evi_qa_bound",
+        "expected_version": task_version(card), "idempotency_key": "unbound-runner",
+    }, _Ledger(), "digest-unbound-runner")
+    path = repo / "mcp_auth" / "acceptance" / f"{body['confirmation_id']}.json"
+    record = json.loads(path.read_text(encoding="utf-8"))
+    record.pop("runner_confirmation_request_id", None)
+    path.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
+    audit = AuditStore(str(repo / "mcp_audit"))
+    approved = decide_acceptance(registry, body["confirmation_id"], "approve", audit=audit)
+    assert approved["reason"] == "CONFIRMATION", approved
+    rejected = decide_acceptance(registry, body["confirmation_id"], "reject", audit=audit)
+    assert rejected["reason"] == "CONFIRMATION", rejected
+    assert json.loads((repo / "user_data" / "board.json").read_text(encoding="utf-8"))[0]["status"] == "已完成"
+    store = RunnerCheckpointStore(data_root=str(repo), project_root=str(repo), project_id=project_id)
+    assert store.load_checkpoint("T0778").state == RunnerState.PENDING_USER_ACCEPTANCE.value
+    assert store.load_checkpoint("T0778").confirmation_request_id == "runner-conf-not-mcp"
+    assert _user_confirmations(repo) == 0
+
+
+def test_bound_approval_without_checkpoint_file_is_not_recovered(tmp_path: Path, monkeypatch) -> None:
+    """隔离测试双重。已绑定 Runner 的批准在检查点文件消失后，不能靠看板标记补记。"""
+    repo, _candidate, _registry_path, registry, body, project_id, _evidence_id = _pending_applied_approval(tmp_path, monkeypatch)
+    store = RunnerCheckpointStore(data_root=str(repo), project_root=str(repo), project_id=project_id)
+    checkpoint_path = next((repo / "runner_checkpoints").rglob("T0778.json"))
+    checkpoint_path.unlink()
+    board_path = repo / "user_data" / "board.json"
+    board = json.loads(board_path.read_text(encoding="utf-8"))
+    board[0]["process"] = str(board[0].get("process") or "") + "\nacceptance-decision:%s:approve" % body["confirmation_id"]
+    board_path.write_text(json.dumps(board, ensure_ascii=False), encoding="utf-8")
+    result = decide_acceptance(registry, body["confirmation_id"], "approve", audit=AuditStore(str(repo / "mcp_audit")))
+    assert result["ok"] is False and result["reason"] == "CHECKPOINT", result
+    saved = json.loads((repo / "mcp_auth" / "acceptance" / f"{body['confirmation_id']}.json").read_text(encoding="utf-8"))
+    assert saved["consumed"] is not True
+    assert list((repo / "runner_checkpoints").rglob("T0778.json")) == []
+    del store
 
 
 def test_historical_reject_without_runner_binding_is_not_synced(tmp_path: Path) -> None:
@@ -507,7 +730,7 @@ def test_accept_checkpoint_save_failure_recovers_in_new_process(tmp_path: Path, 
     repo, _candidate, registry_path, registry, project, card, principal, project_id = _open(tmp_path)
     body = create_application(project, principal, {
         "task_id": "T0778", "evidence_id": "evi_qa_bound",
-        "expected_version": task_version(card), "idempotency_key": "checkpoint-approve",
+        "expected_version": task_version(card),         "idempotency_key": "checkpoint-approve",
     }, _Ledger(), "digest-checkpoint-approve")
     real = RunnerCheckpointStore.save_checkpoint
 

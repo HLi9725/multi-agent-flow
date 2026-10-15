@@ -301,6 +301,8 @@ def load_task_execution_spec(
     task_id: str,
     authority_root: Optional[str] = None,
     overrides: Optional[Dict[str, Any]] = None,
+    *,
+    allow_terminal_read: bool = False,
 ) -> TaskExecutionSpec:
     """
     从权威看板中加载并构建不可变的 TaskExecutionSpec。
@@ -365,7 +367,7 @@ def load_task_execution_spec(
     if not status:
         status = "待开始"
 
-    if status in ("已验收", "已取消", "已废弃"):
+    if status in ("已验收", "已取消", "已废弃") and not (allow_terminal_read and status == "已验收"):
         raise TaskSpecInvalidStatusError(
             f"Task '{task_id}' is in terminal status '{status}', cannot be executed by Runner."
         )
