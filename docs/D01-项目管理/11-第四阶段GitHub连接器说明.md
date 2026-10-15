@@ -5,7 +5,7 @@ stage: Phase-4
 type: guide
 status: in-progress
 author: 李开发
-updated_at: 2026-10-13
+updated_at: 2026-10-15
 tags: [MCP, GitHub Projects, 4E, STDIO]
 ---
 
@@ -55,3 +55,7 @@ tags: [MCP, GitHub Projects, 4E, STDIO]
 本机没有 `GITHUB_TOKEN`、`GH_TOKEN`，也没有 `gh` 命令。`~\.config\gh\hosts.yml`、`%APPDATA%\GitHub CLI\hosts.yml` 和 `~\.github\token` 都不存在。因此没有发起 `api.github.com` 请求。假传输结果仍然不是真实 GitHub 通过。
 
 继续只读验证需要沙箱 Project 的所有者、项目编号，以及只含 Projects 读权限的凭据。凭据不要粘贴到对话里，放到本机环境变量或 GitHub CLI 登录状态即可。只读凭据不能做写入测试。写入前还要单独授权目标条目和清理方式。禁止操作正式业务看板。
+
+## 7. 2026-10-15 条件复检
+
+沿用 T0041 做了只读条件检查，没有改任务状态。记录和文档里仍然没有沙箱 Project 所有者和项目编号。本机没有 `GITHUB_TOKEN`、`GH_TOKEN`，没有 `gh` 命令，也没有 `~\.config\gh\hosts.yml`、`%APPDATA%\GitHub CLI\hosts.yml` 或 `~\.github\token`。因此没有连接 `api.github.com`，没有做项目识别、读取或分页。假传输和协议自测仍然不是真实 GitHub 验证。T0041 保持已阻塞。缺少的外部条件是：沙箱所有者、项目编号，以及只含 Projects 读权限的本机凭据或 CLI 登录状态。
