@@ -11,7 +11,7 @@ from typing import Iterable
 
 from scripts._lib.core.file_lock import LockBusyError, acquire_lock, release_lock
 
-from .common import OnboardError, read_bytes, sha256_bytes, within
+from .common import OnboardError, guard_project_path, read_bytes, sha256_bytes
 
 
 def lock_path(data_root: str) -> str:
@@ -26,7 +26,9 @@ def state_path(data_root: str) -> str:
     return os.path.join(data_root, "user_data", "onboarding", "state.json")
 
 
-def atomic_write(path: str, data: bytes) -> None:
+def atomic_write(path: str, data: bytes, *, project_root: str | None = None) -> None:
+    if project_root is not None:
+        guard_project_path(project_root, path)
     directory = os.path.dirname(path)
     os.makedirs(directory, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(prefix=".yy-flow-onboard-", dir=directory)
@@ -35,6 +37,8 @@ def atomic_write(path: str, data: bytes) -> None:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
+        if project_root is not None:
+            guard_project_path(project_root, path)
         os.replace(temporary, path)
     except Exception:
         try:
@@ -130,9 +134,12 @@ def rollback(progress: dict, project_root: str) -> list[str]:
         if status not in {"written", "replacing", "pending"}:
             continue
         path = item["path"]
-        if not within(project_root, path):
-            problems.append(path)
-            continue
+        guard_project_path(project_root, path)
+        if item.get("had_backup"):
+            backup_path = item.get("backup")
+            if not isinstance(backup_path, str) or not backup_path:
+                raise OnboardError("RESTORE", "备份记录无效，已停止恢复")
+            guard_project_path(project_root, backup_path)
         current = read_bytes(path)
         planned = item.get("sha256", "")
         backup_sha = item.get("backup_sha256", "")
@@ -152,12 +159,15 @@ def rollback(progress: dict, project_root: str) -> list[str]:
     restored = []
     for item in reversed(actions):
         path = item["path"]
+        guard_project_path(project_root, path)
         if item.get("had_backup"):
+            guard_project_path(project_root, item["backup"])
             backup = read_bytes(item.get("backup") or "")
             if backup is None or sha256_bytes(backup) != item.get("backup_sha256"):
                 raise OnboardError("RESTORE", "备份不可用，已停止恢复")
-            atomic_write(path, backup)
+            atomic_write(path, backup, project_root=project_root)
         else:
+            guard_project_path(project_root, path)
             os.remove(path)
         item["status"] = "restored"
         restored.append(path)

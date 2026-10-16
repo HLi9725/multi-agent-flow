@@ -730,7 +730,7 @@ def test_def_t0048_4_records_replacing_before_file_swap(tmp_path: Path, monkeypa
     seen: list[str] = []
     real_write = txn.atomic_write
 
-    def wrapped(path: str, data: bytes) -> None:
+    def wrapped(path: str, data: bytes, **kwargs) -> None:
         if os.path.basename(path) == "mcp.json":
             progress_file = project / ".yy-flow" / "user_data" / "onboarding" / "progress.json"
             document = json.loads(progress_file.read_text(encoding="utf-8"))
@@ -740,7 +740,7 @@ def test_def_t0048_4_records_replacing_before_file_swap(tmp_path: Path, monkeypa
                 if os.path.normcase(item["path"]) == os.path.normcase(os.path.abspath(path))
             )
             seen.append(row["status"])
-        real_write(path, data)
+        real_write(path, data, **kwargs)
 
     monkeypatch.setattr(txn, "atomic_write", wrapped)
     err = io.StringIO()

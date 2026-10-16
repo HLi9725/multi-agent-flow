@@ -56,6 +56,25 @@ def within(root: str, candidate: str) -> bool:
         return False
 
 
+def guard_project_path(root: str, candidate: str, *, mount_leaf: bool = False) -> None:
+    """Reject lexical escapes and redirected parents before any filesystem write.
+
+    A managed skill mount may point outside the project, but its parent may not.
+    Ordinary files, journals, locks and backups must also resolve inside it.
+    """
+    absolute_root = os.path.normcase(os.path.abspath(root))
+    absolute = os.path.normcase(os.path.abspath(candidate))
+    try:
+        lexical_inside = os.path.commonpath([absolute_root, absolute]) == absolute_root
+    except ValueError:
+        lexical_inside = False
+    parent = os.path.dirname(absolute) if absolute != absolute_root else absolute
+    if not lexical_inside or not within(root, parent):
+        raise OnboardError("PATH", "目标父目录跳出项目根，已停止")
+    if not mount_leaf and not within(root, candidate):
+        raise OnboardError("PATH", "目标路径跳出项目根，已停止")
+
+
 def symlink_escape(path: str) -> bool:
     absolute = os.path.abspath(path)
     real = os.path.realpath(absolute)

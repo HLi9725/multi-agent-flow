@@ -8,6 +8,8 @@ import getpass
 import hashlib
 import json
 import os
+import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -32,6 +34,7 @@ from .common import (
     FORBIDDEN_SCOPES,
     SERVER_NAME,
     OnboardError,
+    guard_project_path,
     read_bytes,
     sha256_bytes,
     within,
@@ -84,6 +87,7 @@ def execute(args: argparse.Namespace) -> dict:
 def setup(args: argparse.Namespace, write: bool) -> dict:
     layout = resolve_layout(args.project_root, args.skill_root)
     clients = _clients(args.clients)
+    _preflight_paths(layout, clients)
     python = probe_python(args.python or sys.executable)
     os_user = getpass.getuser().strip()
     revision = code_version(layout.skill_root)
@@ -97,6 +101,7 @@ def setup(args: argparse.Namespace, write: bool) -> dict:
         raise OnboardError("INCOMPLETE", "上次接入写入未完成。请先查看 --diagnose，再用 --apply 恢复后重试")
     if not write:
         exports = _export_bytes(python, layout, clients)
+        exports = _rewrite_exports_for_absolute(exports, [], layout.skill_root, python, layout.data_root)
         planned = _build_plan(
             layout, clients, python, registry_text.encode("utf-8"), exports, entry_hashes, link_label="pending",
             recorded_files=(existing_state or {}).get("files") or {},
@@ -114,8 +119,10 @@ def setup(args: argparse.Namespace, write: bool) -> dict:
         )
     handle = txn.acquire(layout.data_root)
     try:
+        _preflight_paths(layout, clients)
         progress = txn.load_json(txn.progress_path(layout.data_root))
         if txn.incomplete(progress):
+            _validate_progress_paths(layout, progress)
             txn.rollback(progress, layout.project_root)
             txn.save_json(txn.progress_path(layout.data_root), progress)
             existing_state = _state(layout)
@@ -125,8 +132,13 @@ def setup(args: argparse.Namespace, write: bool) -> dict:
         if mount_label == "absolute_entry":
             link_label = "absolute_entry"
         exports = _export_bytes(python, layout, clients)
-        if missing_mounts:
-            exports = _rewrite_exports_for_absolute(exports, missing_mounts, layout.skill_root)
+        if link_label == "absolute_entry":
+            missing_mounts.append(".yy-flow/skill")
+            if layout.mode == "legacy":
+                missing_mounts.append("")
+        exports = _rewrite_exports_for_absolute(
+            exports, missing_mounts, layout.skill_root, python, layout.data_root,
+        )
         planned = _build_plan(
             layout, clients, python, registry_text.encode("utf-8"), exports, entry_hashes, link_label,
             recorded_files=(existing_state or {}).get("files") or {},
@@ -139,6 +151,8 @@ def setup(args: argparse.Namespace, write: bool) -> dict:
         for item in planned:
             if item["role"] == "state":
                 continue
+            _guard_path(layout, item["path"])
+            _guard_path(layout, backup_dir)
             records.append(
                 txn.file_record(item["path"], item["data"], item["role"], item["config_index"], item["entry_hash"], backup_dir)
             )
@@ -157,10 +171,11 @@ def setup(args: argparse.Namespace, write: bool) -> dict:
                 raise OnboardError("WRITE_FAILED", f"第 {fail_at} 个客户端配置写入前失败，接入未完成")
             txn.mark_status(progress, item["path"], "replacing")
             txn.save_json(txn.progress_path(layout.data_root), progress)
+            _guard_path(layout, item["path"])
             current = read_bytes(item["path"])
             if current != item["data"]:
                 try:
-                    txn.atomic_write(item["path"], item["data"])
+                    txn.atomic_write(item["path"], item["data"], project_root=layout.project_root)
                 except OSError as exc:
                     progress["phase"] = "failed"
                     txn.save_json(txn.progress_path(layout.data_root), progress)
@@ -255,7 +270,10 @@ def diagnose(project_root: str) -> dict:
 
 def recover(project_root: str, write: bool) -> dict:
     layout = resolve_layout(project_root, None)
+    _preflight_paths(layout, [])
     progress = txn.load_json(txn.progress_path(layout.data_root))
+    if progress:
+        _validate_progress_paths(layout, progress)
     if not txn.incomplete(progress):
         return _public(
             ok=True,
@@ -282,7 +300,10 @@ def recover(project_root: str, write: bool) -> dict:
         )
     handle = txn.acquire(layout.data_root)
     try:
+        _preflight_paths(layout, [])
         progress = txn.load_json(txn.progress_path(layout.data_root))
+        if progress:
+            _validate_progress_paths(layout, progress)
         restored = txn.rollback(progress, layout.project_root) if progress else []
         if progress:
             txn.save_json(txn.progress_path(layout.data_root), progress)
@@ -306,6 +327,7 @@ def recover(project_root: str, write: bool) -> dict:
 def remove_managed(args: argparse.Namespace, write: bool) -> dict:
     layout = resolve_layout(args.project_root, args.skill_root)
     clients = _clients(args.clients)
+    _preflight_paths(layout, clients)
     state = _state(layout)
     if not state:
         raise OnboardError("NOT_MANAGED", "没有受管接入记录，拒绝删除")
@@ -339,6 +361,7 @@ def remove_managed(args: argparse.Namespace, write: bool) -> dict:
         )
     handle = txn.acquire(layout.data_root)
     try:
+        _preflight_paths(layout, clients)
         fresh = _state(layout) or state
         entry_hashes = fresh.get("entry_hashes", {})
         removed_clients = []
@@ -346,6 +369,7 @@ def remove_managed(args: argparse.Namespace, write: bool) -> dict:
         conflicts = []
         for client in clients:
             path = os.path.join(layout.project_root, *CLIENT_CONFIGS[client].split("/"))
+            _guard_path(layout, path)
             current = read_bytes(path)
             if current is None:
                 removed_clients.append(client)
@@ -359,7 +383,7 @@ def remove_managed(args: argparse.Namespace, write: bool) -> dict:
                 continue
             data = updated.encode("utf-8")
             if data != current:
-                txn.atomic_write(path, data)
+                txn.atomic_write(path, data, project_root=layout.project_root)
             removed_clients.append(client)
             removed_files.append(os.path.relpath(path, layout.project_root))
         if removed_clients:
@@ -574,6 +598,7 @@ def _ensure_skill_link(layout: Layout) -> str:
     if layout.mode == "legacy":
         return "absolute_entry"
     link = os.path.join(layout.project_root, ".yy-flow", "skill")
+    guard_project_path(layout.project_root, link, mount_leaf=True)
     if os.path.lexists(link):
         if os.path.normcase(os.path.realpath(link)) == os.path.normcase(layout.skill_root):
             return "symlink" if os.path.islink(link) else "project_directory"
@@ -594,6 +619,7 @@ def _ensure_platform_mounts(layout: Layout, clients: list[str]) -> tuple[str, li
     """按平台声明把技能根挂进项目。链接失败时不复制源码，改记绝对入口。"""
     missing = []
     for relative, link, source in _platform_mounts(layout, clients):
+        guard_project_path(layout.project_root, link, mount_leaf=True)
         if os.path.lexists(link):
             if _same_tree(source, link) and (_is_reparse_point(link) or os.path.islink(link)):
                 continue
@@ -654,13 +680,46 @@ def _try_link(source: str, link: str) -> bool:
     return _same_tree(target, link)
 
 
-def _rewrite_exports_for_absolute(exports: dict[str, bytes], prefixes: list[str], skill_root: str) -> dict[str, bytes]:
+def _rewrite_exports_for_absolute(
+    exports: dict[str, bytes], prefixes: list[str], skill_root: str, python: str | None = None,
+    data_root: str | None = None,
+) -> dict[str, bytes]:
     absolute = os.path.abspath(skill_root).replace("\\", "/")
+    python = (python or sys.executable).replace("\\", "/")
+    normalized = sorted({prefix.replace("\\", "/").rstrip("/") for prefix in prefixes}, key=len, reverse=True)
+    command_prefixes = sorted(set(normalized).union({".agents/skills/yy-flow", ".yy-flow/skill", ""}), key=len, reverse=True)
+    script_prefixes = [(prefix + "/" if prefix else "") + "scripts/" for prefix in command_prefixes]
+    expression = r"\bpython3?\s+(?:" + "|".join(re.escape(prefix) for prefix in script_prefixes) + r")(?P<script>[A-Za-z0-9_./-]+\.py)"
+
+    def invocation(script):
+        if os.name == "nt":
+            # PowerShell's call operator is required for a quoted executable.
+            quote = lambda value: "'" + value.replace("'", "''") + "'"
+            bind = "$env:YY_FLOW_PROJECT_ROOT=" + quote(data_root.replace("\\", "/")) + "; " if data_root else ""
+            return bind + "& " + quote(python) + " " + quote(script)
+        bind = "YY_FLOW_PROJECT_ROOT=" + shlex.quote(data_root) + " " if data_root else ""
+        return bind + shlex.quote(python) + " " + shlex.quote(script)
+
     rewritten = {}
     for relative, data in exports.items():
         text = data.decode("utf-8")
-        for prefix in prefixes:
-            text = text.replace(prefix.replace("\\", "/"), absolute)
+        commands = []
+
+        def command(match):
+            marker = "\x00YYFLOW_COMMAND_" + str(len(commands)) + "\x00"
+            commands.append((marker, invocation(absolute + "/scripts/" + match.group("script"))))
+            return marker
+
+        if "\x00" in text:
+            raise OnboardError("EXPORT", "导出文本含无效字符")
+        text = re.sub(expression, command, text)
+        path_prefixes = [re.escape(prefix) for prefix in normalized if prefix]
+        if path_prefixes:
+            # A single pass over original references must not rewrite an absolute
+            # path inserted by an earlier replacement (embedded installs).
+            text = re.sub("|".join(path_prefixes), lambda _match: absolute, text)
+        for marker, value in commands:
+            text = text.replace(marker, value)
         rewritten[relative] = text.encode("utf-8")
     return rewritten
 
@@ -668,12 +727,7 @@ def _rewrite_exports_for_absolute(exports: dict[str, bytes], prefixes: list[str]
 def _same_tree(root: str, path: str) -> bool:
     root_real = os.path.normcase(os.path.realpath(root))
     path_real = os.path.normcase(os.path.realpath(path))
-    if path_real == root_real:
-        return True
-    try:
-        return os.path.commonpath([root_real, path_real]) == root_real
-    except ValueError:
-        return False
+    return path_real == root_real
 
 
 def _is_reparse_point(path: str) -> bool:
@@ -806,12 +860,51 @@ def _assert_clean(raw: bytes) -> None:
 
 
 def _guard_path(layout: Layout, path: str) -> None:
+    guard_project_path(layout.project_root, path)
     if not within(layout.project_root, path):
         raise OnboardError("PATH", "写入路径跳出项目根，已停止")
     if within(layout.skill_root, path) and os.path.normcase(os.path.realpath(layout.skill_root)) != os.path.normcase(layout.project_root):
         raise OnboardError("PATH", "共享正本不能因当前项目接入写入运行数据")
     if layout.mode == "shared" and within(layout.skill_root, path):
         raise OnboardError("PATH", "共享正本不能因当前项目接入写入运行数据")
+
+
+def _preflight_paths(layout: Layout, clients: list[str]) -> None:
+    """Validate the entire selected write surface before creating even a lock."""
+    targets = [
+        layout.registry_path, layout.pointer_path, layout.board_path,
+        txn.state_path(layout.data_root), txn.progress_path(layout.data_root),
+        txn.lock_path(layout.data_root),
+        os.path.join(layout.data_root, "user_data", "onboarding", "backups", "current"),
+    ]
+    for client in clients:
+        targets.append(os.path.join(layout.project_root, *CLIENT_CONFIGS[client].split("/")))
+        for relative in EXPORT_DIRS[client]:
+            targets.append(os.path.join(layout.project_root, *relative.split("/")))
+    for path in targets:
+        _guard_path(layout, path)
+    mounts = _platform_mounts(layout, clients)
+    mounts.append((".yy-flow/skill", os.path.join(layout.project_root, ".yy-flow", "skill"), layout.skill_root))
+    for _relative, path, _source in mounts:
+        guard_project_path(layout.project_root, path, mount_leaf=True)
+        if os.path.lexists(path) and not _same_tree(_source, path):
+            raise OnboardError("SKILL_ROOT", "已有技能挂载未指向所选代码根，已停止")
+
+
+def _validate_progress_paths(layout: Layout, progress: dict) -> None:
+    backup_root = os.path.join(layout.data_root, "user_data", "onboarding", "backups")
+    records = progress.get("files")
+    if not isinstance(records, list):
+        raise OnboardError("BAD_CONFIG", "接入进度文件列表无效")
+    for record in records:
+        if not isinstance(record, dict) or not isinstance(record.get("path"), str):
+            raise OnboardError("BAD_CONFIG", "接入进度路径无效")
+        _guard_path(layout, record["path"])
+        if record.get("had_backup"):
+            backup = record.get("backup")
+            if not isinstance(backup, str) or not within(backup_root, backup):
+                raise OnboardError("PATH", "恢复备份不属于当前项目的接入备份目录")
+            _guard_path(layout, backup)
 
 
 def _clients(raw: str) -> list[str]:
