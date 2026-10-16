@@ -4,7 +4,7 @@ module: workflow
 stage: Phase-4
 type: guide
 status: active
-updated_at: 2026-10-15
+updated_at: 2026-10-16
 tags: [单角色, 自动编排, Profile, 使用指南]
 ---
 
@@ -219,7 +219,11 @@ Cursor 原生验收核对真实子代理记录、策略、候选、检查与官�
 
 接入入口只有 `scripts/setup_project.py`。默认预览，追加 `--apply` 才写入项目级角色、规则和 MCP 配置。受管服务名是 `yy-flow`。登记只给当前操作系统用户的 `read`，不会自动打开建卡、流转或验收。
 
-已实现的是下面这些命令，以及 apply 结束前的本地 STDIO 协议自检。协议自检会做 initialize、tools/list、项目和任务读取、未知项目拒绝、写入拒绝。它不是 Cursor、Codex 或 Antigravity 的真实连接。AC-14 要求的真实客户端现场探活尚未验证，不能写成已通过。`--skip-self-check` 只用于故障注入，同样不是现场验证。
+已实现的是下面这些命令，以及 apply 结束前的本地 STDIO 协议自检。协议自检会做 initialize、tools/list、项目和任务读取、未知项目拒绝、写入拒绝。它不是 Cursor、Codex 或 Antigravity 的真实连接。2026-10-16 隔离项目的 Codex 和 Cursor 已完成真实工具发现及只读查询；Antigravity 项目插件仍待现场验证，不能写成三客户端全部通过。`--skip-self-check` 只用于故障注入，同样不是现场验证。
+
+Antigravity 当前 App 按项目插件发现 MCP：生成 `.agents/plugins/yy-flow/plugin.json` 和同目录 `mcp_config.json`，不再只生成会被该安装版忽略的 `.agents/mcp_config.json`。更新时只迁移旧受管且未被用户改动的 `yy-flow` 条目，保留其他服务器；未知同名插件拒绝接管，用户修改过的清单或服务器条目拒绝覆盖。插件两文件和旧条目迁移共用事务日志，中断后使用下面的恢复命令。
+
+配置生成后，在客户端打开项目根目录（不是子目录）。Cursor 从 Customize → MCPs 启用项目 `yy-flow`；Antigravity 从 Customizations → Installed 确认项目 `yy-flow` 插件。如未发现，先重开项目或新建会话；不通过增加 MCP Allow 通配规则或改全局配置来解决发现问题。然后真实调用 `get_project` 和 `list_tasks` 核对登记项目。生成器只声明协议自检，不替用户记为现场通过。移除只去掉自身 MCP 条目，保留插件清单、角色、第三方服务器和业务数据；空插件不再提供本工具。
 
 首次安装共享正本（Windows，默认源 `HLi9725/multi-agent-flow`，默认入口 `main`）：
 

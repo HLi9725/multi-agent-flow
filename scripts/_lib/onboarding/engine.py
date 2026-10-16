@@ -26,6 +26,8 @@ from .clients import (
     strip_mcp_json,
 )
 from .common import (
+    ANTIGRAVITY_LEGACY_CONFIG,
+    ANTIGRAVITY_MANIFEST,
     CLIENT_CONFIGS,
     CLIENTS,
     CREDENTIAL_ENV,
@@ -334,7 +336,7 @@ def remove_managed(args: argparse.Namespace, write: bool) -> dict:
     entry_hashes = state.get("entry_hashes", {})
     planned = []
     for client in clients:
-        path = os.path.join(layout.project_root, *CLIENT_CONFIGS[client].split("/"))
+        path = _remove_config_path(layout, client, state)
         current = read_bytes(path)
         if current is None:
             continue
@@ -368,7 +370,7 @@ def remove_managed(args: argparse.Namespace, write: bool) -> dict:
         removed_files = []
         conflicts = []
         for client in clients:
-            path = os.path.join(layout.project_root, *CLIENT_CONFIGS[client].split("/"))
+            path = _remove_config_path(layout, client, fresh)
             _guard_path(layout, path)
             current = read_bytes(path)
             if current is None:
@@ -492,6 +494,31 @@ def _build_plan(layout, clients, python, registry_bytes, exports, entry_hashes, 
             updated = merge_mcp_json(text, entry, recorded, label)
             item_hash = entry_hash
         planned.append(_item(path, updated.encode("utf-8"), "config", config_index, item_hash))
+        if client == "antigravity":
+            # Keep the manifest in the same journal as the server definition.
+            # Retrying or recovering must never manufacture an enabled plugin
+            # around an unrelated pre-existing directory.
+            manifest = os.path.join(layout.project_root, *ANTIGRAVITY_MANIFEST.split("/"))
+            manifest_bytes = b'{"name":"yy-flow"}\n'
+            _reject_managed_edit(layout, manifest, manifest_bytes, recorded_files, "Antigravity 插件清单")
+            legacy = os.path.join(layout.project_root, *ANTIGRAVITY_LEGACY_CONFIG.split("/"))
+            legacy_bytes = _read_existing(legacy)
+            if legacy_bytes is not None:
+                try:
+                    legacy_doc = json.loads(legacy_bytes.decode("utf-8"))
+                except (ValueError, UnicodeError) as exc:
+                    raise OnboardError("BAD_CONFIG", "Antigravity 旧配置无法解析，拒绝迁移") from exc
+                servers = legacy_doc.get("mcpServers", {}) if isinstance(legacy_doc, dict) else None
+                if not isinstance(servers, dict):
+                    raise OnboardError("BAD_CONFIG", "Antigravity 旧配置结构无效，拒绝迁移")
+                if SERVER_NAME in servers:
+                    if ANTIGRAVITY_LEGACY_CONFIG not in recorded_files or not recorded:
+                        raise OnboardError("CONFLICT", "Antigravity 旧同名条目未受管，拒绝迁移或重复启用")
+                    stripped = strip_mcp_json(legacy_bytes.decode("utf-8"), recorded, "Antigravity 旧配置")
+                    planned.append(_item(legacy, stripped.encode("utf-8"), "legacy_config", 0, ""))
+            # Activate last: the old registration must be removed first, so
+            # migration does not temporarily enable two copies of our server.
+            planned.append(_item(manifest, manifest_bytes, "plugin", 0, sha256_bytes(manifest_bytes)))
     for relative, data in sorted(exports.items()):
         path = os.path.join(layout.project_root, relative)
         current = _read_existing(path)
@@ -753,6 +780,16 @@ def _strip_client(client: str, text: str, recorded: str) -> str:
     return strip_mcp_json(text, recorded or None, label)
 
 
+def _remove_config_path(layout: Layout, client: str, state: dict) -> str:
+    relative = CLIENT_CONFIGS[client]
+    if client == "antigravity":
+        files = state.get("files") or {}
+        old = files.get(ANTIGRAVITY_LEGACY_CONFIG) or {}
+        if relative not in files and old.get("role") == "config":
+            relative = ANTIGRAVITY_LEGACY_CONFIG
+    return os.path.join(layout.project_root, *relative.split("/"))
+
+
 def _state_document(layout, clients, python, revision, planned, link_label, verification: dict, existing_state: dict | None = None) -> dict:
     previous = existing_state or {}
     files = dict(previous.get("files") or {})
@@ -879,16 +916,49 @@ def _preflight_paths(layout: Layout, clients: list[str]) -> None:
     ]
     for client in clients:
         targets.append(os.path.join(layout.project_root, *CLIENT_CONFIGS[client].split("/")))
+        if client == "antigravity":
+            targets.extend(os.path.join(layout.project_root, *p.split("/")) for p in (
+                ANTIGRAVITY_MANIFEST, ANTIGRAVITY_LEGACY_CONFIG,
+            ))
         for relative in EXPORT_DIRS[client]:
             targets.append(os.path.join(layout.project_root, *relative.split("/")))
     for path in targets:
         _guard_path(layout, path)
+    if "antigravity" in clients:
+        _check_antigravity_plugin(layout)
     mounts = _platform_mounts(layout, clients)
     mounts.append((".yy-flow/skill", os.path.join(layout.project_root, ".yy-flow", "skill"), layout.skill_root))
     for _relative, path, _source in mounts:
         guard_project_path(layout.project_root, path, mount_leaf=True)
         if os.path.lexists(path) and not _same_tree(_source, path):
             raise OnboardError("SKILL_ROOT", "已有技能挂载未指向所选代码根，已停止")
+
+
+def _check_antigravity_plugin(layout: Layout) -> None:
+    """Only create/activate our own plugin; never adopt a user's plugin."""
+    manifest = os.path.join(layout.project_root, *ANTIGRAVITY_MANIFEST.split("/"))
+    folder = os.path.dirname(manifest)
+    if not os.path.isdir(folder) or not os.listdir(folder):
+        return
+    state = _state(layout) or {}
+    files = state.get("files") or {}
+    progress = txn.load_json(txn.progress_path(layout.data_root))
+    pending = txn.incomplete(progress)
+    if pending:
+        _validate_progress_paths(layout, progress)
+    records = {item.get("path"): item for item in (progress or {}).get("files", [])} if pending else {}
+    recorded = files.get(ANTIGRAVITY_MANIFEST)
+    interrupted = records.get(manifest)
+    if not recorded and not interrupted:
+        raise OnboardError("CONFLICT", "Antigravity yy-flow 插件目录未受管，拒绝接管")
+    current = read_bytes(manifest)
+    if current is not None:
+        digest = sha256_bytes(current)
+        allowed = {recorded.get("sha256")} if isinstance(recorded, dict) else set()
+        if interrupted:
+            allowed.update((interrupted.get("sha256"), interrupted.get("backup_sha256")))
+        if digest not in allowed:
+            raise OnboardError("CONFLICT", "Antigravity 插件清单已被修改，拒绝覆盖或移除")
 
 
 def _validate_progress_paths(layout: Layout, progress: dict) -> None:

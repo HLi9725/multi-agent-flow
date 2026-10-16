@@ -137,7 +137,8 @@ def test_ac01_preview_then_apply_three_clients(tmp_path: Path) -> None:
     assert result["ac14_live_client_verified"] is False
     cursor = json.loads((project / ".cursor" / "mcp.json").read_text(encoding="utf-8"))
     codex = (project / ".codex" / "config.toml").read_text(encoding="utf-8")
-    anti = json.loads((project / ".agents" / "mcp_config.json").read_text(encoding="utf-8"))
+    anti = json.loads((project / ".agents/plugins/yy-flow/mcp_config.json").read_text(encoding="utf-8"))
+    assert json.loads((project / ".agents/plugins/yy-flow/plugin.json").read_text(encoding="utf-8")) == {"name": "yy-flow"}
     assert list(cursor["mcpServers"]) == ["yy-flow"]
     command = cursor["mcpServers"]["yy-flow"]
     assert command["args"][1:4] == ["stdio", "--registry", str(_find_named(project, "mcp_registry.json"))]
@@ -195,6 +196,9 @@ def test_ac03_preserves_foreign_config_and_rejects_conflict(tmp_path: Path) -> N
     cursor = json.loads((project / ".cursor" / "mcp.json").read_text(encoding="utf-8"))
     assert cursor["note"] == "keep"
     assert cursor["mcpServers"]["other"]["command"] == "node"
+    assert json.loads((project / ".agents/mcp_config.json").read_text(encoding="utf-8")) == {
+        "mcpServers": {"remote": {"command": "node"}},
+    }
     conflict = tmp_path / "conflict"
     conflict.mkdir()
     (conflict / ".cursor").mkdir()
@@ -412,10 +416,10 @@ def test_ac07_write_failure_interrupt_and_user_edit(tmp_path: Path) -> None:
     third_fail = _run(_base(third, "--apply"), env={"YY_FLOW_ONBOARDING_FAIL_CONFIG": "3"})
     assert third_fail.returncode != 0
     assert (third / ".codex" / "config.toml").is_file()
-    assert not (third / ".agents" / "mcp_config.json").exists()
+    assert not (third / ".agents/plugins/yy-flow/mcp_config.json").exists()
     third_ok = _run(_base(third, "--apply"))
     assert third_ok.returncode == 0, third_ok.stderr
-    assert (third / ".agents" / "mcp_config.json").is_file()
+    assert (third / ".agents/plugins/yy-flow/mcp_config.json").is_file()
 
     stopped = tmp_path / "stop"
     stopped.mkdir()
@@ -487,7 +491,7 @@ def test_ac10_unselected_client_and_readonly_boundary(tmp_path: Path) -> None:
     proc = _run(["--project-root", str(project), "--skill-root", str(REPO), "--clients", "cursor", "--json", "--apply"])
     assert proc.returncode == 0, proc.stderr
     assert (project / ".codex" / "config.toml").read_text(encoding="utf-8") == sentinel
-    assert not (project / ".agents" / "mcp_config.json").exists()
+    assert not (project / ".agents/plugins/yy-flow/mcp_config.json").exists()
     assert (project / ".cursor" / "mcp.json").is_file()
     _assert_readonly_registry(project)
     _scan_tree(project)
@@ -847,7 +851,8 @@ def test_def_t0048_7_partial_client_update_keeps_other_records(tmp_path: Path) -
     watched = []
     for relative in (
         ".codex/config.toml",
-        ".agents/mcp_config.json",
+        ".agents/plugins/yy-flow/mcp_config.json",
+        ".agents/plugins/yy-flow/plugin.json",
         ".codex/agents/flow-dev.toml",
         ".agents/agents/flow-dev.md",
     ):

@@ -4,9 +4,11 @@
 Antigravity 项目级 MCP 查证来源（2026-10-15）：
 https://antigravity.google/docs/mcp/
 https://www.antigravity.google/docs/ide/mcp
-官方工作区文件是 ``.agents/mcp_config.json``，服务器表字段是 ``mcpServers``
-（stdio 使用 command/args/env）。全局文件 ``~/.gemini/config/mcp_config.json``
-不在本模块写入范围内。
+网站说明与当前 App 的内置指南存在差异。2026-10-16 核对本机
+agy-customizations/docs/{mcp_servers,plugins}.md：App 采用项目插件
+``.agents/plugins/yy-flow/{plugin.json,mcp_config.json}``，服务器表字段为
+``mcpServers``（stdio 使用 command/args/env）。旧独立项目文件只迁移已受管
+条目；全局 ``~/.gemini/config/mcp_config.json`` 不在本模块写入范围内。
 Cursor 项目文件是 ``.cursor/mcp.json``，同样使用 ``mcpServers``。
 Codex 项目文件是 ``.codex/config.toml`` 的 ``[mcp_servers.<name>]`` 表。
 受管服务名固定为 yy-flow。TOML 只替换受管注释区块，不整文件重写。

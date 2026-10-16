@@ -21,8 +21,10 @@ ARCH_MARKER = 'meta:\n  initialized: false\nproject:\n  name: ""\n'
 CLIENT_CONFIGS = {
     "cursor": ".cursor/mcp.json",
     "codex": ".codex/config.toml",
-    "antigravity": ".agents/mcp_config.json",
+    "antigravity": ".agents/plugins/yy-flow/mcp_config.json",
 }
+ANTIGRAVITY_MANIFEST = ".agents/plugins/yy-flow/plugin.json"
+ANTIGRAVITY_LEGACY_CONFIG = ".agents/mcp_config.json"
 EXPORT_DIRS = {
     "cursor": (".cursor/rules", ".cursor/agents"),
     "codex": (".codex/agents",),
