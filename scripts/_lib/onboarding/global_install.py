@@ -64,7 +64,16 @@ def run_git(args: list[str], cwd: str | None = None) -> subprocess.CompletedProc
     if "pull" in command:
         raise InstallError("GIT", "禁止用 git pull 切换指定版本")
     try:
-        proc = subprocess.run(command, cwd=cwd, capture_output=True, text=True, timeout=120, check=False)
+        proc = subprocess.run(
+            command,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=120,
+            check=False,
+        )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise InstallError("GIT", "Git 命令无法执行") from exc
     if proc.returncode != 0:
@@ -100,7 +109,7 @@ def install(source: str, ref: str, dest: str) -> dict:
         run_git(["-C", staging, "remote", "add", "origin", url])
         run_git(["-C", staging, "fetch", "origin", ref])
         run_git(["-C", staging, "checkout", "--detach", "FETCH_HEAD"])
-        sha = run_git(["-C", staging, "rev-parse", "HEAD"]).stdout.strip()
+        sha = (run_git(["-C", staging, "rev-parse", "HEAD"]).stdout or "").strip()
         if SHA_RE.fullmatch(sha) is None:
             raise InstallError("GIT", "无法确认检出的提交")
         if os.path.isfile(os.path.join(staging, "user_data", "board.json")):
@@ -147,11 +156,34 @@ def _reject_unsafe_dest(dest: str) -> None:
         raise InstallError("POLLUTED", "正本含 user_data/board.json，拒绝把运行数据当成可更新代码")
     if os.path.isdir(os.path.join(dest, ".git")):
         proc = run_git(["-C", dest, "status", "--porcelain"])
-        if proc.stdout.strip():
+        if _foreign_dirty(proc.stdout or "").strip():
             raise InstallError("DIRTY", "正本有未提交改动，已停止且不会自动 stash")
         return
     if not _is_managed_copy(dest):
         raise InstallError("DEST", "目标已存在且不是受管正本，拒绝覆盖")
+
+
+_OWN_MARKERS = {".yy-flow-shared", "install-record.json"}
+
+
+def _foreign_dirty(stdout: str) -> str:
+    """安装器写在正本里的标记不算用户改动。"""
+    kept = []
+    for line in stdout.splitlines():
+        if len(line) < 4:
+            if line.strip():
+                kept.append(line)
+            continue
+        path = line[3:].strip()
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1].strip()
+        if len(path) >= 2 and path[0] == '"' and path[-1] == '"':
+            path = path[1:-1]
+        path = path.replace("\\", "/")
+        if path in _OWN_MARKERS:
+            continue
+        kept.append(line)
+    return "\n".join(kept)
 
 
 def _is_managed_copy(path: str) -> bool:

@@ -101,11 +101,15 @@ def file_record(path: str, data: bytes, role: str, config_index: int, entry_hash
     }
 
 
-def mark_written(progress: dict, path: str) -> None:
+def mark_status(progress: dict, path: str, status: str) -> None:
     for item in progress["files"]:
         if os.path.normcase(item["path"]) == os.path.normcase(path):
-            item["status"] = "written"
+            item["status"] = status
             return
+
+
+def mark_written(progress: dict, path: str) -> None:
+    mark_status(progress, path, "written")
 
 
 def incomplete(progress: dict | None) -> bool:
@@ -113,13 +117,17 @@ def incomplete(progress: dict | None) -> bool:
 
 
 def rollback(progress: dict, project_root: str) -> list[str]:
-    """把仍等于本次计划内容的文件恢复到备份。用户后续改动会中止恢复。"""
+    """把仍等于本次计划内容的文件恢复到备份。用户后续改动会中止恢复。
+
+    pending / replacing 也要检查：替换已经落盘、进度还没记成 written 时同样恢复。
+    """
     if not incomplete(progress):
         return []
     problems = []
     actions = []
     for item in progress.get("files", []):
-        if item.get("status") != "written":
+        status = item.get("status")
+        if status not in {"written", "replacing", "pending"}:
             continue
         path = item["path"]
         if not within(project_root, path):
@@ -129,7 +137,7 @@ def rollback(progress: dict, project_root: str) -> list[str]:
         planned = item.get("sha256", "")
         backup_sha = item.get("backup_sha256", "")
         if current is None:
-            if item.get("had_backup"):
+            if item.get("had_backup") and status in {"written", "replacing"}:
                 problems.append(path)
             continue
         current_sha = sha256_bytes(current)

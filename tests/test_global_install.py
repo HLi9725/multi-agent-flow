@@ -3,14 +3,16 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
 import sys
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 from scripts._lib.core.file_lock import acquire_lock, release_lock
-from scripts._lib.onboarding.global_install import DEFAULT_REF, DEFAULT_SOURCE, install
+from scripts._lib.onboarding.global_install import DEFAULT_REF, DEFAULT_SOURCE, install, main
 
 REPO = Path(__file__).resolve().parents[1]
 FAKE = REPO / "tests" / "support" / "fake_git.py"
@@ -173,3 +175,123 @@ def shutil_which(name: str) -> str | None:
     from shutil import which
 
     return which(name)
+
+
+def _git(args: list[str], cwd: Path | None = None) -> None:
+    proc = subprocess.run(
+        ["git", *args],
+        cwd=str(cwd) if cwd else None,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+
+
+def _local_origin_env(origin: Path) -> dict[str, str]:
+    github = "https://github.com/HLi9725/multi-agent-flow.git"
+    local = origin.as_posix()
+    return {
+        "GIT_CONFIG_COUNT": "3",
+        "GIT_CONFIG_KEY_0": "core.autocrlf",
+        "GIT_CONFIG_VALUE_0": "false",
+        "GIT_CONFIG_KEY_1": "core.filemode",
+        "GIT_CONFIG_VALUE_1": "false",
+        "GIT_CONFIG_KEY_2": f"url.{local}.insteadOf",
+        "GIT_CONFIG_VALUE_2": github,
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+
+
+def _install_main(dest: Path) -> tuple[int, str, str]:
+    err = io.StringIO()
+    out = io.StringIO()
+    with redirect_stderr(err), redirect_stdout(out):
+        code = main(["--dest", str(dest), "--ref", "main", "--source", DEFAULT_SOURCE, "--json"])
+    return code, out.getvalue(), err.getvalue()
+
+
+def test_def_t0048_6_real_git_ignores_own_markers(tmp_path: Path) -> None:
+    origin = tmp_path / "origin.git"
+    seed = tmp_path / "seed"
+    _git(["init", "--bare", "-b", "main", str(origin)])
+    _git(["init", "-b", "main", str(seed)])
+    (seed / "scripts").mkdir()
+    (seed / "scripts" / "mcp_server.py").write_text("print('mcp')\n", encoding="utf-8")
+    (seed / "README.md").write_text("seed\n", encoding="utf-8")
+    _git(["-C", str(seed), "config", "user.email", "dev@example.com"])
+    _git(["-C", str(seed), "config", "user.name", "dev"])
+    _git(["-C", str(seed), "config", "core.autocrlf", "false"])
+    _git(["-C", str(seed), "add", "."])
+    _git(["-C", str(seed), "commit", "-m", "init"])
+    _git(["-C", str(seed), "remote", "add", "origin", str(origin)])
+    _git(["-C", str(seed), "push", "origin", "main"])
+    gitconfig = Path.home() / ".gitconfig"
+    before_config = gitconfig.read_bytes() if gitconfig.is_file() else None
+    dest = tmp_path / "canon"
+    keys = (
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_KEY_0",
+        "GIT_CONFIG_VALUE_0",
+        "GIT_CONFIG_KEY_1",
+        "GIT_CONFIG_VALUE_1",
+        "GIT_CONFIG_KEY_2",
+        "GIT_CONFIG_VALUE_2",
+        "GIT_TERMINAL_PROMPT",
+        "YY_FLOW_GIT_ARGV",
+    )
+    saved = {key: os.environ.get(key) for key in keys}
+    os.environ.pop("YY_FLOW_GIT_ARGV", None)
+    os.environ.update(_local_origin_env(origin))
+    try:
+        first, out, err = _install_main(dest)
+        assert first == 0, err
+        assert json.loads(out)["ok"] is True
+        assert (dest / "scripts" / "mcp_server.py").is_file()
+        assert (dest / ".yy-flow-shared").is_file()
+        assert (dest / "install-record.json").is_file()
+        second, out2, err2 = _install_main(dest)
+        assert second == 0, err2
+        assert json.loads(out2)["ok"] is True
+        readme = dest / "README.md"
+        readme.write_text("user edit\n", encoding="utf-8")
+        third, _out3, err3 = _install_main(dest)
+        assert third != 0
+        payload = json.loads(err3)
+        assert payload["code"] == "DIRTY"
+        assert readme.read_text(encoding="utf-8") == "user edit\n"
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    after_config = gitconfig.read_bytes() if gitconfig.is_file() else None
+    assert after_config == before_config
+
+
+def test_def_t0048_8_git_undecodable_stdout_is_business_error(tmp_path: Path, monkeypatch) -> None:
+    script = tmp_path / "bad_stdout.py"
+    script.write_text(
+        "import sys\n"
+        "sys.stdout.buffer.write(b'\\xff\\xfe\\x80')\n"
+        "sys.stdout.buffer.flush()\n"
+        "raise SystemExit(0)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("YY_FLOW_GIT_ARGV", json.dumps([sys.executable, str(script)]))
+    err = io.StringIO()
+    try:
+        with redirect_stderr(err):
+            code = main(["--dest", str(tmp_path / "canon"), "--ref", "main", "--json"])
+    except UnicodeDecodeError as exc:
+        raise AssertionError("uncaught UnicodeDecodeError: " + str(exc)) from exc
+    text = err.getvalue()
+    assert "UnicodeDecodeError" not in text
+    assert code != 0
+    payload = json.loads(text)
+    assert payload["ok"] is False
+    assert payload["code"]

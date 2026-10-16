@@ -121,7 +121,12 @@ def setup(args: argparse.Namespace, write: bool) -> dict:
             existing_state = _state(layout)
             entry_hashes = (existing_state or {}).get("entry_hashes", {})
         link_label = _ensure_skill_link(layout)
+        mount_label, missing_mounts = _ensure_platform_mounts(layout, clients)
+        if mount_label == "absolute_entry":
+            link_label = "absolute_entry"
         exports = _export_bytes(python, layout, clients)
+        if missing_mounts:
+            exports = _rewrite_exports_for_absolute(exports, missing_mounts, layout.skill_root)
         planned = _build_plan(
             layout, clients, python, registry_text.encode("utf-8"), exports, entry_hashes, link_label,
             recorded_files=(existing_state or {}).get("files") or {},
@@ -150,6 +155,8 @@ def setup(args: argparse.Namespace, write: bool) -> dict:
                 progress["phase"] = "failed"
                 txn.save_json(txn.progress_path(layout.data_root), progress)
                 raise OnboardError("WRITE_FAILED", f"第 {fail_at} 个客户端配置写入前失败，接入未完成")
+            txn.mark_status(progress, item["path"], "replacing")
+            txn.save_json(txn.progress_path(layout.data_root), progress)
             current = read_bytes(item["path"])
             if current != item["data"]:
                 try:
@@ -180,7 +187,9 @@ def setup(args: argparse.Namespace, write: bool) -> dict:
                 "ac14_live_client_verified": False,
                 "note": "--skip-self-check 只用于故障注入，不是真实客户端验证，也不是 AC-14 通过",
             }
-        state = _state_document(layout, clients, python, revision, planned, link_label, verification)
+        state = _state_document(
+            layout, clients, python, revision, planned, link_label, verification, existing_state,
+        )
         state_bytes = json.dumps(state, ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
         _assert_clean(state_bytes)
         txn.atomic_write(txn.state_path(layout.data_root), state_bytes)
@@ -330,28 +339,51 @@ def remove_managed(args: argparse.Namespace, write: bool) -> dict:
         )
     handle = txn.acquire(layout.data_root)
     try:
-        for item in planned:
-            current = read_bytes(item["path"])
-            if current is None:
-                continue
-            txn.atomic_write(item["path"], item["data"])
-        kept = dict(state)
-        kept_clients = [client for client in state.get("clients", []) if client not in clients]
-        kept["clients"] = kept_clients
-        hashes = dict(entry_hashes)
+        fresh = _state(layout) or state
+        entry_hashes = fresh.get("entry_hashes", {})
+        removed_clients = []
+        removed_files = []
+        conflicts = []
         for client in clients:
-            hashes.pop(client, None)
-        kept["entry_hashes"] = hashes
-        kept["verification"] = "removed"
-        txn.atomic_write(txn.state_path(layout.data_root), json.dumps(kept, ensure_ascii=False, indent=2).encode("utf-8") + b"\n")
+            path = os.path.join(layout.project_root, *CLIENT_CONFIGS[client].split("/"))
+            current = read_bytes(path)
+            if current is None:
+                removed_clients.append(client)
+                continue
+            try:
+                updated = _strip_client(client, current.decode("utf-8"), entry_hashes.get(client, ""))
+            except OnboardError as exc:
+                if exc.code != "CONFLICT":
+                    raise
+                conflicts.append(exc)
+                continue
+            data = updated.encode("utf-8")
+            if data != current:
+                txn.atomic_write(path, data)
+            removed_clients.append(client)
+            removed_files.append(os.path.relpath(path, layout.project_root))
+        if removed_clients:
+            kept = dict(fresh)
+            kept["clients"] = [client for client in fresh.get("clients", []) if client not in removed_clients]
+            hashes = dict(entry_hashes)
+            for client in removed_clients:
+                hashes.pop(client, None)
+            kept["entry_hashes"] = hashes
+            kept["verification"] = "removed"
+            txn.atomic_write(
+                txn.state_path(layout.data_root),
+                json.dumps(kept, ensure_ascii=False, indent=2).encode("utf-8") + b"\n",
+            )
+        if conflicts:
+            raise OnboardError("CONFLICT", conflicts[0].message, diff=conflicts[0].diff)
         return _public(
             ok=True,
             action="remove",
             layout=layout,
             clients=clients,
-            python=state.get("python", ""),
-            revision=state.get("code_version", ""),
-            files=[os.path.relpath(item["path"], layout.project_root) for item in planned],
+            python=fresh.get("python", ""),
+            revision=fresh.get("code_version", ""),
+            files=removed_files,
             verification="removed",
             message="已移除未改动的受管 yy-flow 条目。运行数据和其他服务器保留",
         )
@@ -382,13 +414,15 @@ def code_version(skill_root: str) -> str:
             ["git", "-C", skill_root, "rev-parse", "HEAD"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=15,
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
         proc = None
     if proc is not None and proc.returncode == 0:
-        sha = proc.stdout.strip()
+        sha = (proc.stdout or "").strip()
         if len(sha) in {40, 64} and all(char in "0123456789abcdef" for char in sha.lower()):
             return sha
     target = os.path.join(skill_root, "scripts", "mcp_server.py")
@@ -504,6 +538,8 @@ def _export_bytes(python: str, layout: Layout, clients: list[str]) -> dict[str, 
             env=env,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=180,
             check=False,
         )
@@ -517,10 +553,14 @@ def _export_bytes(python: str, layout: Layout, clients: list[str]) -> dict[str, 
                 if not os.path.isdir(root):
                     raise OnboardError("EXPORT", "未导出所选客户端目录：" + relative_root)
                 for dirpath, dirnames, filenames in os.walk(root):
-                    dirnames[:] = [name for name in dirnames if not os.path.islink(os.path.join(dirpath, name))]
+                    dirnames[:] = [
+                        name for name in dirnames
+                        if not os.path.islink(os.path.join(dirpath, name))
+                        and not _is_reparse_point(os.path.join(dirpath, name))
+                    ]
                     for name in filenames:
                         full = os.path.join(dirpath, name)
-                        if os.path.islink(full):
+                        if os.path.islink(full) or _is_reparse_point(full):
                             continue
                         relative = os.path.relpath(full, staging)
                         blob = read_bytes(full)
@@ -540,6 +580,8 @@ def _ensure_skill_link(layout: Layout) -> str:
         raise OnboardError("SKILL_ROOT", "项目内 .yy-flow/skill 已指向其他位置。共享模式不会整份复制，请先处理该路径")
     if layout.mode == "project":
         return "project_directory"
+    if os.environ.get("YY_FLOW_ONBOARDING_DENY_LINKS", "").strip() == "1":
+        return "absolute_entry"
     try:
         os.makedirs(os.path.dirname(link), exist_ok=True)
         os.symlink(layout.skill_root, link, target_is_directory=True)
@@ -548,9 +590,130 @@ def _ensure_skill_link(layout: Layout) -> str:
         return "absolute_entry"
 
 
-def _state_document(layout, clients, python, revision, planned, link_label, verification: dict) -> dict:
-    files = {}
-    entry_hashes = {}
+def _ensure_platform_mounts(layout: Layout, clients: list[str]) -> tuple[str, list[str]]:
+    """按平台声明把技能根挂进项目。链接失败时不复制源码，改记绝对入口。"""
+    missing = []
+    for relative, link, source in _platform_mounts(layout, clients):
+        if os.path.lexists(link):
+            if _same_tree(source, link) and (_is_reparse_point(link) or os.path.islink(link)):
+                continue
+            raise OnboardError("SKILL_ROOT", "平台技能挂载已指向其他位置：" + relative)
+        if not _try_link(source, link):
+            missing.append(relative)
+    return ("absolute_entry" if missing else "symlink"), missing
+
+
+def _platform_mounts(layout: Layout, clients: list[str]) -> list[tuple[str, str, str]]:
+    path = os.path.join(layout.skill_root, "config", "agent_platforms.yaml")
+    try:
+        import yaml
+
+        with open(path, "r", encoding="utf-8") as handle:
+            document = yaml.safe_load(handle)
+    except (OSError, UnicodeError) as exc:
+        raise OnboardError("EXPORT", "平台配置无法读取") from exc
+    if not isinstance(document, dict):
+        raise OnboardError("EXPORT", "平台配置无法解析")
+    skill_name = document.get("default_skill_name") or "yy-flow"
+    platforms = document.get("platforms") or {}
+    found = []
+    seen = set()
+    for client in clients:
+        spec = platforms.get(client) or {}
+        template = spec.get("skill_target")
+        if not isinstance(template, str) or not template.strip():
+            continue
+        relative = template.format(skill_name=skill_name).replace("\\", "/")
+        link = os.path.join(layout.project_root, *relative.split("/"))
+        key = os.path.normcase(os.path.abspath(link))
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append((relative, link, layout.skill_root))
+    return found
+
+
+def _try_link(source: str, link: str) -> bool:
+    if os.environ.get("YY_FLOW_ONBOARDING_DENY_LINKS", "").strip() == "1":
+        return False
+    os.makedirs(os.path.dirname(link), exist_ok=True)
+    if os.path.lexists(link):
+        return False
+    target = os.path.abspath(source)
+    try:
+        os.symlink(target, link, target_is_directory=os.path.isdir(target))
+    except OSError:
+        if not (os.name == "nt" and os.path.isdir(target)):
+            return False
+        try:
+            import _winapi
+
+            _winapi.CreateJunction(target, link)
+        except OSError:
+            return False
+    return _same_tree(target, link)
+
+
+def _rewrite_exports_for_absolute(exports: dict[str, bytes], prefixes: list[str], skill_root: str) -> dict[str, bytes]:
+    absolute = os.path.abspath(skill_root).replace("\\", "/")
+    rewritten = {}
+    for relative, data in exports.items():
+        text = data.decode("utf-8")
+        for prefix in prefixes:
+            text = text.replace(prefix.replace("\\", "/"), absolute)
+        rewritten[relative] = text.encode("utf-8")
+    return rewritten
+
+
+def _same_tree(root: str, path: str) -> bool:
+    root_real = os.path.normcase(os.path.realpath(root))
+    path_real = os.path.normcase(os.path.realpath(path))
+    if path_real == root_real:
+        return True
+    try:
+        return os.path.commonpath([root_real, path_real]) == root_real
+    except ValueError:
+        return False
+
+
+def _is_reparse_point(path: str) -> bool:
+    if os.path.islink(path):
+        return True
+    if os.name != "nt" or not os.path.lexists(path):
+        return False
+    import ctypes
+
+    get_attrs = ctypes.windll.kernel32.GetFileAttributesW
+    get_attrs.argtypes = [ctypes.c_wchar_p]
+    get_attrs.restype = ctypes.c_uint32
+    attrs = get_attrs(path)
+    if attrs == 0xFFFFFFFF:
+        return False
+    return bool(attrs & 0x400)
+
+
+def _strip_client(client: str, text: str, recorded: str) -> str:
+    if client == "codex":
+        return strip_managed_toml(text, recorded or None)
+    label = "Cursor 配置" if client == "cursor" else "Antigravity 配置"
+    return strip_mcp_json(text, recorded or None, label)
+
+
+def _state_document(layout, clients, python, revision, planned, link_label, verification: dict, existing_state: dict | None = None) -> dict:
+    previous = existing_state or {}
+    files = dict(previous.get("files") or {})
+    entry_hashes = dict(previous.get("entry_hashes") or {})
+    selected = set(clients)
+    for client in selected:
+        entry_hashes.pop(client, None)
+        files.pop(CLIENT_CONFIGS[client], None)
+        for key in list(entry_hashes):
+            if not key.startswith("export:"):
+                continue
+            relative = key[len("export:"):]
+            if _client_owns_export(client, relative):
+                entry_hashes.pop(key, None)
+                files.pop(relative, None)
     for item in planned:
         relative = os.path.relpath(item["path"], layout.project_root).replace("\\", "/")
         files[relative] = {"sha256": sha256_bytes(item["data"]), "role": item["role"]}
@@ -560,6 +723,7 @@ def _state_document(layout, clients, python, revision, planned, link_label, veri
                 entry_hashes[client] = item["entry_hash"]
         elif item["role"] == "export":
             entry_hashes[_export_key(relative)] = sha256_bytes(item["data"])
+    merged_clients = [item for item in CLIENTS if item in selected.union(previous.get("clients") or [])]
     return {
         "managed": True,
         "server_name": SERVER_NAME,
@@ -569,7 +733,7 @@ def _state_document(layout, clients, python, revision, planned, link_label, veri
         "link": link_label,
         "code_version": revision,
         "python": python,
-        "clients": list(clients),
+        "clients": merged_clients,
         "files": files,
         "entry_hashes": entry_hashes,
         "write_enabled": False,
@@ -578,6 +742,14 @@ def _state_document(layout, clients, python, revision, planned, link_label, veri
         "client_connection_verified": False,
         "ac14_live_client_verified": False,
     }
+
+
+def _client_owns_export(client: str, relative: str) -> bool:
+    normalized = relative.replace("\\", "/")
+    for root in EXPORT_DIRS[client]:
+        if normalized == root or normalized.startswith(root + "/"):
+            return True
+    return False
 
 
 def _client_for_path(relative: str) -> str:
@@ -661,7 +833,15 @@ def _hook_index(name: str) -> int:
 
 def _run_probe(command: list[str]) -> int:
     try:
-        proc = subprocess.run(command, capture_output=True, text=True, timeout=30, check=False)
+        proc = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=False,
+        )
     except (OSError, subprocess.TimeoutExpired):
         return 1
     return proc.returncode

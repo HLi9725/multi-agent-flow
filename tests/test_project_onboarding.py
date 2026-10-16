@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import getpass
+import io
 import json
 import os
 import stat
 import subprocess
 import sys
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 import pytest
@@ -54,8 +56,42 @@ def _base(root: Path, *extra: str) -> list[str]:
     return ["--project-root", str(root), "--skill-root", str(REPO), "--clients", CLIENTS, "--json", *extra]
 
 
+def _is_reparse(path: Path) -> bool:
+    if path.is_symlink():
+        return True
+    if os.name != "nt" or not os.path.lexists(path):
+        return False
+    import ctypes
+
+    get_attrs = ctypes.windll.kernel32.GetFileAttributesW
+    get_attrs.argtypes = [ctypes.c_wchar_p]
+    get_attrs.restype = ctypes.c_uint32
+    attrs = get_attrs(str(path))
+    if attrs == 0xFFFFFFFF:
+        return False
+    return bool(attrs & 0x400)
+
+
+def _walk_files(root: Path):
+    """跳过指向技能根的联接，避免把技能仓整棵树当成项目文件。"""
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [name for name in dirnames if not _is_reparse(Path(dirpath) / name)]
+        for name in filenames:
+            path = Path(dirpath) / name
+            if path.is_symlink() or _is_reparse(path):
+                continue
+            yield path
+
+
+def _find_named(root: Path, name: str) -> Path:
+    for path in _walk_files(root):
+        if path.name == name:
+            return path
+    raise AssertionError(name + " missing")
+
+
 def _assert_readonly_registry(root: Path) -> dict:
-    path = next(root.rglob("mcp_registry.json"))
+    path = _find_named(root, "mcp_registry.json")
     data = json.loads(path.read_text(encoding="utf-8"))
     text = path.read_text(encoding="utf-8")
     assert "github_credential" not in text
@@ -71,8 +107,8 @@ def _assert_readonly_registry(root: Path) -> dict:
 
 
 def _scan_tree(root: Path) -> None:
-    for path in root.rglob("*"):
-        if not path.is_file() or path.is_symlink():
+    for path in _walk_files(root):
+        if not path.is_file():
             continue
         text = path.read_text(encoding="utf-8", errors="ignore")
         assert TOKEN not in text
@@ -104,7 +140,7 @@ def test_ac01_preview_then_apply_three_clients(tmp_path: Path) -> None:
     anti = json.loads((project / ".agents" / "mcp_config.json").read_text(encoding="utf-8"))
     assert list(cursor["mcpServers"]) == ["yy-flow"]
     command = cursor["mcpServers"]["yy-flow"]
-    assert command["args"][1:4] == ["stdio", "--registry", str(next(project.rglob("mcp_registry.json")))]
+    assert command["args"][1:4] == ["stdio", "--registry", str(_find_named(project, "mcp_registry.json"))]
     assert command["command"] == sys.executable
     assert "[mcp_servers.yy-flow]" in codex
     assert "# BEGIN YY-FLOW MANAGED yy-flow" in codex
@@ -121,10 +157,8 @@ def test_ac01_preview_then_apply_three_clients(tmp_path: Path) -> None:
     _scan_tree(project)
     before = {
         path.relative_to(project).as_posix(): path.read_bytes()
-        for path in project.rglob("*")
-        if path.is_file()
-        and not path.is_symlink()
-        and "onboarding" not in path.parts
+        for path in _walk_files(project)
+        if "onboarding" not in path.parts
         and "mcp_audit" not in path.parts
         and "locks" not in path.parts
         and path.name != "state.json"
@@ -567,3 +601,303 @@ def _release_write_share(handle) -> None:
     kernel.CloseHandle.argtypes = [ctypes.c_void_p]
     kernel.CloseHandle.restype = ctypes.c_int
     kernel.CloseHandle(handle)
+
+
+def test_def_t0048_3_remove_rechecks_hash_inside_lock(tmp_path: Path, monkeypatch) -> None:
+    """拿锁成功后、写入前用户改了 Cursor 条目，移除不得用锁前计划覆盖。"""
+    project = tmp_path / "race"
+    project.mkdir()
+    applied = _run(
+        ["--project-root", str(project), "--skill-root", str(REPO), "--clients", "cursor,codex", "--json", "--apply"]
+    )
+    assert applied.returncode == 0, applied.stderr
+    cursor = project / ".cursor" / "mcp.json"
+    codex = project / ".codex" / "config.toml"
+    assert "yy-flow" in cursor.read_text(encoding="utf-8")
+    assert "[mcp_servers.yy-flow]" in codex.read_text(encoding="utf-8")
+
+    import scripts._lib.onboarding.transaction as txn
+    from scripts._lib.onboarding.engine import main as onboard_main
+
+    original = txn.acquire
+    armed = {"value": True}
+
+    def wrapped(data_root: str):
+        handle = original(data_root)
+        if armed["value"]:
+            armed["value"] = False
+            document = json.loads(cursor.read_text(encoding="utf-8"))
+            document["mcpServers"]["yy-flow"]["args"] = ["user-kept-arg"]
+            cursor.write_text(json.dumps(document, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        return handle
+
+    monkeypatch.setattr(txn, "acquire", wrapped)
+    user_text = None
+
+    def run_remove(clients: str) -> tuple[int, str]:
+        err = io.StringIO()
+        out = io.StringIO()
+        with redirect_stderr(err), redirect_stdout(out):
+            code = onboard_main(
+                [
+                    "--project-root",
+                    str(project),
+                    "--skill-root",
+                    str(REPO),
+                    "--clients",
+                    clients,
+                    "--remove",
+                    "--apply",
+                    "--json",
+                ]
+            )
+        return code, err.getvalue() or out.getvalue()
+
+    code, raw = run_remove("cursor")
+    user_text = cursor.read_text(encoding="utf-8")
+    assert code != 0
+    payload = json.loads(raw)
+    assert payload["code"] == "CONFLICT"
+    assert json.loads(user_text)["mcpServers"]["yy-flow"]["args"] == ["user-kept-arg"]
+    assert cursor.read_text(encoding="utf-8") == user_text
+    codex_remove, codex_raw = run_remove("codex")
+    assert codex_remove == 0, codex_raw
+    assert "[mcp_servers.yy-flow]" not in codex.read_text(encoding="utf-8")
+    assert cursor.read_text(encoding="utf-8") == user_text
+
+
+def test_def_t0048_4_recover_pending_file_already_replaced(tmp_path: Path) -> None:
+    """进度仍是 pending，磁盘已是计划内容时，恢复必须回到备份，且不覆盖之后的用户内容。"""
+    from scripts._lib.onboarding.common import sha256_bytes
+
+    def plant(name: str, disk: bytes, backup_blob: bytes, planned: bytes) -> tuple[Path, Path]:
+        project = tmp_path / name
+        project.mkdir()
+        pointer = project / ".yy-flow" / "skill-pointer.json"
+        pointer.parent.mkdir(parents=True)
+        pointer.write_text(json.dumps({"skill_root": str(REPO), "managed": True}), encoding="utf-8")
+        target = project / ".cursor" / "mcp.json"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(disk)
+        backup_dir = project / ".yy-flow" / "user_data" / "onboarding" / "backups" / "current"
+        backup_dir.mkdir(parents=True)
+        backup = backup_dir / sha256_bytes(os.path.abspath(target).encode("utf-8"))
+        backup.write_bytes(backup_blob)
+        progress = {
+            "txn_id": "t0048-4-" + name,
+            "phase": "writing",
+            "complete": False,
+            "files": [
+                {
+                    "path": os.path.abspath(target),
+                    "role": "config",
+                    "config_index": 1,
+                    "sha256": sha256_bytes(planned),
+                    "entry_hash": "planned-entry",
+                    "status": "pending",
+                    "had_backup": True,
+                    "backup": os.path.abspath(backup),
+                    "backup_sha256": sha256_bytes(backup_blob),
+                }
+            ],
+        }
+        progress_path = project / ".yy-flow" / "user_data" / "onboarding" / "progress.json"
+        progress_path.write_text(json.dumps(progress, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        return project, target
+
+    planned = b'{"mcpServers": {"yy-flow": {"command": "planned"}}}\n'
+    original = b'{"mcpServers": {"other": {"command": "keep"}}}\n'
+    project, target = plant("replaced", planned, original, planned)
+    restored = _run(["--project-root", str(project), "--recover", "--apply", "--json"])
+    assert restored.returncode == 0, restored.stderr
+    assert target.read_bytes() == original
+
+    user = b'{"mcpServers": {"yy-flow": {"args": ["after-backup"]}}}\n'
+    project_user, target_user = plant("user-after", user, original, planned)
+    refused = _run(["--project-root", str(project_user), "--recover", "--apply", "--json"])
+    assert refused.returncode != 0
+    assert _payload(refused)["code"] == "USER_CHANGE"
+    assert target_user.read_bytes() == user
+
+
+def test_def_t0048_4_records_replacing_before_file_swap(tmp_path: Path, monkeypatch) -> None:
+    """替换文件之前，进度里必须已经记下即将替换。"""
+    project = tmp_path / "order"
+    project.mkdir()
+    import scripts._lib.onboarding.transaction as txn
+    from scripts._lib.onboarding.engine import main as onboard_main
+
+    seen: list[str] = []
+    real_write = txn.atomic_write
+
+    def wrapped(path: str, data: bytes) -> None:
+        if os.path.basename(path) == "mcp.json":
+            progress_file = project / ".yy-flow" / "user_data" / "onboarding" / "progress.json"
+            document = json.loads(progress_file.read_text(encoding="utf-8"))
+            row = next(
+                item
+                for item in document["files"]
+                if os.path.normcase(item["path"]) == os.path.normcase(os.path.abspath(path))
+            )
+            seen.append(row["status"])
+        real_write(path, data)
+
+    monkeypatch.setattr(txn, "atomic_write", wrapped)
+    err = io.StringIO()
+    out = io.StringIO()
+    with redirect_stderr(err), redirect_stdout(out):
+        code = onboard_main(
+            [
+                "--project-root",
+                str(project),
+                "--skill-root",
+                str(REPO),
+                "--clients",
+                "cursor",
+                "--json",
+                "--apply",
+                "--skip-self-check",
+            ]
+        )
+    assert code == 0, err.getvalue()
+    assert seen == ["replacing"]
+    progress = json.loads((project / ".yy-flow" / "user_data" / "onboarding" / "progress.json").read_text(encoding="utf-8"))
+    assert progress["phase"] == "committed"
+    assert progress["complete"] is True
+    assert any(item["status"] == "written" for item in progress["files"] if item["path"].endswith("mcp.json"))
+
+
+def test_def_t0048_5_skill_mounts_and_runtime_config(tmp_path: Path) -> None:
+    project = tmp_path / "blank"
+    project.mkdir()
+    applied = _run(_base(project, "--apply"))
+    assert applied.returncode == 0, applied.stderr
+    platforms = yaml.safe_load((REPO / "config" / "agent_platforms.yaml").read_text(encoding="utf-8"))
+    skill_name = platforms["default_skill_name"]
+    skill_real = os.path.normcase(os.path.realpath(REPO))
+    problems = []
+    for client in ("cursor", "codex", "antigravity"):
+        spec = platforms["platforms"][client]
+        if spec.get("skill_target"):
+            relative = spec["skill_target"].format(skill_name=skill_name)
+            mount = project.joinpath(*relative.split("/"))
+            if not _is_reparse(mount):
+                problems.append("missing skill mount " + relative)
+                continue
+            resolved = os.path.normcase(os.path.realpath(mount))
+            inside = resolved == skill_real or resolved.startswith(skill_real + os.sep)
+            if not inside or resolved.startswith(os.path.normcase(str(tmp_path))):
+                problems.append("mount escaped skill root " + relative)
+            server = os.path.normcase(os.path.realpath(os.path.join(mount, "scripts", "mcp_server.py")))
+            expected = os.path.normcase(os.path.realpath(REPO / "scripts" / "mcp_server.py"))
+            if server != expected:
+                problems.append("mount does not expose skill scripts " + relative)
+        else:
+            relative = spec["rule_target"].format(skill_name=skill_name)
+            rule = project.joinpath(*relative.split("/"))
+            if not rule.is_file():
+                problems.append("missing rule " + relative)
+    workflow = project / ".yy-flow" / "user_data" / "workflow.config.yaml"
+    if not workflow.is_file():
+        problems.append("missing user_data/workflow.config.yaml")
+    assert not problems, problems
+    assert workflow.read_bytes() == (REPO / "config" / "workflow.config.yaml").read_bytes()
+    from scripts.paths import resolve_runtime_config
+
+    resolved_cfg = resolve_runtime_config(env={"YY_FLOW_PROJECT_ROOT": str(project / ".yy-flow")}, cwd=str(project))
+    assert os.path.normcase(os.path.realpath(resolved_cfg)) == os.path.normcase(os.path.realpath(workflow))
+    arch = yaml.safe_load((project / ".yy-flow" / "user_data" / "project_architecture.config.yaml").read_text(encoding="utf-8"))
+    assert arch["meta"]["initialized"] is False
+    board = json.loads((project / ".yy-flow" / "user_data" / "board.json").read_text(encoding="utf-8"))
+    assert board == []
+
+    kept = tmp_path / "kept"
+    kept.mkdir()
+    existing = kept / ".yy-flow" / "user_data" / "workflow.config.yaml"
+    existing.parent.mkdir(parents=True)
+    existing.write_bytes(b"sentinel: keep-user-config\n")
+    kept_apply = _run(_base(kept, "--apply"))
+    assert kept_apply.returncode == 0, kept_apply.stderr
+    assert existing.read_bytes() == b"sentinel: keep-user-config\n"
+    assert json.loads((kept / ".yy-flow" / "user_data" / "board.json").read_text(encoding="utf-8")) == []
+
+    isolated = tmp_path / "nolink"
+    isolated.mkdir()
+    denied = _run(_base(isolated, "--apply"), env={"YY_FLOW_ONBOARDING_DENY_LINKS": "1"})
+    assert denied.returncode == 0, denied.stderr
+    mount = isolated / ".agents" / "skills" / "yy-flow"
+    assert not (mount / "scripts" / "mcp_server.py").exists()
+    assert not _is_reparse(mount)
+    pointer = json.loads((isolated / ".yy-flow" / "skill-pointer.json").read_text(encoding="utf-8"))
+    assert pointer["link"] == "absolute_entry"
+    assert os.path.isfile(pointer["script"])
+    assert os.path.normcase(os.path.realpath(pointer["script"])).startswith(skill_real)
+    skill_posix = str(REPO).replace("\\", "/")
+    for relative in (".agents/agents/flow-dev.md", ".codex/agents/flow-dev.toml"):
+        text = (isolated.joinpath(*relative.split("/"))).read_text(encoding="utf-8")
+        assert ".agents/skills/yy-flow" not in text.replace("\\", "/")
+        assert skill_posix in text.replace("\\", "/")
+
+
+def test_def_t0048_7_partial_client_update_keeps_other_records(tmp_path: Path) -> None:
+    project = tmp_path / "batch"
+    project.mkdir()
+    first = _run(_base(project, "--apply"))
+    assert first.returncode == 0, first.stderr
+    watched = []
+    for relative in (
+        ".codex/config.toml",
+        ".agents/mcp_config.json",
+        ".codex/agents/flow-dev.toml",
+        ".agents/agents/flow-dev.md",
+    ):
+        path = project.joinpath(*relative.split("/"))
+        assert path.is_file(), relative
+        watched.append((path, path.read_bytes()))
+    state_path = project / ".yy-flow" / "user_data" / "onboarding" / "state.json"
+    before = json.loads(state_path.read_text(encoding="utf-8"))
+    assert {"cursor", "codex", "antigravity"} <= set(before["clients"])
+    second = _run(
+        ["--project-root", str(project), "--skill-root", str(REPO), "--clients", "cursor", "--json", "--apply"]
+    )
+    assert second.returncode == 0, second.stderr
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert {"cursor", "codex", "antigravity"} <= set(state["clients"])
+    for client in ("codex", "antigravity"):
+        assert state["entry_hashes"][client] == before["entry_hashes"][client]
+    export_keys = [
+        key
+        for key in before["entry_hashes"]
+        if key.startswith("export:.codex/") or key.startswith("export:.agents/")
+    ]
+    assert export_keys
+    for key in export_keys:
+        assert state["entry_hashes"][key] == before["entry_hashes"][key]
+    for path, blob in watched:
+        assert path.read_bytes() == blob
+    third = _run(_base(project, "--apply"))
+    assert third.returncode == 0, third.stderr
+    assert _payload(third).get("code") != "CONFLICT"
+    _assert_readonly_registry(project)
+
+
+def test_def_t0048_8_export_undecodable_stdout_is_business_error(tmp_path: Path) -> None:
+    hook = tmp_path / "hook"
+    hook.mkdir()
+    (hook / "sitecustomize.py").write_text(
+        "import sys\n"
+        "if any('verify_and_export_agents.py' in arg for arg in sys.argv):\n"
+        "    sys.stdout.buffer.write(b'\\xff\\xfe\\x80')\n"
+        "    sys.stdout.buffer.flush()\n"
+        "    raise SystemExit(1)\n",
+        encoding="utf-8",
+    )
+    project = tmp_path / "decode"
+    project.mkdir()
+    previous = os.environ.get("PYTHONPATH", "")
+    pythonpath = str(hook) + (os.pathsep + previous if previous else "")
+    proc = _run(_base(project, "--apply"), env={"PYTHONPATH": pythonpath})
+    combined = (proc.stderr or "") + "\n" + (proc.stdout or "")
+    assert "UnicodeDecodeError" not in combined
+    assert proc.returncode != 0
+    assert _payload(proc)["code"] == "EXPORT"

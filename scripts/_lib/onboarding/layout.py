@@ -221,6 +221,15 @@ def new_project_files(layout: Layout) -> dict[str, bytes]:
     files = {}
     if layout.create_board:
         files[layout.board_path] = EMPTY_BOARD
+        workflow = os.path.join(layout.data_root, "user_data", "workflow.config.yaml")
+        if not os.path.isfile(workflow):
+            source = os.path.join(layout.skill_root, "config", "workflow.config.yaml")
+            try:
+                with open(source, "rb") as handle:
+                    raw = handle.read()
+            except OSError as exc:
+                raise OnboardError("SKILL_ROOT", "技能根缺少 config/workflow.config.yaml") from exc
+            files[workflow] = raw
     if layout.create_arch:
         arch = os.path.join(layout.data_root, "user_data", "project_architecture.config.yaml")
         files[arch] = ARCH_MARKER.encode("utf-8")
