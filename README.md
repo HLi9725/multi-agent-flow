@@ -73,17 +73,43 @@ powershell -ExecutionPolicy Bypass -File .yy-flow\skill\scripts\init_skill.ps1
 ```
 
 <details>
-<summary><b>多项目共享安装（可选，单份只读正本 + 全局软链）</b></summary>
+<summary><b>多项目共享安装与项目接入</b></summary>
+
+共享安装器只更新受管代码正本，不改 `~/.cursor`、`~/.codex`、`~/.gemini`。默认仓库是 `HLi9725/multi-agent-flow`，默认稳定入口是 `main`，并记录最终解析到的提交。功能分支不是默认入口。
+
+```powershell
+# Windows 首次安装共享正本（需要能访问 GitHub；脏目录或运行标记会拒绝更新）
+powershell -ExecutionPolicy Bypass -File .\scripts\install_global.ps1
+
+# 已有正本更新到 main。不能热更新时会要求先停用占用正本的进程，不会代为结束进程
+powershell -ExecutionPolicy Bypass -File .\scripts\install_global.ps1 -Ref main
+```
 
 ```bash
-# Linux / macOS 一次性全局共享安装：
-bash scripts/install_global.sh
-
-# Windows PowerShell 一次性全局共享安装：
-powershell -ExecutionPolicy Bypass -File .\scripts\install_global.ps1
+# Linux / macOS。下面只是命令形式；没有在对应系统上实际安装成功过，不能把脚本语法检查当成安装成功
+YY_FLOW_INSTALL_SOURCE=HLi9725/multi-agent-flow bash scripts/install_global.sh main
 ```
-- **代码共享**：`~/agent-skills/multi-agent-flow` 正本只读；
-- **数据隔离**：每个项目的 `user_data/` 自动锚定各自项目根。
+
+项目接入的唯一入口是 `scripts/setup_project.py`。默认只预览；只有 `--apply` 才写入。配置声明服务名固定为 `yy-flow`，客户端可能添加命名空间前缀。登记默认只有当前操作系统用户对指定项目的 `read`。`--skip-self-check` 只用于故障注入，不是真实客户端连接，也不是 AC-14 通过。2026-10-16 Windows 隔离项目已完成 Codex、Cursor、Antigravity 三客户端真实发现与只读查询；这不表示每个新项目已经连接，也不扩大为其他系统或完整写入链的验证。
+
+```powershell
+# 预览。项目内已有 .yy-flow/skill 时可以不传 --skill-root
+python scripts/setup_project.py --project-root "D:\work\demo" --skill-root "D:\agent-skills\multi-agent-flow" --clients cursor,codex,antigravity
+
+# 首次接入或更新受管配置
+python scripts/setup_project.py --project-root "D:\work\demo" --skill-root "D:\agent-skills\multi-agent-flow" --clients cursor,codex,antigravity --apply
+
+# 只读诊断、恢复未完成写入、移除未改动的受管条目
+python scripts/setup_project.py --project-root "D:\work\demo" --diagnose
+python scripts/setup_project.py --project-root "D:\work\demo" --recover --apply
+python scripts/setup_project.py --project-root "D:\work\demo" --remove --apply
+```
+
+- 适用边界：项目级 Cursor `.cursor/mcp.json`、Codex `.codex/config.toml`、Antigravity `.agents/plugins/yy-flow/` 内的 `plugin.json` 与 `mcp_config.json`。当前 Antigravity App 用插件发现 MCP；旧 `.agents/mcp_config.json` 仅迁移已受管且未被用户修改的 `yy-flow` 条目，第三方条目保留。不写用户全局配置，不自动授予写入、流转或验收权限。
+- 客户端启用仍由用户确认：Cursor 在 Customize → MCPs 启用项目 `yy-flow`；Antigravity 在 Customizations → Installed 确认项目插件 `yy-flow`，如未发现先重开项目或新建会话。自动生成配置不等于客户端已经连接。`--remove` 只移除自身 MCP 条目；插件清单、角色、第三方服务器及运行数据保留，空插件不再提供本工具。
+- Antigravity 项目插件清单应通过原生 `GetAllPlugins` 带当前项目 `workspaceUris` 核对；不带项目的 CLI/Installed 空列表不能单独判定项目插件不存在。本次实际 MCP 服务器名为 `yy-flow_yy-flow`，调用应以客户端真实发现结果为准，不能强行查找无前缀的 `yy-flow`。MCP Tools 页面是权限规则，不是服务器注册入口，不要添加通配 Allow 来解决发现问题。
+- 成功时的 STDIO 结果只说明协议自检通过。它不能代替在真实客户端里发现并查询。
+- 共享正本若是某个业务项目的 `.yy-flow/skill`，接入会拒绝，避免数据根落到那个项目。
 
 </details>
 
