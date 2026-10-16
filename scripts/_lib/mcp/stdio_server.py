@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import threading
 from dataclasses import dataclass
+from datetime import date
 from typing import Any, BinaryIO, Dict, Mapping
 
 from scripts.enums import TaskStatus
@@ -89,9 +90,16 @@ def _initialize(message: Mapping[str, Any], session: RpcSession, request_id: Any
         session.failed = True
         raise error("VALIDATION", details={"reason": "PROTOCOL_VERSION"})
     version = params.get("protocolVersion")
-    if version != MCP_PROTOCOL_VERSION:
+    try:
+        valid_version = isinstance(version, str) and date.fromisoformat(version).isoformat() == version
+    except ValueError:
+        valid_version = False
+    if not valid_version:
         session.failed = True
         raise error("VALIDATION", details={"reason": "PROTOCOL_VERSION"})
+    # MCP lifecycle: an unsupported offer must receive a version this server
+    # implements. The client decides whether it can continue with that version.
+    # Do not echo an offered version whose semantics we have not implemented.
     session.announced = True
     return _rpc_ok(
         request_id,

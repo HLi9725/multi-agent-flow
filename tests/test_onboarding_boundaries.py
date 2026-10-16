@@ -137,11 +137,14 @@ def test_recovery_primitive_rejects_outside_backup(tmp_path):
 
 
 def run_command(command: str) -> subprocess.CompletedProcess:
+    # Native Python pipes use the Windows locale, independently of PowerShell's
+    # Console.OutputEncoding. Keep only the test subprocess output deterministic.
+    env = dict(os.environ, PYTHONIOENCODING="utf-8")
     if os.name == "nt":
         command = "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; " + command
         return subprocess.run(["powershell.exe", "-NoProfile", "-Command", command],
-                              capture_output=True, timeout=30)
-    return subprocess.run(["/bin/sh", "-c", command], capture_output=True, timeout=30)
+                              capture_output=True, timeout=30, env=env)
+    return subprocess.run(["/bin/sh", "-c", command], capture_output=True, timeout=30, env=env)
 
 
 def test_cursor_without_links_has_executable_absolute_role_entry(tmp_path, monkeypatch):

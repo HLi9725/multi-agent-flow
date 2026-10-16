@@ -385,6 +385,41 @@ def test_unauthenticated_expired_audience_and_bad_signature(tmp_path: Path) -> N
         server.close()
 
 
+def test_initialize_negotiates_version_and_keeps_http_header_gate(tmp_path: Path) -> None:
+    registry = _registry(tmp_path)
+    issued = _issue(registry, ["read"])
+    server = HttpServer(registry)
+    try:
+        status, headers, body = server.request(
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                "protocolVersion": "2026-03-03", "capabilities": {},
+                "clientInfo": {"name": "newer-client", "version": "0"},
+            }}, token=issued["token"], protocol=False,
+        )
+        assert status == 200
+        assert json.loads(body)["result"]["protocolVersion"] == MCP_PROTOCOL_VERSION
+        session = headers.get(MCP_SESSION_HEADER) or headers.get(MCP_SESSION_HEADER.lower())
+        assert session
+        notification = {"jsonrpc": "2.0", "method": "notifications/initialized"}
+        status, _, body = server.request(notification, token=issued["token"], session=session, protocol=False)
+        assert status == 400
+        assert json.loads(body)["error"]["data"]["details"]["reason"] == "PROTOCOL_VERSION"
+        status, _, _ = server.request(notification, token=issued["token"], session=session)
+        assert status == 202
+        status, payload = server.call(issued["token"], session, "get_project", {"project_id": "alpha"})
+        assert status == 200
+        assert payload["result"]["isError"] is False
+        status, payload = server.call(issued["token"], session, "create_task", {
+            "project_id": "alpha", "name": "denied", "type": "A", "assignee": "李开发",
+            "idempotency_key": "negotiation-readonly-denied",
+        })
+        assert status == 200
+        assert payload["result"]["isError"] is True
+        assert payload["result"]["structuredContent"]["code"] == "FORBIDDEN"
+    finally:
+        server.close()
+
+
 def test_revoked_and_disabled_are_revoked(tmp_path: Path) -> None:
     registry = _registry(tmp_path)
     issued = _issue(registry, ["read"])
