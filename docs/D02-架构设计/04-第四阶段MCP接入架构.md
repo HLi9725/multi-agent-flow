@@ -5,7 +5,7 @@ stage: Phase-4
 type: design-spec
 status: draft
 author: 钱架构
-updated_at: 2026-10-14
+updated_at: 2026-10-16
 tags: [MCP, 协议适配, 权限, GitHub Projects]
 ---
 
@@ -267,9 +267,9 @@ Cursor 原生编排、Codex/Antigravity Production Runner、单角色 CLI 继续
 python scripts/mcp_server.py stdio --registry <登记文件>
 ```
 
-进程标准输入输出使用 JSON-RPC。官方 STDIO 帧仍是 `Content-Length: <字节数>\r\n\r\n` 加 UTF-8 正文。2026-10-13 已核对规范页，官方帧没有改成换行 JSON，因此不得删除现有 Content-Length 读写。客户端若首字节不是该头，按第 10.2 节兼容；只改 `protocol.py` 的帧读写，不改 `service.py`、工具 Schema、权限和状态机。
+进程标准输入输出使用 UTF-8 JSON-RPC，官方 STDIO 以换行分隔单条消息（2026-10-16 核对 MCP Transports）。现有 `Content-Length: <字节数>\r\n\r\n` 是历史自定义帧兼容，不是官方 STDIO 要求；保留双帧读写能力，并以客户端实际使用的帧返回，不改工具 Schema、权限和状态机。
 
-最小方法集：`initialize`、`notifications/initialized`、`tools/list`、`tools/call`、`ping`。`initialize` 声明的协议版本字符串锁定为 `2025-11-25`。客户端协商到其他版本：会话失败，`VALIDATION`，进程不降级到未写明的旧行为。
+最小方法集：`initialize`、`notifications/initialized`、`tools/list`、`tools/call`、`ping`。服务端实际实现并返回的协议版本为 `2025-11-25`。客户端提出合法但不同的版本时，按 MCP Lifecycle 返回服务端支持的版本，由客户端决定是否继续；不直接拒绝，也不冒称支持客户端提出的版本。缺失或非法日期版本仍返回 `VALIDATION`。工具调用必须等待 `notifications/initialized`，HTTP 后续请求仍严格核对最终协商版本头。
 
 4A 的 `tools/list` 只有 `get_project`、`get_task`、`list_tasks`、`get_status`。
 

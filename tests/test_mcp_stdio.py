@@ -462,12 +462,34 @@ def test_registry_env_and_refused_transports(tmp_path: Path) -> None:
     assert "官方 SDK 后端未启用" in sdk.stderr.decode("utf-8")
 
 
-def test_rejected_protocol_version_does_not_downgrade(tmp_path: Path) -> None:
+@pytest.mark.parametrize("offered", ["2024-11-05", "2025-06-18", "2026-03-03"])
+def test_other_protocol_version_negotiates_server_supported_version(tmp_path: Path, offered: str) -> None:
+    client = StdioSession(tmp_path)
+    try:
+        started = client.request(
+            "initialize",
+            {"protocolVersion": offered, "capabilities": {}, "clientInfo": {"name": "x", "version": "0"}},
+        )
+        assert started["result"]["protocolVersion"] == MCP_PROTOCOL_VERSION
+        before_ready = client.request("tools/list", {})
+        assert before_ready["error"]["data"]["code"] == "VALIDATION"
+        client.notify("notifications/initialized")
+        listed = client.request("tools/list", {})
+        assert {tool["name"] for tool in listed["result"]["tools"]} == {
+            "get_project", "get_task", "list_tasks", "get_status",
+        }
+    finally:
+        blob = client.close()
+        _assert_clean(blob)
+
+
+@pytest.mark.parametrize("offered", [None, "", 123, True, [], {}, "bad", "2025-99-99"])
+def test_invalid_protocol_version_does_not_initialize(tmp_path: Path, offered) -> None:
     client = StdioSession(tmp_path)
     try:
         failed = client.request(
             "initialize",
-            {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "x", "version": "0"}},
+            {"protocolVersion": offered, "capabilities": {}, "clientInfo": {"name": "x", "version": "0"}},
         )
         assert failed["error"]["code"] == -32004
         assert failed["error"]["data"]["code"] == "VALIDATION"

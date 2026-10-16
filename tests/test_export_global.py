@@ -126,17 +126,25 @@ class TestSharedMarker:
 
 
 class TestInstallerGuards:
-    """install_global 守卫逻辑（source-grep，不实际联网安装）"""
+    """安装器薄封装必须把守卫留在可测的 Python 模块里。静态检查不是真实安装成功。"""
 
     def test_installer_refuses_polluted_canonical(self):
         with open(os.path.join(REPO_ROOT, "scripts", "install_global.sh"), encoding="utf-8") as f:
             src = f.read()
-        assert "user_data/board.json" in src, "安装器必须含正本污染守卫"
-        assert ".yy-flow-shared" in src, "安装器必须写入共享标记"
-        assert "degit" in src and "tar.gz" in src, "degit + tarball 双通道"
+        module = os.path.join(REPO_ROOT, "scripts", "_lib", "onboarding", "global_install.py")
+        with open(module, encoding="utf-8") as f:
+            core = f.read()
+        assert "global_install.py" in src
+        assert "status=$?" in src
+        assert "user_data" in core and "board.json" in core
+        assert ".yy-flow-shared" in core
+        assert "fetch" in core and "checkout" in core
+        assert "degit" not in src and "degit" not in core
 
     def test_installer_ps1_same_guards(self):
         with open(os.path.join(REPO_ROOT, "scripts", "install_global.ps1"), encoding="utf-8") as f:
             src = f.read()
-        assert "user_data\\board.json" in src
-        assert ".yy-flow-shared" in src
+        assert "global_install.py" in src
+        assert "LASTEXITCODE" in src
+        assert "HLi9725/multi-agent-flow" in src
+        assert "main" in src

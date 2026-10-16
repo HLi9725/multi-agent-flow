@@ -4,7 +4,7 @@ module: workflow
 stage: Phase-4
 type: guide
 status: active
-updated_at: 2026-10-15
+updated_at: 2026-10-16
 tags: [单角色, 自动编排, Profile, 使用指南]
 ---
 
@@ -214,3 +214,51 @@ Cursor 原生验收核对真实子代理记录、策略、候选、检查与官�
 ```
 
 细节与测量基线见 `docs/D01-项目管理/12-工作流效率治理.md`。
+
+## 9. 共享安装与项目接入
+
+接入入口只有 `scripts/setup_project.py`。默认预览，追加 `--apply` 才写入项目级角色、规则和 MCP 配置。受管服务名是 `yy-flow`。登记只给当前操作系统用户的 `read`，不会自动打开建卡、流转或验收。
+
+已实现的是下面这些命令，以及 apply 结束前的本地 STDIO 协议自检。协议自检会做 initialize、tools/list、项目和任务读取、未知项目拒绝、写入拒绝。它不是 Cursor、Codex 或 Antigravity 的真实连接。2026-10-16 Windows 隔离项目已完成三个客户端的真实工具发现及 `get_project`、`list_tasks` 只读查询；该结果不自动适用于其他项目、系统或业务写入权限。`--skip-self-check` 只用于故障注入，同样不是现场验证。
+
+Antigravity 当前 App 按项目插件发现 MCP：生成 `.agents/plugins/yy-flow/plugin.json` 和同目录 `mcp_config.json`，不再只生成会被该安装版忽略的 `.agents/mcp_config.json`。更新时只迁移旧受管且未被用户改动的 `yy-flow` 条目，保留其他服务器；未知同名插件拒绝接管，用户修改过的清单或服务器条目拒绝覆盖。插件两文件和旧条目迁移共用事务日志，中断后使用下面的恢复命令。
+
+配置生成后，在客户端打开项目根目录（不是子目录）。Cursor 从 Customize → MCPs 启用项目 `yy-flow`；Antigravity 从 Customizations → Installed 确认项目 `yy-flow` 插件。如未发现，先重开项目或新建会话；不通过增加 MCP Allow 通配规则或改全局配置来解决发现问题。然后真实调用 `get_project` 和 `list_tasks` 核对登记项目。生成器只声明协议自检，不替用户记为现场通过。移除只去掉自身 MCP 条目，保留插件清单、角色、第三方服务器和业务数据；空插件不再提供本工具。
+
+Antigravity 的项目插件还应通过 `/plugin` 内置指南中的正式 `GetAllPlugins` 查询核对，并传入当前项目的 `workspaceUris`，只输出目标插件的名称、路径、disabled、isGlobal 和 MCP 名称，不输出认证令牌或完整技能正文。全局 Installed 页面或 CLI 空列表不是项目插件不存在的充分证据。本次项目插件的实际服务器名是 `yy-flow_yy-flow`，而声明名仍是 `yy-flow`；以真实工具列表的命名空间调用，不能写死无前缀服务器名。只看到插件或工具列表还不算真实查询通过。
+
+首次安装共享正本（Windows，默认源 `HLi9725/multi-agent-flow`，默认入口 `main`）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install_global.ps1
+python "$env:USERPROFILE\agent-skills\multi-agent-flow\scripts\setup_project.py" `
+  --project-root "D:\work\demo" `
+  --skill-root "$env:USERPROFILE\agent-skills\multi-agent-flow" `
+  --clients cursor,codex,antigravity
+python "$env:USERPROFILE\agent-skills\multi-agent-flow\scripts\setup_project.py" `
+  --project-root "D:\work\demo" `
+  --skill-root "$env:USERPROFILE\agent-skills\multi-agent-flow" `
+  --clients cursor,codex,antigravity `
+  --apply
+```
+
+已有项目更新受管配置，或正本更新后再接入。正本目录有本地改动、运行看板或 `.yy-flow-running` 时，安装器会拒绝，不会自动 stash，也不会结束用户进程。
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install_global.ps1 -Ref main
+python .yy-flow\skill\scripts\setup_project.py --project-root . --clients cursor,codex,antigravity --apply
+python .yy-flow\skill\scripts\setup_project.py --project-root . --diagnose
+```
+
+Linux / macOS 的 `scripts/install_global.sh` 提供同样的参数边界。当前没有在这些系统上完成一次真实安装，不能把脚本存在或语法检查写成安装成功。
+
+诊断、只恢复未完成事务、移除仍与受管哈希一致的 `yy-flow` 条目：
+
+```powershell
+python scripts\setup_project.py --project-root "D:\work\demo" --diagnose
+python scripts\setup_project.py --project-root "D:\work\demo" --recover --apply
+python scripts\setup_project.py --project-root "D:\work\demo" --remove
+python scripts\setup_project.py --project-root "D:\work\demo" --remove --apply
+```
+
+适用边界：只生成项目内配置；保留其他 MCP、TOML 注释和运行数据；同名非受管条目或用户改过的受管文件会拒绝覆盖。不写 `github_credential`，不把进程里的令牌写入生成文件，不修改用户全局客户端配置。

@@ -668,6 +668,8 @@ def main():
                         help="全局共享安装模式：挂载各宿主用户级技能目录（global_skill_target）")
     parser.add_argument("--target-project-dir", default=None,
                         help="宿主项目目录（默认: 当前工作目录）")
+    parser.add_argument("--platforms", default=None,
+                        help="逗号分隔的平台键。传入后只导出这些平台，不按目录探测；省略时保持原探测行为")
     args = parser.parse_args()
 
     global TARGET_PROJECT_DIR
@@ -675,7 +677,16 @@ def main():
         TARGET_PROJECT_DIR = os.path.abspath(args.target_project_dir)
 
     platforms_config = load_platforms_config()
-    active_platforms = detect_active_platforms(platforms_config, global_mode=args.global_mode)
+    if args.platforms is not None:
+        requested = [item.strip() for item in args.platforms.split(",") if item.strip()]
+        known = platforms_config.get("platforms", {})
+        unknown = [item for item in requested if item not in known]
+        if not requested or unknown:
+            print("[FAILED] --platforms 含未知或空平台: " + ",".join(unknown or ["<empty>"]))
+            sys.exit(2)
+        active_platforms = list(dict.fromkeys(requested))
+    else:
+        active_platforms = detect_active_platforms(platforms_config, global_mode=args.global_mode)
 
     mode_label = "全局共享安装 (user-level mount)" if args.global_mode else "项目级挂载"
     print("==============================================================================")
